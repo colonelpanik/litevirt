@@ -232,3 +232,8 @@ func (s *Server) invalidateInventoryCache() {
 	defer s.invCacheMu.Unlock()
 	s.invCacheAt = time.Time{}
 }
+
+// InvalidateInventoryCache is the exported form, for harnesses outside this
+// package (tests/fleet) whose scenarios change the fake runtime's health and
+// must not wait out the cache TTL.
+func (s *Server) InvalidateInventoryCache() { s.invalidateInventoryCache() }

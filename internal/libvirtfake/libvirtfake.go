@@ -83,6 +83,10 @@ type Fake struct {
 	// Nil = default success.
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
+	// outage, which marks the host's runtime inventory INCOMPLETE and must
+	// refuse new residency at admission time.
+	FailListDomains func() error
 	// FailAttachDisk / FailDetachDisk inject a live disk hot-plug primitive failure so
 	// scenarios can exercise attach-rollback / detach-forward compensation.
 	FailAttachDisk func(domain, path, targetDev, bus string) error
@@ -462,6 +466,11 @@ func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
 func (f *Fake) ListDomains() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.FailListDomains != nil {
+		if err := f.FailListDomains(); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]string, 0, len(f.domains))
 	for n := range f.domains {
 		out = append(out, n)

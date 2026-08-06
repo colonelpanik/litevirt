@@ -87,10 +87,14 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// peer-migrate and does NOT admit again (backup_container.go), so one move
 	// reserves exactly once instead of demanding twice the container's memory.
 	// Unconditional: an uncapped container reserves nothing on the target but
-	// still becomes resident there, and the safety half of the admission
-	// (ownership conditions involving the target) must run even at zero delta.
+	// still becomes resident there, and the safety half of the admission must run
+	// even at zero delta. The decision itself is the DESTINATION's
+	// (acquireDestinationHostLease): only the target daemon can probe its own
+	// runtime inventory, so it admits against fresh local state and holds the
+	// durable reservation; this side keeps the lease for the whole transfer and
+	// releases it on every return path.
 	{
-		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
+		lease, aerr := s.acquireDestinationHostLease(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return aerr
 		}

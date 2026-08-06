@@ -253,6 +253,8 @@ const (
 	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
 	LiteVirt_ReserveProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
 	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
+	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
+	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -636,6 +638,20 @@ type LiteVirtClient interface {
 	// owner, which is the only node that reserves against it.
 	ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error)
 	ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -3222,6 +3238,26 @@ func (c *liteVirtClient) ReleaseProjectCapacity(ctx context.Context, in *Release
 	return out, nil
 }
 
+func (c *liteVirtClient) ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReserveHostCapacityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReserveHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3603,6 +3639,20 @@ type LiteVirtServer interface {
 	// owner, which is the only node that reserves against it.
 	ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error)
 	ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -4311,6 +4361,12 @@ func (UnimplementedLiteVirtServer) ReserveProjectCapacity(context.Context, *Rese
 }
 func (UnimplementedLiteVirtServer) ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReserveHostCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostCapacity not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -8249,6 +8305,42 @@ func _LiteVirt_ReleaseProjectCapacity_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReserveHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReserveHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReserveHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, req.(*ReserveHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, req.(*ReleaseHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -9051,6 +9143,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseProjectCapacity",
 			Handler:    _LiteVirt_ReleaseProjectCapacity_Handler,
+		},
+		{
+			MethodName: "ReserveHostCapacity",
+			Handler:    _LiteVirt_ReserveHostCapacity_Handler,
+		},
+		{
+			MethodName: "ReleaseHostCapacity",
+			Handler:    _LiteVirt_ReleaseHostCapacity_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

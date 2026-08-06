@@ -133,6 +133,57 @@ func TestReserveProjectCapacity_RefusesWithNoAuthorityAtAll(t *testing.T) {
 // TestReleaseProjectCapacity_FreesTheLease: a granted lease holds quota until it is
 // released, so the release path has to actually work — a silent no-op here would
 // leak a project's quota on every admission.
+// TestReleaseProjectCapacity_RefusesWhatItDoesNotHold: release validates WHAT
+// it terminates, exactly like its host-capacity sibling. A blind terminal-step
+// writer reachable over peer mTLS is a lever for completing an arbitrary
+// operation — a workload operation whose id doubles as its lease (resize), or
+// another project's live quota lease — by naming its id.
+func TestReleaseProjectCapacity_RefusesWhatItDoesNotHold(t *testing.T) {
+	s := authorityServer(t, "tenant")
+	ctx := mtlsCtx("peer-host")
+	bg := context.Background()
+	if _, err := corrosion.ClaimInitialProjectAuthority(bg, s.db, "tenant", s.hostName); err != nil {
+		t.Fatalf("ClaimInitialProjectAuthority: %v", err)
+	}
+
+	if _, err := s.ReleaseProjectCapacity(ctx, &pb.ReleaseProjectCapacityRequest{
+		Project: "tenant", LeaseId: "no-such-op",
+	}); status.Code(err) != codes.NotFound {
+		t.Fatalf("unknown lease id: got %v, want NotFound", err)
+	}
+
+	// A non-capacity workload operation must not be completable through this door.
+	if err := corrosion.InsertOperation(bg, s.db, corrosion.OperationRecord{
+		ID: "resize-op-1", Method: "ResizeVMLive", ResourceKind: "vm", ResourceID: "some-vm",
+		OperationKind: string(corrosion.OpResourceUpdateRunning),
+	}); err != nil {
+		t.Fatalf("insert vm op: %v", err)
+	}
+	if _, err := s.ReleaseProjectCapacity(ctx, &pb.ReleaseProjectCapacityRequest{
+		Project: "tenant", LeaseId: "resize-op-1",
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("non-capacity operation: got %v, want FailedPrecondition", err)
+	}
+
+	// Another project's live lease is foreign here, and refusing must leave it held.
+	resp, err := s.ReserveProjectCapacity(ctx, reserveReq("tenant", 1))
+	if err != nil {
+		t.Fatalf("ReserveProjectCapacity: %v", err)
+	}
+	if _, err := s.ReleaseProjectCapacity(ctx, &pb.ReleaseProjectCapacityRequest{
+		Project: "other-tenant", LeaseId: resp.LeaseId,
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("cross-project release: got %v, want FailedPrecondition", err)
+	}
+	cpu, _, rerr := corrosion.ProjectReserved(bg, s.db, "tenant")
+	if rerr != nil {
+		t.Fatalf("ProjectReserved: %v", rerr)
+	}
+	if cpu != 1 {
+		t.Fatalf("refused cross-project release still altered the lease: held %d vCPU, want 1", cpu)
+	}
+}
+
 func TestReleaseProjectCapacity_FreesTheLease(t *testing.T) {
 	s := authorityServer(t, "tenant")
 	ctx := mtlsCtx("peer-host")

@@ -114,12 +114,37 @@ func (s *Server) ReserveProjectCapacity(ctx context.Context, req *pb.ReserveProj
 // is a worse outcome than honouring a release from a node that has since lost
 // authority. Releasing only ever frees capacity, so a stale caller cannot use this
 // to admit anything.
+//
+// It DOES validate what it is asked to terminate, like ReleaseHostCapacity: only a
+// capacity operation whose reservation is bound to the named project may be
+// completed here. A terminal-step writer that completes any id it is handed is a
+// lever for erasing another project's live lease — or finishing a WORKLOAD
+// operation whose id doubles as its lease (resize) — over nothing but peer mTLS.
 func (s *Server) ReleaseProjectCapacity(ctx context.Context, req *pb.ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
 	if req.LeaseId == "" {
 		return &emptypb.Empty{}, nil
+	}
+	op, err := corrosion.GetOperation(ctx, s.db, req.LeaseId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read lease operation: %v", err)
+	}
+	if op == nil {
+		return nil, status.Errorf(codes.NotFound, "no operation %q on this holder", req.LeaseId)
+	}
+	if op.ResourceKind != corrosion.CapacityResourceKind {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"operation %q is a %s operation, not a capacity lease", req.LeaseId, op.ResourceKind)
+	}
+	rv, err := corrosion.DecodeReservation(op.ReservationJSON)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "decode lease reservation: %v", err)
+	}
+	if rv.Project != req.Project {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"lease %q reserves for project %q, not %q", req.LeaseId, rv.Project, req.Project)
 	}
 	if err := corrosion.AppendOperationStep(ctx, s.db, corrosion.OperationStepRecord{
 		OperationID: req.LeaseId, StepName: corrosion.OpStepCompleted,

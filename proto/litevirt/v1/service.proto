@@ -2376,6 +2376,21 @@ service LiteVirt {
     // owner, which is the only node that reserves against it.
     rpc ReserveProjectCapacity(ReserveProjectCapacityRequest) returns (ReserveProjectCapacityResponse);
     rpc ReleaseProjectCapacity(ReleaseProjectCapacityRequest) returns (google.protobuf.Empty);
+
+    // ── destination-owned migration host admission ──
+    // PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+    // only it can probe its own runtime inventory, and replicated capacity
+    // observations degrade to DB-only arithmetic exactly when they are missing,
+    // stale, or unreadable — so a source-side decision silently loses the final
+    // target-local safety gate. The source obtains this lease before stopping a
+    // container or beginning a VM transfer, holds it across the whole move, and
+    // releases it on every return path. The destination refuses a request naming
+    // any host but itself, runs full local host admission (fresh inventory,
+    // ownership conditions, runtime-only load), persists a durable reservation
+    // operation, and returns its id as the lease. Release is idempotent and only
+    // ever terminates a capacity operation targeting the local host.
+    rpc ReserveHostCapacity(ReserveHostCapacityRequest) returns (ReserveHostCapacityResponse);
+    rpc ReleaseHostCapacity(ReleaseHostCapacityRequest) returns (google.protobuf.Empty);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -2839,4 +2854,27 @@ message ReserveProjectCapacityResponse {
 message ReleaseProjectCapacityRequest {
     string project  = 1;
     string lease_id = 2;
+}
+
+message ReserveHostCapacityRequest {
+    string host          = 1;  // MUST name the destination daemon itself
+    string project       = 2;
+    string method        = 3;  // originating RPC name, recorded in the journal
+    string principal     = 4;  // originating end-user, preserved for audit
+    string resource_id   = 5;  // "vm:<name>" / "ct:<name>" — the workload moving in
+    int32  cpu_delta     = 6;  // positive grow only; ≤0 reserves nothing
+    int32  mem_mib_delta = 7;
+    // The two admission-intent facts, named independently (see admissionIntent):
+    // new_residency gates on fresh local inventory even at zero delta;
+    // vm_overhead charges the per-domain qemu overhead to HOST figures only.
+    bool   new_residency = 8;
+    bool   vm_overhead   = 9;
+}
+message ReserveHostCapacityResponse {
+    // Destination-local operation id; passed back to ReleaseHostCapacity. Empty
+    // when the admission passed safety but reserved nothing (zero delta).
+    string lease_id = 1;
+}
+message ReleaseHostCapacityRequest {
+    string lease_id = 1;
 }

@@ -118,6 +118,11 @@ const releaseTimeout = 10 * time.Second
 type reservationLease struct {
 	s  *Server
 	id string
+	// hostHolder is the daemon holding the HOST half when it is not this node —
+	// a destination-owned migration lease (acquireDestinationHostLease). The
+	// operation row lives in the DESTINATION's database, so release must travel
+	// back over the peer channel instead of terminating a local operation.
+	hostHolder string
 	// The PROJECT-QUOTA half may be held on another node — the project's admission
 	// authority holder — so it is tracked separately from the local host reservation
 	// and released wherever it actually lives.
@@ -218,6 +223,15 @@ func (l *reservationLease) release(ctx context.Context) {
 	}
 	id := l.id
 	l.id = ""
+	if l.hostHolder != "" && l.hostHolder != l.s.hostName {
+		if err := l.s.releaseRemoteHostLease(rctx, l.hostHolder, id); err != nil {
+			slog.Error("destination-held capacity reservation was not released; the destination "+
+				"holds it until the stale-lease sweep collects it",
+				"operation", id, "destination", l.hostHolder, "error", err)
+			l.s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+		}
+		return
+	}
 	if err := corrosion.AppendOperationStep(rctx, l.s.db, corrosion.OperationStepRecord{
 		OperationID: id, StepName: corrosion.OpStepCompleted,
 	}); err != nil {
@@ -245,7 +259,7 @@ func (l *reservationLease) release(ctx context.Context) {
 func (s *Server) admitWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, "", method, host, project, resourceID,
+	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
 		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
 }
 
@@ -261,7 +275,7 @@ func (s *Server) admitGrowWithReservation(
 		tag = "ct"
 	}
 	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
-	return s.admitReserved(ctx, "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, intentResourceGrow)
+	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, intentResourceGrow)
 }
 
 // admitWithReservationID is admitWithReservation with an explicit operation ID.
@@ -272,7 +286,7 @@ func (s *Server) admitGrowWithReservation(
 func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, opID, method, host, project, resourceID,
+	return s.admitReserved(ctx, callerPrincipal(ctx), opID, method, host, project, resourceID,
 		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
 }
 
@@ -290,7 +304,7 @@ func (s *Server) admitWithReservationID(
 func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, "", method, host, project, resourceID,
+	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
 		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, false, intent)
 }
 
@@ -354,8 +368,16 @@ func (s *Server) reserveWithoutCheck(
 	return lease, nil
 }
 
+// callerPrincipal renders the calling end-user as recorded in operation
+// journals. The DELEGATED admission paths (project quota, destination-owned
+// host leases) carry this across the peer hop explicitly, so the journal names
+// who asked rather than which daemon relayed it.
+func callerPrincipal(ctx context.Context) string {
+	return callerUsername(ctx) + "@" + callerRealm(ctx)
+}
+
 func (s *Server) admitReserved(
-	ctx context.Context, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota bool, intent admissionIntent,
+	ctx context.Context, principal, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota bool, intent admissionIntent,
 ) (*reservationLease, error) {
 	// Host safety BEFORE the zero-delta fast path AND before any reservation: an
 	// active ownership condition on this host or workload, or an incomplete
@@ -411,7 +433,7 @@ func (s *Server) admitReserved(
 	op := corrosion.OperationRecord{
 		ID:              opID,
 		Method:          method,
-		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
+		Principal:       principal,
 		Project:         project,
 		ResourceKind:    corrosion.CapacityResourceKind,
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),

@@ -19,6 +19,7 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"testing"
 
@@ -182,6 +183,57 @@ func TestFleet_MigrateVM_ReleasesItsReservation(t *testing.T) {
 	}
 }
 
+// TestFleet_MigrateVM_RefusedWhenTargetInventoryIncomplete pins WHERE the
+// admission decision runs. The destination's database and replicated state look
+// perfectly healthy — plenty of headroom, no conditions — but its own runtime
+// probe fails, so the host cannot enumerate what it is already running. Only
+// the DESTINATION daemon can know that: the source's replicated view has no
+// fresh observation to consult and silently degrades to DB-only arithmetic. A
+// source-side admission therefore admits this migration; the destination-owned
+// admission refuses it before anything is stopped, copied, or provisioned.
+func TestFleet_MigrateVM_RefusedWhenTargetInventoryIncomplete(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	ctx := context.Background()
+	entry, src, dst := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+
+	for _, n := range []*Node{entry, src, dst} {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+	seedRunningVM(t, c, src, "blind-mover", "", 2, 4096)
+
+	// The destination's libvirt stops answering. Its DB still says "roomy".
+	dst.Virt.FailListDomains = func() error { return errListDomainsDown }
+	dst.Server.InvalidateInventoryCache()
+
+	err := migrateAt(t, c, entry, "blind-mover", dst.Name)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("migrating onto a host that cannot enumerate its own runtime: got %v, want FailedPrecondition — "+
+			"only the destination can see its inventory is incomplete, so the destination must be the one deciding", err)
+	}
+	rec, gerr := corrosion.GetVM(ctx, src.DB, "blind-mover")
+	if gerr != nil || rec == nil {
+		t.Fatalf("GetVM blind-mover: rec=%v err=%v", rec, gerr)
+	}
+	if rec.HostName != src.Name || rec.State != "running" {
+		t.Errorf("refused migration disturbed the VM: host=%q state=%q, want %s/running", rec.HostName, rec.State, src.Name)
+	}
+
+	// Control: the destination's runtime heals and the same migration lands.
+	dst.Virt.FailListDomains = nil
+	dst.Server.InvalidateInventoryCache()
+	if err := migrateAt(t, c, entry, "blind-mover", dst.Name); err != nil {
+		t.Fatalf("migrate after the destination's inventory healed: %v", err)
+	}
+	// The destination-held admission lease must not outlive the move.
+	cpu, mem, rerr := corrosion.HostReserved(ctx, dst.DB, dst.Name)
+	if rerr != nil {
+		t.Fatalf("HostReserved: %v", rerr)
+	}
+	if cpu != 0 || mem != 0 {
+		t.Fatalf("after a landed migration the destination still holds %d vCPU/%d MiB in reservations, want 0/0", cpu, mem)
+	}
+}
+
 // TestFleet_MigrateContainer_IsAdmittedAgainstTheTargetHostsCapacity: a cold
 // container migrate lands the container's whole memory cap on the target, and
 // admitted nothing.
@@ -235,3 +287,7 @@ func TestFleet_MigrateContainer_IsAdmittedAgainstTheTargetHostsCapacity(t *testi
 		t.Fatalf("after a landed container migrate the target still holds %d vCPU/%d MiB in reservations, want 0/0", cpu, mem)
 	}
 }
+
+// errListDomainsDown is the injected libvirtd outage for the incomplete-
+// inventory scenario.
+var errListDomainsDown = errors.New("libvirtd unreachable")

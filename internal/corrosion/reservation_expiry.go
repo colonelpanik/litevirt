@@ -17,6 +17,28 @@ import (
 // genuinely spoken for.
 const CapacityResourceKind = "capacity"
 
+// TransferCapacityLeaseMaxAge bounds a capacity lease held ACROSS A TRANSFER:
+// the destination-held (or local-target) admission lease of MigrateVM,
+// MigrateContainer, and DrainHost, which legitimately stays nonterminal for as
+// long as the data takes to move. A --with-storage migration of a large disk
+// routinely outlives the RPC-scoped TTL, and cancelling its lease mid-flight
+// releases headroom the incoming workload is about to consume — a concurrent
+// create is then admitted against memory already spoken for, the exact
+// overpack the lease exists to prevent. The trade is deliberate: a transfer
+// lease leaked by a crashed source strands capacity until THIS ceiling
+// collects it, bounded and fail-closed, instead of a live transfer being
+// silently overpacked. Sized for multi-terabyte storage copies on modest
+// links.
+const TransferCapacityLeaseMaxAge = 6 * time.Hour
+
+// transferLeaseMethods are the originating RPCs whose capacity leases span a
+// whole data transfer rather than one admission RPC.
+var transferLeaseMethods = map[string]bool{
+	"MigrateVM":        true,
+	"MigrateContainer": true,
+	"DrainHost":        true,
+}
+
 // ExpireStaleCapacityReservations cancels admission leases older than maxAge.
 //
 // Reserve-then-verify made a crash between "reserve" and "release" leak capacity
@@ -33,10 +55,14 @@ const CapacityResourceKind = "capacity"
 // Local-deterministic and idempotent: appending a terminal step converges under the
 // same immutable-merge discipline as the terminal reaper, so every node may run it.
 func ExpireStaleCapacityReservations(ctx context.Context, c *Client, maxAge time.Duration) (int, error) {
-	cutoff := time.Now().Add(-maxAge).UTC().Format(time.RFC3339)
+	now := time.Now()
+	cutoff := now.Add(-maxAge).UTC().Format(time.RFC3339)
+	// Transfer-method leases (see transferLeaseMethods) age against the
+	// transfer ceiling instead: they legitimately span the whole data move.
+	transferCutoff := now.Add(-TransferCapacityLeaseMaxAge).UTC().Format(time.RFC3339)
 
 	rows, err := c.Query(ctx,
-		`SELECT id, operation_kind FROM operations
+		`SELECT id, operation_kind, method, created_at FROM operations
 		  WHERE deleted_at IS NULL
 		    AND resource_kind = ?
 		    AND reservation_json != ''
@@ -62,6 +88,9 @@ func ExpireStaleCapacityReservations(ctx context.Context, c *Client, maxAge time
 	expired := 0
 	for _, r := range rows {
 		id := r.String("id")
+		if transferLeaseMethods[r.String("method")] && r.String("created_at") >= transferCutoff {
+			continue // an in-flight transfer's lease — not orphaned, just long
+		}
 		state, _ := ReduceOperationState(OperationKind(r.String("operation_kind")), byOp[id])
 		if IsOperationTerminal(state) {
 			continue // already released

@@ -111,3 +111,59 @@ func TestExpireStaleCapacityReservations_NeverTouchesSpecBackedOperations(t *tes
 		t.Errorf("reserved vCPU = %d, want 4 — the resize's reservation was released", held)
 	}
 }
+
+// insertAgedMethodOp is insertAgedOp with an explicit originating method, for
+// the transfer-lease TTL cases.
+func insertAgedMethodOp(t *testing.T, db *Client, id, method string, age time.Duration, cpu, mem int) {
+	t.Helper()
+	ctx := context.Background()
+	rv := ReservationVector{TargetHost: "h1", TargetCPU: cpu, TargetMemMiB: mem}
+	enc, err := rv.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if err := InsertOperation(ctx, db, OperationRecord{
+		ID: id, Method: method, ResourceKind: CapacityResourceKind,
+		OperationKind: string(OpResourceUpdateRunning), ReservationJSON: enc,
+	}); err != nil {
+		t.Fatalf("InsertOperation %s: %v", id, err)
+	}
+	when := time.Now().Add(-age).UTC().Format(time.RFC3339)
+	if err := db.Execute(ctx, `UPDATE operations SET created_at = ? WHERE id = ?`, when, id); err != nil {
+		t.Fatalf("age %s: %v", id, err)
+	}
+}
+
+// TestExpireStaleCapacityReservations_TransferLeasesGetTheTransferTTL: the
+// admission lease of a migration or drain is held ACROSS THE TRANSFER — a
+// --with-storage move routinely runs past the 15-minute RPC-scoped TTL, and a
+// sweep that cancels it mid-flight releases headroom the incoming workload is
+// about to consume: a concurrent create is then admitted against memory
+// already spoken for, the exact overpack the lease exists to prevent. Transfer
+// methods therefore age against TransferCapacityLeaseMaxAge; a crashed
+// source's leaked lease is still collected, just later.
+func TestExpireStaleCapacityReservations_TransferLeasesGetTheTransferTTL(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	insertAgedMethodOp(t, db, "old-create", "CreateVM", time.Hour, 1, 512)
+	insertAgedMethodOp(t, db, "mid-migrate", "MigrateVM", time.Hour, 1, 512)
+	insertAgedMethodOp(t, db, "mid-ct", "MigrateContainer", time.Hour, 1, 512)
+	insertAgedMethodOp(t, db, "mid-drain", "DrainHost", time.Hour, 1, 512)
+	insertAgedMethodOp(t, db, "dead-migrate", "MigrateVM", TransferCapacityLeaseMaxAge+time.Hour, 1, 512)
+
+	n, err := ExpireStaleCapacityReservations(ctx, db, 15*time.Minute)
+	if err != nil {
+		t.Fatalf("ExpireStaleCapacityReservations: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expired %d leases, want 2 (the stale CreateVM lease and the truly dead migration)", n)
+	}
+	held, _, err := HostReserved(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostReserved: %v", err)
+	}
+	if held != 3 {
+		t.Errorf("reserved vCPU = %d after the sweep, want 3 — an in-flight transfer's lease was freed under it", held)
+	}
+}

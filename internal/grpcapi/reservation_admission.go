@@ -13,6 +13,38 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// admissionIntent names the two INDEPENDENT facts an admission needs about the
+// action it is deciding, which one boolean used to conflate:
+//
+//   - newResidency: the action makes a workload RESIDENT on the target host
+//     (create, start, migrate-in, restore-in, fresh promotion). This is the
+//     SAFETY fact: incomplete or unattributable local inventory refuses new
+//     residency regardless of the numeric delta, because an uncapped container
+//     asks the ledger for nothing and still lands on the host.
+//   - vmOverhead: the target receives a qemu DOMAIN, so the HOST figures carry
+//     the per-domain memory overhead. Host-only, never project quota — the
+//     hypervisor's cost of running the guest, not memory the tenant asked for.
+//
+// Containers become resident without ever paying qemu overhead; a resource grow
+// of a running workload is neither. Conflating the two is what let container
+// callers opt out of residency safety by (correctly) declining VM overhead.
+type admissionIntent struct {
+	newResidency bool
+	vmOverhead   bool
+}
+
+var (
+	// intentVMResident: a qemu domain appears on the host (VM create, start of a
+	// stopped VM, migrate-in, restore-in, fresh promotion).
+	intentVMResident = admissionIntent{newResidency: true, vmOverhead: true}
+	// intentContainerResident: a container appears on the host — full residency
+	// safety, no qemu overhead.
+	intentContainerResident = admissionIntent{newResidency: true}
+	// intentResourceGrow: a delta on a workload already resident and counted,
+	// overhead included.
+	intentResourceGrow = admissionIntent{}
+)
+
 // quotaSubject is the workload a project-quota admission is FOR: its identity
 // (kind, host, name) and the ABSOLUTE size the admission grows it to. The settle
 // rule retires a released lease only when this workload contributes at least the
@@ -208,18 +240,13 @@ func (l *reservationLease) release(ctx context.Context) {
 // granted has actually landed in its replica, instead of guessing from a clock.
 //
 // A zero/negative delta consumes nothing and takes the cheap path — no operation
-// row, no lease — so a shrink never queues behind anything.
-// newVMOnHost says a qemu domain is APPEARING on host (a create, or a start that
-// makes a stopped VM resident), so host capacity must also carry that VM's
-// per-domain memory overhead. It is charged against the HOST only, never against
-// project quota: the overhead is the hypervisor's cost of running the guest, not
-// memory the tenant asked for, and billing it to the quota would shrink every
-// project's usable allocation by an accounting artifact.
+// row, no lease — but only AFTER host safety has passed: residency is a safety
+// decision even when nothing numeric is requested (see admissionIntent).
 func (s *Server) admitWithReservation(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
 }
 
 // admitGrowWithReservation is admitWithReservation for a GROW of an existing
@@ -234,7 +261,7 @@ func (s *Server) admitGrowWithReservation(
 		tag = "ct"
 	}
 	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
-	return s.admitReserved(ctx, "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, false)
+	return s.admitReserved(ctx, "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, intentResourceGrow)
 }
 
 // admitWithReservationID is admitWithReservation with an explicit operation ID.
@@ -243,10 +270,10 @@ func (s *Server) admitGrowWithReservation(
 // example, ResizeVMLive derives a deterministic ID from an idempotency key and
 // then needs admission/verification to participate in the same winner election).
 func (s *Server) admitWithReservationID(
-	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
+	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, opID, method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -261,10 +288,10 @@ func (s *Server) admitWithReservationID(
 // quietly adding another holder. The quota figures stay zero regardless — identity
 // here never charges anything.
 func (s *Server) admitHostWithReservation(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, false, newVMOnHost)
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, false, intent)
 }
 
 // reserveWithoutCheck publishes a HOST reservation without verifying it fits —
@@ -284,15 +311,17 @@ func (s *Server) admitHostWithReservation(
 func (s *Server) reserveWithoutCheck(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
-	if cpuDelta <= 0 && memDelta <= 0 {
-		return &reservationLease{}, nil
-	}
 	// --allow-overcommit bypasses the numeric headroom CHECK only. Host safety
 	// — active ownership conditions, incomplete local inventory — binds the
-	// overcommit path exactly as it binds everything else.
+	// overcommit path exactly as it binds everything else, and binds it BEFORE
+	// the zero-delta fast path: residency is a safety decision even when the
+	// numeric delta is zero.
 	sub := subjectForCreate(resourceID, host, cpuDelta, memDelta)
-	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, true); err != nil {
+	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, true, true); err != nil {
 		return nil, err
+	}
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
 	}
 	rv := corrosion.ReservationVector{
 		Project:    project,
@@ -326,21 +355,27 @@ func (s *Server) reserveWithoutCheck(
 }
 
 func (s *Server) admitReserved(
-	ctx context.Context, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota, newVMOnHost bool,
+	ctx context.Context, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota bool, intent admissionIntent,
 ) (*reservationLease, error) {
+	// Host safety BEFORE the zero-delta fast path AND before any reservation: an
+	// active ownership condition on this host or workload, or an incomplete
+	// local inventory for a newly-resident workload, refuses outright — no lease
+	// to leak, nothing to unwind. A fully uncapped container reaches here with a
+	// zero delta and must still be a real safety decision; only after safety
+	// passes may a zero delta return the empty no-op lease.
+	if err := s.checkHostSafety(ctx, host, subject.Kind, subject.Name, intent.newResidency,
+		intent.newResidency || cpuDelta > 0 || memDelta > 0); err != nil {
+		return nil, err
+	}
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
-	// Host safety BEFORE any reservation: an active ownership condition on this
-	// host or workload, or an incomplete local inventory for a newly-resident
-	// workload, refuses outright — no lease to leak, nothing to unwind.
-	if err := s.checkHostSafety(ctx, host, subject.Kind, subject.Name, newVMOnHost); err != nil {
-		return nil, err
-	}
 
-	// Host figures carry the per-domain overhead; quota figures never do.
+	// Host figures carry the per-domain overhead; quota figures never do. The
+	// overhead follows the qemu DOMAIN, not residency: a container becomes
+	// resident without one.
 	hostMemDelta := memDelta
-	if newVMOnHost {
+	if intent.vmOverhead {
 		hostMemDelta = s.capacity.MemChargeFor(memDelta)
 	}
 
@@ -494,13 +529,17 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 //
 // The returned lease carries the commit fence like any other quota grant.
 func (s *Server) admitQuotaWithReservation(
-	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int, newWorkload bool,
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int, intent admissionIntent,
 ) (*reservationLease, error) {
+	// Safety before the zero-delta fast path, same as admitReserved. The quota
+	// figures never carry vmOverhead — it is a host-side cost — so only the
+	// residency half of the intent is consulted here.
+	if err := s.checkHostSafety(ctx, host, kind, name, intent.newResidency,
+		intent.newResidency || cpuDelta > 0 || memDelta > 0); err != nil {
+		return nil, err
+	}
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
-	}
-	if err := s.checkHostSafety(ctx, host, kind, name, newWorkload); err != nil {
-		return nil, err
 	}
 	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
 	tag := "vm"

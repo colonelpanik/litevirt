@@ -120,7 +120,7 @@ func (s *Server) autoDefineRestoredVM(
 	// below, so the provisional reservation is only dropped once the VM's own row
 	// accounts for the same capacity.
 	lease, aerr := s.admitWithReservation(
-		ctx, "RestoreLive", s.hostName, project, "vm:"+targetName, int(spec.Cpu), int(spec.MemoryMib), true)
+		ctx, "RestoreLive", s.hostName, project, "vm:"+targetName, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
 	if aerr != nil {
 		return "", "", aerr
 	}

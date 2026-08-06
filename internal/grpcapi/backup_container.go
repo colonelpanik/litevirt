@@ -738,8 +738,10 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	var restoreQuotaLease *reservationLease
 	if s.migrateSourceFromPeer(ctx) == "" {
 		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
-		if spec.MemMiB > 0 {
-			lease, aerr := s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, spec.MemMiB, false)
+		// Unconditional, like CreateContainer: an archived spec with no limits
+		// still restores into RESIDENCY, and that is the safety decision.
+		{
+			lease, aerr := s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, spec.MemMiB, intentContainerResident)
 			if aerr != nil {
 				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 				return aerr
@@ -748,7 +750,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		}
 		if !relocation && (spec.CPULimit > 0 || spec.MemMiB > 0) {
 			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
-				corrosion.WorkloadContainer, req.Name, spec.CPULimit, spec.MemMiB, spec.CPULimit, spec.MemMiB, true)
+				corrosion.WorkloadContainer, req.Name, spec.CPULimit, spec.MemMiB, spec.CPULimit, spec.MemMiB, intentContainerResident)
 			if aerr != nil {
 				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 				return aerr

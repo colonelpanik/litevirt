@@ -164,12 +164,14 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // func is never nil and must be deferred by the caller so the reservation
 // outlives the commit.
 //
-// newVMOnHost says whether a VM is APPEARING on this host (a create, or a start of
-// a stopped VM) as opposed to a delta on one already running. When true the HOST
-// side is charged one extra qemu overhead, because free capacity is computed net of
-// one overhead per VM already there and the incoming one is not counted yet. A
-// delta on a running VM must NOT be charged again — its overhead is already
-// subtracted, so re-adding it would refuse a legal grow, every time.
+// intent.vmOverhead says whether a qemu domain is APPEARING on this host (a
+// create, or a start of a stopped VM) as opposed to a delta on one already
+// running. When set the HOST side is charged one extra qemu overhead, because
+// free capacity is computed net of one overhead per VM already there and the
+// incoming one is not counted yet. A delta on a running VM must NOT be charged
+// again — its overhead is already subtracted, so re-adding it would refuse a
+// legal grow, every time. (See admissionIntent for why overhead and residency
+// are separate facts.)
 //
 // The overhead is charged to the HOST only, never to project quota: it is a
 // physical cost of running qemu, not tenant-consumed memory, and folding it into
@@ -178,9 +180,9 @@ func (s *Server) reserveHostCapacity(host string, cpuDelta, memMiBDelta int) fun
 // The host lock is released before the quota step, which may make a peer RPC to
 // the project's authority holder. That ordering is load-bearing: never hold the
 // host lock across a peer call.
-func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, newVMOnHost bool) (func(), error) {
+func (s *Server) admitResources(ctx context.Context, host, project string, cpuDelta, memMiBDelta int, intent admissionIntent) (func(), error) {
 	hostMem := memMiBDelta
-	if newVMOnHost {
+	if intent.vmOverhead {
 		hostMem = s.capacity.MemChargeFor(memMiBDelta)
 	}
 	release, err := s.admitHostCapacity(ctx, host, cpuDelta, hostMem)
@@ -399,11 +401,22 @@ func (s *Server) derivedProjectHolder(ctx context.Context, project string) strin
 // the journal while the headroom it should be protecting is handed to the next
 // admission. Every reservation writer calls this immediately after inserting.
 //
-// A project with no authority yet stamps empty facts, which aggregation treats as a
-// legacy claim and keeps counting.
+// A project with DEFINITELY no authority yet stamps empty facts, which aggregation
+// treats as a legacy claim and keeps counting. An authority read FAILURE is a
+// different state and fails closed: treating it as "no authority" would stamp
+// empty facts on a project that does have a current authority, and aggregation
+// would then refuse to count the reservation — a live lease consuming nothing,
+// its headroom handed to the next admission. The caller releases the provisional
+// operation and refuses the admission; nothing is admitted on an unreadable
+// authority ledger.
 func (s *Server) stampReservationAuthority(ctx context.Context, opID, project string) error {
+	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"cannot read project-quota authority for %q before attributing its reservation: %v", project, err)
+	}
 	var facts *corrosion.ReservationFacts
-	if cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project); err == nil && ok {
+	if ok {
 		facts = corrosion.ReservationFactsFor(project, cur.Epoch, cur.Holder)
 	}
 	if err := corrosion.AppendReservationFacts(ctx, s.db, opID, 0, project, facts); err != nil {

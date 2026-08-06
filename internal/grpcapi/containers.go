@@ -151,9 +151,14 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// otherwise a concurrent create for a different name sees the same headroom
 	// and both pass. Placed after tenancy and before any runtime or IPAM work, so
 	// a refusal leaves no partial state to unwind.
+	// The host admission is UNCONDITIONAL — a fully uncapped container reserves
+	// nothing but still becomes resident, and residency is a safety decision
+	// (incomplete inventory, active ownership conditions) the container cannot
+	// opt out of by declining limits. The zero-delta case returns an empty lease
+	// after safety passes.
 	var ctLease *reservationLease
-	if req.MemoryMib > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), false)
+	{
+		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -161,7 +166,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	}
 	if req.Cpu > 0 || req.MemoryMib > 0 {
 		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
-			corrosion.WorkloadContainer, req.Name, int(req.Cpu), int(req.MemoryMib), int(req.Cpu), int(req.MemoryMib), true)
+			corrosion.WorkloadContainer, req.Name, int(req.Cpu), int(req.MemoryMib), int(req.Cpu), int(req.MemoryMib), intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -283,12 +288,14 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Host capacity admission — memory only (see CreateContainer). Starting is when
 	// the memory is actually taken: a stopped container is accounted as nothing, so
 	// checking only at create would be sidestepped by creating several that each fit
-	// and starting them all. Skipped when already running (adds nothing) and when
-	// uncapped (nothing to admit).
+	// and starting them all. Skipped when already running (adds nothing). An
+	// UNCAPPED container reserves nothing but is still admitted: the start makes it
+	// resident, and residency is the safety decision — a host with incomplete
+	// inventory or an active ownership condition refuses it even at zero delta.
 	// Reserved, not just checked, so the memory stays accounted for across the
 	// runtime start and the "running" state write below.
-	if rec.State != "running" && rec.MemMiB > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, "ct:"+req.Name, 0, rec.MemMiB, false)
+	if rec.State != "running" {
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}

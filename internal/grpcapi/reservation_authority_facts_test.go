@@ -42,7 +42,7 @@ func TestAdmitWithReservation_HoldsCapacityUnderAnEstablishedAuthority(t *testin
 	ctx := context.Background()
 	authorityHost(t, s, "_default")
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", s.hostName, "_default", "vm:probe", 2, 2048, false)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", s.hostName, "_default", "vm:probe", 2, 2048, intentResourceGrow)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestAdmitHostWithReservation_HoldsHostCapacityWithoutChargingQuota(t *testi
 	ctx := context.Background()
 	authorityHost(t, s, "_default")
 
-	lease, err := s.admitHostWithReservation(ctx, "StartVM", s.hostName, "_default", "vm:facts-test", 2, 2048, false)
+	lease, err := s.admitHostWithReservation(ctx, "StartVM", s.hostName, "_default", "vm:facts-test", 2, 2048, intentResourceGrow)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}

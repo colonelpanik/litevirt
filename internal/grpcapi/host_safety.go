@@ -52,8 +52,13 @@ func subjectKindForWorkload(kind string) string {
 // (workloadKind, workloadName) is the workload being acted on ("" for
 // host-only decisions); newWorkload says a workload would BECOME RESIDENT on
 // host (create, start, migrate-in, restore-in) — the case an incomplete local
-// inventory must refuse.
-func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, workloadName string, newWorkload bool) error {
+// inventory must refuse. hostGrowth says the admission actually GROWS capacity
+// on host (a positive delta, or new residency of any size) — the case the
+// host-involvement clause exists for. A zero-growth action on a RUNNING
+// workload (a shrink, a non-size reconfigure) grows nothing, so an unrelated
+// workload's condition merely involving the host must not refuse it; the
+// workload-scoped clause still binds regardless.
+func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, workloadName string, newWorkload, hostGrowth bool) error {
 	conditions, err := corrosion.ListHealthConditions(ctx, s.db, false)
 	if err != nil {
 		// Conservative under uncertainty: an unreadable safety state is not a
@@ -72,7 +77,12 @@ func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, worklo
 					"resolve the condition first; see `lv health`",
 				subjectKind, workloadName, c.Severity, c.Code, strings.Join(c.Hosts, ", "))
 		}
-		// Capacity-growing admission to an involved host.
+		// Capacity-growing admission to an involved host. Only when this
+		// admission grows anything there — growing into a possibly-corrupting
+		// host is the risk; a zero-growth reconfigure adds nothing to corrupt.
+		if !hostGrowth {
+			continue
+		}
 		for _, h := range c.Hosts {
 			if h == host {
 				return status.Errorf(codes.FailedPrecondition,

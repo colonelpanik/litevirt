@@ -264,7 +264,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// fail-fast cannot see in-flight reservations, so relying on it here
 			// let concurrent overcommit creates all observe the same headroom.
 			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib), true)
+				corrosion.WorkloadVM, spec.Name, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
 			if qerr != nil {
 				return nil, qerr
 			}
@@ -318,7 +318,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), true)
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -1116,7 +1116,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
 			// per-VM overhead subtraction, so starting it adds both its guest memory
 			// and a new qemu overhead.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), true)
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
 			if aerr != nil {
 				return nil, aerr
 			}
@@ -2953,7 +2953,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// it must be the SERIALIZED admission, not the unserialized local
 				// check, or concurrent overcommit grows all see the same headroom.
 				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
-					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), false)
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), intentResourceGrow)
 				if qerr != nil {
 					return nil, qerr
 				}
@@ -3038,7 +3038,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 					}
 				}
 				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", vm.HostName, vm.Project,
-					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), false)
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem), intentResourceGrow)
 				if qerr != nil {
 					return nil, qerr
 				}

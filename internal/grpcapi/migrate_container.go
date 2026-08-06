@@ -86,8 +86,11 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// whole migrate, and the target's RestoreContainer recognises a verified
 	// peer-migrate and does NOT admit again (backup_container.go), so one move
 	// reserves exactly once instead of demanding twice the container's memory.
-	if rec.MemMiB > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, false)
+	// Unconditional: an uncapped container reserves nothing on the target but
+	// still becomes resident there, and the safety half of the admission
+	// (ownership conditions involving the target) must run even at zero delta.
+	{
+		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return aerr
 		}

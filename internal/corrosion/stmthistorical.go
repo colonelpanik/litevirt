@@ -87,6 +87,26 @@ func HistoricalShapes() []HistoricalShape {
 		`updated_at = ? `+
 		`WHERE name = ?`, "configure_host_fixed_v130")
 
+	// Upstream #126 (schema v44) emitted durable quota-reservation statements.
+	// This integration line already used v44-v49 for different additive schema,
+	// so it retains those SQL shapes as receive-only compatibility contracts while
+	// preserving the table at local schema v50.
+	add(`INSERT OR IGNORE INTO quota_reservations
+		      (id, project, holder, cpu, mem_mib, state, workload, kind, host,
+		       want_cpu, want_mem, expires_at, created_at, updated_at, deleted_at)
+		      VALUES (?, ?, ?, ?, ?, 'pending', '', '', '', 0, 0, ?, ?, ?, NULL)`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations
+		    SET state = ?, workload = ?, kind = ?, host = ?, want_cpu = ?, want_mem = ?,
+		        expires_at = ?, updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations SET deleted_at = ?, updated_at = ?
+		  WHERE id = ? AND state = ? AND deleted_at IS NULL`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations SET deleted_at = ?, updated_at = ? WHERE id = ?`, "quota_reservations_upstream_v44")
+	add(`INSERT OR IGNORE INTO quota_reservations
+		 (id, project, holder, cpu, mem_mib, state, workload, kind, host,
+		  want_cpu, want_mem, expires_at, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "quota_reservations_upstream_v44")
+
 	// Schema v44 widened these three builders with receiver-visible lifecycle
 	// and routing columns. Keep the v1.3.0 shapes accepted for the supported
 	// rolling-upgrade/WAL-retention horizon; receiver-only v44 columns retain

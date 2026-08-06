@@ -38,7 +38,7 @@ import (
 //
 // Updated again for v45 (audit tamper-evidence). The audit_log INSERT gained
 // key_id/signature/seq, and the hash-chain reseal UPDATE gained a
-// `signature IS NULL OR signature = ''` guard so it can never rewrite a signed
+// `signature IS NULL OR signature = ”` guard so it can never rewrite a signed
 // row — the guard lives in the SQL because that statement applies verbatim by
 // primary key on every peer, and without it a tampering node's reseal would
 // replicate over everyone else's good copies. Both pre-v45 shapes were ADDED as
@@ -55,7 +55,12 @@ import (
 // stays accepted, and its identity is otherwise unchanged; DispAuditReseal makes
 // the receiver execute the GUARDED form regardless of which shape arrived, so a
 // legacy sender still works and a signed row is unreachable by any reseal.
-const compatibilityDigest = "07c9c609d450bb1f5dc8536ee1f1d6c642b9fbfeffaf48978fb1080bd1b8d5e8"
+//
+// Updated for the upstream #126 merge: its five durable quota-reservation SQL
+// shapes are receive-only on this integration line and were added as the
+// quota_reservations_upstream_v44 family. No previously accepted historical
+// identity was removed or changed.
+const compatibilityDigest = "23dbf172dc6f828aebf4cd8815412923e6852e685e9f95e2ad336e65eef75c73"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -103,6 +108,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"insert_host_v130":                      1,   // pre-capacity-policy hosts insert (narrower column list)
 	"insert_host_v43":                       1,   // capacity overrides present, before v44 capacity-policy fingerprint
 	"configure_host_fixed_v130":             1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
+	"quota_reservations_upstream_v44":       5,   // upstream #126 durable reservation statements, receive-only on this line
 	"containers_upsert_v130":                1,   // pre-v44 container upsert without lifecycle fencing columns
 	"containers_rekey_v130":                 1,   // pre-v44 container re-key without lifecycle fencing columns
 	"notification_routes_insert_v130":       1,   // pre-v44 route insert without subject/project selectors

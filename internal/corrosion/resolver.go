@@ -403,15 +403,15 @@ var capabilityMap = map[string]tableResolver{
 		}, "control_plane"),
 		ruleContentMax(),
 	}},
-	"host_labels":   {category: "content", chain: contentDefaultChain()},
-	"host_health":   {category: "content", chain: contentDefaultChain()},
+	"host_labels": {category: "content", chain: contentDefaultChain()},
+	"host_health": {category: "content", chain: contentDefaultChain()},
 	// v50 durable health: condition/status rows are written by one evaluator
 	// instance at a time (the detector lease holder), and capacity observations
 	// only by the host they describe — single-writer per row, so an exact-instant
 	// tie already means something is wrong; the default chain settles it
 	// deterministically, and the next scan overwrites whatever won.
-	"health_conditions":         {category: "content", chain: contentDefaultChain()},
-	"health_evaluator_status":   {category: "content", chain: contentDefaultChain()},
+	"health_conditions":          {category: "content", chain: contentDefaultChain()},
+	"health_evaluator_status":    {category: "content", chain: contentDefaultChain()},
 	"host_capacity_observations": {category: "content", chain: contentDefaultChain()},
 	// v48 host network intent: single-writer per row (the owning host), so an
 	// exact-instant tie already means something is wrong; the default chain
@@ -431,20 +431,24 @@ var capabilityMap = map[string]tableResolver{
 	// content-max it. vm_pci_realizations is the RESOLVED/computed outcome of an
 	// intent (concrete address/alias), like vm_disks/host_pci_devices — plain
 	// content-default.
-	"vm_pci_intent":           {category: "content", chain: contentOpaqueChain("selector_payload")},
-	"vm_pci_realizations":     {category: "content", chain: contentDefaultChain()},
-	"snapshots":               {category: "content", chain: contentDefaultChain()},
-	"dns_records":             {category: "content", chain: contentDefaultChain()},
-	"fencing_log":             {category: "content", chain: contentDefaultChain()},
-	"audit_log":               {category: "content", chain: contentDefaultChain()},
-	"network_vteps":           {category: "content", chain: contentDefaultChain()},
-	"bgp_peers":               {category: "content", chain: contentDefaultChain()},
-	"ip_allocations":          {category: "content", chain: contentDefaultChain()},
-	"container_interfaces":    {category: "content", chain: contentDefaultChain()},
-	"host_pci_devices":        {category: "content", chain: contentDefaultChain()},
-	"resource_mappings":       {category: "content", chain: contentDefaultChain()},
-	"service_endpoints":       {category: "content", chain: contentDefaultChain()},
-	"backup_repos":            {category: "content", chain: contentDefaultChain()},
+	"vm_pci_intent":        {category: "content", chain: contentOpaqueChain("selector_payload")},
+	"vm_pci_realizations":  {category: "content", chain: contentDefaultChain()},
+	"snapshots":            {category: "content", chain: contentDefaultChain()},
+	"dns_records":          {category: "content", chain: contentDefaultChain()},
+	"fencing_log":          {category: "content", chain: contentDefaultChain()},
+	"audit_log":            {category: "content", chain: contentDefaultChain()},
+	"network_vteps":        {category: "content", chain: contentDefaultChain()},
+	"bgp_peers":            {category: "content", chain: contentDefaultChain()},
+	"ip_allocations":       {category: "content", chain: contentDefaultChain()},
+	"container_interfaces": {category: "content", chain: contentDefaultChain()},
+	"host_pci_devices":     {category: "content", chain: contentDefaultChain()},
+	"resource_mappings":    {category: "content", chain: contentDefaultChain()},
+	"service_endpoints":    {category: "content", chain: contentDefaultChain()},
+	"backup_repos":         {category: "content", chain: contentDefaultChain()},
+	// Upstream schema-v44 durable quota charge, retained as v50 on this line.
+	// Tombstone-first LWW prevents a retired charge from being resurrected;
+	// otherwise the committed identity follows the ordinary content chain.
+	"quota_reservations":      {category: "content", chain: contentDefaultChain()},
 	"replication_checkpoints": {category: "content", chain: contentDefaultChain()},
 	"vm_backups":              {category: "content", chain: contentDefaultChain()},
 	"container_backups":       {category: "content", chain: contentDefaultChain()},

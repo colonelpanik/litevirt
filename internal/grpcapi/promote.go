@@ -541,6 +541,18 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return status.Errorf(codes.InvalidArgument, "invalid promotion name %q", targetName)
 	}
 
+	// Reconstruct the spec from the durable record BEFORE admission: the host
+	// lease must cover the spec's complete CPU and memory, and a record that
+	// cannot even be parsed should refuse before any disk or domain mutation.
+	var spec pb.VMSpec
+	if vm.Spec == "" {
+		return status.Errorf(codes.FailedPrecondition, "vm %q record has no spec to define from", vm.Name)
+	}
+	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
+	}
+	spec.Name = targetName
+
 	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
 	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought
 	// back up. A takeover promote (same name) carries the original VM's adoption state, so
@@ -589,6 +601,57 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 		}
 	}
+	// Admission (fail-closed), BEFORE any disk build, domain destruction,
+	// definition, or start. A promotion defines and starts a full-sized VM — the
+	// same consumption a create of that VM would have — so it passes the same
+	// local host admission every other residency path passes, against this
+	// host's fresh inventory. Coordinator planning telemetry is advisory: even
+	// when planning degraded during a read failure, this executing host refuses
+	// an unsafe or over-capacity promotion using its own state.
+	//
+	// A crash-recovery retry adopting a running domain this host positively
+	// identifies as its own prior promotion (checkpoint/marker + running) does
+	// NOT reserve again — the runtime consumption already exists, and charging
+	// it a second time would refuse exactly the recovery the marker exists to
+	// protect. It still runs workload safety: an active ownership condition
+	// refuses the adoption. A foreign same-name domain never gets the
+	// exception (promoteDomainAlreadyStarted).
+	var promoteQuotaLease *reservationLease
+	if started {
+		if err := s.checkHostSafety(ctx, s.hostName, corrosion.WorkloadVM, targetName, false, false); err != nil {
+			return err
+		}
+	} else {
+		// A same-name takeover of a VM the ledger already counts as RUNNING ON
+		// THIS HOST (a same-host rebuild) re-homes consumption headroom already
+		// accounts for; charging the full size again would refuse a legal
+		// recovery. Every other fresh promotion is a full-sized VM appearing
+		// here. The zero-delta admission still runs the residency safety gate.
+		admitCPU, admitMem := int(spec.Cpu), int(spec.MemoryMib)
+		if !renamed && vm.HostName == s.hostName && vm.State == "running" {
+			admitCPU, admitMem = 0, 0
+		}
+		hostLease, aerr := s.admitHostWithReservation(ctx, "PromoteReplica", s.hostName, vm.Project, "vm:"+targetName, admitCPU, admitMem, intentVMResident)
+		if aerr != nil {
+			return aerr
+		}
+		defer hostLease.release(ctx)
+		if renamed {
+			// A renamed promotion writes a SECOND allocation alongside the
+			// original — a new allocation the project does not yet carry — so
+			// it also reserves project quota for the full absolute size and
+			// target identity. The lease is held until persistence completes
+			// and carries the authority commit fence checked before the insert.
+			qLease, qerr := s.admitQuotaWithReservation(ctx, "PromoteReplica", s.hostName, vm.Project,
+				corrosion.WorkloadVM, targetName, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+			if qerr != nil {
+				return qerr
+			}
+			defer qLease.release(ctx)
+			promoteQuotaLease = qLease
+		}
+	}
+
 	if s.virt.DomainExists(targetName) && !started {
 		// (If this proof already reached "started", the existing domain is OUR OWN
 		// prior promotion — never destroy it on resume; fall through to persist.)
@@ -674,18 +737,6 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		recordStep("disk_built")
 	}
-
-	// Reconstruct the spec from the durable record.
-	var spec pb.VMSpec
-	if vm.Spec == "" {
-		os.Remove(livePath)
-		return status.Errorf(codes.FailedPrecondition, "vm %q record has no spec to define from", vm.Name)
-	}
-	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
-		os.Remove(livePath)
-		return status.Errorf(codes.Internal, "parse vm spec: %v", err)
-	}
-	spec.Name = targetName
 
 	multiDiskNote := ""
 	if len(spec.Disks) > 1 {
@@ -798,6 +849,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.pinMachineFromDomain(&spec)
 	specJSON, _ := json.Marshal(&spec)
 	if renamed {
+		// The quota-authority commit fence, immediately BEFORE the durable
+		// write — the narrower the gap, the smaller the window in which
+		// authority can move. If it refuses after the domain was started,
+		// unwind everything THIS attempt created — the just-started domain,
+		// the newly materialized live disk, the promote marker — and return
+		// the fence error. The original durable VM is untouched, and nothing
+		// was persisted. (An adopted retry holds no quota lease; the nil
+		// lease's fence allows, matching the no-second-reservation rule.)
+		if err := promoteQuotaLease.allowCommit(ctx); err != nil {
+			_ = s.virt.DestroyDomain(targetName)
+			_ = s.virt.UndefineDomain(targetName, false)
+			os.Remove(livePath)
+			s.removePromoteMarker(targetName)
+			return err
+		}
 		rec := corrosion.VMRecord{
 			Name: targetName, HostName: s.hostName, Spec: string(specJSON),
 			State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),

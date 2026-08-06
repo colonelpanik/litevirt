@@ -1421,6 +1421,26 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
 	}
 
+	// A restart of a STOPPED VM is an operator START in restart clothing: the VM
+	// contributes nothing to host usage or per-domain overhead while stopped, so
+	// bringing it up adds both — exactly what StartVM admits — and without this
+	// gate RestartVM was the one unadmitted operator start. A restart of a
+	// RUNNING VM is net-zero (destroy+start of consumption already counted,
+	// overhead included) and deliberately admits nothing: a full host must
+	// always be able to restart what it already runs.
+	if vm.State != "running" {
+		var spec pb.VMSpec
+		if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+		}
+		lease, aerr := s.admitHostWithReservation(ctx, "RestartVM", vm.HostName, vm.Project,
+			"vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+	}
+
 	// Destroy, then bring it back up through the shared start primitive (so VLAN taps
 	// are reapplied and PostStart hooks run — a plain inline StartDomain skipped both).
 	s.virt.DestroyDomain(vm.Name)

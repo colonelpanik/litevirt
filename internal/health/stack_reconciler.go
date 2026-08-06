@@ -15,7 +15,10 @@ const stackReconcileInterval = 30 * time.Second
 // StackCleaner is the interface for resource cleanup operations.
 // Implemented by grpcapi.Server.
 type StackCleaner interface {
-	DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error)
+	// DeleteVMForStackCleanup, NOT DeleteVM. This loop has no identity, and DeleteVM is
+	// RBAC-gated — calling it directly fails "no authenticated principal" every time and
+	// the retry loop spins forever. The implementation attaches a system principal.
+	DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error)
 	RemoveLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord)
 	DeprovisionNetworkByName(ctx context.Context, name string) error
 	ExternalNetworkNames(ctx context.Context, stackName string) map[string]bool
@@ -84,7 +87,7 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 
 	remainingVMs := 0
 	for _, vm := range vms {
-		if _, err := r.cleaner.DeleteVM(ctx, &pb.DeleteVMRequest{Name: vm.Name}); err != nil {
+		if _, err := r.cleaner.DeleteVMForStackCleanup(ctx, &pb.DeleteVMRequest{Name: vm.Name}); err != nil {
 			slog.Warn("stack-reconciler: delete VM failed, will retry",
 				"stack", stack.Name, "vm", vm.Name, "error", err)
 			remainingVMs++

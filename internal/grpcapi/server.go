@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -34,6 +35,16 @@ type Server struct {
 
 	hostName   string
 	dataDir    string
+	// containersRoot is where per-container state (and the owner-epoch marker)
+	// lives — <dataDir>/containers in production, injected by the daemon so the
+	// runtime-inventory collector can read markers. Empty disables marker reads
+	// (they report missing).
+	containersRoot string
+
+	// Admission-gate local-inventory cache (see localInventoryCached).
+	invCacheMu sync.Mutex
+	invCache   runtimeInventory
+	invCacheAt time.Time
 	pkiDir     string
 	db         *corrosion.Client
 	virt       LibvirtBackend
@@ -98,10 +109,6 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
-	// enfProjectQuotaAuthority is this node's kill-switch for routing project-quota
-	// admission to the project's authority holder; gated by this flag AND the
-	// ProjectQuotaAuthorityV1 latch. Advertised CONDITIONALLY on the flag.
-	enfProjectQuotaAuthority bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -119,6 +126,31 @@ type Server struct {
 	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
 	// revoke an already-formed latch.
 	enfCanonicalRegistry bool
+	// enfProjectAuthority is this node's kill-switch for DELEGATED project-quota
+	// admission; gated by this flag AND the ProjectAuthorityV1 latch. Advertised
+	// CONDITIONALLY on the flag (like operation_protocol): a peer still admitting from
+	// its own replica would bypass the single decider entirely, so serializing against
+	// one is worthless until every node has opted in.
+	enfProjectAuthority bool
+	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
+	commitFenceHook func(op string)
+	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
+	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
+	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
+	// audit write refuse rather than land unsigned. Advertised CONDITIONALLY on the
+	// flag (like operation_protocol): a peer with it off keeps writing unsigned rows,
+	// which are exactly what a forgery looks like, so the latch must require config
+	// uniformity.
+	enfAuditSignature bool
+	// enfOwnerEpoch + ownerEpochReady gate owner_epoch_v1 advertisement: the flag
+	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
+	// (the health backfill reports it). Both required — the fleet must never
+	// latch across a node whose workloads are ungraduated.
+	enfOwnerEpoch bool
+	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
+	// and the token latched, this node refuses replication from an isolated host.
+	enfIsolationEpoch bool
+	ownerEpochReady   func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -140,6 +172,9 @@ type Server struct {
 	capHealthMu     sync.Mutex
 	capHealthLast   map[string]bool
 	capHealthCursor int
+	// isolationCursor round-robins the §A self-reported-quarantine check
+	// (one peer per HA cycle). Guarded by capHealthMu.
+	isolationCursor int
 
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
@@ -151,12 +186,10 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
-	// testHookBeforeSpecCommit is a test seam: when non-nil it runs immediately before
-	// the reconfigure path's commit fence. Production leaves it nil. It exists because
-	// the fence's whole point is a handoff that happens AFTER the VM has been stopped,
-	// and there is no other way to move authority mid-request from a test — without it
-	// the abort lands before the stop and the test silently asserts nothing.
-	testHookBeforeSpecCommit func()
+	// bridgeEnsure is a test seam for host bridge availability and provisioning.
+	// Production leaves it nil, preserving the net.InterfaceByName +
+	// network.EnsureBridge validation path.
+	bridgeEnsure func(name string) error
 
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
@@ -221,10 +254,10 @@ type Server struct {
 	dualRunMetrics   *metrics.DualRunMetrics
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
-	// gather (self-local + peer ReportRuntime): when non-nil it replaces the real probes,
+	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be
 	// reached this pass (a coverage gap), and the hosts on an older binary that does not
-	// implement ReportRuntime (surfaced but NOT paged as a coverage gap — expected during
+	// implement GetRuntimeInventory (surfaced but NOT paged as a coverage gap — expected during
 	// a rolling upgrade).
 	gatherRuntimeOverride func(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string)
 
@@ -241,29 +274,6 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
-	// hostAdmit serializes host-capacity ADMISSION on this node and records the
-	// grows this node has admitted but not yet committed. See admitHostCapacity
-	// for why the ledger — not the lock — is what makes admission safe.
-	//
-	// A SEPARATE map from vmLocks, not a namespaced key in it: vmLocks is keyed by
-	// bare VM name, so a host and a VM sharing a name would collide on one
-	// non-reentrant mutex and StartVM would self-deadlock. It also carries the
-	// counters, which vmLocks' signature cannot.
-	hostAdmitMu sync.Mutex
-	hostAdmit   map[string]*hostAdmitState
-
-	// projectAdmit does the same for project-quota admission, keyed by normalized
-	// project name. Only meaningful on the project's authority holder — see
-	// admitProjectQuota.
-	projectAdmitMu sync.Mutex
-	projectAdmit   map[string]*projectAdmitState
-
-	// reservationSourceOverride is a test seam for the takeover drain (nil in production).
-	reservationSourceOverride corrosion.ReservationSource
-
-	// (Reservations are no longer held in memory. They are rows in the replicated
-	// quota_reservations table, because a charge must survive this node ceasing to be
-	// the project's authority — see corrosion.ReserveProjectQuota.)
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
@@ -296,6 +306,13 @@ type Server struct {
 	// in tests / when unwired (durable recovery disabled, in-memory rollback still
 	// applies).
 	opJournal *opjournal.Journal
+
+	// hostNetSys + hostNetAdvertiseIP wire the host network apply protocol
+	// (SetHostNetworkEnv): the netplan-touching System (real on a daemon, fake
+	// in fleet tests) and the address whose loss the connectivity confirm and
+	// self-cutoff guard protect. nil/'' = feature unwired, RPCs refuse.
+	hostNetSys         hostnet.System
+	hostNetAdvertiseIP string
 
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
@@ -378,6 +395,8 @@ type Server struct {
 	// advertisedCapabilities before the daemon wires this in, so the read must not race the
 	// write. Unset (nil) → never fenced.
 	watchdogFenced atomic.Pointer[func() bool]
+	// walQuarantined reports a rollback below an already-latched capability token.
+	walQuarantined atomic.Pointer[func() bool]
 
 	// hwV2Ready is the CONTRACT h advertise-readiness flag: set at the END of a
 	// successful BackfillHardwareTables, once the audit pass has classified every
@@ -397,6 +416,20 @@ func (s *Server) SetDemotionUnfenced(on bool) { s.demotionUnfenced.Store(on) }
 
 // SetWatchdogFenced injects the self-fenced predicate (Phase 2 defense-in-depth).
 func (s *Server) SetWatchdogFenced(fn func() bool) { s.watchdogFenced.Store(&fn) }
+
+// SetWALQuarantined injects the predicate reporting that this node is under WAL
+// quarantine — it is running a binary rolled back below a capability token it had
+// already latched, so it emits no replicated writes. Nil-safe: unset ⇒ not
+// quarantined, which is every healthy node.
+func (s *Server) SetWALQuarantined(fn func() bool) { s.walQuarantined.Store(&fn) }
+
+// walQuarantinedNow reports whether this node is currently WAL-quarantined.
+func (s *Server) walQuarantinedNow() bool {
+	if fn := s.walQuarantined.Load(); fn != nil && *fn != nil {
+		return (*fn)()
+	}
+	return false
+}
 
 // advertisedCapabilities is Supported() as-is — vip_demote_v1 is a SOFTWARE capability
 // advertised by every new-binary node regardless of any hardware watchdog (the decouple:
@@ -419,6 +452,15 @@ func (s *Server) advertisedCapabilities() []string {
 	if s.selfFenced() {
 		return []string{}
 	}
+	// A WAL-quarantined node is a rollback below something this cluster already
+	// latched. It advertises NOTHING, for the same reason a self-fenced node does:
+	// presenting as a healthy participant would let the cluster latch further
+	// tokens across a member that cannot honour them. Peers see the gap and raise
+	// ha_degraded; every peer already latched keeps enforcing, because the latch is
+	// monotone. That is exactly the bounded state this is meant to produce.
+	if s.walQuarantinedNow() {
+		return []string{}
+	}
 	caps := capabilities.Supported()
 	// operation_protocol_v1 is advertised CONDITIONALLY on the local config flag,
 	// unlike the other reversible tokens. Those are additive safety checks where a
@@ -430,22 +472,39 @@ func (s *Server) advertisedCapabilities() []string {
 	// opted in.
 	if !s.enfOperationProtocol {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
+		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
+	}
+	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
+	// a peer outright, and a node that isn't enforcing would keep accepting the
+	// isolated node's state and re-inject it — so the latch requires CONFIG
+	// uniformity, not just a uniform build.
+	if !s.enfIsolationEpoch {
+		caps = withoutCapability(caps, capabilities.IsolationEpochV1)
 	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
 	// flag is off keeps the cluster from latching until every node has opted in.
-	// project_quota_authority_v1: same reasoning as operation_protocol_v1 above. A
-	// flag-off node keeps admitting quota locally and unserialized, so relying on
-	// the routing requires CONFIG uniformity, not just a uniform build.
-	if !s.enfProjectQuotaAuthority {
-		caps = withoutCapability(caps, capabilities.ProjectQuotaAuthorityV1)
-	}
 	if !s.enfCanonicalIdentity {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
 	}
 	if !s.enfCanonicalRegistry {
 		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
+	}
+	// project_authority_v1 is likewise advertised CONDITIONALLY on its config flag. A
+	// single decider only serializes admissions that all ROUTE through it; a peer with
+	// the flag off keeps deciding from its own replica and races the holder anyway. So
+	// the latch must require CONFIG uniformity, not just a uniform build.
+	if !s.enfProjectAuthority {
+		caps = withoutCapability(caps, capabilities.ProjectAuthorityV1)
+	}
+	// audit_signature_v1 is likewise advertised CONDITIONALLY on its config flag. A
+	// node with the flag off writes unsigned audit rows into the same replicated
+	// table, and an unsigned row is precisely the shape a forgery takes — so no node
+	// may start REFUSING unsignable writes (and treating "unsigned" as evidence)
+	// until every node has opted in. Config uniformity, not just a uniform build.
+	if !s.enfAuditSignature {
+		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
 	}
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
@@ -456,6 +515,14 @@ func (s *Server) advertisedCapabilities() []string {
 	// data. "Advertise = this node reads correctly across the transition."
 	if !s.hardwareV2Ready() {
 		caps = withoutCapability(caps, capabilities.HardwareV2)
+	}
+	// owner_epoch_v1 (Phase 4) follows the hardware_v2 model: advertised only
+	// when the operator opted in (config uniformity, like every enforcement
+	// token) AND this node is READY — its owned workloads have all graduated
+	// out of the pre-epoch 0. Advertising earlier could latch the fleet across
+	// a node whose runtime markers and generations don.t exist yet.
+	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
+		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
 	}
 	return caps
 }
@@ -525,19 +592,6 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 
-// SetProjectQuotaAuthority is this node's kill switch for routing project-quota
-// admission to the project's authority holder. It also gates ADVERTISEMENT of
-// project_quota_authority_v1, so the token can only latch once every node opts in.
-func (s *Server) SetProjectQuotaAuthority(on bool) { s.enfProjectQuotaAuthority = on }
-
-// projectQuotaAuthorityActive reports whether this node routes project-quota
-// admission to the holder: the config flag AND the cluster-wide latch. Same
-// `flag && Enforced` model as the rest of the family. False ⇒ the old local
-// unserialized check, unchanged.
-func (s *Server) projectQuotaAuthorityActive(ctx context.Context) bool {
-	return s.enfProjectQuotaAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectQuotaAuthorityV1)
-}
-
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
 // `flag && Enforced` model as the rest of the family.
@@ -593,6 +647,58 @@ func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity =
 // (and thus acceptance of canonical writes) can't happen until every node has opted in.
 func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
 
+// SetProjectAuthorityEnforce sets this node's kill-switch for delegated project-quota
+// admission (enforcement.project_authority). Enforcement is this flag AND the
+// ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
+func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
+
+// SetCommitFenceHook installs a TEST-ONLY hook run immediately before a commit
+// fence (reservationLease.allowCommit) is evaluated on a long-running operation
+// (clone, live restore, container restore). Moving a project's authority AFTER
+// admission but BEFORE the durable write inside one handler invocation is
+// otherwise impossible to arrange, and a fence test that cannot arrange it
+// cannot fail. Production never calls this; the hook must be set before the
+// operation starts and cleared after.
+func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// fireCommitFenceHook runs the test hook, if any, naming the operation about to
+// evaluate its commit fence.
+func (s *Server) fireCommitFenceHook(op string) {
+	if h := s.commitFenceHook; h != nil {
+		h(op)
+	}
+}
+
+// SetAuditSignatureEnforce sets this node's kill-switch for tamper-evident audit
+// logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing
+// an unsignable audit write additionally requires the AuditSignatureV1 latch, and
+// advertisement is withheld while the flag is off.
+func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
+
+// SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
+func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+
+// SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
+// it on and the token latched, this node refuses replication from a host the
+// cluster recorded as isolated.
+func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch = on }
+
+// SetOwnerEpochReady wires the readiness probe consulted before advertising
+// owner_epoch_v1 (nil = never ready).
+func (s *Server) SetOwnerEpochReady(fn func() bool) { s.ownerEpochReady = fn }
+
+// projectAuthorityActive reports whether this node routes project-quota admissions
+// through the project's authority holder: the config flag AND the cluster-wide latch.
+// Same `flag && Enforced` model as the rest of the family.
+func (s *Server) projectAuthorityActive(ctx context.Context) bool {
+	return s.enfProjectAuthority && s.gate != nil && s.gate.Enforced(ctx, capabilities.ProjectAuthorityV1)
+}
+
+// The audit-signature latch is consulted on the corrosion client (see
+// SetAuditSignatureRequired in daemon.go), not here. It used to have a mirror
+// predicate on the server that nothing ever called — a gate for a refusal that
+// the write path had already stopped performing.
+
 // liveResizeActive reports whether this node may originate live-resize behavior
 // (setting max_cpu): the config flag AND the cluster-wide LiveResizeV1 latch, so an
 // old peer can't have max_cpu dropped from a spec it later rewrites.
@@ -630,12 +736,22 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.rbacRealm
 	case capabilities.OperationProtocolV1:
 		return s.enfOperationProtocol
+	case capabilities.CapacityAdmissionV1:
+		return s.enfOperationProtocol
 	case capabilities.LiveResizeV1:
 		return s.enfLiveResize
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity
 	case capabilities.CanonicalRegistryV1:
 		return s.enfCanonicalRegistry
+	case capabilities.ProjectAuthorityV1:
+		return s.enfProjectAuthority
+	case capabilities.AuditSignatureV1:
+		return s.enfAuditSignature
+	case capabilities.OwnerEpochV1:
+		return s.enfOwnerEpoch
+	case capabilities.IsolationEpochV1:
+		return s.enfIsolationEpoch
 	default:
 		return false
 	}
@@ -826,6 +942,11 @@ type ContainerRuntime interface {
 	DeleteContainer(ctx context.Context, name string) error
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
+	// ContainerLimits reads the container's configured cgroup limits back from
+	// the runtime's own on-disk config (0 = unlimited). The runtime-inventory
+	// collector reports these so capacity accounting can charge runtime-only
+	// containers and flag uncapped ones.
+	ContainerLimits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	// ContainerExists reports whether the on-disk container artifact (dir) exists —
@@ -908,8 +1029,6 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		images:         images,
 		events:         events.NewBus(),
 		vmLocks:        make(map[string]*sync.Mutex),
-		hostAdmit:      make(map[string]*hostAdmitState),
-		projectAdmit:   make(map[string]*projectAdmitState),
 		loginThrottle:  newLoginThrottle(),
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),
@@ -1223,23 +1342,32 @@ func (s *Server) dialPeerAddr(target string) (*grpc.ClientConn, error) {
 // peerClient creates a gRPC client connection to a remote host's daemon.
 // The caller must close the returned connection when done.
 func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	host, err := corrosion.GetHost(ctx, s.db, hostName)
+	// corrosion.ResolvePeerTarget, not a GetHost here: it falls back to the gossip
+	// membership address for a peer whose hosts row has not replicated yet, and this
+	// used to fail closed on exactly that. Peer TRUST was taught to accept such a
+	// peer without peer DIALLING being taught to reach one, so on a freshly
+	// provisioned cluster every outbound grpcapi peer RPC failed with "not found in
+	// cluster state" — self-upgrade pings, cluster-state digest fanout, anti-entropy
+	// triggers, backup sink pushes, console forwarding. The replicator was never
+	// affected because it already used this resolver.
+	//
+	// It still errors for a name in neither cluster state nor gossip: the fallback is
+	// to membership, not to guesswork, and grpc.NewClient would otherwise not reject
+	// an empty address until the first RPC — console and VNC forwarders need the
+	// reason now, not later.
+	target, err := corrosion.ResolvePeerTarget(ctx, s.db, hostName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", hostName, err)
-	}
-	if host == nil {
-		return nil, nil, fmt.Errorf("host %q not found in cluster state", hostName)
-	}
-	if host.Address == "" {
-		// grpc.NewClient won't reject this until first RPC; fail fast with a
-		// clear reason so console/VNC forwarders can report it to the user.
-		return nil, nil, fmt.Errorf("host %q has no address in cluster state", hostName)
+		return nil, nil, err
 	}
 	// dialPeer always attaches obs trace-context options (injects W3C trace context
 	// on the outbound peer RPC when tracing is active; nil otherwise).
-	conn, err := s.dialPeerAddr(peerTarget(host.Address, host.GRPCPort))
+	conn, err := s.dialPeerAddr(target)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial host %s: %w", hostName, err)
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// SetContainersRoot tells the runtime-inventory collector where per-container
+// owner-epoch markers live (the same root the container checker converges).
+func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }

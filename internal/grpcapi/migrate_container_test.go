@@ -26,6 +26,9 @@ func migrateTestServer(t *testing.T, state string) (*Server, *fakeCTRuntime, str
 	repo := ctTestRepo(t)
 	rt := &fakeCTRuntime{exportPayload: []byte("rootfs-bytes")}
 	s.SetContainerRuntime(rt)
+	// The target's host admission is DESTINATION-owned, so a single-server test
+	// needs a fake peer to answer for host-b.
+	fakeDestinationAdmission(s)
 	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
 		HostName: "host-a", Name: "ct1", State: state, Image: "alpine:3.19",
 		CPULimit: 2, MemMiB: 256, Project: "acme",

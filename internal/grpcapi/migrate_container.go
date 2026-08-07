@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -68,6 +69,36 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	} else if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on target host %q", req.Name, req.TargetHost)
+	}
+
+	// Capacity admission on the TARGET, MEMORY only — a container's cpu_limit is a
+	// cgroup weight, not a vCPU reservation, so only its memory cap is comparable
+	// to a VM's (mirrors CreateContainer). An uncapped container reserves nothing,
+	// matching how it is accounted.
+	//
+	// HOST-only: the migrate MOVES an allocation the project's quota already counts
+	// (the source row outlives the transfer and is removed only once the target
+	// lands), so charging quota again would refuse the migration of any container
+	// over half its quota.
+	//
+	// It runs HERE — before the cold-transfer stop — so a target that cannot hold
+	// the container never causes an outage on the source. The lease is held for the
+	// whole migrate, and the target's RestoreContainer recognises a verified
+	// peer-migrate and does NOT admit again (backup_container.go), so one move
+	// reserves exactly once instead of demanding twice the container's memory.
+	// Unconditional: an uncapped container reserves nothing on the target but
+	// still becomes resident there, and the safety half of the admission must run
+	// even at zero delta. The decision itself is the DESTINATION's
+	// (acquireDestinationHostLease): only the target daemon can probe its own
+	// runtime inventory, so it admits against fresh local state and holds the
+	// durable reservation; this side keeps the lease for the whole transfer and
+	// releases it on every return path.
+	{
+		lease, aerr := s.acquireDestinationHostLease(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
+		if aerr != nil {
+			return aerr
+		}
+		defer lease.release(ctx)
 	}
 
 	unlock := s.lockVM("ct/" + req.Name)
@@ -255,7 +286,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_RESTORING, Status: "restoring on target"})
-	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning)
+	outcome, rerr := s.migrateRestore(ctx, req.TargetHost, req.RepoPath, req.Name, timestamp, wasRunning, rec.OwnerEpoch)
 	switch outcome {
 	case corrosion.RestoreLanded:
 		// The target recorded its row (authoritative). Even if its start then failed,
@@ -283,6 +314,16 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return parkSource(fmt.Errorf("target landed but source runtime cleanup failed: %v (source left tracked+stopped on %s)", err, source))
 	}
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
+		// DeleteContainer already retried with a fresh guard, so this is a real
+		// DB failure or persistent contention (the source row's authority kept
+		// moving — e.g. a concurrent failover claiming it). Either way the
+		// migration ITSELF succeeded: the target landed and owns the leases.
+		// Park the source so the duplicate row is visible for cleanup rather
+		// than silently serving two live copies.
+		if errors.Is(err, corrosion.ErrDeleteContended) {
+			return parkSource(fmt.Errorf("migration landed on %s, but the source row on %s kept changing under the delete guard "+
+				"(a concurrent writer holds it — check for a racing failover, then remove the source row)", req.TargetHost, source))
+		}
 		return parkSource(fmt.Errorf("target landed but source row tombstone failed: %v (remove the source row on %s)", err, source))
 	}
 	// Best-effort now (a stale source interface row is hidden once the source
@@ -310,7 +351,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 // restore (whose later start may have failed) from a genuine pre-row failure and
 // only roll back the source in the latter case. The test seam replaces the whole
 // drive so the path is unit-testable without a second daemon.
-func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error) {
+func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, timestamp string, start bool, ownerEpoch int64) (corrosion.RestoreOutcome, error) {
 	// Tell the target this is a migrate FROM us (peer-verified on the far side), so it keeps
 	// the imported NIC IPs — we handed it the IPAM leases before this call — rather than
 	// re-reserving and blanking them. The transport (PR-4 push to the target's staging repo
@@ -325,7 +366,7 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 	// claims it. Fail-open until the gate is cluster-wide (pre-flip / mixed roll).
 	var proof *pb.RuntimeActionProof
 	if s.gateActive(ctx) {
-		proof = s.mintRelocationProof(ctx, name, target)
+		proof = s.mintRelocationProof(ctx, name, target, ownerEpoch)
 		if proof == nil {
 			return corrosion.RestoreNotAttempted, fmt.Errorf(
 				"migrate refused: could not mint a relocation proof for %q (target may not advertise the split-brain gate)", target)
@@ -340,7 +381,7 @@ func (s *Server) migrateRestore(ctx context.Context, target, repoPath, name, tim
 // the analog of mintLBProof/the failover coordinator's mint. Fresh-Pings the target so a proof
 // is never handed to a host that doesn't advertise the gate. nil on an ungated target / write
 // failure (the caller refuses the migrate under enforcement).
-func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHost string) *pb.RuntimeActionProof {
+func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHost string, ownerEpoch int64) *pb.RuntimeActionProof {
 	if !s.destSupportsGate(ctx, destHost) {
 		slog.Error("mintRelocationProof: destination does not advertise the split-brain gate; refusing proof-bearing migrate",
 			"container", containerName, "dest", destHost)
@@ -351,6 +392,7 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 		ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 		TargetName: containerName, DestHost: destHost, Coordinator: s.hostName,
 		LeaseHolder: s.hostName, RelocationToken: newID(),
+		OwnerEpoch: strconv.FormatInt(ownerEpoch, 10),
 	}
 	if err := corrosion.WriteActionProof(ctx, s.db, pr); err != nil {
 		slog.Warn("mintRelocationProof: write proof failed", "container", containerName, "dest", destHost, "error", err)
@@ -359,5 +401,6 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 	return &pb.RuntimeActionProof{
 		Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
 		DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+		OwnerEpoch: pr.OwnerEpoch,
 	}
 }

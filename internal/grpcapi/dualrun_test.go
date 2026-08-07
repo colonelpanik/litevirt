@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/metrics"
@@ -36,6 +37,11 @@ func (r *recordingVirt) ListDomains() ([]string, error) {
 		names = append(names, n)
 	}
 	return names, nil
+}
+
+func (r *recordingVirt) DumpXML(name string) (string, error) {
+	// Minimal well-formed domain XML so the inventory collector can read a size.
+	return `<domain type='kvm'><name>` + name + `</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu></domain>`, nil
 }
 
 func (r *recordingVirt) DomainState(name string) (string, error) {
@@ -128,8 +134,18 @@ func captureDualRun(t *testing.T, s *Server) (sets func(target string) int, clea
 	return sets, clears, unsub
 }
 
-func confirmed(st *dualRunState, kind, target string) bool {
-	return st.confirmed[finding{kind: kind, target: target}]
+// condLifecycle reads a condition's durable lifecycle ("" when no row exists).
+func condLifecycle(s *Server, kind, target string) string {
+	code, subjectKind := conditionIdentity(kind)
+	h, ok, err := corrosion.GetHealthCondition(context.Background(), s.db, dualRunEvaluator, code, subjectKind, target)
+	if err != nil || !ok {
+		return ""
+	}
+	return h.Lifecycle
+}
+
+func confirmedCond(s *Server, kind, target string) bool {
+	return condLifecycle(s, kind, target) == corrosion.ConditionConfirmed
 }
 
 // TestDualRun_VMOnTwoHosts_PagesAfterDebounce: a VM that is an active disk-holder on two
@@ -144,25 +160,24 @@ func TestDualRun_VMOnTwoHosts_PagesAfterDebounce(t *testing.T) {
 	sets, _, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
 
-	s.detectDualRunPass(ctx, st) // pass 1 — below threshold
-	if confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // pass 1 — below threshold
+	if confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("confirmed on pass 1 — debounce not applied")
 	}
 	if got := sets("ha.dualrun.vm:vmA"); got != 0 {
 		t.Fatalf("paged %d times on pass 1, want 0", got)
 	}
 
-	s.detectDualRunPass(ctx, st) // pass 2 — confirm
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // pass 2 — confirm
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("not confirmed on pass 2")
 	}
 	if got := sets("ha.dualrun.vm:vmA"); got != 1 {
 		t.Fatalf("paged %d times through pass 2, want 1", got)
 	}
 
-	s.detectDualRunPass(ctx, st) // pass 3 — still present, no re-page (set-transition only)
+	s.detectDualRunPass(ctx) // pass 3 — still present, no re-page (set-transition only)
 	if got := sets("ha.dualrun.vm:vmA"); got != 1 {
 		t.Fatalf("paged %d times through pass 3, want 1 (set-transition only)", got)
 	}
@@ -182,10 +197,9 @@ func TestDualRun_StuckMigrationTwoDiskHolders_Pages(t *testing.T) {
 			"h2": {diskHolderVMs: []string{"vmA"}},
 		})
 		ctx := context.Background()
-		st := newDualRunState()
-		s.detectDualRunPass(ctx, st)
-		s.detectDualRunPass(ctx, st)
-		if !confirmed(st, kindDualRunVM, "vmA") {
+		s.detectDualRunPass(ctx)
+		s.detectDualRunPass(ctx)
+		if !confirmedCond(s, kindDualRunVM, "vmA") {
 			t.Fatalf("state %q: two active disk-holders must page regardless of DB migration state", state)
 		}
 	}
@@ -203,13 +217,12 @@ func TestDualRun_OwnerMismatch_MigrationExempt(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCond(s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must stay exempt for a migrating VM (cutover lag)")
 	}
-	if confirmed(st, kindDualRunVM, "vmA") {
+	if confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("single holder is not a dual-run")
 	}
 }
@@ -225,10 +238,9 @@ func TestDualRun_VIPOnTwoHosts(t *testing.T) {
 		"h1": {kernelVIPs: []string{"10.0.0.9"}},
 		"h2": {},
 	})
-	st1 := newDualRunState()
-	s1.detectDualRunPass(ctx, st1)
-	s1.detectDualRunPass(ctx, st1)
-	if confirmed(st1, kindDualRunVIP, "10.0.0.9") {
+	s1.detectDualRunPass(ctx)
+	s1.detectDualRunPass(ctx)
+	if confirmedCond(s1, kindDualRunVIP, "10.0.0.9") {
 		t.Fatal("single VIP holder should not page")
 	}
 
@@ -238,10 +250,9 @@ func TestDualRun_VIPOnTwoHosts(t *testing.T) {
 		"h1": {kernelVIPs: []string{"10.0.0.9"}},
 		"h2": {kernelVIPs: []string{"10.0.0.9"}},
 	})
-	st2 := newDualRunState()
-	s2.detectDualRunPass(ctx, st2)
-	s2.detectDualRunPass(ctx, st2)
-	if !confirmed(st2, kindDualRunVIP, "10.0.0.9") {
+	s2.detectDualRunPass(ctx)
+	s2.detectDualRunPass(ctx)
+	if !confirmedCond(s2, kindDualRunVIP, "10.0.0.9") {
 		t.Fatal("dual VIP holder should page")
 	}
 }
@@ -260,13 +271,12 @@ func TestDualRun_OwnerMismatch_CoverageGated(t *testing.T) {
 		"h1": {},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	}, "h3")
-	stP := newDualRunState()
-	sPartial.detectDualRunPass(ctx, stP)
-	sPartial.detectDualRunPass(ctx, stP)
-	if confirmed(stP, kindOwnerMismatch, "vmA") {
+	sPartial.detectDualRunPass(ctx)
+	sPartial.detectDualRunPass(ctx)
+	if confirmedCond(sPartial, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be suppressed when the DB owner was not probed (partial coverage)")
 	}
-	if !confirmed(stP, kindDualRunCoverage, "h3") {
+	if !confirmedCond(sPartial, kindDualRunCoverage, "h3") {
 		t.Fatal("expected a coverage finding for the unprobed owner h3")
 	}
 
@@ -278,10 +288,9 @@ func TestDualRun_OwnerMismatch_CoverageGated(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 		"h3": {},
 	})
-	stF := newDualRunState()
-	sFull.detectDualRunPass(ctx, stF)
-	sFull.detectDualRunPass(ctx, stF)
-	if !confirmed(stF, kindOwnerMismatch, "vmA") {
+	sFull.detectDualRunPass(ctx)
+	sFull.detectDualRunPass(ctx)
+	if !confirmedCond(sFull, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch should page under full coverage with owner probed-and-absent")
 	}
 }
@@ -295,10 +304,9 @@ func TestDualRun_CrossNodeTies(t *testing.T) {
 		"h2": {unresolvedTies: 3},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindLWWUnresolved, "h2") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindLWWUnresolved, "h2") {
 		t.Fatal("expected an unresolved-ties finding for the peer h2")
 	}
 }
@@ -313,13 +321,12 @@ func TestDualRun_ProbeFailure_SurfacedNotSilent(t *testing.T) {
 	sets, _, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	if confirmedCond(s, kindDualRunCoverage, "h2") {
 		t.Fatal("coverage finding confirmed on pass 1 — debounce not applied")
 	}
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunCoverage, "h2") {
 		t.Fatal("unprobed host must surface as a coverage finding")
 	}
 	if got := sets("ha.dualrun.coverage:h2"); got != 1 {
@@ -335,29 +342,37 @@ func TestDualRun_HealClearsConfirmed(t *testing.T) {
 	_, clears, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
 
 	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("precondition: should be confirmed")
 	}
 
-	// Heal: only one holder now.
+	// Heal: only one holder now. Resolution is STRICTER than confirmation — one
+	// clean pass proves nothing (a probe can race a restart); the condition
+	// resolves only after TWO consecutive complete clean scans.
 	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {},
 	})
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunVM, "vmA") {
-		t.Fatal("healed dual-run must clear from confirmed")
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
+		t.Fatal("one clean scan must NOT resolve a confirmed dual-run")
+	}
+	if got := clears("ha.dualrun.vm:vmA"); got != 0 {
+		t.Fatalf("cleared event fired %d times after one clean scan, want 0", got)
+	}
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionResolved {
+		t.Fatalf("after two complete clean scans lifecycle = %q, want resolved", got)
 	}
 	if got := clears("ha.dualrun.vm:vmA"); got != 1 {
-		t.Fatalf("cleared event fired %d times, want 1", got)
+		t.Fatalf("cleared event fired %d times, want exactly 1", got)
 	}
 }
 
@@ -375,32 +390,43 @@ func TestDualRun_NeverDestroys(t *testing.T) {
 	s.virt = rv
 	seedVM(t, s, "vmA", "h1", "running")
 
-	st := newDualRunState()
 	for i := 0; i < 3; i++ {
-		s.detectDualRunPass(ctx, st) // real gather → localRuntimeSnapshot(self)
+		s.detectDualRunPass(ctx) // real gather → localRuntimeSnapshot(self)
 	}
 	if rv.destroys != 0 || rv.undefines != 0 {
 		t.Fatalf("detector performed destructive ops: destroys=%d undefines=%d", rv.destroys, rv.undefines)
 	}
 }
 
-// TestReportRuntime_PeerOnly: the RPC rejects a non-peer caller and, for a peer, returns
-// this host's local runtime snapshot.
-func TestReportRuntime_PeerOnly(t *testing.T) {
+// TestGetRuntimeInventory_PeerOnly: the RPC rejects a non-peer caller and, for a
+// peer, returns this host's local runtime inventory with running domains marked
+// as disk-holders.
+func TestGetRuntimeInventory_PeerOnly(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{domains: map[string]string{"run": "running", "stop": "stopped"}}
 
-	if _, err := s.ReportRuntime(adminCtx(), &pb.ReportRuntimeRequest{}); err == nil {
-		t.Fatal("ReportRuntime must reject a non-peer (admin) caller")
+	if _, err := s.GetRuntimeInventory(adminCtx(), &pb.GetRuntimeInventoryRequest{}); err == nil {
+		t.Fatal("GetRuntimeInventory must reject a non-peer (admin) caller")
 	}
 
 	ctx := peerCtxFor(t, s, "peer-1")
-	resp, err := s.ReportRuntime(ctx, &pb.ReportRuntimeRequest{})
+	resp, err := s.GetRuntimeInventory(ctx, &pb.GetRuntimeInventoryRequest{})
 	if err != nil {
-		t.Fatalf("ReportRuntime(peer): %v", err)
+		t.Fatalf("GetRuntimeInventory(peer): %v", err)
 	}
-	if len(resp.GetDiskHolderVms()) != 1 || resp.GetDiskHolderVms()[0] != "run" {
-		t.Fatalf("disk_holder_vms = %v, want [run]", resp.GetDiskHolderVms())
+	var holders []string
+	for _, w := range resp.GetWorkloads() {
+		if w.GetDiskHolder() {
+			holders = append(holders, w.GetName())
+		}
+	}
+	if len(holders) != 1 || holders[0] != "run" {
+		t.Fatalf("disk holders = %v, want [run]", holders)
+	}
+	// The stopped-but-defined domain is still LISTED — runtime state the DB
+	// comparison needs — just not a holder.
+	if len(resp.GetWorkloads()) != 2 {
+		t.Fatalf("workloads = %d entries, want 2 (run + stop)", len(resp.GetWorkloads()))
 	}
 }
 
@@ -409,7 +435,7 @@ func TestReportRuntime_PeerOnly(t *testing.T) {
 func TestLocalRuntimeSnapshot_OnlyRunningVMsAreDiskHolders(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{domains: map[string]string{"run": "running", "stop": "stopped"}}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if len(snap.diskHolderVMs) != 1 || snap.diskHolderVMs[0] != "run" {
 		t.Fatalf("disk-holders = %v, want [run] only", snap.diskHolderVMs)
 	}
@@ -452,10 +478,9 @@ func TestDualRun_FencedHostStillRunning_Detected(t *testing.T) {
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("a fenced host still running the VM must be detected as a dual-run")
 	}
 }
@@ -470,10 +495,9 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 		"h1": {runningCTs: []string{"ctA"}},
 		"h2": {runningCTs: []string{"ctA"}},
 	})
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunCT, "ctA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunCT, "ctA") {
 		t.Fatal("a container running on two hosts should page")
 	}
 
@@ -486,10 +510,9 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 		"h1": {runningCTs: []string{"ctB"}},
 		"h2": {runningCTs: []string{"ctB"}},
 	})
-	stMig := newDualRunState()
-	sMig.detectDualRunPass(ctx, stMig)
-	sMig.detectDualRunPass(ctx, stMig)
-	if !confirmed(stMig, kindDualRunCT, "ctB") {
+	sMig.detectDualRunPass(ctx)
+	sMig.detectDualRunPass(ctx)
+	if !confirmedCond(sMig, kindDualRunCT, "ctB") {
 		t.Fatal("two running containers must page regardless of DB migration state")
 	}
 }
@@ -501,10 +524,9 @@ func TestDualRun_UnsupportedPeer_NotPagedAsCoverage(t *testing.T) {
 	s := dualRunTestServer(t, 2)
 	s.gatherRuntimeOverride = gatherWith(map[string]runtimeSnapshot{"h1": {}}, nil, []string{"h2"})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCond(s, kindDualRunCoverage, "h2") {
 		t.Fatal("an older-binary peer must not page as a coverage gap")
 	}
 }
@@ -520,10 +542,9 @@ func TestDualRun_OwnerMismatch_UnprobedOwnerDeferred(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	}, "h3")
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCond(s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be deferred when the DB owner was not positively probed")
 	}
 }
@@ -534,7 +555,6 @@ func TestDualRun_DebounceReArmsOnFlap(t *testing.T) {
 	s := dualRunTestServer(t, 2)
 	seedVM(t, s, "vmA", "h1", "running")
 	ctx := context.Background()
-	st := newDualRunState()
 
 	present := fixedGather(map[string]runtimeSnapshot{
 		"h1": {diskHolderVMs: []string{"vmA"}},
@@ -546,16 +566,16 @@ func TestDualRun_DebounceReArmsOnFlap(t *testing.T) {
 	})
 
 	s.gatherRuntimeOverride = present
-	s.detectDualRunPass(ctx, st) // seen=1
+	s.detectDualRunPass(ctx) // seen=1
 	s.gatherRuntimeOverride = absent
-	s.detectDualRunPass(ctx, st) // gone -> reset
+	s.detectDualRunPass(ctx) // gone -> reset
 	s.gatherRuntimeOverride = present
-	s.detectDualRunPass(ctx, st) // seen=1 again (must NOT confirm)
-	if confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // seen=1 again (must NOT confirm)
+	if confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("a flapping finding must not confirm on its first pass back (counter must reset)")
 	}
-	s.detectDualRunPass(ctx, st) // seen=2 -> confirm
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // seen=2 -> confirm
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("should confirm after two consecutive passes back")
 	}
 }
@@ -613,7 +633,7 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 	// Enumeration failure → partial, no VMs.
 	s := testServer(t)
 	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if !snap.partial {
 		t.Fatal("ListDomains error must mark the snapshot partial")
 	}
@@ -624,7 +644,7 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 		domains:    map[string]string{"ok": "running", "wedged": "running"},
 		stateErrOn: map[string]bool{"wedged": true},
 	}
-	snap2 := s2.localRuntimeSnapshot(context.Background())
+	snap2 := snapshotFromInventory(s2.collectRuntimeInventory(context.Background()))
 	if !snap2.partial {
 		t.Fatal("a per-item DomainState error must mark the snapshot partial")
 	}
@@ -635,21 +655,26 @@ func TestLocalRuntimeSnapshot_PartialOnProbeError(t *testing.T) {
 	// Clean host → not partial.
 	s3 := testServer(t)
 	s3.virt = &recordingVirt{domains: map[string]string{"ok": "running"}}
-	if s3.localRuntimeSnapshot(context.Background()).partial {
+	if snapshotFromInventory(s3.collectRuntimeInventory(context.Background())).partial {
 		t.Fatal("a clean host must not be marked partial")
 	}
 }
 
-// TestReportRuntime_CarriesPartial: the partial flag rides the RPC response.
-func TestReportRuntime_CarriesPartial(t *testing.T) {
+// TestGetRuntimeInventory_CarriesIncomplete: the completeness flag rides the RPC
+// response — complete=false when a local probe errored, so a caller can never
+// mistake a blind host for an empty one.
+func TestGetRuntimeInventory_CarriesIncomplete(t *testing.T) {
 	s := testServer(t)
 	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
-	resp, err := s.ReportRuntime(peerCtxFor(t, s, "peer-1"), &pb.ReportRuntimeRequest{})
+	resp, err := s.GetRuntimeInventory(peerCtxFor(t, s, "peer-1"), &pb.GetRuntimeInventoryRequest{})
 	if err != nil {
-		t.Fatalf("ReportRuntime: %v", err)
+		t.Fatalf("GetRuntimeInventory: %v", err)
 	}
-	if !resp.GetPartial() {
-		t.Fatal("ReportRuntime must report partial=true when a local probe errored")
+	if resp.GetComplete() {
+		t.Fatal("GetRuntimeInventory must report complete=false when a local probe errored")
+	}
+	if len(resp.GetErrors()) == 0 {
+		t.Fatal("an incomplete inventory must say why")
 	}
 }
 
@@ -666,13 +691,12 @@ func TestDualRun_PartialOwner_NoFalseOwnerMismatch(t *testing.T) {
 		"h3": {partial: true},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCond(s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be deferred when the owner's snapshot is partial")
 	}
-	if !confirmed(st, kindDualRunCoverage, "h3") {
+	if !confirmedCond(s, kindDualRunCoverage, "h3") {
 		t.Fatal("a partial host must raise a coverage finding")
 	}
 }
@@ -686,10 +710,9 @@ func TestDualRun_PartialHost_PositiveHoldersStillCounted(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}, partial: true},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
 		t.Fatal("a partial host's positive holder must still count toward a dual-run")
 	}
 }
@@ -740,11 +763,17 @@ type fakeCT struct {
 	names   []string
 	listErr error
 	states  map[string]string
+	// limits maps name → {cpu, memMiB}; absent means 0/0 (fully unlimited).
+	limits map[string][2]int
 }
 
 func (f *fakeCT) ListContainers(context.Context) ([]string, error) { return f.names, f.listErr }
 func (f *fakeCT) StateContainer(_ context.Context, n string) (string, error) {
 	return f.states[n], nil
+}
+func (f *fakeCT) ContainerLimits(_ context.Context, n string) (int, int, error) {
+	l := f.limits[n]
+	return l[0], l[1], nil
 }
 
 // TestLocalRuntimeSnapshot_NonLXCHost_NotPartial: on a host without lxc-* tooling the CT
@@ -759,7 +788,7 @@ func TestLocalRuntimeSnapshot_NonLXCHost_NotPartial(t *testing.T) {
 	s := testServer(t)
 	// The runtime is wired (as the daemon does) but would error — must be ignored.
 	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("exec: \"lxc-ls\": executable file not found in $PATH")}
-	snap := s.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s.collectRuntimeInventory(context.Background()))
 	if snap.partial {
 		t.Fatal("a non-LXC host must not be marked partial by a skipped CT probe")
 	}
@@ -777,18 +806,358 @@ func TestLocalRuntimeSnapshot_LXCCapable_ProbeErrorPartial(t *testing.T) {
 
 	s := testServer(t)
 	s.containerRuntime = &fakeCT{listErr: fmt.Errorf("lxc-ls: permission denied")}
-	if !s.localRuntimeSnapshot(context.Background()).partial {
+	if !snapshotFromInventory(s.collectRuntimeInventory(context.Background())).partial {
 		t.Fatal("a container-list error on an LXC-capable host must mark the snapshot partial")
 	}
 
 	// And a healthy capable host reports its running containers, not partial.
 	s2 := testServer(t)
 	s2.containerRuntime = &fakeCT{names: []string{"ctA", "ctB"}, states: map[string]string{"ctA": "running", "ctB": "stopped"}}
-	snap := s2.localRuntimeSnapshot(context.Background())
+	snap := snapshotFromInventory(s2.collectRuntimeInventory(context.Background()))
 	if snap.partial {
 		t.Fatal("a healthy LXC host must not be partial")
 	}
 	if len(snap.runningCTs) != 1 || snap.runningCTs[0] != "ctA" {
 		t.Fatalf("running CTs = %v, want [ctA]", snap.runningCTs)
+	}
+}
+
+// twoHolderGather is the canonical dual-run fixture: vmA an active disk-holder
+// on both hosts, full coverage.
+func twoHolderGather() func(context.Context, []string) (map[string]runtimeSnapshot, []string, []string) {
+	return fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}},
+		"h2": {diskHolderVMs: []string{"vmA"}},
+	})
+}
+
+// readCond fetches the durable condition row for assertions.
+func readCond(t *testing.T, s *Server, kind, target string) corrosion.HealthCondition {
+	t.Helper()
+	code, subjectKind := conditionIdentity(kind)
+	h, ok, err := corrosion.GetHealthCondition(context.Background(), s.db, dualRunEvaluator, code, subjectKind, target)
+	if err != nil || !ok {
+		t.Fatalf("condition %s/%s missing: ok=%v err=%v", kind, target, ok, err)
+	}
+	return h
+}
+
+// TestConditionLifecycle_ObservedWarningThenConfirmedCritical pins the severity
+// progression: the first positive scan records an OBSERVED warning; the second
+// consecutive one CONFIRMS at critical (for a corruption-class code).
+func TestConditionLifecycle_ObservedWarningThenConfirmedCritical(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	seedVM(t, s, "vmA", "h1", "running")
+	s.gatherRuntimeOverride = twoHolderGather()
+	ctx := context.Background()
+
+	s.detectDualRunPass(ctx)
+	h := readCond(t, s, kindDualRunVM, "vmA")
+	if h.Lifecycle != corrosion.ConditionObserved || h.Severity != corrosion.SeverityWarning {
+		t.Fatalf("after one scan: %s/%s, want observed/warning", h.Lifecycle, h.Severity)
+	}
+	if h.ObserveCount != 1 || h.FirstSeen == "" || h.ConfirmedAt != "" {
+		t.Errorf("observed row bookkeeping wrong: %+v", h)
+	}
+
+	s.detectDualRunPass(ctx)
+	h = readCond(t, s, kindDualRunVM, "vmA")
+	if h.Lifecycle != corrosion.ConditionConfirmed || h.Severity != corrosion.SeverityCritical {
+		t.Fatalf("after two scans: %s/%s, want confirmed/critical", h.Lifecycle, h.Severity)
+	}
+	if h.ConfirmedAt == "" || h.ObserveCount != 2 {
+		t.Errorf("confirmed row bookkeeping wrong: %+v", h)
+	}
+	if len(h.Hosts) != 2 {
+		t.Errorf("involved hosts = %v, want both holders", h.Hosts)
+	}
+}
+
+// TestConditionLifecycle_SurvivesLeaderChange: a NEW leader (fresh process state,
+// same replicated rows) continues the lifecycle exactly where the old one
+// stopped — the confirmed state neither re-arms nor re-pages, and its counts
+// keep advancing.
+func TestConditionLifecycle_SurvivesLeaderChange(t *testing.T) {
+	s1 := dualRunTestServer(t, 2)
+	seedVM(t, s1, "vmA", "h1", "running")
+	s1.gatherRuntimeOverride = twoHolderGather()
+	ctx := context.Background()
+	s1.detectDualRunPass(ctx)
+	s1.detectDualRunPass(ctx)
+	if !confirmedCond(s1, kindDualRunVM, "vmA") {
+		t.Fatal("precondition: confirmed on the first leader")
+	}
+
+	// Leadership moves: h2 shares the SAME replicated state, no in-memory carry.
+	s2 := &Server{hostName: "h2", db: s1.db, events: events.NewBus()}
+	s2.gatherRuntimeOverride = twoHolderGather()
+	sets, _, stop := captureDualRun(t, s2)
+	defer stop()
+	s2.detectDualRunPass(ctx)
+	h := readCond(t, s2, kindDualRunVM, "vmA")
+	if h.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("new leader sees lifecycle %q, want confirmed preserved", h.Lifecycle)
+	}
+	if h.ObserveCount != 3 {
+		t.Errorf("observe count = %d, want 3 (continued, not re-armed)", h.ObserveCount)
+	}
+	if got := sets("ha.dualrun.vm:vmA"); got != 0 {
+		t.Errorf("new leader re-paged a standing confirmed condition %d times, want 0", got)
+	}
+	if h.Reporter != "h2" {
+		t.Errorf("reporter = %q, want the new leader h2", h.Reporter)
+	}
+}
+
+// TestConditionLifecycle_IncompleteCoverageCannotResolve: with the dual-run gone
+// but a peer unreachable, the scan proves nothing about absence — the condition
+// must stay confirmed with its clean streak unadvanced, for as many passes as
+// the blindness lasts.
+func TestConditionLifecycle_IncompleteCoverageCannotResolve(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	seedVM(t, s, "vmA", "h1", "running")
+	s.gatherRuntimeOverride = twoHolderGather()
+	ctx := context.Background()
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+
+	// vmA no longer reported anywhere — but h2 is unreachable.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}},
+	}, "h2")
+	for i := 0; i < 3; i++ {
+		s.detectDualRunPass(ctx)
+	}
+	h := readCond(t, s, kindDualRunVM, "vmA")
+	if h.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("lifecycle = %q under incomplete coverage, want confirmed retained", h.Lifecycle)
+	}
+	if h.CleanCount != 0 {
+		t.Errorf("clean streak advanced to %d under incomplete coverage, want 0 — partial scans prove nothing", h.CleanCount)
+	}
+
+	// Coverage returns: two complete clean scans resolve it.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionResolved {
+		t.Fatalf("after coverage returned and two clean scans: %q, want resolved", got)
+	}
+}
+
+// TestConditionLifecycle_GateInvalidCannotResolve: a leader without local quorum
+// may RECORD positive evidence but may not PROVE absence — resolution waits for
+// the decision gate.
+func TestConditionLifecycle_GateInvalidCannotResolve(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	seedVM(t, s, "vmA", "h1", "running")
+	s.gatherRuntimeOverride = twoHolderGather()
+	ctx := context.Background()
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+
+	// Quorum lost; the dual-run also disappears from the (complete) gather.
+	s.SetGate(fakeServerGate{execOK: false})
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionConfirmed {
+		t.Fatalf("lifecycle = %q with an invalid gate, want confirmed retained", got)
+	}
+
+	// Quorum back: the same clean evidence now resolves.
+	s.SetGate(fakeServerGate{execOK: true})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionResolved {
+		t.Fatalf("lifecycle = %q after quorum returned, want resolved", got)
+	}
+}
+
+// TestConditionLifecycle_EvaluatorStatusRecordsCoverage: every pass writes the
+// evaluator's scan status, so consumers can tell "clean" from "blind".
+func TestConditionLifecycle_EvaluatorStatusRecordsCoverage(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	ctx := context.Background()
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{"h1": {}}, "h2")
+	s.detectDualRunPass(ctx)
+
+	sts, err := corrosion.ListHealthEvaluatorStatus(ctx, s.db)
+	if err != nil || len(sts) != 1 {
+		t.Fatalf("evaluator status rows = %d err=%v, want 1", len(sts), err)
+	}
+	if sts[0].Evaluator != dualRunEvaluator || sts[0].Coverage != corrosion.CoveragePartial {
+		t.Fatalf("status = %+v, want dual_run/partial", sts[0])
+	}
+
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{"h1": {}, "h2": {}})
+	s.detectDualRunPass(ctx)
+	sts, _ = corrosion.ListHealthEvaluatorStatus(ctx, s.db)
+	if sts[0].Coverage != corrosion.CoverageComplete {
+		t.Fatalf("coverage = %q after a full gather, want complete", sts[0].Coverage)
+	}
+}
+
+// TestEpochMismatch_ValidEqualMarkerDoesNotFire is the false-positive
+// regression the LAB caught: with owner_epoch_v1 latched, a VM running on its
+// DB owner with a VALID marker EQUAL to the row's epoch must raise nothing.
+// The detector's DB index is built from ListVMs, which did not select
+// vm_owner_epoch — so every epoched VM compared marker N against 0 and paged.
+func TestEpochMismatch_ValidEqualMarkerDoesNotFire(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vmA'`); err != nil {
+		t.Fatalf("stamp epoch: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 9, status: MarkerValid}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if lc := condLifecycle(s, kindEpochMismatch, "vmA"); lc != "" {
+		t.Fatalf("valid equal marker raised owner_epoch_mismatch (lifecycle %q) — the ListVMs epoch column regression", lc)
+	}
+
+	// Control: an UNEQUAL marker on the owner does fire and confirms.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 4, status: MarkerValid}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindEpochMismatch, "vmA") {
+		t.Fatal("an unequal marker on the DB owner must confirm owner_epoch_mismatch")
+	}
+}
+
+// TestConditionLifecycle_DBIndexFailureCannotResolve: the owner- and
+// epoch-mismatch checks iterate the DB VM index, so a failed ListVMs makes the
+// detector silently blind to ownership drift — while runtime peer coverage can
+// still be complete. Two such passes must NOT count as clean scans and resolve
+// a confirmed condition; a pass whose index read failed proved nothing.
+func TestConditionLifecycle_DBIndexFailureCannotResolve(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	// DB owner h1, sole runtime holder h2 → owner mismatch, confirmed on pass 2.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {}, "h2": {diskHolderVMs: []string{"vmA"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionConfirmed {
+		t.Fatalf("setup: lifecycle = %q, want confirmed", got)
+	}
+
+	// Break ONLY the VM index. Runtime gather stays complete, so without the
+	// db_index gate these passes read as clean and resolve the condition.
+	if err := s.db.Execute(ctx, `ALTER TABLE vms RENAME TO vms_broken`); err != nil {
+		t.Fatalf("hide vms table: %v", err)
+	}
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	h := readCond(t, s, kindOwnerMismatch, "vmA")
+	if h.Lifecycle != corrosion.ConditionConfirmed {
+		t.Fatalf("lifecycle = %q after passes with a failed DB index, want confirmed retained — "+
+			"an unreadable index is blindness, not absence", h.Lifecycle)
+	}
+	if h.CleanCount != 0 {
+		t.Errorf("clean streak advanced to %d with a failed DB index, want 0", h.CleanCount)
+	}
+	// The evaluator status must say PARTIAL, not complete, so cluster health
+	// shows the detector as degraded rather than green-and-blind.
+	sts, err := corrosion.ListHealthEvaluatorStatus(ctx, s.db)
+	if err != nil || len(sts) != 1 {
+		t.Fatalf("evaluator status rows = %d err=%v, want 1", len(sts), err)
+	}
+	if sts[0].Coverage != corrosion.CoveragePartial {
+		t.Fatalf("evaluator coverage = %q with a failed DB index, want partial", sts[0].Coverage)
+	}
+
+	// Index repaired and the drift healed: the same clean evidence now resolves.
+	if err := s.db.Execute(ctx, `ALTER TABLE vms_broken RENAME TO vms`); err != nil {
+		t.Fatalf("restore vms table: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindOwnerMismatch, "vmA"); got != corrosion.ConditionResolved {
+		t.Fatalf("after repair and two clean scans: %q, want resolved", got)
+	}
+}
+
+// TestDualRun_SameNameDistinctContainers_NoFalsePositive: container names are
+// NOT cluster-unique — the schema keys rows by (host_name, name) — so two
+// unrelated containers named "web" on two hosts, each backed by its own DB row
+// and running on its own host, are a legitimate steady state. Grouping runtime
+// holders by bare name flagged them as a critical ct_dual_run, which is
+// admission-gating with no operator force-clear: a naming coincidence froze
+// capacity-growing admission on both hosts.
+func TestDualRun_SameNameDistinctContainers_NoFalsePositive(t *testing.T) {
+	ctx := context.Background()
+	s := dualRunTestServer(t, 2)
+	seedContainer(t, s, "web", "h1", "running")
+	seedContainer(t, s, "web", "h2", "running")
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}},
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunCT, "web"); got != "" && got != corrosion.ConditionResolved {
+		t.Fatalf("two DISTINCT DB-backed containers sharing a name raised %q — names are per-host, not cluster-unique", got)
+	}
+
+	// The same shape with the second copy UNBACKED is the real thing: a copy
+	// running where no row claims it, while the name is claimed elsewhere.
+	s2 := dualRunTestServer(t, 2)
+	seedContainer(t, s2, "web", "h1", "running")
+	s2.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}},
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s2.detectDualRunPass(ctx)
+	s2.detectDualRunPass(ctx)
+	if !confirmedCond(s2, kindDualRunCT, "web") {
+		t.Fatal("a same-named copy with no backing DB row must still page — that is the split a crashed relocation leaves")
+	}
+}
+
+// TestDualRun_RelocatingSourceDoesNotLegitimizeHolder: mid-relocation, the
+// source row (state=relocating + restore marker) describes the copy being MOVED
+// AWAY. If the fenced-but-alive source still runs the container while the
+// restored target does too, BOTH rows exist — and the source's row must not
+// count as backing, or the canonical crashed-relocation dual-run reads as two
+// legitimate containers.
+func TestDualRun_RelocatingSourceDoesNotLegitimizeHolder(t *testing.T) {
+	ctx := context.Background()
+	s := dualRunTestServer(t, 2)
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		Name: "web", HostName: "h1", State: "relocating",
+		StateDetail: corrosion.RelocateRestoreDetail("h2", "attempt-1"),
+	}); err != nil {
+		t.Fatalf("UpsertContainer source: %v", err)
+	}
+	seedContainer(t, s, "web", "h2", "running") // the landed restore
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {runningCTs: []string{"web"}}, // fenced host's runtime is still live
+		"h2": {runningCTs: []string{"web"}},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunCT, "web") {
+		t.Fatal("a still-running relocation source beside its landed target must page — the source row is not backing, it is the move itself")
 	}
 }

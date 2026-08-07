@@ -57,6 +57,7 @@ type Fake struct {
 	diskSources map[string]map[string]string   // domain → target-dev → source file
 	stats       map[string]*libvirt.DomainStats
 	reasons     map[string]string // domain → injected DomainStateReason.Reason
+	ownerEpochs map[string]int64  // domain → Phase 4 owner-epoch metadata marker
 	events      []Event
 
 	// Optional time source for events. Defaults to time.Now.
@@ -82,6 +83,10 @@ type Fake struct {
 	// Nil = default success.
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
+	// outage, which marks the host's runtime inventory INCOMPLETE and must
+	// refuse new residency at admission time.
+	FailListDomains func() error
 	// FailAttachDisk / FailDetachDisk inject a live disk hot-plug primitive failure so
 	// scenarios can exercise attach-rollback / detach-forward compensation.
 	FailAttachDisk func(domain, path, targetDev, bus string) error
@@ -461,6 +466,11 @@ func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
 func (f *Fake) ListDomains() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.FailListDomains != nil {
+		if err := f.FailListDomains(); err != nil {
+			return nil, err
+		}
+	}
 	out := make([]string, 0, len(f.domains))
 	for n := range f.domains {
 		out = append(out, n)
@@ -486,6 +496,14 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	}
 	if x, ok := f.xml[name]; ok {
 		return x, nil
+	}
+	// A domain seeded via SetState alone has no explicit XML — synthesize a
+	// minimal definition, because REAL libvirt cannot have a domain without
+	// one. Erroring here made every SetState-only rig read as an incomplete
+	// runtime inventory, which is a fake artifact, not a modeled failure
+	// (tests that want a broken DumpXML use FailDumpXML).
+	if _, ok := f.domains[name]; ok {
+		return `<domain type='kvm'><name>` + name + `</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu></domain>`, nil
 	}
 	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
 }
@@ -1228,3 +1246,29 @@ func (f *Fake) RegisterDomainEventCallback(cb libvirt.DomainEventCallback) {
 	// directly (TODO if needed).
 }
 func (f *Fake) Close() error { return nil }
+
+// SetDomainOwnerEpoch / GetDomainOwnerEpoch mirror the Phase 4 runtime marker
+// stored in domain metadata. The fake records them per domain so fleet and
+// unit tests can assert write-through and convergence without libvirt.
+func (f *Fake) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.ownerEpochs == nil {
+		f.ownerEpochs = make(map[string]int64)
+	}
+	f.ownerEpochs[name] = epoch
+	return nil
+}
+
+func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return 0, false, fmt.Errorf("domain %q not found", name)
+	}
+	e, ok := f.ownerEpochs[name]
+	return e, ok, nil
+}

@@ -169,6 +169,9 @@ func TestRelocateContainer(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.Execute(ctx, `UPDATE containers SET owner_epoch = 5 WHERE host_name = ? AND name = ?`, "dead", "web"); err != nil {
+		t.Fatalf("seed epoch: %v", err)
+	}
 	if err := RelocateContainer(ctx, c, "dead", "web", "live"); err != nil {
 		t.Fatalf("RelocateContainer: %v", err)
 	}
@@ -186,6 +189,14 @@ func TestRelocateContainer(t *testing.T) {
 	}
 	if g.Image != "alpine:3.19" || g.CPULimit != 2 || g.MemMiB != 256 || g.Project != "p1" || g.OnHostFailure != "image-recreate" {
 		t.Errorf("target spec not preserved: %+v", g)
+	}
+	// Phase 4 (lab-proven ordering): the target row is created at the SOURCE
+	// owner epoch — the relocation proof carries that epoch and the executor
+	// compares it against this row before recreating, so any other value
+	// (0 here, observed live; or an eager +1) wedges a legitimate relocation
+	// forever. The +1 mints only at completion.
+	if g.OwnerEpoch != 5 {
+		t.Errorf("target owner epoch = %d, want the source epoch 5", g.OwnerEpoch)
 	}
 	// Exactly one live "web" cluster-wide.
 	all, _ := ListContainers(ctx, c, "")

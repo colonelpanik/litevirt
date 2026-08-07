@@ -1,5 +1,16 @@
 # Self-upgrade from a peer (auto-catch-up)
 
+> **v50 is a coordinated major upgrade.** The v50 release replaces the health,
+> runtime-inventory, and capacity RPC surface outright (no mixed-version
+> compatibility): `GetHostHealth`, `ReportRuntime`, `CheckVMRuntime`,
+> `CheckContainerRuntime`, and `ClusterStatus.alerts` are gone, and every
+> consumer reads `GetClusterHealth` / `GetRuntimeInventory`. Upgrade the whole
+> cluster together — take a consistent database backup first, then replace
+> every daemon and client in one campaign. Stored data migrates automatically
+> (schema v42 → v50 is verified end to end); running MIXED versions is
+> unsupported and will surface as `Unimplemented` peer RPCs and dual-run
+> coverage gauge entries until the stragglers are upgraded.
+
 ## Problem
 
 `lv host upgrade` is operator-initiated and only touches **reachable** hosts. A

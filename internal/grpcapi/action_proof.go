@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -19,6 +20,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		LeaseHolder: p.GetLeaseHolder(), LeaseExpiresAt: p.GetLeaseExpiresAt(),
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
 		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
+		OwnerEpoch: p.GetOwnerEpoch(),
 	}
 }
 
@@ -65,9 +67,24 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 	} else if !ok || pr.Action != p.GetAction() || pr.TargetKind != p.GetTargetKind() ||
 		pr.TargetName != p.GetTargetName() || pr.DestHost != p.GetDestHost() ||
 		pr.Coordinator != p.GetCoordinator() || pr.RelocationToken != p.GetRelocationToken() ||
-		pr.FenceEpoch != p.GetFenceEpoch() {
+		pr.FenceEpoch != p.GetFenceEpoch() || pr.OwnerEpoch != p.GetOwnerEpoch() {
 		return "", status.Errorf(codes.FailedPrecondition,
 			"persisted proof %s does not match the carried proof (divergent/seeded row)", p.GetId())
+	}
+	// VM proofs additionally bind to the current workload ownership generation.
+	// A valid prepared row can outlive an A→B→A ownership cycle; without this
+	// comparison it could authorize a later promotion after its decision context
+	// was superseded. Container restore has no target row yet, so its executor-side
+	// generation check lives on the token-bound relocate-recreate path.
+	if targetKind == "vm" && p.GetOwnerEpoch() != "" {
+		vm, err := corrosion.GetVM(ctx, s.db, targetName)
+		if err != nil {
+			return "", status.Errorf(codes.Unavailable, "read %s owner epoch for proof %s: %v", targetName, p.GetId(), err)
+		}
+		if vm == nil || p.GetOwnerEpoch() != strconv.FormatInt(vm.OwnerEpoch, 10) {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"runtime-action proof %s is stale for %s owner epoch", p.GetId(), targetName)
+		}
 	}
 	if err := corrosion.ClaimActionProof(ctx, s.db, p.GetId(), s.hostName); err != nil {
 		if errors.Is(err, corrosion.ErrProofSpent) {

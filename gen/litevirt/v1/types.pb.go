@@ -405,6 +405,13 @@ type VMSpec struct {
 	Tpm           bool   `protobuf:"varint,38,opt,name=tpm,proto3" json:"tpm,omitempty"`                                 // emulated TPM 2.0 device (Windows 11 / BitLocker)
 	Uuid          string `protobuf:"bytes,39,opt,name=uuid,proto3" json:"uuid,omitempty"`                                // stable domain identity; makes the libvirt swtpm path deterministic
 	MaxCpu        int32  `protobuf:"varint,40,opt,name=max_cpu,json=maxCpu,proto3" json:"max_cpu,omitempty"`             // vCPU hotplug ceiling; >cpu emits <vcpu current=cpu>max_cpu</vcpu> for live CPU add (live_resize)
+	// on_host_failure is the host-loss policy as a plain string ("restart-any" |
+	// "restart-same" | "none"; "" = legacy/none). It exists because the failover
+	// coordinator reads the PERSISTED spec JSON's top-level "on_host_failure" key,
+	// and MigrationPolicy.on_host_failure cannot express that: RESTART_ANY is enum
+	// value 0, which encoding/json omitempty drops entirely on store, making
+	// restart-any indistinguishable from unset. The string field round-trips.
+	OnHostFailure string `protobuf:"bytes,41,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -719,6 +726,13 @@ func (x *VMSpec) GetMaxCpu() int32 {
 	return 0
 }
 
+func (x *VMSpec) GetOnHostFailure() string {
+	if x != nil {
+		return x.OnHostFailure
+	}
+	return ""
+}
+
 type DiskSpec struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
@@ -983,17 +997,19 @@ func (x *CloudInitSpec) GetNetworkconfig() string {
 }
 
 type PlacementSpec struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Host          string                 `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
-	AntiAffinity  []string               `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
-	Affinity      []string               `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
-	Require       map[string]string      `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Prefer        map[string]string      `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Spread        bool                   `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
-	MaxPerNode    int32                  `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
-	Policy        string                 `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
-	Rebalance     *RebalanceSpec         `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
-	NoMigrate     bool                   `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A host pin restricts candidate selection but never bypasses hard
+	// constraints (capacity, labels, devices, anti-affinity, or replica caps).
+	Host          string            `protobuf:"bytes,1,opt,name=host,proto3" json:"host,omitempty"`
+	AntiAffinity  []string          `protobuf:"bytes,2,rep,name=anti_affinity,json=antiAffinity,proto3" json:"anti_affinity,omitempty"`
+	Affinity      []string          `protobuf:"bytes,3,rep,name=affinity,proto3" json:"affinity,omitempty"`
+	Require       map[string]string `protobuf:"bytes,4,rep,name=require,proto3" json:"require,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Prefer        map[string]string `protobuf:"bytes,5,rep,name=prefer,proto3" json:"prefer,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Spread        bool              `protobuf:"varint,6,opt,name=spread,proto3" json:"spread,omitempty"`                             // legacy; prefer policy
+	MaxPerNode    int32             `protobuf:"varint,7,opt,name=max_per_node,json=maxPerNode,proto3" json:"max_per_node,omitempty"` // 0 = unlimited
+	Policy        string            `protobuf:"bytes,8,opt,name=policy,proto3" json:"policy,omitempty"`                              // balance | bin-pack | spread-strict | cost-aware
+	Rebalance     *RebalanceSpec    `protobuf:"bytes,9,opt,name=rebalance,proto3" json:"rebalance,omitempty"`                        // day-2 reconciliation; nil inherits cluster default
+	NoMigrate     bool              `protobuf:"varint,10,opt,name=no_migrate,json=noMigrate,proto3" json:"no_migrate,omitempty"`     // VM opts out of all live migration
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3849,6 +3865,11 @@ type Host struct {
 	IpmiAddress   string                 `protobuf:"bytes,18,opt,name=ipmi_address,json=ipmiAddress,proto3" json:"ipmi_address,omitempty"`
 	WatchdogDev   string                 `protobuf:"bytes,19,opt,name=watchdog_dev,json=watchdogDev,proto3" json:"watchdog_dev,omitempty"`
 	Region        string                 `protobuf:"bytes,20,opt,name=region,proto3" json:"region,omitempty"` // federation: failure-domain label
+	// Serial of the host's mTLS certificate. Not secret — it is the public
+	// identifier of a public certificate — and `lv host rm` needs it to revoke that
+	// certificate at the moment of removal, after which the row is tombstoned and
+	// the serial is no longer readable.
+	CertSerial    string `protobuf:"bytes,21,opt,name=cert_serial,json=certSerial,proto3" json:"cert_serial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4019,6 +4040,13 @@ func (x *Host) GetWatchdogDev() string {
 func (x *Host) GetRegion() string {
 	if x != nil {
 		return x.Region
+	}
+	return ""
+}
+
+func (x *Host) GetCertSerial() string {
+	if x != nil {
+		return x.CertSerial
 	}
 	return ""
 }
@@ -5221,66 +5249,6 @@ func (x *HostResourceStats) GetVmStats() []*VMStats {
 	return nil
 }
 
-type Alert struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Level         string                 `protobuf:"bytes,1,opt,name=level,proto3" json:"level,omitempty"`
-	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Alert) Reset() {
-	*x = Alert{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[52]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Alert) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Alert) ProtoMessage() {}
-
-func (x *Alert) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[52]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Alert.ProtoReflect.Descriptor instead.
-func (*Alert) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{52}
-}
-
-func (x *Alert) GetLevel() string {
-	if x != nil {
-		return x.Level
-	}
-	return ""
-}
-
-func (x *Alert) GetMessage() string {
-	if x != nil {
-		return x.Message
-	}
-	return ""
-}
-
-func (x *Alert) GetTimestamp() *timestamppb.Timestamp {
-	if x != nil {
-		return x.Timestamp
-	}
-	return nil
-}
-
 type ClusterEvent struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Action        string                 `protobuf:"bytes,1,opt,name=action,proto3" json:"action,omitempty"`
@@ -5294,7 +5262,7 @@ type ClusterEvent struct {
 
 func (x *ClusterEvent) Reset() {
 	*x = ClusterEvent{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[53]
+	mi := &file_litevirt_v1_types_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5306,7 +5274,7 @@ func (x *ClusterEvent) String() string {
 func (*ClusterEvent) ProtoMessage() {}
 
 func (x *ClusterEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[53]
+	mi := &file_litevirt_v1_types_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5319,7 +5287,7 @@ func (x *ClusterEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterEvent.ProtoReflect.Descriptor instead.
 func (*ClusterEvent) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{53}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *ClusterEvent) GetAction() string {
@@ -5376,7 +5344,7 @@ type StoragePool struct {
 
 func (x *StoragePool) Reset() {
 	*x = StoragePool{}
-	mi := &file_litevirt_v1_types_proto_msgTypes[54]
+	mi := &file_litevirt_v1_types_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5388,7 +5356,7 @@ func (x *StoragePool) String() string {
 func (*StoragePool) ProtoMessage() {}
 
 func (x *StoragePool) ProtoReflect() protoreflect.Message {
-	mi := &file_litevirt_v1_types_proto_msgTypes[54]
+	mi := &file_litevirt_v1_types_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5401,7 +5369,7 @@ func (x *StoragePool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StoragePool.ProtoReflect.Descriptor instead.
 func (*StoragePool) Descriptor() ([]byte, []int) {
-	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{54}
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *StoragePool) GetName() string {
@@ -5485,7 +5453,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\x94\f\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xbc\f\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5533,7 +5501,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"secureBoot\x12\x10\n" +
 	"\x03tpm\x18& \x01(\bR\x03tpm\x12\x12\n" +
 	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
-	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x1a9\n" +
+	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
+	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +
@@ -5840,7 +5809,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xc4\x06\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe5\x06\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -5866,7 +5835,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0efence_strategy\x18\x11 \x01(\tR\rfenceStrategy\x12!\n" +
 	"\fipmi_address\x18\x12 \x01(\tR\vipmiAddress\x12!\n" +
 	"\fwatchdog_dev\x18\x13 \x01(\tR\vwatchdogDev\x12\x16\n" +
-	"\x06region\x18\x14 \x01(\tR\x06region\x1a9\n" +
+	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
+	"\vcert_serial\x18\x15 \x01(\tR\n" +
+	"certSerial\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +
@@ -5991,11 +5962,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x0fmem_total_bytes\x18\x04 \x01(\x03R\rmemTotalBytes\x12\"\n" +
 	"\rdisk_rd_bytes\x18\x05 \x01(\x03R\vdiskRdBytes\x12\"\n" +
 	"\rdisk_wr_bytes\x18\x06 \x01(\x03R\vdiskWrBytes\x12/\n" +
-	"\bvm_stats\x18\a \x03(\v2\x14.litevirt.v1.VMStatsR\avmStats\"q\n" +
-	"\x05Alert\x12\x14\n" +
-	"\x05level\x18\x01 \x01(\tR\x05level\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\x128\n" +
-	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xac\x01\n" +
+	"\bvm_stats\x18\a \x03(\v2\x14.litevirt.v1.VMStatsR\avmStats\"\xac\x01\n" +
 	"\fClusterEvent\x12\x16\n" +
 	"\x06action\x18\x01 \x01(\tR\x06action\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x16\n" +
@@ -6071,7 +6038,7 @@ func file_litevirt_v1_types_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 59)
+var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
 var file_litevirt_v1_types_proto_goTypes = []any{
 	(VMState)(0),                  // 0: litevirt.v1.VMState
 	(HostState)(0),                // 1: litevirt.v1.HostState
@@ -6131,14 +6098,13 @@ var file_litevirt_v1_types_proto_goTypes = []any{
 	(*LBKeepalivedResponse)(nil),  // 55: litevirt.v1.LBKeepalivedResponse
 	(*VMStats)(nil),               // 56: litevirt.v1.VMStats
 	(*HostResourceStats)(nil),     // 57: litevirt.v1.HostResourceStats
-	(*Alert)(nil),                 // 58: litevirt.v1.Alert
-	(*ClusterEvent)(nil),          // 59: litevirt.v1.ClusterEvent
-	(*StoragePool)(nil),           // 60: litevirt.v1.StoragePool
-	nil,                           // 61: litevirt.v1.VMSpec.LabelsEntry
-	nil,                           // 62: litevirt.v1.PlacementSpec.RequireEntry
-	nil,                           // 63: litevirt.v1.PlacementSpec.PreferEntry
-	nil,                           // 64: litevirt.v1.Host.LabelsEntry
-	(*timestamppb.Timestamp)(nil), // 65: google.protobuf.Timestamp
+	(*ClusterEvent)(nil),          // 58: litevirt.v1.ClusterEvent
+	(*StoragePool)(nil),           // 59: litevirt.v1.StoragePool
+	nil,                           // 60: litevirt.v1.VMSpec.LabelsEntry
+	nil,                           // 61: litevirt.v1.PlacementSpec.RequireEntry
+	nil,                           // 62: litevirt.v1.PlacementSpec.PreferEntry
+	nil,                           // 63: litevirt.v1.Host.LabelsEntry
+	(*timestamppb.Timestamp)(nil), // 64: google.protobuf.Timestamp
 }
 var file_litevirt_v1_types_proto_depIdxs = []int32{
 	7,  // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
@@ -6151,11 +6117,11 @@ var file_litevirt_v1_types_proto_depIdxs = []int32{
 	17, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
 	18, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
 	19, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
-	61, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
+	60, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
 	24, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
 	23, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
-	62, // 13: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
-	63, // 14: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
+	61, // 13: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
+	62, // 14: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
 	11, // 15: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
 	12, // 16: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
 	2,  // 17: litevirt.v1.MigrationPolicy.strategy:type_name -> litevirt.v1.MigrateStrategy
@@ -6172,36 +6138,35 @@ var file_litevirt_v1_types_proto_depIdxs = []int32{
 	0,  // 28: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
 	36, // 29: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
 	37, // 30: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
-	65, // 31: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
-	65, // 32: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
+	64, // 31: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
+	64, // 32: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
 	39, // 33: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
 	40, // 34: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
 	42, // 35: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
 	24, // 36: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
 	41, // 37: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
 	1,  // 38: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
-	64, // 39: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
-	65, // 40: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
-	65, // 41: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
+	63, // 39: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
+	64, // 40: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
+	64, // 41: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
 	32, // 42: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
-	60, // 43: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
-	65, // 44: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
-	65, // 45: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
-	65, // 46: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	65, // 47: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
-	65, // 48: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
+	59, // 43: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
+	64, // 44: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
+	64, // 45: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
+	64, // 46: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	64, // 47: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
+	64, // 48: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
 	49, // 49: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
 	20, // 50: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
 	52, // 51: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
 	51, // 52: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
 	56, // 53: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
-	65, // 54: litevirt.v1.Alert.timestamp:type_name -> google.protobuf.Timestamp
-	65, // 55: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
-	56, // [56:56] is the sub-list for method output_type
-	56, // [56:56] is the sub-list for method input_type
-	56, // [56:56] is the sub-list for extension type_name
-	56, // [56:56] is the sub-list for extension extendee
-	0,  // [0:56] is the sub-list for field type_name
+	64, // 54: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
+	55, // [55:55] is the sub-list for method output_type
+	55, // [55:55] is the sub-list for method input_type
+	55, // [55:55] is the sub-list for extension type_name
+	55, // [55:55] is the sub-list for extension extendee
+	0,  // [0:55] is the sub-list for field type_name
 }
 
 func init() { file_litevirt_v1_types_proto_init() }
@@ -6220,7 +6185,7 @@ func file_litevirt_v1_types_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_types_proto_rawDesc), len(file_litevirt_v1_types_proto_rawDesc)),
 			NumEnums:      6,
-			NumMessages:   59,
+			NumMessages:   58,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

@@ -24,6 +24,12 @@ type ClusterState struct {
 
 	// Capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	Capacity corrosion.CapacityPolicy
+
+	// Observations is each host's effective-capacity observation, folded into
+	// batch placement so runtime-only usage counts against headroom and an
+	// incomplete/stale host is excluded — the same rules the single-VM Select
+	// path applies.
+	Observations []corrosion.HostCapacityObservation
 }
 
 // LoadClusterState queries Corrosion once and builds an immutable snapshot.
@@ -69,6 +75,14 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		devices[h.Name] = devs
 	}
 
+	// Effective-capacity observations. Best-effort: a missing set degrades to
+	// the DB-only arithmetic (exactly what the snapshot had before), never to
+	// a failed plan.
+	observations, err := corrosion.ListHostCapacityObservations(ctx, db)
+	if err != nil {
+		observations = nil
+	}
+
 	// Load image availability: which hosts have each image ready.
 	images, err := corrosion.ListImages(ctx, db)
 	if err != nil {
@@ -88,13 +102,14 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 	}
 
 	return &ClusterState{
-		Hosts:      hosts,
-		VMs:        vms,
-		Containers: containers,
-		Networks:   networks,
-		LBs:        lbs,
-		Devices:    devices,
-		ImageHosts: imageHosts,
-		Capacity:   capacity,
+		Hosts:        hosts,
+		VMs:          vms,
+		Containers:   containers,
+		Networks:     networks,
+		LBs:          lbs,
+		Devices:      devices,
+		ImageHosts:   imageHosts,
+		Capacity:     capacity,
+		Observations: observations,
 	}, nil
 }

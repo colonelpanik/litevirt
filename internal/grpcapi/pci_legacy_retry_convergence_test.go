@@ -206,6 +206,7 @@ func TestMigrateVM_VFReleaseFailThenRetry_Converges(t *testing.T) {
 	fake.FailMigrateToTarget = func(_, _ string) error { return errors.New("injected migrate failure") }
 	fake.FailDetachHostdev = notFoundOnAbsentDetach(fake)
 	s.virt = fake
+	fakeDestinationAdmission(s)
 
 	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)

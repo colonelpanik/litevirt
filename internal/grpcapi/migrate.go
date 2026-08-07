@@ -322,6 +322,36 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		}
 	}
 
+	// Capacity admission on the TARGET. A migration puts a full-sized RUNNING VM
+	// onto another host — the same consumption a create of that VM would have — and
+	// nothing admitted it, so an operator (or the health checker's automatic
+	// re-home, which drives this same handler) could pack a target past the point
+	// where `lv run` refuses a VM of exactly that size, with nothing logged because
+	// nothing checked.
+	//
+	// HOST-only, deliberately (no project quota): a migration MOVES an allocation
+	// the project's quota already counts — it does not grow it — so charging quota
+	// again would refuse the migration of any workload occupying more than half
+	// its quota. That is the exact double-count the host-only admission exists for
+	// (see the start paths).
+	//
+	// The DECISION runs on the DESTINATION (acquireDestinationHostLease): only the
+	// target daemon can probe its own runtime inventory, and the replicated
+	// observation this side would otherwise lean on degrades to DB-only arithmetic
+	// exactly when it is missing, stale, or unreadable. The source asks once, holds
+	// the returned destination-local lease across the whole transfer, and releases
+	// it on every return path. It sits after the free source-local preflights
+	// (which need no peer round trip to refuse) and before ALL target-side setup
+	// (network provisioning, cloud-init, disk stubs) and the transfer itself, so a
+	// refusal still wastes no work and changes no state anywhere. The figures are
+	// the VM's ACTUAL allocation, which is what the target's usage will report
+	// once the VM lands there.
+	migLease, err := s.acquireDestinationHostLease(ctx, "MigrateVM", targetHost.Name, vm.Project, "vm:"+vm.Name, vm.CPUActual, vm.MemActual, intentVMResident)
+	if err != nil {
+		return err
+	}
+	defer migLease.release(ctx)
+
 	// Pre-provision networks on target host. This ensures bridges, DHCP, NAT,
 	// VXLAN tunnels, and IRB gateways exist before the VM arrives — critical for
 	// both live and cold migrations (#38).
@@ -1024,7 +1054,8 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 
 	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
 	// the disks AND target back and abort (source still owns it + is intact).
-	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
+	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
+	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
 		rollbackDisks()
 		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
 		return status.Errorf(codes.Internal, "reassign VM %q to %s: %v", vm.Name, targetHost.Name, err)

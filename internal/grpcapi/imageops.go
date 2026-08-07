@@ -253,25 +253,65 @@ func (s *Server) AutoPullImage(ctx context.Context, imageName string) error {
 // autoPullImage finds a peer that has the image and asks it to push to this host.
 // Blocks until the transfer completes. Used by CreateVM and reconciler auto-pull.
 func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
-	// Find a peer host that has this image ready.
+	// Already in the local store → nothing to pull. The reconciler reaches
+	// here whenever a VM's overlay disk is missing; the backing image being
+	// present locally is common (post-failover recreate on a host that
+	// pulled it earlier) and must not depend on any peer being alive.
+	//
+	// Existence is NOT integrity: a host killed mid-transfer can reboot with
+	// a zero-byte or truncated file at the final path, and short-circuiting
+	// on it blocks the very re-pull that would heal it (observed live: qemu
+	// "Image is not in qcow2 format" retrying forever). Require a nonzero
+	// size, and when the replicated images row records the expected size,
+	// require an exact match — a mismatch falls through to a fresh pull,
+	// which overwrites the damaged copy.
+	if s.images != nil {
+		if fi, err := os.Stat(s.images.ImagePath(imageName)); err == nil && fi.Size() > 0 {
+			img, ierr := corrosion.GetImage(ctx, s.db, imageName)
+			if ierr != nil || img == nil || img.SizeBytes <= 0 || img.SizeBytes == fi.Size() {
+				return nil
+			}
+			slog.Warn("auto-pull: local image size mismatch, re-pulling",
+				"image", imageName, "local_bytes", fi.Size(), "expected_bytes", img.SizeBytes)
+		}
+	}
+
+	// Find peer hosts that have this image ready.
 	hosts, err := corrosion.GetImageHosts(ctx, s.db, imageName)
 	if err != nil {
 		return fmt.Errorf("query image_hosts: %w", err)
 	}
-	var sourceHost string
+	var lastErr error
 	for _, ih := range hosts {
-		if ih.Status == "ready" && ih.HostName != s.hostName {
-			sourceHost = ih.HostName
-			break
+		if ih.Status != "ready" || ih.HostName == s.hostName {
+			continue
 		}
+		// Never dial a holder the cluster knows is dead: a fenced/offline
+		// source turns a recoverable miss into an endless transient-retry
+		// loop in the failover reconciler. An unknown host row stays a
+		// candidate (fail open on missing knowledge, not on stale state).
+		if h, herr := corrosion.GetHost(ctx, s.db, ih.HostName); herr == nil && h != nil {
+			if h.State == "fenced" || h.State == "offline" {
+				continue
+			}
+		}
+		if perr := s.pullImageFromPeer(ctx, imageName, ih.HostName); perr != nil {
+			lastErr = perr
+			continue // next candidate — one bad source must not end recovery
+		}
+		return nil
 	}
-	if sourceHost == "" {
-		return fmt.Errorf("no peer host has image %q with status=ready", imageName)
+	if lastErr != nil {
+		return lastErr
 	}
+	return fmt.Errorf("no peer host has image %q with status=ready", imageName)
+}
 
+// pullImageFromPeer asks one specific ready holder to push imageName to this
+// host and drains the progress stream until completion.
+func (s *Server) pullImageFromPeer(ctx context.Context, imageName, sourceHost string) error {
 	slog.Info("auto-pulling image from peer", "image", imageName, "source", sourceHost, "target", s.hostName)
 
-	// Call PushImage on the source host, telling it to push to us.
 	client, conn, err := s.peerClient(ctx, sourceHost)
 	if err != nil {
 		return fmt.Errorf("cannot reach source host %s: %w", sourceHost, err)
@@ -283,20 +323,19 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 		TargetHost: s.hostName,
 	})
 	if err != nil {
-		return fmt.Errorf("PushImage RPC: %w", err)
+		return fmt.Errorf("PushImage RPC to %s: %w", sourceHost, err)
 	}
 
-	// Drain the progress stream until completion.
 	for {
 		prog, err := stream.Recv()
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return fmt.Errorf("PushImage stream: %w", err)
+			return fmt.Errorf("PushImage stream from %s: %w", sourceHost, err)
 		}
 		if prog.Error != "" {
-			return fmt.Errorf("PushImage error: %s", prog.Error)
+			return fmt.Errorf("PushImage error from %s: %s", sourceHost, prog.Error)
 		}
 		if prog.Status == "complete" {
 			break

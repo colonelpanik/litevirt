@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,6 +46,11 @@ type ContainerChecker struct {
 	// onRekey observes each runtime re-key decision (result ∈ rekeyed /
 	// split_brain / inconclusive / error) — nil-safe; tests assert on it.
 	onRekey func(name, result string)
+	// guardedContainerRekeyActive reports whether the operation/capacity
+	// protocol is configured and latched cluster-wide, so emitting guarded v44
+	// re-key shapes is safe during a rolling upgrade. nil/false fails closed for
+	// modern authority while pre-authority rows keep the v1.3 envelope.
+	guardedContainerRekeyActive func() bool
 
 	// gate is the split-brain safety gate (Phase 1). When set + enforced, a
 	// container re-key additionally requires local quorum (ExecutionGate). See
@@ -63,6 +69,11 @@ type ContainerChecker struct {
 	// container was first seen running-locally-but-owned-elsewhere.
 	ownerMu            sync.Mutex
 	ownershipFirstSeen map[string]time.Time
+
+	// containersRoot is where Phase 4 owner-epoch markers live
+	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
+	// checkers that predate markers); the daemon wires the real path.
+	containersRoot string
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -74,12 +85,44 @@ func NewContainerChecker(hostName string, db *corrosion.Client, runtime lxc.Runt
 // SetEventBus sets the event bus for publishing container lifecycle events.
 func (c *ContainerChecker) SetEventBus(bus *events.Bus) { c.bus = bus }
 
+// SetContainersRoot wires the directory Phase 4 owner-epoch markers live under.
+func (c *ContainerChecker) SetContainersRoot(root string) { c.containersRoot = root }
+
+// SetGuardedContainerRekeyActive injects the cheap configured+latch decision
+// used to select modern guarded re-key WAL shapes.
+func (c *ContainerChecker) SetGuardedContainerRekeyActive(fn func() bool) {
+	c.guardedContainerRekeyActive = fn
+}
+
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (c *ContainerChecker) SetGate(g runtimeGate) { c.gate = g }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (c *ContainerChecker) SetGateRefusedObserver(fn func(action, reason string)) {
 	c.onGateRefused = fn
+}
+
+// stateWriteGated reports whether this node may assert container cluster state
+// from its own local runtime observation right now. It must not while it lacks
+// quorum: a node that was down through a relocation still holds a LIVE copy of
+// the source row, its drift heal matches that copy locally, and the resulting
+// newer updated_at then DEFEATS the relocation's tombstone on ordinary LWW when
+// the tombstone finally arrives (shouldSkipLWW keeps the strictly-newer local
+// row; ruleTombstone only arbitrates exact-instant ties). The row is then live
+// on the rejoining node forever — the duplicate_live_container the lab produced
+// on 2026-08-02. Withholding the write until quorum means convergence delivers
+// the tombstone first and there is nothing left to heal.
+//
+// Gated on split_brain_gate_v1, matching the reconciler's self-heal site: no
+// latch, no behavior change. Returns the refusal reason for the metric.
+func (c *ContainerChecker) stateWriteGated(ctx context.Context) (bool, string) {
+	if c.gate == nil || !c.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
+		return false, ""
+	}
+	if g := c.gate.ExecutionGate(ctx); !g.OK {
+		return true, g.Reason
+	}
+	return false, ""
 }
 
 func (c *ContainerChecker) noteGateRefused(action, reason string) {
@@ -175,6 +218,21 @@ const orphanLeaseMinAge = 5 * time.Minute
 // from the original aren't preserved — the faithful path is restore-from-backup,
 // a follow-up). On failure it leaves the row pending so the next sweep retries.
 func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.ContainerRecord) {
+	// Ownership-dispute gate, EXECUTE side (mirrors startPendingVM): a pending
+	// relocation minted before the condition was raised must not materialize
+	// another instance while ownership is contested. The row stays pending;
+	// recovery resumes when the evaluator proves resolution. Fail closed on a
+	// read error.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "container", ct.Name); cerr != nil {
+		slog.Warn("containercheck: cannot read health conditions; deferring relocated recreate (fail closed)",
+			"container", ct.Name, "error", cerr)
+		return
+	} else if disputed {
+		slog.Warn("containercheck: refusing relocated recreate — active ownership condition",
+			"container", ct.Name, "condition", code)
+		return
+	}
+
 	spec := corrosion.DecodeCreateSpec(ct.CreateSpec)
 
 	// Already materialized by a prior tick (runtime container exists)? A prior tick
@@ -268,7 +326,27 @@ func (c *ContainerChecker) recreateRelocated(ctx context.Context, ct corrosion.C
 		}
 		return
 	}
-	if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+	// Phase 4 duality (mirrors the corrosion relocation writers): a target row
+	// carrying a real ownership generation completes through the minting write
+	// — running + owner_epoch+1 in one guarded statement, so the claimed
+	// proof's epoch is stale from this moment on. A pre-epoch row (epoch 0)
+	// keeps the legacy completion so older receivers never see the new shape.
+	var err error
+	if ct.OwnerEpoch != 0 {
+		err = corrosion.CompleteContainerRelocation(ctx, c.db, c.hostName, ct.Name, ct.RelocateToken)
+		if err == nil && c.containersRoot != "" {
+			// Phase 4 write-through: mirror the just-minted generation into the
+			// host-local marker. Best-effort — the container is already running
+			// and the convergence pass repairs a missed write.
+			if merr := WriteContainerOwnerEpochMarker(c.containersRoot, ct.Name, ct.OwnerEpoch+1); merr != nil {
+				slog.Warn("containercheck: owner-epoch marker write failed (convergence will repair)",
+					"container", ct.Name, "epoch", ct.OwnerEpoch+1, "error", merr)
+			}
+		}
+	} else {
+		err = corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", "")
+	}
+	if err != nil {
 		slog.Error("containercheck: relocate-recreate state write failed — NOT publishing relocated event",
 			"container", ct.Name, "error", err)
 		c.noteStateWriteFail(corrosion.OpContainerState, err)
@@ -309,6 +387,17 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 		slog.Warn("containercheck: relocation proof does not match this container/host, refusing",
 			"container", ct.Name, "proof", pr.ID)
 		c.noteGateRefused(corrosion.ActionRelocate, ReasonProofConflict)
+		return "", false
+	}
+	// A token identifies the attempt; owner_epoch identifies the ownership
+	// generation that attempt was authorized against. Reject a prepared proof
+	// that survived an intervening ownership change (ABA) before claiming it.
+	// Empty is the pre-epoch form and remains inert until owner_epoch_v1 flips.
+	if pr.OwnerEpoch != "" && pr.OwnerEpoch != strconv.FormatInt(ct.OwnerEpoch, 10) {
+		slog.Warn("containercheck: relocation proof owner epoch is stale, refusing",
+			"container", ct.Name, "proof", pr.ID, "proof_epoch", pr.OwnerEpoch,
+			"current_epoch", ct.OwnerEpoch)
+		c.noteGateRefused(corrosion.ActionRelocate, ReasonStaleEpoch)
 		return "", false
 	}
 	if err := corrosion.ClaimActionProof(ctx, c.db, pr.ID, c.hostName); err != nil {
@@ -412,11 +501,21 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		// Reality: up (FROZEN maps to running). Heal cluster drift and clear any
 		// stale stop cause so a later unexpected stop is judged fresh.
 		if ct.State != "running" {
-			if err := corrosion.SetContainerStateDetailStrict(ctx, c.db, c.hostName, ct.Name, "running", ""); err != nil {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding drift heal — no quorum",
+					"container", ct.Name, "reason", reason, "runtime", "running")
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
+			// Epoch-carried like the other heal writes: the statement replicates
+			// with its own precondition, so a peer whose row moved to a new
+			// owner generation matches nothing instead of inheriting stale state.
+			if err := corrosion.SetContainerStateDetailStrictAtEpoch(ctx, c.db, c.hostName, ct.Name, "running", "", ct.OwnerEpoch); err != nil {
 				if errors.Is(err, corrosion.ErrNoRowsAffected) {
-					// Row vanished between the sweep list and here (concurrent
-					// delete) — nothing to reconcile, not a write fault.
-					slog.Debug("containercheck: reconcile target row gone; skipping", "container", ct.Name)
+					// Row vanished (concurrent delete) or its ownership
+					// generation moved past this sweep's read — nothing this
+					// decision may safely reconcile; the next sweep re-reads.
+					slog.Debug("containercheck: reconcile target row gone or re-owned; skipping", "container", ct.Name)
 					return
 				}
 				slog.Error("containercheck: reconcile write failed — NOT publishing reconciled event",
@@ -441,7 +540,13 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// Operator intent always wins (the container analogue of vms.state_detail).
 	if ct.StateDetail == operatorStopDetail {
 		if ct.State != "stopped" {
-			if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail); err != nil {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding operator-stop heal — no quorum",
+					"container", ct.Name, "reason", reason)
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
+			if err := corrosion.SetContainerStateDetailAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", operatorStopDetail, ct.OwnerEpoch); err != nil {
 				slog.Warn("containercheck: operator-stop heal write failed", "container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)
 			}
@@ -453,7 +558,16 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	if rp == nil {
 		// No policy: heal state drift only — don't fabricate a stop cause or act.
 		if ct.State != "stopped" {
-			if err := corrosion.SetContainerState(ctx, c.db, c.hostName, ct.Name, "stopped"); err != nil {
+			if refused, reason := c.stateWriteGated(ctx); refused {
+				slog.Warn("containercheck: withholding no-policy state heal — no quorum",
+					"container", ct.Name, "reason", reason)
+				c.noteGateRefused(corrosion.OpContainerState, reason)
+				return
+			}
+			// Carries the generation this decision was made against, so the
+			// statement replicates with its own precondition and a peer whose
+			// row has moved to a new owner generation matches nothing.
+			if err := corrosion.SetContainerStateAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", ct.OwnerEpoch); err != nil {
 				slog.Warn("containercheck: no-policy state heal write failed", "container", ct.Name, "error", err)
 				c.noteStateWriteFail(corrosion.OpContainerState, err)
 			}
@@ -466,7 +580,13 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 	// restartDecision reads (containers have no libvirt-style cause, so we pass
 	// cause="" and let the detail drive the decision).
 	if ct.State != "stopped" || ct.StateDetail != outOfBandDestroyDetail {
-		if err := corrosion.SetContainerStateDetail(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail); err != nil {
+		if refused, reason := c.stateWriteGated(ctx); refused {
+			slog.Warn("containercheck: withholding out-of-band stop record — no quorum",
+				"container", ct.Name, "reason", reason)
+			c.noteGateRefused(corrosion.OpContainerState, reason)
+			return
+		}
+		if err := corrosion.SetContainerStateDetailAtEpoch(ctx, c.db, c.hostName, ct.Name, "stopped", outOfBandDestroyDetail, ct.OwnerEpoch); err != nil {
 			slog.Warn("containercheck: out-of-band stop record write failed", "container", ct.Name, "error", err)
 			c.noteStateWriteFail(corrosion.OpContainerState, err)
 		}

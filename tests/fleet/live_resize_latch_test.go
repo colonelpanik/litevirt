@@ -111,7 +111,7 @@ func TestFleet_LiveResize_LatchIsBuildUniformNotConfigUniform(t *testing.T) {
 	// Flag on HERE only; the peer stays default-off.
 	owner.Server.SetLiveResize(true)
 
-	caps, err := owner.Server.PeerCapabilities(ctx, peer.Name)
+	caps, _, err := owner.Server.PeerCapabilities(ctx, peer.Name)
 	if err != nil {
 		t.Fatalf("ping peer for capabilities: %v", err)
 	}

@@ -1,0 +1,70 @@
+<div class="modal-overlay" id="host-network-modal">
+  <div class="modal form-modal">
+    <form hx-post="/ui/hosts/{{.Host}}/network" hx-swap="none"
+          hx-on::after-request="if(event.detail.successful){document.getElementById('host-network-modal').remove()}">
+      <div class="fm-head"><h3>{{if .Edit}}Edit interface intent{{else}}Add interface intent{{end}}</h3>
+        <button type="button" class="fm-x" aria-label="Close" onclick="document.getElementById('host-network-modal').remove()">&times;</button></div>
+      <div class="fm-body">
+        <div class="field-grid">
+          <div class="form-row" style="margin-bottom:0"><label>Interface name</label>
+            <input type="text" name="iface" value="{{with .Edit}}{{.Name}}{{end}}" maxlength="15" required autofocus {{if .Edit}}readonly{{end}}></div>
+          <div class="form-row" style="margin-bottom:0"><label>Kind</label>
+            <select name="kind" onchange="hnKind(this.value)">
+              {{$kind := "bridge"}}{{with .Edit}}{{$kind = .Kind}}{{end}}
+              <option value="bridge" {{if eq $kind "bridge"}}selected{{end}}>bridge</option>
+              <option value="bond" {{if eq $kind "bond"}}selected{{end}}>bond</option>
+              <option value="vlan" {{if eq $kind "vlan"}}selected{{end}}>vlan</option>
+              <option value="ethernet" {{if eq $kind "ethernet"}}selected{{end}}>ethernet</option>
+            </select></div>
+        </div>
+        <div class="form-row hn-members" style="margin-top:12px"><label>Member interfaces (comma-separated)</label>
+          <input type="text" name="members" value="{{with .Edit}}{{join .Members ","}}{{end}}" placeholder="eth1, eth2"></div>
+        <div class="field-grid hn-vlan" style="margin-top:12px">
+          <div class="form-row" style="margin-bottom:0"><label>VLAN link</label>
+            <input type="text" name="vlan_link" value="{{with .Edit}}{{.VlanLink}}{{end}}" placeholder="bond0"></div>
+          <div class="form-row" style="margin-bottom:0"><label>VLAN id</label>
+            <input type="number" name="vlan_id" value="{{with .Edit}}{{if .VlanId}}{{.VlanId}}{{end}}{{end}}" min="1" max="4094"></div>
+        </div>
+        <div class="field-grid hn-bond" style="margin-top:12px">
+          <div class="form-row" style="margin-bottom:0"><label>Bond mode</label>
+            <input type="text" name="bond_mode" value="{{with .Edit}}{{.BondMode}}{{end}}" placeholder="active-backup | 802.3ad"></div>
+          <div class="form-row" style="margin-bottom:0"><label>LACP rate</label>
+            <input type="text" name="lacp_rate" value="{{with .Edit}}{{.LacpRate}}{{end}}" placeholder="fast"></div>
+          <div class="form-row" style="margin-bottom:0"><label>Hash policy</label>
+            <input type="text" name="hash_policy" value="{{with .Edit}}{{.HashPolicy}}{{end}}" placeholder="layer3+4"></div>
+        </div>
+        <hr style="margin:14px 0;border-color:var(--border)">
+        <div class="field-grid">
+          <div class="form-row" style="margin-bottom:0"><label><input type="checkbox" name="dhcp4" {{if .Addr}}{{if .Addr.DHCP4}}checked{{end}}{{end}}> DHCPv4</label></div>
+          <div class="form-row" style="margin-bottom:0"><label><input type="checkbox" name="dhcp6" {{if .Addr}}{{if .Addr.DHCP6}}checked{{end}}{{end}}> DHCPv6</label></div>
+          <div class="form-row" style="margin-bottom:0"><label>MTU</label>
+            <input type="number" name="mtu" value="{{with .Edit}}{{if .Mtu}}{{.Mtu}}{{end}}{{end}}" min="0" placeholder="default"></div>
+        </div>
+        <div class="form-row" style="margin-top:12px"><label>Static addresses (CIDR, comma-separated)</label>
+          <input type="text" name="addresses" value="{{if .Addr}}{{join .Addr.Addresses ","}}{{end}}" placeholder="10.0.10.2/24, fd10::2/64"></div>
+        <div class="field-grid" style="margin-top:12px">
+          <div class="form-row" style="margin-bottom:0"><label>Gateway (v4)</label>
+            <input type="text" name="gateway" value="{{if .Addr}}{{.Addr.Gateway}}{{end}}" placeholder="10.0.10.1"></div>
+          <div class="form-row" style="margin-bottom:0"><label>Gateway (v6)</label>
+            <input type="text" name="gateway6" value="{{if .Addr}}{{.Addr.Gateway6}}{{end}}" placeholder="fd10::1"></div>
+        </div>
+        <div class="form-row" style="margin-top:12px"><label>Nameservers (comma-separated)</label>
+          <input type="text" name="nameservers" value="{{if .Addr}}{{join .Addr.Nameservers ","}}{{end}}" placeholder="10.0.10.1"></div>
+      </div>
+      <div class="fm-foot"><span class="hint">Records intent only — nothing changes until Plan &amp; Apply.</span>
+        <div class="fm-actions">
+          <button type="button" class="btn" onclick="document.getElementById('host-network-modal').remove()">Cancel</button>
+          <button type="submit" class="btn btn-primary">{{if .Edit}}Save{{else}}Record{{end}}</button>
+        </div></div>
+    </form>
+  </div>
+</div>
+<script>
+function hnKind(k){
+  const m=document.getElementById('host-network-modal');
+  m.querySelector('.hn-members').style.display = (k==='bridge'||k==='bond')?'':'none';
+  m.querySelector('.hn-vlan').style.display = (k==='vlan')?'':'none';
+  m.querySelector('.hn-bond').style.display = (k==='bond')?'':'none';
+}
+hnKind(document.querySelector('#host-network-modal select[name=kind]').value);
+</script>

@@ -26,6 +26,8 @@ func newFakeCtRuntime() *fakeCtRuntime {
 	return &fakeCtRuntime{states: map[string]lxc.State{}, startErr: map[string]error{}}
 }
 
+func (f *fakeCtRuntime) Limits(context.Context, string) (int, int, error) { return 0, 0, nil }
+
 func (f *fakeCtRuntime) Create(ctx context.Context, opts lxc.CreateOpts) (*lxc.Container, error) {
 	f.lastCreate = opts
 	return &lxc.Container{Name: opts.Name, State: lxc.StateStopped}, nil
@@ -378,6 +380,94 @@ func TestContainerCheck_RelocateRecreate_EnforcedMarkerlessRefused(t *testing.T)
 	}
 }
 
+// A relocation token is not enough by itself: its proof is bound to the source
+// container's exact ownership generation. Advancing the target row while the
+// proof is in flight must make the old proof unusable (the ABA case).
+func TestContainerCheck_RelocateRecreate_StaleOwnerEpochProofRefuses(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", RelocateToken: "tok-1", OwnerEpoch: 7,
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 7 WHERE host_name = 'node1' AND name = 'ct1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "node1", Coordinator: "coord",
+		RelocationToken: "tok-1", OwnerEpoch: "6",
+	}); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+
+	var refused []string
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 0 {
+		t.Fatal("a proof for owner epoch 6 must not recreate owner epoch 7")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofPrepared {
+		t.Fatalf("stale proof status=%q (ok=%v); want prepared/unclaimed", pr.Status, ok)
+	}
+	if len(refused) != 1 || refused[0] != ReasonStaleEpoch {
+		t.Fatalf("refusal=%v; want [stale_epoch]", refused)
+	}
+}
+
+// Matching owner epochs remain a valid relocation authorization; this catches
+// an over-correction that rejects every non-empty owner-epoch proof.
+func TestContainerCheck_RelocateRecreate_CurrentOwnerEpochProofStarts(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "pending",
+		StateDetail: corrosion.ContainerRelocateRecreateDetail,
+		Image:       "alpine:3.19", RelocateToken: "tok-1", OwnerEpoch: 7,
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 7 WHERE host_name = 'node1' AND name = 'ct1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "node1", Coordinator: "coord",
+		RelocationToken: "tok-1", OwnerEpoch: "7",
+	}); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+
+	c := NewContainerChecker("node1", db, rt)
+	c.SetContainersRoot(t.TempDir())
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if rt.startCount("ct1") != 1 {
+		t.Fatalf("a proof matching current owner epoch 7 must recreate once; starts=%d", rt.startCount("ct1"))
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("matching proof status=%q (ok=%v); want completed", pr.Status, ok)
+	}
+	// Phase 4: the completion MINTS the next generation in the same write that
+	// flips pending to running, so the just-claimed proof (epoch 7) is stale
+	// from this moment on — a replay can never authorize a second recreate.
+	after := mustGetCt(t, db, "ct1")
+	if after.State != "running" || after.OwnerEpoch != 8 {
+		t.Fatalf("after completion: state=%q epoch=%d, want running epoch 8", after.State, after.OwnerEpoch)
+	}
+	// Write-through: the host-local marker carries the POST-mint generation.
+	if e, ok, err := ReadContainerOwnerEpochMarker(c.containersRoot, "ct1"); err != nil || !ok || e != 8 {
+		t.Fatalf("container owner-epoch marker = (%d,%v,%v), want (8,true,nil)", e, ok, err)
+	}
+}
+
 var errFakeStart = &fakeStartError{}
 
 type fakeStartError struct{}
@@ -475,5 +565,40 @@ func TestContainerCheck_RelocateRecreate_OCIFallsBackToImage(t *testing.T) {
 
 	if got := rt.lastCreate.Template; got != "docker.io/library/nginx:1.25" {
 		t.Errorf("recreate used template %q, want the image reference", got)
+	}
+}
+
+// A rejoining node must not write container state drift from its own stale
+// replica before it has quorum. On the lab (2026-08-02) node-3 came back after
+// a relocation it never saw, its no-policy drift heal matched its own still-live
+// row, and that write beat the relocation's tombstone on LWW — resurrecting a
+// retired row cluster-wide. The write is gated the same way the VM self-heal is.
+func TestContainerCheck_QuorumlessNodeDoesNotHealStateDrift(t *testing.T) {
+	db := testLogicDB(t)
+	ctx := context.Background()
+	rt := newFakeCtRuntime()
+	insertCt(t, db, corrosion.ContainerRecord{
+		HostName: "node1", Name: "ct1", State: "running", Image: "alpine:3.19",
+	})
+	if err := db.Execute(ctx, `UPDATE containers SET owner_epoch = 3 WHERE host_name='node1' AND name='ct1'`); err != nil {
+		t.Fatal(err)
+	}
+	// Local runtime says stopped, the row says running: drift the checker would
+	// normally heal.
+	rt.states["ct1"] = lxc.StateStopped
+
+	c := NewContainerChecker("node1", db, rt)
+	c.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+
+	if got := mustGetCt(t, db, "ct1"); got.State != "running" {
+		t.Fatalf("a quorumless node healed state drift: state=%q, want the row untouched", got.State)
+	}
+
+	// Control: with quorum the same drift IS healed — the gate is not a freeze.
+	c.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
+	if got := mustGetCt(t, db, "ct1"); got.State != "stopped" {
+		t.Fatalf("with quorum the drift must be healed: state=%q, want stopped", got.State)
 	}
 }

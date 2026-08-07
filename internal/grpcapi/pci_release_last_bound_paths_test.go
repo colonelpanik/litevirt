@@ -83,6 +83,7 @@ func TestMigrateVM_VFUnbindFails_NotUnownedBound(t *testing.T) {
 	// VF is still released — unowned+bound — which is what the assertions catch).
 	fake.FailMigrateToTarget = func(_, _ string) error { return errors.New("injected migrate failure") }
 	s.virt = fake
+	fakeDestinationAdmission(s)
 
 	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)

@@ -1,6 +1,7 @@
 package placement
 
 import (
+	"time"
 	"context"
 	"fmt"
 	"strconv"
@@ -45,9 +46,22 @@ type ClusterSnapshot struct {
 	// A real zero sample stays active.
 	UsageSampled map[string]bool
 
+	// CapacityUnknown marks hosts whose effective-capacity observation is
+	// INCOMPLETE or STALE. Placement refuses them as new targets outright: a
+	// host that cannot account for what it is running (an uncapped rogue, a
+	// failed probe) or has not reported recently must be treated as unknown,
+	// never as headroom. A host with NO observation yet (fresh cluster, sampler
+	// not started) is allowed — the owning host's admission still runs a fresh
+	// LOCAL inventory check, so bootstrap does not dead-lock on telemetry.
+	CapacityUnknown map[string]bool
+
 	// Per-host PCI device pool — used by Devices dimension and topology
 	// scoring. Optional; lazily loaded by Select if Devices > 0.
 	Devices map[string][]corrosion.PCIDeviceRecord
+	// MappingDevices resolves a portable resource-mapping selector to the
+	// concrete addresses registered on each candidate host.
+	// mapping name → host name → PCI addresses.
+	MappingDevices map[string]map[string][]string
 
 	// Replica counts grouped by base name (for MaxPerNode).
 	ReplicasByBase map[string]map[string]int // baseName → host → count
@@ -81,7 +95,40 @@ func BuildSnapshot(ctx context.Context, db *corrosion.Client) (*ClusterSnapshot,
 	if ctMem, cerr := corrosion.SumContainerMemoryByHost(ctx, db); cerr == nil {
 		snap.AddContainerMemory(ctMem)
 	}
+
+	// Effective-capacity observations: runtime-only consumption (a rogue VM or
+	// container the DB does not know about) counts against headroom, and an
+	// incomplete or stale observation disqualifies the host entirely.
+	if obs, oerr := corrosion.ListHostCapacityObservations(ctx, db); oerr == nil {
+		snap.AddCapacityObservations(obs, time.Now())
+	}
 	return snap, nil
+}
+
+// capacityObservationMaxAge is how old an observation may be before placement
+// treats the host as unknown. Generous multiples of the 60s sampler interval,
+// so one missed sample does not flap hosts out of the pool.
+const capacityObservationMaxAge = 5 * time.Minute
+
+// AddCapacityObservations folds effective-capacity observations into the
+// snapshot: extra runtime-only usage joins Used, and incomplete or stale
+// observations mark the host CapacityUnknown.
+func (s *ClusterSnapshot) AddCapacityObservations(obs []corrosion.HostCapacityObservation, now time.Time) {
+	if s.CapacityUnknown == nil {
+		s.CapacityUnknown = make(map[string]bool, len(obs))
+	}
+	for _, o := range obs {
+		stale := true
+		if t, err := time.Parse(time.RFC3339, o.SampledAt); err == nil {
+			stale = now.Sub(t) > capacityObservationMaxAge
+		}
+		if !o.Complete || stale {
+			s.CapacityUnknown[o.HostName] = true
+			continue
+		}
+		s.CPUUsed[o.HostName] += o.ExtraCPU
+		s.MemUsed[o.HostName] += o.ExtraMemMiB
+	}
 }
 
 // AddContainerMemory folds per-host container memory (MiB) into MemUsed. Kept

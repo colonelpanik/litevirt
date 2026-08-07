@@ -197,7 +197,7 @@ func TestFailoverMetrics_Relocate(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active",
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", CPUTotal: 8, MemTotal: 8192,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -211,9 +211,8 @@ func TestFailoverMetrics_Relocate(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	fm := newFakeMetrics()
 	c.Metrics = fm
-	idx := 0
 	c.relocateContainers(ctx, &corrosion.HostRecord{Name: "dead"},
-		[]corrosion.HostRecord{{Name: "live", State: "active"}}, &idx)
+		[]corrosion.HostRecord{{Name: "live", State: "active"}})
 
 	if got := fm.ct[foKey(ActionRelocate, ResultSuccess, errClassNone)]; got != 1 {
 		t.Errorf("relocate-success = %d, want 1 (ct=%v)", got, fm.ct)

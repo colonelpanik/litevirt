@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
 	"net"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -95,6 +97,13 @@ type Daemon struct {
 	// healthy before its host state flips upgrading→active (the watchdog does the
 	// flip on confirm). Set once in startUpgradeWatchdog, read in Run.
 	upgradePending bool
+
+	// rolledBackTokens names capability tokens this node already latched that this
+	// binary has never heard of — i.e. this binary is a rollback below them. Set at
+	// startup by preflightCapabilityRollback. Non-empty puts the node under WAL
+	// quarantine: it stays UP and reachable, so peers can see it and an operator can
+	// reseed it, but it emits no replicated writes.
+	rolledBackTokens []string
 
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
@@ -259,6 +268,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := preflightWatchdog(d.cfg.WatchdogDev); err != nil {
 		return fmt.Errorf("preflight: %w", err)
 	}
+	// Pre-flight: detect that this binary is a rollback below a capability token
+	// this node already latched. Deliberately NOT fatal. Exiting non-zero here
+	// would, under the unit's OnFailure rollback, be a rollback loop; and the node
+	// has to stay up anyway so peers can see it degraded and an operator can reseed
+	// it. Fail-closed happens at the write path instead, wired below.
+	if toks := preflightCapabilityRollback(d.cfg.DataDir); len(toks) > 0 {
+		d.rolledBackTokens = toks
+		slog.Error("preflight: this binary is a ROLLBACK below capability tokens this node "+
+			"already latched; entering WAL quarantine — no replicated writes will be emitted "+
+			"until this node is upgraded again or reseeded by an operator",
+			"tokens", toks)
+	}
+	// Install the quarantine before InitSchema so nothing this daemon does can
+	// emit. Local-only execs (schema DDL, replication apply) stay open by design,
+	// so a reseed still works.
+	d.db.SetWriteQuarantine(func() string {
+		if len(d.rolledBackTokens) == 0 {
+			return ""
+		}
+		return "rolled back below latched token(s): " + strings.Join(d.rolledBackTokens, ",")
+	})
 
 	// Initialize corrosion schema
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
@@ -270,17 +300,74 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
-	// Re-base THIS host's audit sub-chain at startup. Rows written under the
-	// old global-chain model can't verify per-host, so this heals them eagerly
-	// (idempotent — a consistent chain rewrites nothing) and seeds the
-	// in-process tail. Doing it here, not lazily on the first audit write, means
-	// the chain is verifiable right after a rolling upgrade even on a node that
-	// performs no audited action for a while. Each daemon heals only the
-	// sub-chain it authored, so the cluster self-heals with no coordination.
-	if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+	// Audit signing identity. The signing key IS the host's cluster key: it is
+	// already CA-signed with this host's name as its CN, already present on
+	// every node, and already the credential that says "I am this host".
+	// Minting a separate one would need the CA private key, which lives only on
+	// whichever node ran `lv host init`, so a fresh node could not sign its own
+	// log at all.
+	// Wire the keyring NOW — rows get written during startup and must be signed —
+	// but do NOT record any lifecycle fact yet. Adoption boundaries and retirement
+	// boundaries are sequence numbers, and this runs long before the replicator
+	// starts, so a node restored from a snapshot would read a local tail far
+	// behind its real replicated history and pin a boundary there permanently.
+	// See finishAuditKeyLifecycle, called once replication is up.
+	if d.cfg.Enforcement.AuditSignature {
+		if err := d.setupAuditSigning(ctx); err != nil {
+			// Non-fatal: refusing to start would turn a PKI problem into an
+			// outage. The node keeps running with unsigned rows, which
+			// `lv audit verify` reports as unsigned — visible, not silent.
+			slog.Error("audit signing could not be enabled; rows will be written unsigned",
+				"error", err)
+		}
+	} else {
+		// A non-signing node still needs the cluster CA: a keyring is what
+		// verifies a lifecycle record, so a node without one ignores every
+		// adoption and retirement in the cluster and reports peers' rolled-back
+		// hosts as tampering while every signing node calls the same log clean.
+		d.installAuditVerifier()
+	}
+
+	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
+	// still entirely unsigned.
+	//
+	// This used to run unconditionally, and that was the single biggest hole in
+	// the audit log's tamper-evidence: reseal recomputes hashes from whatever
+	// the rows currently say, so an attacker with database write access could
+	// edit a row, wait for (or cause) a restart, and have the daemon itself
+	// rewrite the chain around the edit. `lv audit verify` then came back clean.
+	//
+	// Reseal now exists solely to heal rows written under the old global-chain
+	// model, which were never tamper-evident to begin with. Once a host has any
+	// signed row, its chain is verified rather than repaired: a hash that does
+	// not recompute is a FINDING, and rewriting it would destroy the only
+	// evidence that anything happened. resealHostChainLocked enforces the same
+	// rule per row, in the SQL as well as in Go, because the statement
+	// replicates.
+	if signed, err := corrosion.HostHasSignedAuditRows(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Warn("could not determine audit chain signing state", "error", err)
+	} else if signed {
+		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
+	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
 		slog.Warn("audit chain reseal at startup failed", "error", err)
 	} else if n > 0 {
-		slog.Info("audit: re-based own-host chain at startup", "host", d.cfg.HostName, "rows", n)
+		slog.Info("audit: re-based legacy unsigned rows at startup",
+			"host", d.cfg.HostName, "rows", n)
+	}
+
+	// Repair any private key this node holds that other local users can read.
+	//
+	// Unconditional, because the damage was: `lv host init root@<host>` pushed
+	// host.key mode 0644 on every node it provisioned, and host.key is the
+	// peer-mTLS identity — any local user on such a node could impersonate it to
+	// the cluster. The push path is fixed, but nobody re-provisions an existing
+	// cluster, so a repair at start is the only thing that reaches one. It used
+	// to hang off enforcement.audit_signature, which defaults to false, so an
+	// operator who upgraded specifically for this fix got neither the repair nor
+	// a warning.
+	if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {
+		slog.Error("a private key in the PKI directory is readable by other local users and "+
+			"could not be tightened", "error", err)
 	}
 
 	// Set up libvirt TLS symlinks so qemu+tls:// migration works
@@ -329,6 +416,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
+	}
+	// And correct the address if it has changed since the row was created —
+	// registerHost is an INSERT, so it cannot.
+	if err := d.reconcileHostAddress(ctx); err != nil {
+		slog.Warn("could not reconcile this host's recorded address", "error", err)
 	}
 	// Write boot state in ONE batched mutation: state + version (+ resources if the
 	// probe succeeded) share a single updated_at. Doing these as separate writes in
@@ -440,6 +532,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 	repl.Start(ctx)
 
+	// Audit key lifecycle, deferred until replication is running.
+	//
+	// Adoption and retirement both record a SEQUENCE, and both are permanent:
+	// records are append-only and the strictest verified value wins, so a boundary
+	// taken from a local tail that is behind the cluster can never be corrected.
+	// Running this before the replicator meant a rebuilt or snapshot-restored node
+	// pinned its contract start — or its predecessor's retirement — below its own
+	// real history, and every row in the gap became a permanent finding on every
+	// node the moment anti-entropy delivered it.
+	go d.finishAuditKeyLifecycle(ctx)
+
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
 	// default inside NewAntiEntropy. (P2-2)
@@ -518,6 +621,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// confirm capability.
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
+	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
@@ -539,6 +643,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// apply synchronously via reload/delta in the handlers).
 	go d.runAuthEngineReload(ctx)
 
+	// Install any cluster CRL this node is missing. Removing a host revokes its
+	// certificate, and a revocation that never arrives is a decommissioned node
+	// still holding a working peer credential.
+	go d.runCRLSync(ctx)
+
+	// Publish this host's signed audit chain head periodically and at shutdown.
+	// Nothing else can detect a truncated tail: the hash chain links backward,
+	// so removing the last N rows leaves every surviving link verifying.
+	go d.runAuditChainHeads(ctx)
+
+	// Verify this node's view of the audit chain on a schedule and publish the
+	// result. A check that only runs when an operator asks for it finds an
+	// intrusion after the incident that prompted them to look.
+	go d.runAuditChainVerify(ctx)
+
 	// Start embedded DNS server, and tell the network layer to chain per-bridge
 	// dnsmasq instances to it for the litevirt domain so guests can resolve
 	// VM/container/anycast names (SetLocalResolver must precede network provisioning).
@@ -549,6 +668,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
 	// self-demotion trip a self-fence when a demotion can't be confirmed.
 	watchdogCtrl := watchdog.NewController()
+	// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
+	// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
+	// abandons running workloads lets the watchdog reboot the host into a safely
+	// fenced state. Probe errors count as NOT owned — the probe runs through the
+	// same clients the daemon manages workloads with, so a host that cannot
+	// answer is overwhelmingly one with no runtime at all (containers-only or
+	// fresh hosts must not reboot on every daemon stop). VIP ownership is not
+	// yet probed here — Phase 5 adds it with the quorum-gated handoff.
+	watchdogCtrl.SetOwnershipCheck(func() bool {
+		if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
+			return true
+		}
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer probeCancel()
+		if names, err := lxcRunner.ListRunning(probeCtx); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running containers owned", "count", len(names))
+			return true
+		}
+		return false
+	})
 	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
@@ -627,14 +767,47 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.VIPProofReclaim,
 		d.cfg.Enforcement.SharedStorageFence,
 	)
+	// One operator switch drives both operation_protocol_v1 and its dependent
+	// capacity_admission_v1 token; capacity admission has no standalone flag.
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
-	svc.SetProjectQuotaAuthority(d.cfg.Enforcement.ProjectQuotaAuthority) // drives the latch + conditional advertisement
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
+	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
+	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
+	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
+	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
+	// the fleet can never latch across a node whose generations do not exist yet.
+	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
+	svc.SetOwnerEpochReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ready, reason := svc.OwnerEpochReadiness(ctx)
+		if !ready {
+			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		}
+		return ready
+	})
+	// Once the whole cluster has latched audit_signature_v1, a write this node
+	// cannot sign is an error-level event rather than a normal one.
+	//
+	// It is NOT a refusal. Refusing was the first design and it lost the record
+	// of operations that had already happened, because every caller of
+	// InsertAuditLog discards its error — so the delete or the fence went ahead
+	// with no audit row at all, which is exactly what an attacker would arrange
+	// by making one file unreadable. The row is written unsigned and the
+	// verifier reports it: a host that has signed once cannot legitimately stop,
+	// so every such row is tampering on every node that reads the log.
+	//
+	// Latched, not Enforced: this is read on the audit write path, which must
+	// not ping peers.
+	d.db.SetAuditSignatureRequired(func() bool {
+		return d.cfg.Enforcement.AuditSignature && d.checker.Latched(capabilities.AuditSignatureV1)
+	})
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
@@ -679,6 +852,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		d.opJournal = j
 		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
+		// Host network apply protocol (v48): the real netplan-touching System,
+		// plus crash recovery INSIDE this barrier — a half-applied netplan
+		// change is restored before any RPC or runtime loop can observe it.
+		svc.SetHostNetworkEnv(&hostnet.RealSystem{
+			AdvertiseIP: d.hostAddress(),
+			GRPCPort:    d.cfg.GRPCPort,
+		}, d.hostAddress())
+		svc.RecoverHostNetworks(ctx)
 		d.runOperationRecovery(ctx)
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
@@ -691,14 +872,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// retries stragglers.
 	svc.RecoverResourceOperations(ctx)
 	go svc.RunResourceOperationRecovery(ctx)
-
-	// Keep the project-quota admission lease alive for every project this node still
-	// holds charges for. Without it the lease (30s) would lapse under a charge that
-	// outlives it — a create waiting on an image pull, a routed reservation — and the
-	// next node would acquire the lease with an EMPTY ledger and re-hand quota that is
-	// still owed. Renewing only while charged also lets an idle node's leases expire,
-	// so authority follows load instead of sticking to whoever went first.
-	go svc.RunQuotaLeaseRenewer(ctx)
 
 	// F1 hardware-operation recovery: resume any locally-owned VM wedged on a
 	// nonterminal device_attach/device_detach operation (a hot-plug that crashed
@@ -805,6 +978,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// advertisedCapabilities, which reads this predicate. (Storage is atomic, so a late wire
 	// is race-free regardless, but wiring first means a self-fence is honored immediately.)
 	svc.SetWatchdogFenced(watchdogCtrl.Fenced)
+	// A rolled-back node stops advertising capabilities, so the cluster cannot
+	// latch anything further across a member that could not honour it, and peers
+	// raise ha_degraded against it.
+	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
 	go vipDemoter.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
@@ -813,6 +990,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	// Effective-capacity sampler: every host publishes what it is ACTUALLY
+	// carrying (union of DB and runtime workloads), so placement counts rogue
+	// runtimes and refuses hosts whose observation is stale or incomplete.
+	go svc.RunCapacitySampler(ctx, 60*time.Second)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -848,6 +1029,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is more useful than a blanket "container runtime not wired".
 	// lxcRunner was created above (shared with the metrics collector).
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+	// The runtime-inventory collector reads owner-epoch markers from the same
+	// root the container checker converges them into.
+	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 
 	// Advertise LXC capability as a host label so the compose planner places
 	// container (kind=lxc/oci) workloads only on hosts that can actually run
@@ -890,11 +1074,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that stopped unexpectedly per its restart policy. Shares the runtime wired
 	// above; operator-stopped containers are left alone (state_detail).
 	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+	ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 	ctChecker.SetEventBus(svc.EventBus())
 	// Runtime container re-key (Phase 4): corroborate a locally-running container
 	// whose only live DB row points elsewhere against every workload-capable peer
 	// before reclaiming it (a PK re-key).
 	ctChecker.SetPeerContainerRuntimeChecker(svc.CheckPeerContainerRuntime)
+	// Guarded v44 re-key WAL is emitted only after the operation protocol's
+	// config kill-switch is on and both the operation + dependent capacity
+	// capabilities have latched cluster-wide. Until then modern authority fails
+	// closed; pre-authority rows retain the exact v1.3 envelope.
+	ctChecker.SetGuardedContainerRekeyActive(func() bool {
+		return d.cfg.Enforcement.OperationProtocol &&
+			d.checker.Latched(capabilities.OperationProtocolV1) &&
+			d.checker.Latched(capabilities.CapacityAdmissionV1)
+	})
 	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
 	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
 	// enforced — wired before the container reconcile loop starts.
@@ -1118,6 +1312,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Handle shutdown, re-exec, and uninstall signals.
 	shutdownDone := make(chan struct{})
 	reexecRequested := false
+	uninstalled := false
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -1135,6 +1330,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			reexecRequested = true
 		case <-svc.ShutdownCh:
 			slog.Info("shutdown requested by uninstall")
+			uninstalled = true
 		}
 		done := make(chan struct{})
 		go func() {
@@ -1172,6 +1368,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if reexecRequested {
 		return ErrReExec
 	}
+	// Uninstall has already removed the unit files and the binary. Under
+	// Restart=always systemd would restart a unit whose ExecStart no longer
+	// exists, so this exit has to be distinguishable from an ordinary one — the
+	// unit's RestartPreventExitStatus pins the status the caller exits with.
+	if uninstalled {
+		return ErrUninstalled
+	}
 
 	// Serve returns ErrServerStopped on graceful shutdown — not a real error.
 	if serveErr != nil && serveErr != grpc.ErrServerStopped {
@@ -1183,6 +1386,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 // ErrReExec is returned by Run when the daemon should re-exec itself
 // after a binary upgrade.
 var ErrReExec = fmt.Errorf("re-exec requested")
+
+// ErrUninstalled is returned by Run after an uninstall removed this node. The
+// caller must exit with systemdunit.UninstallExitCode so Restart=always does not
+// restart a unit that no longer has a binary to run.
+var ErrUninstalled = fmt.Errorf("uninstalled")
 
 func (d *Daemon) registerHost(ctx context.Context) error {
 	// Get system resources from libvirt
@@ -1202,7 +1410,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 
 	addr := d.hostAddress()
 
-	return corrosion.InsertHost(ctx, d.db, corrosion.HostRecord{
+	return corrosion.RegisterHost(ctx, d.db, corrosion.HostRecord{
 		Name:          d.cfg.HostName,
 		Address:       addr,
 		SSHUser:       "root",
@@ -1216,6 +1424,37 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		FenceStrategy: "best-effort",
 		Version:       d.cfg.Version,
 	})
+}
+
+// reconcileHostAddress rewrites this host's address when the row disagrees with
+// what the daemon now believes its address to be.
+//
+// registerHost cannot do it: InsertHost is a plain INSERT, so on every start
+// after the first it is a no-op and the address recorded at bootstrap is
+// permanent. That address comes from getOutboundIP() when advertise_address is
+// unset — the source IP toward the DEFAULT route, which on a multi-homed host is
+// the wrong interface. Setting advertise_address afterwards is the documented fix
+// for exactly that, and without this it changed nothing.
+//
+// It matters beyond this node. Peers dial hosts.address, and `lv host add` seeds
+// the new node's join_peers from ListHosts, so one wrong row is copied into the
+// gossip configuration of every host added after it. In the lab that produced four
+// nodes advertising the same NAT address, each dialling itself.
+//
+// Only on a real change, so an unchanged address cannot restamp updated_at on
+// every restart and win LWW against a genuine concurrent write from another node.
+func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
+	want := d.hostAddress()
+	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)
+	if err != nil || h == nil || h.Address == want {
+		return err
+	}
+	slog.Warn("correcting this host's recorded address; peers dial this value and it is "+
+		"copied into the gossip configuration of hosts added later",
+		"host", d.cfg.HostName, "was", h.Address, "now", want)
+	return d.db.Execute(ctx,
+		`UPDATE hosts SET address = ?, updated_at = ? WHERE name = ?`,
+		want, d.db.NowTS(), d.cfg.HostName)
 }
 
 // localDiskTotalGiB returns the total disk capacity in GiB for the filesystem
@@ -1374,12 +1613,10 @@ func (d *Daemon) hostAddress() string {
 }
 
 func getOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
+	if ip := netutil.OutboundIP(); ip != "" {
+		return ip
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	return "127.0.0.1"
 }
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.
@@ -1755,6 +1992,34 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			slog.Warn("operation reaper", "error", perr)
 		} else if reaped > 0 {
 			slog.Info("operation reaper", "reaped", reaped)
+		}
+		// Authority still held by projects that no longer exist. Retiring on delete
+		// is forward-only, so anything deleted before that landed keeps live
+		// authority forever — nothing else collects it, because an authority row
+		// never becomes terminal on its own. A recreated name would inherit it.
+		if retired, perr := corrosion.ReconcileOrphanedProjectAuthority(ctx, d.db); perr != nil {
+			slog.Warn("orphaned project-authority reconcile", "error", perr)
+		} else if retired > 0 {
+			slog.Info("retired authority held by deleted projects", "count", retired)
+		}
+		// Resolved health conditions past their 30-day retention. Tombstoned, not
+		// hard-deleted, so replicas that have not yet seen the resolution converge
+		// to the tombstone instead of resurrecting the row.
+		if removed, perr := corrosion.TombstoneResolvedHealthConditions(ctx, d.db, time.Now()); perr != nil {
+			slog.Warn("resolved health-condition retention", "error", perr)
+		} else if removed > 0 {
+			slog.Info("tombstoned resolved health conditions past retention", "count", removed)
+		}
+		// Orphaned admission leases (F2). A reserve-then-verify lease lives for one
+		// RPC, so anything this old is a crash between reserve and release — which
+		// the terminal reaper above can never collect, because an abandoned lease
+		// never becomes terminal and would consume headroom forever. Scoped to
+		// capacity leases so it can never expire a long resize/migration whose
+		// reservation IS backed by a committed spec.
+		if expired, perr := corrosion.ExpireStaleCapacityReservations(ctx, d.db, capacityLeaseMaxAge); perr != nil {
+			slog.Warn("capacity lease expiry", "error", perr)
+		} else if expired > 0 {
+			slog.Warn("capacity lease expiry: released orphaned admission leases", "count", expired)
 		}
 		// Idempotency keys: hard-delete records past their TTL (v39). Ephemeral +
 		// bounded by expires_at; a resurrected expired copy never matches, so a

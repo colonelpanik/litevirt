@@ -486,6 +486,37 @@ func TestRestoreContainerFromBackup_FindsManifestAndDrives(t *testing.T) {
 	}
 }
 
+// The failover coordinator reads its durable token-bound proof and carries the
+// full owner-epoch binding on the peer RPC. Dropping OwnerEpoch while translating
+// ProofRecord→protobuf makes this test observe an empty value at the real client
+// transport boundary.
+func TestDriveRemoteRestore_CarriesOwnerEpoch(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	if err := corrosion.WriteActionProof(ctx, s.db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "host-b", Coordinator: s.hostName,
+		RelocationToken: "tok-1", OwnerEpoch: "7",
+	}); err != nil {
+		t.Fatalf("WriteActionProof: %v", err)
+	}
+	var got *pb.RestoreContainerRequest
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &fakeLVClient{restoreContainerFn: func(req *pb.RestoreContainerRequest) ([]*pb.RestoreContainerProgress, error) {
+			got = req
+			return nil, nil
+		}}, func() {}, nil
+	}
+
+	outcome, err := s.driveRemoteRestore(ctx, "host-b", "repo-not-present", "ct1", "ts", "tok-1")
+	if err != nil || outcome != corrosion.RestoreLanded {
+		t.Fatalf("driveRemoteRestore: outcome=%v err=%v; want landed/nil", outcome, err)
+	}
+	if got == nil || got.GetProof() == nil || got.GetProof().GetOwnerEpoch() != "7" {
+		t.Fatalf("peer restore proof owner_epoch=%q; want 7", got.GetProof().GetOwnerEpoch())
+	}
+}
+
 // TestRestoreContainer_StampsRelocateTokenFromMetadata exercises the production
 // metadata hop: a RestoreContainer call carrying the x-litevirt-relocate-token
 // metadata stamps that token on the restored row's RelocateToken (the
@@ -536,6 +567,11 @@ func TestClassifyRestoreError(t *testing.T) {
 	beforeRow := []codes.Code{
 		codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument,
 		codes.PermissionDenied, codes.Unimplemented, codes.AlreadyExists,
+		// ResourceExhausted: the target's capacity/quota admission runs before any
+		// import or row write, so a refusal is conclusive. Classified as
+		// indeterminate it would make a coordinator defer on a full target instead
+		// of falling back, and park a cold migrate instead of rolling it back.
+		codes.ResourceExhausted,
 	}
 	for _, code := range beforeRow {
 		if got := classifyRestoreError(status.Error(code, "x")); got != corrosion.RestoreFailedBeforeRow {

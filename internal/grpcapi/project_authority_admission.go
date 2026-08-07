@@ -1,0 +1,395 @@
+package grpcapi
+
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// Delegated project-quota admission — the second half of F2.
+//
+// Reserve-then-verify (reservation_admission.go) makes two concurrent admissions
+// agree on a winner, but only once both reservations are VISIBLE to both deciders.
+// Corrosion is eventually consistent, so two nodes that have not yet exchanged
+// operation rows each see only their own claim and both admit. No amount of local
+// ordering fixes that: the inputs differ.
+//
+// So the PROJECT-QUOTA decision moves to one node — the project's D1 authority
+// holder — which necessarily sees every grant it has made. HOST capacity is not
+// delegated: only the target host's owner reserves against it, so it is already
+// serialized by a single node for exactly the same reason.
+//
+// Why a peer RPC and not a conditional write. A compare-and-swap against the
+// replicated store would succeed independently on each node's own copy — it
+// serializes writes to one row, not decisions across a partition. Delegation is the
+// only shape that makes two racing admissions consult the same view.
+//
+// An unreachable holder REFUSES the admission. That is the repo-wide partition rule
+// (a partition fails closed) applied here: the alternative — deciding locally when
+// the holder cannot be reached — is precisely the behavior this exists to remove,
+// and it would reappear exactly when the network is least trustworthy.
+
+// projectAdmissionSettleGrace bounds how long a RELEASED project lease may keep
+// holding quota while the winner's committed row makes its way to the holder.
+//
+// The lease is normally freed by VISIBILITY, not by this timer: the moment the
+// admitted resource appears in the holder's replica, committed usage counts it and the
+// lease stops (see corrosion.ProjectReservedSettling). Without that, the single
+// decider still over-admits — the winner writes its VM on its OWN node and then
+// releases, leaving the holder's usage short by one admission until replication
+// catches up.
+//
+// This constant only backstops the case where the resource NEVER appears, because the
+// admission was granted and the create then failed downstream. Long enough to cover
+// ordinary replication lag, short enough that a failed create does not sit on quota
+// that nothing is using.
+const projectAdmissionSettleGrace = 5 * time.Second
+
+// ReserveProjectCapacity is the authority holder's side of a delegated admission:
+// it runs reserve-then-verify for the PROJECT-QUOTA dimension against its own view
+// and returns a lease the caller must release.
+//
+// Peer-only. The epoch in the request is the caller's belief about who holds
+// authority; a mismatch is refused rather than decided, so a request aimed at an
+// authority this node no longer holds cannot be answered under the old one.
+func (s *Server) ReserveProjectCapacity(ctx context.Context, req *pb.ReserveProjectCapacityRequest) (*pb.ReserveProjectCapacityResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, req.Project)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
+	}
+	// Bootstrap. The caller minted the initial authority on ITS replica, so the row
+	// naming us has not reached us yet — waiting for replication would fail the very
+	// first admission of every project. We do not have to take the caller's word for
+	// it either: the initial holder is DERIVED, so we re-derive and confirm
+	// independently. A peer cannot talk us into holding an authority our own view of
+	// membership does not assign us.
+	if !ok && req.AuthorityEpoch == 1 && s.derivedProjectHolder(ctx, req.Project) == s.hostName {
+		if _, cerr := corrosion.ClaimInitialProjectAuthority(ctx, s.db, req.Project, s.hostName); cerr != nil {
+			return nil, status.Errorf(codes.Internal, "establish project authority: %v", cerr)
+		}
+		cur, ok, err = corrosion.CurrentProjectAuthority(ctx, s.db, req.Project)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "read project authority: %v", err)
+		}
+	}
+	// Refuse unless we are CURRENTLY the holder at the epoch the caller addressed.
+	// Answering under a newer epoch would be just as wrong as answering under an
+	// older one: the caller's peer may have already been told a different holder is
+	// deciding, and two deciders is the state this whole mechanism removes.
+	if !ok || cur.Holder != s.hostName || cur.Epoch != req.AuthorityEpoch {
+		holder, epoch := "", int64(0)
+		if ok {
+			holder, epoch = cur.Holder, cur.Epoch
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %s does not hold project %q admission authority at epoch %d (current: holder %q epoch %d)",
+			s.hostName, req.Project, req.AuthorityEpoch, holder, epoch)
+	}
+
+	// Rebuild the subject from the wire: identity (kind:name from resource_id,
+	// host) plus the absolute want. The HOLDER's op row is the one the settle rule
+	// reads, so the retire-by-observation hint must survive the delegation hop.
+	subject := subjectForCreate(req.ResourceId, req.WorkloadHost, corrosion.QuotaAmount{
+		VCPU: int(req.WantCpu), MemMiB: int(req.WantMemMib),
+		DiskGiB: int(req.WantDiskGib), NIC: int(req.WantNic),
+	})
+	delta := corrosion.QuotaAmount{
+		VCPU: int(req.CpuDelta), MemMiB: int(req.MemMibDelta),
+		DiskGiB: int(req.DiskGibDelta), NIC: int(req.NicDelta),
+	}
+	lease, err := s.admitProjectLocal(ctx, req.Method, req.Project, req.Principal, req.ResourceId, subject, delta)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ReserveProjectCapacityResponse{LeaseId: lease, AuthorityEpoch: cur.Epoch}, nil
+}
+
+// ReleaseProjectCapacity frees a lease granted by ReserveProjectCapacity. Peer-only
+// and idempotent (a repeated release re-appends an identical terminal step).
+//
+// Deliberately NOT epoch-checked. A lease outliving a takeover must still be
+// releasable — refusing here would strand held quota until the expiry reaper, which
+// is a worse outcome than honouring a release from a node that has since lost
+// authority. Releasing only ever frees capacity, so a stale caller cannot use this
+// to admit anything.
+//
+// It DOES validate what it is asked to terminate, like ReleaseHostCapacity: only a
+// capacity operation whose reservation is bound to the named project may be
+// completed here. A terminal-step writer that completes any id it is handed is a
+// lever for erasing another project's live lease — or finishing a WORKLOAD
+// operation whose id doubles as its lease (resize) — over nothing but peer mTLS.
+func (s *Server) ReleaseProjectCapacity(ctx context.Context, req *pb.ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	if req.LeaseId == "" {
+		return &emptypb.Empty{}, nil
+	}
+	op, err := corrosion.GetOperation(ctx, s.db, req.LeaseId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read lease operation: %v", err)
+	}
+	if op == nil {
+		return nil, status.Errorf(codes.NotFound, "no operation %q on this holder", req.LeaseId)
+	}
+	if op.ResourceKind != corrosion.CapacityResourceKind {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"operation %q is a %s operation, not a capacity lease", req.LeaseId, op.ResourceKind)
+	}
+	rv, err := corrosion.DecodeReservation(op.ReservationJSON)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "decode lease reservation: %v", err)
+	}
+	if rv.Project != req.Project {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"lease %q reserves for project %q, not %q", req.LeaseId, rv.Project, req.Project)
+	}
+	if err := corrosion.AppendOperationStep(ctx, s.db, corrosion.OperationStepRecord{
+		OperationID: req.LeaseId, StepName: corrosion.OpStepCompleted,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "release project lease: %v", err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
+// admitProjectLocal runs reserve-then-verify for the project-quota dimension against
+// THIS node's view, returning the lease's operation id. It is the holder's decision
+// procedure, used both when serving a delegated request and when this node is itself
+// the holder (in which case there is no reason to make a network call to ourselves).
+//
+// principal is the ORIGINATING end user, carried across the delegation so the
+// journal records who asked rather than which daemon relayed it.
+func (s *Server) admitProjectLocal(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount) (string, error) {
+	if delta.IsZero() {
+		return "", nil
+	}
+	rv := corrosion.ReservationVector{
+		Project: project, ProjectCPU: delta.VCPU, ProjectMemMiB: delta.MemMiB,
+		ProjectDiskGiB: delta.DiskGiB, ProjectNIC: delta.NIC,
+		Workload: subject.Name, WorkloadKind: subject.Kind, WorkloadHost: subject.Host,
+		WantCPU: subject.Want.VCPU, WantMemMiB: subject.Want.MemMiB,
+		WantDiskGiB: subject.Want.DiskGiB, WantNIC: subject.Want.NIC,
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	op := corrosion.OperationRecord{
+		ID:              newID(),
+		Method:          method,
+		Principal:       principal,
+		Project:         project,
+		ResourceID:      resourceID,
+		ResourceKind:    corrosion.CapacityResourceKind,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return "", status.Errorf(codes.Internal, "reserve project capacity: %v", err)
+	}
+	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+		s.releaseLocalLease(ctx, op.ID)
+		return "", err
+	}
+	if err := s.checkProjectQuotaSettling(ctx, project, delta, op.ID); err != nil {
+		s.releaseLocalLease(ctx, op.ID)
+		return "", err
+	}
+	return op.ID, nil
+}
+
+// checkProjectQuotaSettling is the quota check the AUTHORITY HOLDER makes: committed
+// usage, plus earlier in-flight claimants, plus winners whose committed row has not
+// reached this node yet (see projectAdmissionSettleGrace).
+func (s *Server) checkProjectQuotaSettling(ctx context.Context, project string, delta corrosion.QuotaAmount, opID string) error {
+	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
+	if err != nil {
+		return status.Errorf(codes.Internal, "get project quota: %v", err)
+	}
+	if q == nil {
+		return nil // unbounded
+	}
+	u, err := corrosion.SumProjectUsage(ctx, s.db, project)
+	if err != nil {
+		return status.Errorf(codes.Internal, "sum project usage: %v", err)
+	}
+	r, err := corrosion.ProjectReservedSettlingAmount(ctx, s.db, project, opID, projectAdmissionSettleGrace, time.Now())
+	if err != nil {
+		return status.Errorf(codes.Internal, "sum project reservations: %v", err)
+	}
+	return quotaVerdict(project, q, corrosion.QuotaAmount{
+		VCPU: u.VCPUUsed, MemMiB: u.MemMiBUsed, DiskGiB: u.DiskGiBUsed, NIC: u.NICUsed,
+	}, r, delta)
+}
+
+// releaseLocalLease marks a local capacity lease terminal, freeing it.
+func (s *Server) releaseLocalLease(ctx context.Context, id string) {
+	if id == "" {
+		return
+	}
+	if err := corrosion.AppendOperationStep(ctx, s.db, corrosion.OperationStepRecord{
+		OperationID: id, StepName: corrosion.OpStepCompleted,
+	}); err != nil {
+		s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+	}
+}
+
+// admitProjectQuota decides the project-quota half of an admission, delegating to
+// the authority holder when delegation is active and this node is not the holder.
+// It returns the holder it decided on and the lease held there ("" for a local or
+// no-op decision).
+func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount) (holder, leaseID string, epoch int64, err error) {
+	if delta.IsZero() {
+		return "", "", 0, nil
+	}
+	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
+
+	// This function is only reachable while delegated enforcement is LATCHED
+	// (projectAuthorityActive gated every caller), so there is no local fallback
+	// below — a downgrade to an unfenced, unreserved local check is precisely the
+	// unserialized double-admission the latch promises is gone. The earlier
+	// version fell back "rather than refusing outright"; concurrent first
+	// admissions of a new project on two nodes then both took it (a non-candidate
+	// legitimately reads an empty authority until the candidate mints), each
+	// checked a view containing neither, and the project exceeded quota with an
+	// epoch-0 grant the commit fence treats as unfenced. Refuse or route; never
+	// downgrade.
+	auth, aerr := s.ensureProjectAuthority(ctx, project)
+	if aerr != nil {
+		return "", "", 0, status.Errorf(codes.Unavailable,
+			"cannot establish project %q admission authority: %v — refusing to admit unserialized while delegation is latched", project, aerr)
+	}
+	if auth.Holder == "" {
+		// A brand-new project and this node is not its deterministic candidate
+		// (the candidate would have minted in ensureProjectAuthority). Route the
+		// bootstrap admission to the candidate at epoch 1: ReserveProjectCapacity
+		// re-derives the holder from its own membership view and mints before
+		// admitting, so we are not taking our own stale view's word for anything.
+		candidate := s.derivedProjectHolder(ctx, project)
+		if candidate == "" || candidate == s.hostName {
+			// No candidate derivable (hosts unreadable), or derivation names us
+			// while the mint above did not stick — both are transient state
+			// problems, and the caller retries.
+			return "", "", 0, status.Errorf(codes.Unavailable,
+				"project %q has no admission authority and no reachable candidate; retry", project)
+		}
+		auth = corrosion.ProjectAuthority{Holder: candidate, Epoch: 1}
+	}
+	if auth.Holder == s.hostName {
+		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, delta)
+		return s.hostName, id, auth.Epoch, derr
+	}
+
+	client, conn, cerr := s.peerClient(ctx, auth.Holder)
+	if cerr != nil {
+		return "", "", 0, status.Errorf(codes.Unavailable,
+			"project %q admission authority %s is unreachable, refusing to admit from a stale local view: %v",
+			project, auth.Holder, cerr)
+	}
+	defer conn.Close()
+
+	resp, rerr := client.ReserveProjectCapacity(ctx, &pb.ReserveProjectCapacityRequest{
+		Project:        project,
+		Method:         method,
+		CpuDelta:       int32(delta.VCPU),
+		MemMibDelta:    int32(delta.MemMiB),
+		DiskGibDelta:   int32(delta.DiskGiB),
+		NicDelta:       int32(delta.NIC),
+		AuthorityEpoch: auth.Epoch,
+		Principal:      principal,
+		ResourceId:     resourceID,
+		WorkloadHost:   subject.Host,
+		WantCpu:        int32(subject.Want.VCPU),
+		WantMemMib:     int32(subject.Want.MemMiB),
+		WantDiskGib:    int32(subject.Want.DiskGiB),
+		WantNic:        int32(subject.Want.NIC),
+	})
+	if rerr != nil {
+		// A FailedPrecondition means authority moved between our read and the call.
+		// Retry ONCE against the freshly-read holder: a handoff should not surface as
+		// a spurious refusal to the user, but retrying indefinitely would turn a
+		// flapping authority into a hang.
+		if status.Code(rerr) == codes.FailedPrecondition {
+			return s.retryProjectQuotaOnce(ctx, method, project, principal, resourceID, subject, delta, auth.Epoch)
+		}
+		return "", "", 0, rerr
+	}
+	// The epoch the grant was ACTUALLY made under, from the holder — not our own
+	// read. The commit fence re-validates this epoch before the durable write.
+	return auth.Holder, resp.LeaseId, resp.AuthorityEpoch, nil
+}
+
+// retryProjectQuotaOnce re-reads the authority and makes exactly one more attempt,
+// used when the first attempt raced a handoff. prevEpoch guards against retrying
+// into the same stale answer.
+func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount, prevEpoch int64) (holder, leaseID string, epoch int64, err error) {
+	cur, ok, cerr := corrosion.CurrentProjectAuthority(ctx, s.db, project)
+	if cerr != nil || !ok || cur.Epoch == prevEpoch {
+		return "", "", 0, status.Errorf(codes.Unavailable,
+			"project %q admission authority moved while admitting; retry", project)
+	}
+	if cur.Holder == s.hostName {
+		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, delta)
+		return s.hostName, id, cur.Epoch, derr
+	}
+	client, conn, derr := s.peerClient(ctx, cur.Holder)
+	if derr != nil {
+		return "", "", 0, status.Errorf(codes.Unavailable,
+			"project %q admission authority %s is unreachable: %v", project, cur.Holder, derr)
+	}
+	defer conn.Close()
+	resp, rerr := client.ReserveProjectCapacity(ctx, &pb.ReserveProjectCapacityRequest{
+		Project:        project,
+		Method:         method,
+		CpuDelta:       int32(delta.VCPU),
+		MemMibDelta:    int32(delta.MemMiB),
+		DiskGibDelta:   int32(delta.DiskGiB),
+		NicDelta:       int32(delta.NIC),
+		AuthorityEpoch: cur.Epoch,
+		Principal:      principal,
+		ResourceId:     resourceID,
+		WorkloadHost:   subject.Host,
+		WantCpu:        int32(subject.Want.VCPU),
+		WantMemMib:     int32(subject.Want.MemMiB),
+		WantDiskGib:    int32(subject.Want.DiskGiB),
+		WantNic:        int32(subject.Want.NIC),
+	})
+	if rerr != nil {
+		return "", "", 0, rerr
+	}
+	return cur.Holder, resp.LeaseId, resp.AuthorityEpoch, nil
+}
+
+// releaseProjectQuota frees a lease taken by admitProjectQuota, wherever it lives.
+func (s *Server) releaseProjectQuota(ctx context.Context, holder, project, leaseID string) {
+	if leaseID == "" {
+		return
+	}
+	if holder == "" || holder == s.hostName {
+		s.releaseLocalLease(ctx, leaseID)
+		return
+	}
+	client, conn, err := s.peerClient(ctx, holder)
+	if err != nil {
+		// The lease is stranded on the holder until the expiry reaper collects it.
+		// Surfaced rather than swallowed: it shows up later as quota pressure with no
+		// workload behind it, which is miserable to diagnose from scratch.
+		s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+		return
+	}
+	defer conn.Close()
+	if _, err := client.ReleaseProjectCapacity(ctx, &pb.ReleaseProjectCapacityRequest{
+		Project: project, LeaseId: leaseID,
+	}); err != nil {
+		s.noteStateWriteFail(string(corrosion.OpResourceUpdateRunning), err)
+	}
+}

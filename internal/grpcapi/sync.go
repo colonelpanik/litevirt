@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -294,6 +295,9 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
 		return nil, err
 	}
+	if err := s.requireNotIsolated(ctx, req.Sender); err != nil {
+		return nil, err
+	}
 
 	// Schema-version skew check, keyed off DB-APPLIED schema (the columns each
 	// DB actually has), not the binary const. Both sides advertise/compare their
@@ -393,4 +397,54 @@ func requireReplicationPeer(ctx context.Context, sender string) error {
 			"replication sender %q does not match peer certificate %q", sender, cn)
 	}
 	return nil
+}
+
+// requireNotIsolated refuses replication from a host the CLUSTER has recorded
+// as isolated (§A). This is the half the 2026-07-29 self-quarantine slice was
+// missing: a node that self-mutes is exactly the node whose self-assessment
+// cannot be relied on, so the refusal has to come from the peers.
+//
+// Deliberately NOT a version-skew check — mixed-version rolling upgrades must
+// keep working. It gates only on the recorded isolation fact, which a healthy
+// peer wrote and which the isolated node cannot clear itself.
+//
+// Scope is INJECTION ONLY (PushMutations). The state-dump and digest RPCs stay
+// open to an isolated node ON PURPOSE: reseed works by pulling a full state
+// dump from a healthy peer and verifying the digest matches, so refusing those
+// would make the isolated node unreseedable — quarantine with no exit. The
+// mirror direction (a healthy node must not MERGE from an isolated peer) is
+// enforced client-side, where the pull is initiated.
+//
+// Gated on isolation_epoch_v1: pre-latch clusters behave exactly as before, and
+// a partition (no latch) adds no new refusals — failing closed here would mean
+// refusing legitimate peers during a partition, which is the opposite of what
+// this protects.
+func (s *Server) requireNotIsolated(ctx context.Context, sender string) error {
+	if !s.tokenEnabled(capabilities.IsolationEpochV1) || s.gate == nil {
+		return nil
+	}
+	// Enforced (not CapabilityActiveForHealth): this is an enforcement
+	// decision, so it takes the same latch-backed path every other gate uses.
+	// The ForHealth variant is positive-cached for the HA monitor and must not
+	// decide whether to refuse a peer.
+	if !s.gate.Enforced(ctx, capabilities.IsolationEpochV1) {
+		return nil
+	}
+	epoch, reason, err := corrosion.HostIsolation(ctx, s.db, sender)
+	if err != nil {
+		// Fail OPEN on a read error: refusing every peer because our own DB
+		// hiccuped would turn a local fault into a cluster-wide outage. The
+		// isolated node stays self-quarantined regardless.
+		slog.Warn("isolation admission: could not read the sender's isolation — allowing",
+			"sender", sender, "error", err)
+		return nil
+	}
+	if epoch == 0 {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"replication from %q refused: the cluster recorded it isolated at epoch %d (%s) — "+
+			"its state was produced outside the current compatibility regime; "+
+			"run `lv host reseed %s` to replace that state and rejoin",
+		sender, epoch, reason, sender)
 }

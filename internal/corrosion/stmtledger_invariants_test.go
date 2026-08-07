@@ -9,7 +9,10 @@ import "testing"
 // (which would let that builder's shape back-pressure a peer) is caught; update it deliberately when
 // a replicated bulk-update builder is added or removed.
 func TestCurrentLedgerCategories(t *testing.T) {
-	const wantBulk = 32
+	// v50 raised this from 33: TombstoneResolvedHealthConditions is a deliberate
+	// retention bulk-update (tombstoning resolved conditions past the 30-day
+	// window), the same class as every other retention sweep counted here.
+	const wantBulk = 34
 	bulk := 0
 	for fp, e := range stmtLedger {
 		if e.Disposition == DispBulkUpdate {

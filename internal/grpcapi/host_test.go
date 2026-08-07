@@ -6,7 +6,6 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -155,16 +154,19 @@ func TestInspectHost_Found(t *testing.T) {
 	}
 }
 
-func TestGetHostHealth_Empty(t *testing.T) {
+func TestGetClusterHealth_Empty(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
 
-	resp, err := s.GetHostHealth(ctx, &emptypb.Empty{})
+	resp, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
+		t.Fatalf("GetClusterHealth: %v", err)
 	}
-	if len(resp.Entries) != 0 {
-		t.Errorf("expected 0 entries, got %d", len(resp.Entries))
+	if len(resp.GetConnectivity()) != 0 || len(resp.GetConditions()) != 0 {
+		t.Errorf("virgin cluster returned data: %+v", resp)
+	}
+	if resp.GetOverall() != HealthUnknown {
+		t.Errorf("overall = %q, want UNKNOWN (nothing has scanned)", resp.GetOverall())
 	}
 }
 

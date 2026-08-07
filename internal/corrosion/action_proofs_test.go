@@ -88,6 +88,13 @@ func TestActionProof_LifecycleSingleUse(t *testing.T) {
 	if vm.State != "running" || vm.PendingActionID != "" {
 		t.Fatalf("after complete: state=%q pending_action_id=%q; want running/empty", vm.State, vm.PendingActionID)
 	}
+	// Phase 4: completion is where the reschedule mints the new ownership
+	// generation — claim happened at the old epoch, the increment lands in the
+	// SAME mutation that clears pending, so a replayed proof is stale by
+	// construction (read-old → prove → move → mint-new).
+	if vm.OwnerEpoch != 1 {
+		t.Fatalf("completion must mint the new owner epoch, got %d want 1", vm.OwnerEpoch)
+	}
 
 	// A completed proof can't be re-claimed → single use.
 	if err := ClaimActionProof(ctx, c, "p1", "host-b"); !errors.Is(err, ErrProofSpent) {
@@ -155,6 +162,30 @@ func TestWriteVMRescheduleProof_MissingVMRefuses(t *testing.T) {
 	}
 	if _, ok, _ := GetActionProof(ctx, c, "p1"); ok {
 		t.Fatal("no proof row should exist for a vanished VM")
+	}
+}
+
+// The proof row and pending transition are one decision. If ownership advances
+// after the coordinator's read but before this transaction, neither half may be
+// written under the stale generation.
+func TestWriteVMRescheduleProof_StaleOwnerEpochWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	apInsertVM(t, c, "vm1", "host-a", "running")
+	if err := c.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 7 WHERE name = 'vm1'`); err != nil {
+		t.Fatalf("seed owner epoch: %v", err)
+	}
+	p := apProof("p1", "vm1", "host-b")
+	p.OwnerEpoch = "6"
+	if err := WriteVMRescheduleProof(ctx, c, p, "vm1", "host-b"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("stale owner epoch: err=%v; want ErrNoRowsAffected", err)
+	}
+	if _, ok, _ := GetActionProof(ctx, c, "p1"); ok {
+		t.Fatal("stale decision must not leave an orphan proof")
+	}
+	vm, _ := GetVM(ctx, c, "vm1")
+	if vm == nil || vm.HostName != "host-a" || vm.State != "running" || vm.PendingActionID != "" {
+		t.Fatalf("stale decision mutated VM: %+v", vm)
 	}
 }
 

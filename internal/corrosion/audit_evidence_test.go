@@ -1,0 +1,1179 @@
+package corrosion
+
+import (
+	"context"
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
+)
+
+// The tamper-evidence a signature produces is only worth what the REPLICATION
+// layer will let stand.
+//
+// Every check in the verifier reads from three tables — audit_log,
+// audit_chain_heads and audit_signing_keys — and all three replicate. So a node
+// with local database write access does not have to defeat the cryptography at
+// all. It can go after the evidence: publish a chain head that agrees with its
+// rewrite, delete the heads that disagree, clear the retirement marker that
+// makes a rotated-out key's signature a finding, or emit the pre-v45 reseal
+// statement whose WHERE clause never learned about signatures. Each of those
+// moves is silent, and each replicates from one node to every peer — so it does
+// not merely hide the tampering locally, it destroys the good copy that a
+// neighbour would have used to contradict the compromised node.
+//
+// These tests fix the floor under the verifier: what a peer is allowed to
+// change about another node's evidence, whatever clock or epoch it claims.
+
+// ─────────────────── chain heads: who gets to speak for the chain ───────────────────
+
+// TestAuditHeads_RetiredKeyCannotDisplaceTheSealingHead is the attack rotation
+// exists to stop, aimed one level down at the machinery that detects it.
+//
+// The attacker holds the rotated-out key. They rewrite the last row it signed
+// and re-sign it: the signature verifies (they have the key), the chain still
+// links, the sequence numbers are untouched, and the key was inside its
+// boundary. The only witness left is the head published at rotation, signed by
+// the successor key they do not have.
+//
+// So they publish their own head — over the forged tail hash, at a far higher
+// epoch. Selecting the authoritative head by highest epoch hands them the
+// choice: their head becomes the one that gets checked, it agrees with the
+// forgery, and the sealing head that disagrees is silently discarded for being
+// at a lower epoch. Heads have to be tracked PER KEY for the successor's
+// assertion to survive an old key's.
+func TestAuditHeads_RetiredKeyCannotDisplaceTheSealingHead(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+
+	newKR := rotateTo(t, c, dir, "node-0") // seals seq 2 with a head signed by the new key
+	if newKR.KeyID() == oldKR.KeyID() {
+		t.Fatal("rotation produced the same key id; every assertion below would pass vacuously")
+	}
+
+	forged := rewriteTailRowWithRetiredKey(t, c, oldKR, "r2", 2)
+
+	// The head the attacker can make: over their own tail hash, at an epoch far
+	// above anything the host has published, signed with the retired key.
+	if err := insertAuditChainHead(ctx, c, oldKR, "node-0", 99, 2, forged); err != nil {
+		t.Fatalf("publish the forged head: %v", err)
+	}
+
+	res := verify(t, c)
+	// Sanity: the forgery really does defeat every easier check, or this test is
+	// proving something weaker than it claims.
+	if res.BrokenAt != "" || len(res.BadSignature) > 0 {
+		t.Fatalf("the forgery was caught by an easier check (broken_at=%q bad_sig=%v); it is "+
+			"supposed to be chain-consistent and signature-valid", res.BrokenAt, res.BadSignature)
+	}
+	if len(res.HeadMismatch) == 0 {
+		t.Fatalf("a head published with the RETIRED key displaced the sealing head signed by its "+
+			"successor, and a rewrite of the log verified clean: %+v\n"+
+			"epoch is chosen by whoever writes the head, so it cannot be what picks the "+
+			"authority — the successor key's assertion has to survive alongside it", res)
+	}
+}
+
+// TestAuditHeads_RetiredKeyCannotAttestPastItsBoundary.
+//
+// The retirement boundary applies to heads for the same reason it applies to
+// rows: a key that has been rotated out has no standing to make a fresh
+// assertion about the chain. Without this, the holder of a leaked key could
+// keep publishing heads forever and the log would look actively maintained by
+// a key nobody trusts.
+func TestAuditHeads_RetiredKeyCannotAttestPastItsBoundary(t *testing.T) {
+	ctx := context.Background()
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0") // retires the old key at seq 1
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+
+	tail := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r2'`)
+	if err := insertAuditChainHead(ctx, c, oldKR, "node-0", 5, 2, tail); err != nil {
+		t.Fatalf("publish a head with the retired key: %v", err)
+	}
+
+	res := verify(t, c)
+	if len(res.RetiredKeyUse) == 0 {
+		t.Fatalf("a chain head signed by a key retired at seq 1 was accepted as an assertion "+
+			"about seq 2: %+v", res)
+	}
+}
+
+// rewriteTailRowWithRetiredKey rewrites one row's content and re-signs it with
+// the given (retired) keyring, leaving the chain internally consistent. It
+// returns the new content hash.
+func rewriteTailRowWithRetiredKey(t *testing.T, c *Client, kr *AuditKeyring, id string, seq int64) string {
+	t.Helper()
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`UPDATE audit_log SET target = 'bob', username = 'system' WHERE id = ?`, id); err != nil {
+		t.Fatalf("tamper with %s: %v", id, err)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, prev_hash
+		 FROM audit_log WHERE id = ?`, id)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read %s: %v (rows=%d)", id, err, len(rows))
+	}
+	r := rows[0]
+	rec := AuditRecord{
+		ID: r.String("id"), Timestamp: r.String("timestamp"), Username: r.String("username"),
+		HostName: r.String("host_name"), Action: r.String("action"), Target: r.String("target"),
+		Detail: r.String("detail"), Result: r.String("result"), PrevHash: r.String("prev_hash"),
+		Seq: seq,
+	}
+	rec.ContentHash = HashAuditRow(rec)
+	sig, err := kr.SignRow(rec.ContentHash, seq)
+	if err != nil {
+		t.Fatalf("re-sign %s with the retired key: %v", id, err)
+	}
+	if err := c.Execute(ctx,
+		`UPDATE audit_log SET content_hash = ?, signature = ?, key_id = ? WHERE id = ?`,
+		rec.ContentHash, sig, kr.KeyID(), id); err != nil {
+		t.Fatalf("store the re-signed %s: %v", id, err)
+	}
+	return rec.ContentHash
+}
+
+// TestAuditHeads_AFreshHeadIsInsideTheSettleWindow.
+//
+// created_at is the wall time the settle window is measured against, and it must
+// be stamped with NowWall. It was once stamped with NowTS — the LWW conflict key,
+// which starts emitting HLC strings the moment hlc_lww latches — and an HLC value
+// read as wall time parses as nothing, so every freshly published head counted as
+// settled and any peer that had not yet received the rows behind it reported a
+// truncated log. On an HLC cluster that meant a tampering alert seconds after
+// every publish.
+//
+// The fix is the stamp, not a second format to parse. Asserting through the real
+// publish path is what pins it: if the stamp goes back to NowTS the value stops
+// parsing, the head counts as settled, and the shortfall below is reported.
+func TestAuditHeads_AFreshHeadIsInsideTheSettleWindow(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	// Latch HLC conflict-key emission. Without this NowTS still returns RFC3339, so
+	// the wrong stamp would parse fine and this test would pass with the fix
+	// removed — the switch is exactly what made the original bug reachable only on
+	// a cluster that had latched hlc_lww.
+	c.SetHLCEmit(func() bool { return true })
+
+	// Publish through the production path, then move the head above the local tail
+	// so a shortfall exists for the window to suppress.
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	if err := c.Execute(ctx, `UPDATE audit_chain_heads SET seq = 9 WHERE host_name = 'node-0'`); err != nil {
+		t.Fatalf("raise the head above the tail: %v", err)
+	}
+	stamped := oneCol(t, c, `SELECT created_at FROM audit_chain_heads WHERE host_name = 'node-0'`)
+	if _, err := time.Parse(time.RFC3339Nano, stamped); err != nil {
+		t.Fatalf("created_at was stamped as %q, which the settle window cannot parse: %v\n"+
+			"an unparseable value counts as settled, so every freshly published head becomes "+
+			"a truncation report on any peer still receiving the rows behind it", stamped, err)
+	}
+
+	// seq was edited after signing, so the head no longer verifies — which is its
+	// own finding. The one thing that must NOT appear is the truncation.
+	if res := verify(t, c); len(res.TruncatedHosts) > 0 {
+		t.Fatalf("a head published seconds ago was read as a truncated log: %v\n"+
+			"the settle window exists because a peer can hold a head before the rows it "+
+			"attests to", res.TruncatedHosts)
+	}
+
+	// The same shortfall, genuinely older than the window: now it is real.
+	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads`); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	old := time.Now().Add(-2 * headSettleWindow).UTC().Format(time.RFC3339Nano)
+	insertSignedHead(t, c, kr, 0, 9, "aabb", old)
+	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a head older than the settle window attests to seq 9 over a log that ends "+
+			"at 1, and nothing was reported: %+v", res)
+	}
+}
+
+// TestAuditHeads_AnEditedTimestampCannotSilenceTruncation.
+//
+// created_at was outside the signed payload, and the verifier measures the
+// settle window against it. So an attacker could truncate a log and then scribble
+// in created_at on their own heads — an unparseable value meant "not settled",
+// which meant no finding at all. A silent off switch for the one check a
+// backward-linking hash chain cannot perform for itself.
+//
+// Moving created_at inside the signed payload closes it: the edit breaks the
+// signature, which is louder than the truncation would have been. A value the
+// window cannot parse — signed, so the head itself is genuine — gets the
+// conservative reading, settled, and the shortfall is reported.
+func TestAuditHeads_AnEditedTimestampCannotSilenceTruncation(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r2','r3')`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET created_at = 'not-a-timestamp' WHERE host_name = 'node-0'`); err != nil {
+		t.Fatalf("edit created_at: %v", err)
+	}
+
+	res := verify(t, c)
+	if !res.Tampered() {
+		t.Fatalf("editing a head's created_at silenced the truncation it attests to: %+v\n"+
+			"the settle window is measured against that column, so leaving it outside the "+
+			"signature made it an off switch for the check", res)
+	}
+	if len(res.BadSignature) == 0 {
+		t.Errorf("want the edit reported against the head's signature, got %+v", res)
+	}
+
+	// A created_at the settle window cannot parse, but which the signature DOES
+	// cover, so the head itself is genuine. It must count as settled and report the
+	// truncation: the alternative is that writing garbage into the column suppresses
+	// the finding, and an attacker who can truncate a log can certainly do that.
+	if err := c.Execute(ctx, `DELETE FROM audit_chain_heads`); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	insertSignedHead(t, c, kr, 0, 3, "aabb", "not-a-timestamp")
+	res = verify(t, c)
+	if len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a head with an unparseable timestamp stopped detecting a truncation: "+
+			"%+v\nan unreadable clock must not be able to suppress the finding", res)
+	}
+}
+
+// insertSignedHead writes a head with a chosen created_at, signed over it.
+func insertSignedHead(t *testing.T, c *Client, kr *AuditKeyring, epoch, seq int64, hash, createdAt string) {
+	t.Helper()
+	sig, err := kr.SignHead("node-0", epoch, seq, hash, createdAt)
+	if err != nil {
+		t.Fatalf("SignHead: %v", err)
+	}
+	if err := c.Execute(context.Background(),
+		`INSERT INTO audit_chain_heads
+		   (host_name, epoch, seq, head_hash, key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		epoch, seq, hash, kr.KeyID(), sig, createdAt, createdAt); err != nil {
+		t.Fatalf("insert head: %v", err)
+	}
+}
+
+// ─────────────────── the pre-v45 reseal shape ───────────────────
+
+// TestWAL_LegacyResealCannotRewriteASignedRow.
+//
+// The v45 reseal builder grew a `signature IS NULL OR signature = ”` guard
+// precisely because the statement replicates and peers apply it verbatim by
+// primary key with no clock compare. But the PRE-v45 shape — the same UPDATE
+// without the guard — stayed registered for the rolling-upgrade horizon, and a
+// receiver applying it verbatim honours whichever shape it is handed. So the
+// guard was bypassable by simply emitting the older statement, which any node
+// with database write access can do.
+//
+// Worse than a local edit: this one overwrites every peer's good content_hash,
+// and since reseal now refuses to touch signed rows, nothing can put the
+// correct hash back afterwards.
+func TestWAL_LegacyResealCannotRewriteASignedRow(t *testing.T) {
+	c, _, _ := signedClient(t, "node-0")
+	r := NewReplicator(c, "", RelayConfig{})
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	before := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r1'`)
+
+	applyLegacyReseal(t, r, c, "forged-prev", "forged-hash", "r1")
+
+	if got := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r1'`); got != before {
+		t.Fatalf("the pre-v45 reseal shape rewrote a SIGNED row's content_hash (%s -> %s)\n"+
+			"one node emitting the older statement would overwrite the good copy on every "+
+			"peer, and reseal cannot restore it", before, got)
+	}
+	if res := verify(t, c); res.Tampered() {
+		t.Fatalf("the log is reported as tampered after a refused reseal: %+v", res)
+	}
+}
+
+// TestWAL_LegacyResealStillHealsAnUnsignedRow is the other half of the rule.
+//
+// Rejecting the legacy shape outright would back-pressure a peer that is simply
+// running the older build, and legacy rows genuinely do need re-basing. The
+// guard has to exclude only what it was ever meant to exclude — and a sender old
+// enough to emit this shape has no signed rows at all.
+func TestWAL_LegacyResealStillHealsAnUnsignedRow(t *testing.T) {
+	c := newAuditTestClient(t) // no keyring: unsigned, like every pre-v45 row
+	r := NewReplicator(c, "", RelayConfig{})
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	applyLegacyReseal(t, r, c, "rebased-prev", "rebased-hash", "r1")
+
+	if got := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r1'`); got != "rebased-hash" {
+		t.Fatalf("an unsigned legacy row was not re-based by the legacy reseal (content_hash = %q); "+
+			"pre-v45 rows would stay divergent across the cluster forever", got)
+	}
+}
+
+// applyLegacyReseal drives the WAL apply path with the PRE-v45 reseal shape,
+// exactly as a peer on the older build emits it — no signature predicate.
+func applyLegacyReseal(t *testing.T, r *Replicator, c *Client, prev, hash, id string) {
+	t.Helper()
+	s := Statement{
+		SQL:    `UPDATE audit_log SET prev_hash = ?, content_hash = ? WHERE id = ?`,
+		Params: []interface{}{prev, hash, id},
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := r.applyStatementLWW(context.Background(), tx, s, "2999-01-01T00:00:00Z"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("apply the legacy reseal shape: %v\n"+
+			"it must stay ACCEPTED for the upgrade horizon, not back-pressure a peer on the "+
+			"older build", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
+// ─────────────────── anti-entropy over the evidence tables ───────────────────
+
+func headSyncTable() syncTable {
+	return syncTable{Name: "audit_chain_heads", Columns: []string{
+		"host_name", "epoch", "seq", "head_hash", "key_id", "signature",
+		"created_at", "updated_at", "deleted_at",
+	}}
+}
+
+func retirementSyncTable() syncTable {
+	return syncTable{Name: "audit_key_lifecycle", Columns: []string{
+		"host_name", "key_id", "event", "at_seq", "by_key_id",
+		"signature", "created_at", "updated_at", "deleted_at",
+	}}
+}
+
+// mergeOne pushes one incoming anti-entropy row through the real merge path.
+func mergeOne(t *testing.T, c *Client, table syncTable, pkCols []string, pkIdx []int, row []interface{}) {
+	t.Helper()
+	if _, _, err := c.mergeChunk(
+		table, [][]interface{}{row},
+		buildMergeUpsertSQL(table.Name, table.Columns, pkCols),
+		pkCols, pkIdx, indexOf(table.Columns, "updated_at"),
+	); err != nil {
+		t.Fatalf("mergeChunk on %s: %v", table.Name, err)
+	}
+}
+
+// TestAuditEvidence_ATombstoneIsInert.
+//
+// A chain head is the only construct that can detect a truncated tail: a hash
+// chain links backward, so cutting the last N rows leaves every surviving link
+// verifying. Deleting the heads is therefore the efficient attack, and for a
+// while the answer here was a merge rule that refused tombstones and a
+// force-apply that repaired them.
+//
+// Both were the wrong layer. The verifier simply does not filter on deleted_at,
+// so setting it accomplishes nothing at all — no rule to get right, no repair to
+// perform, and no force-apply path that could carry an unrelated column rewrite
+// along with it.
+func TestAuditEvidence_ATombstoneIsInert(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	if before := verify(t, c); before.Tampered() {
+		t.Fatalf("baseline is not clean: %+v", before)
+	}
+
+	// Tombstone every piece of evidence this node holds, with a clock no honest
+	// write can beat.
+	for _, q := range []string{
+		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+		`UPDATE audit_signing_keys SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+	} {
+		if err := c.Execute(ctx, q, "2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+			t.Fatalf("tombstone: %v", err)
+		}
+	}
+
+	// A FRESH keyring, because certFor caches every certificate it resolves.
+	// Reusing the warm one would answer from the cache and never reach the query
+	// whose deleted_at filter is the thing under test — which is also the real
+	// shape of the attack: the node that matters is the one starting up after the
+	// tombstone replicated to it.
+	verifier, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(verifier)
+
+	after := verify(t, c)
+	if len(after.UnknownKeyID) > 0 {
+		t.Fatalf("a tombstoned certificate stopped resolving: %v\n"+
+			"deleting it does not hide the rows it signed, it makes them unverifiable — "+
+			"which reads as mass tampering rather than as the erasure it is", after.UnknownKeyID)
+	}
+	if after.Tampered() {
+		t.Fatalf("tombstoning the evidence changed the verdict: %+v", after)
+	}
+}
+
+// TestAuditEvidence_PeerCannotRewriteAChainHead keeps the half that still
+// matters. A head is a fixed assertion about (host, epoch, seq); there is no
+// later revision of one, so a differing body is corruption or forgery and taking
+// it would overwrite the copy that disagrees with whoever sent it.
+func TestAuditEvidence_PeerCannotRewriteAChainHead(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead: %v", err)
+	}
+	original := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`)
+
+	incoming := []interface{}{
+		"node-0", int64(0), int64(1), "forged-head-hash", kr.KeyID(), "sig",
+		"2026-07-29T10:00:01Z", "2999-01-01T00:00:00Z", nil,
+	}
+	mergeOne(t, c, headSyncTable(), []string{"host_name", "epoch", "seq"}, []int{0, 1, 2}, incoming)
+
+	if got := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0'`); got != original {
+		t.Fatalf("a peer rewrote a published chain head (%s -> %s); the head is what "+
+			"contradicts a rewritten chain, so overwriting it is the whole attack", original, got)
+	}
+}
+
+// ─────────────────── signed retirement ───────────────────
+
+// TestRetirement_ForgedOneIsIgnored is the signed table's reason for existing.
+//
+// An earlier revision of this branch kept retirement in two mutable columns on
+// audit_signing_keys. That table is replicated and LWW, so any peer could write
+// them: setting a retirement on a host's LIVE key put every row that host had
+// ever signed past a boundary — on every node, permanently, with no key required
+// and no way back. The columns are gone, along with the only reader they ever
+// had, so this test now guards the property rather than the migration.
+//
+// A retirement is now an assertion someone had to sign. One that does not verify
+// is not a weaker retirement, it is not a retirement at all.
+func TestRetirement_ForgedOneIsIgnored(t *testing.T) {
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	ins(t, c, "r2", "node-0", "2026-07-29T10:00:02Z")
+
+	// The attacker writes a retirement for the host's ACTIVE key, at seq 0, so
+	// that every row it has signed falls past the boundary. They have no key, so
+	// the signature is junk.
+	if err := c.Execute(context.Background(),
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature,
+		    created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, 'retired', 0, ?, 'deadbeef', ?, ?, NULL)`,
+		kr.KeyID(), kr.KeyID(), "2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("insert the forged retirement: %v", err)
+	}
+
+	res := verify(t, c)
+	if len(res.RetiredKeyUse) > 0 {
+		t.Fatalf("a forged retirement invalidated the host's live chain: %v\n"+
+			"anyone able to write the table could put every row a host ever signed past a "+
+			"boundary, on every node, without holding any key", res.RetiredKeyUse)
+	}
+	if res.Tampered() {
+		t.Fatalf("a forged retirement made the log read as tampered: %+v", res)
+	}
+}
+
+// TestRetirement_SignedOneIsHonoured is the other direction: the mechanism has
+// to still work, or the fix above is just "never retire anything".
+func TestRetirement_SignedOneIsHonoured(t *testing.T) {
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0")
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldKR.KeyID()+`'`); n != 1 {
+		t.Fatalf("a genuine rotation recorded no retirement; the retired-key finding would " +
+			"never fire again")
+	}
+	forgeRowWithKey(t, c, oldKR, "forged", 2)
+	if res := verify(t, c); len(res.RetiredKeyUse) == 0 {
+		t.Fatalf("a row signed by the retired key past its boundary was accepted: %+v", res)
+	}
+}
+
+// TestRetirement_PeerCannotRewriteOne. The boundary is part of the signed
+// payload, so moving it invalidates the signature — but the merge must refuse
+// the rewrite anyway rather than let a peer replace the row that still verifies.
+func TestRetirement_PeerCannotRewriteOne(t *testing.T) {
+	c, oldKR, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+	rotateTo(t, c, dir, "node-0")
+
+	oldID := oldKR.KeyID()
+	sig := oneCol(t, c, `SELECT signature FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`)
+	by := oneCol(t, c, `SELECT by_key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`)
+
+	incoming := []interface{}{
+		"node-0", oldID, "retired", int64(9999), by, sig,
+		"2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z", nil,
+	}
+	mergeOne(t, c, retirementSyncTable(), []string{"host_name", "key_id", "event"}, []int{0, 1, 2}, incoming)
+
+	if got := oneCol(t, c,
+		`SELECT at_seq FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+oldID+`'`); got == "9999" {
+		t.Fatalf("a peer moved a signed retirement boundary to seq 9999; every row the key " +
+			"signed below it is silently re-authorised")
+	}
+}
+
+// forgeRowWithKey appends a correctly chained, correctly signed row using the
+// given key — the move a retirement boundary exists to catch.
+func forgeRowWithKey(t *testing.T, c *Client, kr *AuditKeyring, id string, seq int64) {
+	t.Helper()
+	ctx := context.Background()
+	prev := oneCol(t, c,
+		`SELECT content_hash FROM audit_log WHERE host_name = 'node-0' ORDER BY timestamp DESC, id DESC LIMIT 1`)
+	rec := AuditRecord{
+		ID: id, Timestamp: "2026-07-30T12:00:00Z", Username: "root", HostName: "node-0",
+		Action: "user.delete", Target: "alice", Result: "success", PrevHash: prev, Seq: seq,
+	}
+	rec.ContentHash = HashAuditRow(rec)
+	sig, err := kr.SignRow(rec.ContentHash, rec.Seq)
+	if err != nil {
+		t.Fatalf("SignRow: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail, result,
+		                        prev_hash, content_hash, key_id, signature, seq)
+		 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)`,
+		rec.ID, rec.Timestamp, rec.Username, rec.HostName, rec.Action, rec.Target,
+		rec.Result, rec.PrevHash, rec.ContentHash, kr.KeyID(), sig, rec.Seq); err != nil {
+		t.Fatalf("insert the forged row: %v", err)
+	}
+}
+
+// TestAuditEvidence_ATombstonedHeadStillDetectsTruncation is the half of the
+// inert-tombstone rule that carries the real weight.
+//
+// A certificate that stops resolving is loud — every row it signed turns into an
+// UnknownKeyID finding. A head that stops counting is SILENT: the log simply
+// looks shorter than nothing in particular, and truncation is the one thing a
+// backward-linking hash chain cannot notice on its own. So the tombstone has to
+// be inert here specifically, not merely survive in the table.
+func TestAuditEvidence_ATombstonedHeadStillDetectsTruncation(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	for _, id := range []string{"r1", "r2", "r3"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	// Older than headSettleWindow, so a shortfall is not read as replication lag —
+	// and SIGNED over that timestamp, since created_at is inside the payload.
+	tail := oneCol(t, c, `SELECT content_hash FROM audit_log WHERE id = 'r3'`)
+	insertSignedHead(t, c, kr, 0, 3, tail,
+		time.Now().Add(-2*headSettleWindow).UTC().Format(time.RFC3339))
+
+	// Cut the tail off, then delete the head that would have noticed.
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id IN ('r2','r3')`); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`UPDATE audit_chain_heads SET deleted_at = ?, updated_at = ? WHERE host_name = 'node-0'`,
+		"2999-01-01T00:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("tombstone the head: %v", err)
+	}
+
+	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a tombstoned chain head stopped detecting a truncated log: %+v\n"+
+			"deleting the head is the cheapest way to hide missing rows, so setting "+
+			"deleted_at must accomplish nothing at all", res)
+	}
+}
+
+// TestRetirement_CannotBeRecordedWithoutAKey.
+//
+// The last line of defence under both rollback paths. A retirement is what
+// distinguishes "this host stopped deliberately" from "someone took this host's
+// key away" — and the only thing that can make that distinction is whether a
+// signature could be produced. If an unsigned retirement could be written, then
+// removing a host's key would BE a way to end its signing contract, which is
+// exactly backwards.
+func TestRetirement_CannotBeRecordedWithoutAKey(t *testing.T) {
+	ctx := context.Background()
+	c, kr, dir := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	verifier, err := LoadAuditVerifier(dir) // CA only: can verify, cannot sign
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	if err := RetireAuditKey(ctx, c, verifier, "node-0", kr.KeyID(), 1); err == nil {
+		t.Fatal("a retirement was recorded by a party that cannot sign one\n" +
+			"taking a host's key away would then be a way to end its signing contract")
+	}
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'retired' AND key_id = '`+kr.KeyID()+`'`); n != 0 {
+		t.Fatalf("an unsigned retirement row was written anyway (%d rows)", n)
+	}
+}
+
+// ─────────────────── who may speak for whose key ───────────────────
+
+// TestRetirement_OneHostCannotRetireAnothersKey was the worst defect in the v47
+// lifecycle table, and it passed every test that existed.
+//
+// auditLifecycleDigest signs host_name and VerifyLifecycle checks the SIGNER's
+// certificate names that host — so a node holding a perfectly valid key for its
+// own host A could sign a perfectly verifiable record reading "host A retires
+// <host B's key>". Nothing checked that the key belonged to the host, and the
+// reducer then keyed by key_id alone, discarding the host entirely. Every reader
+// applied it to B: one compromised node permanently invalidating any other host's
+// whole signed history, no forgery required.
+func TestRetirement_OneHostCannotRetireAnothersKey(t *testing.T) {
+	ctx := context.Background()
+	// Two hosts under one cluster CA, as a real cluster has.
+	victim, victimKR, dir := signedClient(t, "node-victim")
+	ins(t, victim, "v1", "node-victim", "2026-07-29T10:00:01Z")
+	ins(t, victim, "v2", "node-victim", "2026-07-29T10:00:02Z")
+
+	attackerKR := peerKeyring(t, dir, "node-attacker", victim)
+
+	// The attacker signs, correctly and verifiably, for its OWN host — while
+	// naming the victim's key.
+	sig, err := attackerKR.SignLifecycle("node-attacker", victimKR.KeyID(), "retired", 0)
+	if err != nil {
+		t.Fatalf("SignLifecycle: %v", err)
+	}
+	if err := victim.Execute(ctx,
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-attacker', ?, 'retired', 0, ?, ?, ?, ?, NULL)`,
+		victimKR.KeyID(), attackerKR.KeyID(), sig,
+		"2026-07-29T10:00:00Z", "2026-07-29T10:00:00Z"); err != nil {
+		t.Fatalf("insert the cross-host retirement: %v", err)
+	}
+
+	res := verify(t, victim)
+	if len(res.RetiredKeyUse) > 0 {
+		t.Fatalf("a record signed by node-attacker retired node-victim's key: %v\n"+
+			"a signature proves who is speaking, not what they may speak about — the key "+
+			"has to belong to the host the record names", res.RetiredKeyUse)
+	}
+	if res.Tampered() {
+		t.Fatalf("a cross-host forgery made the victim's log read as tampered: %+v", res)
+	}
+}
+
+// TestRetirement_ASquatterCannotBlockTheRealRecord.
+//
+// The lifecycle table is append-only and written with INSERT OR IGNORE, so with
+// (host, key, event) as the primary key the FIRST writer owned the slot — and
+// anyone can write the table. An unverifiable row placed there was ignored by the
+// reader AND blocked the host from ever recording its real adoption, so every
+// pre-enforcement row that host had written became evidence, permanently.
+//
+// by_key_id is part of the key now, so a row signed by someone else lands
+// somewhere else.
+func TestRetirement_ASquatterCannotBlockTheRealRecord(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	dir := testPKI(t, "node-0")
+	kr, err := LoadAuditKeyring(dir, "node-0")
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+
+	// Pre-enforcement history, then a squatter claims the adoption slot before the
+	// host ever gets to record its own.
+	c.SetAuditKeyring(nil)
+	for _, id := range []string{"r1", "r2"} {
+		ins(t, c, id, "node-0", "2026-07-29T10:00:0"+id[1:]+"Z")
+	}
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES ('node-0', ?, 'adopted', 0, 'squatter', 'garbage', ?, ?, NULL)`,
+		kr.KeyID(), "2026-07-29T10:00:00Z", "2999-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("squat the adoption slot: %v", err)
+	}
+
+	// The host now starts signing for real.
+	c.SetAuditKeyring(kr)
+	if _, err := AdoptAuditKey(ctx, c, kr, "node-0"); err != nil {
+		t.Fatalf("AdoptAuditKey: %v", err)
+	}
+	ins(t, c, "r3", "node-0", "2026-07-29T10:00:03Z")
+
+	if n := countRows(t, c,
+		`SELECT key_id FROM audit_key_lifecycle WHERE event = 'adopted' AND by_key_id = '`+kr.KeyID()+`'`); n != 1 {
+		t.Fatalf("the host could not record its own adoption; a squatter owned the slot (%d rows)", n)
+	}
+	res := verify(t, c)
+	if len(res.UnsignedAfterSigned) > 0 {
+		t.Fatalf("pre-enforcement rows were claimed by a squatted contract start: %v\n"+
+			"first-write-wins on a table anyone can write is not a defence, it is a lever",
+			res.UnsignedAfterSigned)
+	}
+	if res.Tampered() {
+		t.Fatalf("a squatted lifecycle row made the log read as tampered: %+v", res)
+	}
+}
+
+// peerKeyring mints a second host's signing identity under the SAME cluster CA
+// and publishes it, the way a real peer appears in the table.
+func peerKeyring(t *testing.T, caDir, hostName string, c *Client) *AuditKeyring {
+	t.Helper()
+	dir := t.TempDir()
+	for _, f := range []string{"ca.crt", "ca.key"} {
+		b, err := os.ReadFile(filepath.Join(caDir, f))
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, f), b, 0o600); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+	if err := pki.GenerateHostCert(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"),
+		hostName, net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("GenerateHostCert(%s): %v", hostName, err)
+	}
+	kr, err := LoadAuditKeyring(dir, hostName)
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring(%s): %v", hostName, err)
+	}
+	if err := kr.PublishSigningKey(context.Background(), c); err != nil {
+		t.Fatalf("PublishSigningKey(%s): %v", hostName, err)
+	}
+	return kr
+}
+
+// TestContract_AFabricatedCertificateCannotEnrolAHost is what KeyBelongsToHost
+// actually guards.
+//
+// The contract pre-pass used to read audit_signing_keys directly — host_name and
+// key_id straight off the row, no CA validation — even though the table is
+// replicated and the whole threat model says anyone can write it. One fabricated
+// row naming a victim host put that host under a signing contract it never
+// entered, and every unsigned row it had ever written became evidence on every
+// node.
+//
+// audit_signing_keys is deliberately outside auditEvidenceGuards precisely
+// because certFor re-validates on every use. This is the reader that was
+// bypassing it.
+func TestContract_AFabricatedCertificateCannotEnrolAHost(t *testing.T) {
+	ctx := context.Background()
+	c, _, _ := signedClient(t, "node-0")
+
+	// A victim host with ordinary pre-enforcement history and no contract.
+	c2 := c
+	for _, id := range []string{"v1", "v2"} {
+		if err := c2.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			                        result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, 'u', 'node-victim', 'vm.start', 'x', '', 'ok', '', ?, '', '', ?)`,
+			id, "2026-07-29T09:00:0"+id[1:]+"Z", "hash-"+id, id[1:]); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	// The forgery: a certificate row naming the victim, with a PEM that is not a
+	// certificate at all.
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)
+		 VALUES ('fabricated-key', 'node-victim', 'not a certificate', ?, ?, NULL)`,
+		"2026-07-29T10:00:00Z", "2026-07-29T10:00:00Z"); err != nil {
+		t.Fatalf("insert the fabricated certificate: %v", err)
+	}
+
+	if res := verify(t, c); len(res.UnsignedAfterSigned) > 0 {
+		t.Fatalf("a fabricated certificate row enrolled node-victim into a contract: %v\n"+
+			"the row's own host_name column is not evidence of anything; ownership has to be "+
+			"proved through the cluster CA", res.UnsignedAfterSigned)
+	}
+}
+
+// TestAuditHeads_ANodeWithNoKeyringAccusesNobody.
+//
+// A node whose LoadAuditVerifier failed — missing or unreadable ca.crt — has
+// verified nothing about any head: not its signature, not its timestamp. Treating
+// that as "settled" made it report every peer as truncated during ordinary
+// replication lag, while every node that COULD verify called the same log clean.
+//
+// Two nodes disagreeing about identical replicated rows is the one outcome this
+// design cannot tolerate: cross-node agreement is the entire reason to believe
+// any node's verdict. A node that can check nothing must say nothing.
+func TestAuditHeads_ANodeWithNoKeyringAccusesNobody(t *testing.T) {
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	// A head attesting far beyond what this node holds, old enough that a node
+	// which COULD verify it would report a truncation.
+	old := time.Now().Add(-2 * headSettleWindow).UTC().Format(time.RFC3339)
+	insertSignedHead(t, c, kr, 0, 9, "aabb", old)
+	if res := verify(t, c); len(res.TruncatedHosts) == 0 {
+		t.Fatalf("a node WITH a keyring should report this shortfall; the test is not set up")
+	}
+
+	// The same database, read by a node that cannot verify anything.
+	c.SetAuditKeyring(nil)
+	res := verify(t, c)
+	if len(res.TruncatedHosts) > 0 {
+		t.Fatalf("a node with no keyring accused a peer of truncation: %v\n"+
+			"it verified nothing — not the signature, not the timestamp — so it has no "+
+			"basis to disagree with every node that can", res.TruncatedHosts)
+	}
+	if res.Tampered() {
+		t.Fatalf("a node that can verify nothing reported tampering: %+v", res)
+	}
+}
+
+// TestSchema_TheLifecyclePKAdmitsTwoSigners.
+//
+// The primary key is (host_name, key_id, event, by_key_id), and by_key_id is in it
+// on purpose. Without it the table was first-write-wins on data any peer can
+// write: an unverifiable row placed in the slot was ignored by every reader AND
+// blocked the host from ever recording the genuine record, so a host's entire
+// pre-enforcement history became evidence, permanently.
+//
+// Two VERIFIED records for one (host, key, event) are also the legitimate case — a
+// rotation and an operator retire-audit-key retire the same key with different
+// signers — so the reader keeps the strictest rather than the first.
+func TestSchema_TheLifecyclePKAdmitsTwoSigners(t *testing.T) {
+	ctx := context.Background()
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	if err := c.execLocal(ctx,
+		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
+		 VALUES ('node-0','k1','adopted',7,'k1','realsig','2026-07-29T10:00:00Z','2026-07-29T10:00:00Z')`); err != nil {
+		t.Fatalf("seed a genuine record: %v", err)
+	}
+	if err := c.execLocal(ctx,
+		`INSERT INTO audit_key_lifecycle (host_name,key_id,event,at_seq,by_key_id,signature,created_at,updated_at)
+		 VALUES ('node-0','k1','adopted',0,'squatter','garbage','2026-07-29T11:00:00Z','2026-07-29T11:00:00Z')`); err != nil {
+		t.Fatalf("a second signer collides with the genuine record: %v\n"+
+			"a narrow key is what let an unverifiable row block a real one permanently", err)
+	}
+	if n := countRows(t, c, `SELECT key_id FROM audit_key_lifecycle WHERE event = 'adopted'`); n != 2 {
+		t.Fatalf("want both records present, got %d", n)
+	}
+}
+
+// ─────────────────── a host that cannot sign at all ───────────────────
+
+// publishCertOnlyAged puts a host in the state setupAuditSigning reaches when
+// LoadAuditKeyring fails: certificate published, no adoption record, no key. The
+// certificate is backdated past the settle window, because the thing under test is
+// a host that never adopts — not one that has not adopted yet.
+func publishCertOnlyAged(t *testing.T, c *Client, dir, host string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := c.Execute(ctx, `DELETE FROM audit_key_lifecycle`); err != nil {
+		t.Fatalf("clear lifecycle: %v", err)
+	}
+	if err := c.Execute(ctx, `DELETE FROM audit_signing_keys`); err != nil {
+		t.Fatalf("clear certs: %v", err)
+	}
+	c.SetAuditKeyring(nil)
+	if _, err := PublishSigningCertOnly(ctx, c, dir, host); err != nil {
+		t.Fatalf("PublishSigningCertOnly: %v", err)
+	}
+	old := time.Now().Add(-2 * adoptionSettleWindow).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ? WHERE host_name = ?`, old, host); err != nil {
+		t.Fatalf("age the certificate: %v", err)
+	}
+}
+
+// TestNeverAdopted_AHostThatCannotSignIsReported.
+//
+// The false NEGATIVE a whole-branch read found, and the only one this session:
+// every other finding was a legitimate action wrongly reported as tampering.
+//
+// setupAuditSigning publishes a host's certificate even when the private key
+// cannot be read, on the stated grounds that publishing nothing is the worst
+// outcome — the host would "look like one that was never meant to sign, so its
+// entire audit log reads as ordinary pre-enforcement history", and "the key is
+// unreadable is precisely the state an attacker arranges, so it must not be the
+// state that goes unnoticed".
+//
+// Requiring an adoption record for a contract made that comment false: a host that
+// cannot read its key cannot SIGN an adoption either, so the cert-only path put it
+// under no contract and its unsigned rows were reported clean on every node.
+func TestNeverAdopted_AHostThatCannotSignIsReported(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	for _, id := range []string{"u1", "u2", "u3"} {
+		ins(t, c, id, "node-0", "2026-07-29T11:00:0"+id[1:]+"Z")
+	}
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) == 0 {
+		t.Fatalf("a host with a published certificate and no adoption wrote %d unsigned rows "+
+			"and nothing was reported: %+v\nmaking the key unreadable would switch tamper-"+
+			"evidence off silently, which is the one outcome the cert-only publish exists to "+
+			"prevent", res.Unsigned, res)
+	}
+	// NOT Tampered — see AuditVerifyResult.Tampered. The certificate row this reads
+	// is unauthenticated, so calling it evidence of interference handed any peer a
+	// permanent false accusation. It must still FAIL the command, which is what
+	// Unverified is for: a key nobody can read is not a clean result.
+	if res.Tampered() {
+		t.Errorf("a finding derived from an unauthenticated row is reported as tampering")
+	}
+	if !res.Unverified() {
+		t.Errorf("NeverAdopted is in neither verdict, so `lv audit verify` exits 0 for a host "+
+			"that declares signed rows and cannot sign: %+v", res)
+	}
+}
+
+// TestNeverAdopted_AStartingDaemonIsNotReported.
+//
+// The daemon publishes its certificate immediately and defers adoption by
+// auditLifecycleSettle, so between the two every host in the cluster is briefly in
+// exactly the shape above. Reporting it would put a tamper verdict on every node
+// for the first minute after any restart — the kind of false alarm that gets the
+// whole feature switched off.
+func TestNeverAdopted_AStartingDaemonIsNotReported(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	// Same state, except the certificate was published just now.
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ? WHERE host_name = 'node-0'`,
+		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("restamp: %v", err)
+	}
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) > 0 {
+		t.Fatalf("a certificate published seconds ago was reported as never adopted: %v\n"+
+			"the daemon defers adoption on purpose, so this fires on every host on every "+
+			"restart", res.NeverAdopted)
+	}
+}
+
+// TestNeverAdopted_ARetiredKeyIsNotReported.
+//
+// `lv host retire-audit-key` mints a certificate, publishes it, and retires it in
+// the same breath — so it has a retirement and deliberately no adoption. A rule
+// keyed on "no adoption" alone would report every retirement the command performs
+// as evidence of a host that cannot sign.
+func TestNeverAdopted_ARetiredKeyIsNotReported(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	ins(t, c, "r1", "node-0", "2026-07-29T10:00:01Z")
+
+	seq, err := HostTailSeq(ctx, c, "node-0")
+	if err != nil {
+		t.Fatalf("HostTailSeq: %v", err)
+	}
+	if err := RetireAuditKey(ctx, c, kr, "node-0", kr.KeyID(), seq); err != nil {
+		t.Fatalf("RetireAuditKey: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`DELETE FROM audit_key_lifecycle WHERE event = 'adopted'`); err != nil {
+		t.Fatalf("drop the adoption: %v", err)
+	}
+	old := time.Now().Add(-2 * adoptionSettleWindow).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`UPDATE audit_signing_keys SET created_at = ?`, old); err != nil {
+		t.Fatalf("age the certificate: %v", err)
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if len(res.NeverAdopted) > 0 {
+		t.Fatalf("a retired certificate was reported as never adopted: %v\n"+
+			"retire-audit-key publishes a certificate that self-retires and never adopts, so "+
+			"this would fire on every deliberate retirement", res.NeverAdopted)
+	}
+}
+
+// TestNeverAdopted_TheCertificateStampIsAWallTime.
+//
+// The age of a certificate is the only thing separating "this host is still
+// starting up" from "this host cannot sign". publishCert stamped created_at with
+// NowTS, which becomes an HLC string once hlc_lww latches — and an HLC value read
+// as wall time parses as nothing, so on a latched cluster no certificate could ever
+// be aged and the finding could never fire. The chain heads had this exact bug.
+//
+// SetHLCEmit is what makes this real: without it NowTS still returns RFC3339, the
+// wrong stamp parses fine, and the test passes with the fix removed.
+func TestNeverAdopted_TheCertificateStampIsAWallTime(t *testing.T) {
+	ctx := context.Background()
+	c, kr, _ := signedClient(t, "node-0")
+	c.SetHLCEmit(func() bool { return true })
+
+	if err := c.Execute(ctx, `DELETE FROM audit_signing_keys`); err != nil {
+		t.Fatalf("clear certs: %v", err)
+	}
+	if err := kr.PublishSigningKey(ctx, c); err != nil {
+		t.Fatalf("PublishSigningKey: %v", err)
+	}
+
+	stamped := oneCol(t, c, `SELECT created_at FROM audit_signing_keys WHERE host_name = 'node-0'`)
+	if _, err := time.Parse(time.RFC3339Nano, stamped); err != nil {
+		t.Fatalf("created_at was stamped as %q, which cannot be parsed as a wall time: %v\n"+
+			"a certificate that cannot be aged can never be reported as never-adopted, so a "+
+			"host whose key is unreadable stays silent on every node", stamped, err)
+	}
+}
+
+// TestNeverAdopted_APlantedCertificateIsNotTamperEvidence.
+//
+// The one HIGH finding of the security review that survived triage, reproduced
+// before it was fixed. `NeverAdopted` used to feed Tampered(), and it is derived
+// from a certificate row plus the ABSENCE of an adoption — where the certificate
+// row is unauthenticated replicated data. So any peer could take a certificate it
+// merely OBSERVED (every host presents its own in every TLS handshake), insert it
+// naming that host, and pin a permanent `TAMPERED` verdict on a host that had
+// done nothing. Tombstoning the row did not clear it either.
+//
+// It is still reported and still fails the command — a host that declares signed
+// rows and cannot sign is never called clean — but it no longer claims that
+// somebody interfered, because nothing here can know that.
+func TestNeverAdopted_APlantedCertificateIsNotTamperEvidence(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+
+	// A genuine CA-issued certificate for a host that never enabled signing.
+	// Public by construction: this is what the victim presents in a handshake.
+	victimDir := t.TempDir()
+	if err := pki.GenerateHostCert(
+		filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key"),
+		filepath.Join(victimDir, "host.crt"), filepath.Join(victimDir, "host.key"),
+		"victim", net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("mint the victim's certificate: %v", err)
+	}
+	certPEM, err := os.ReadFile(filepath.Join(victimDir, "host.crt"))
+	if err != nil {
+		t.Fatalf("read the victim's certificate: %v", err)
+	}
+	parsed, err := parseCertPEM(certPEM)
+	if err != nil {
+		t.Fatalf("parse the victim's certificate: %v", err)
+	}
+	keyID, err := AuditKeyID(parsed)
+	if err != nil {
+		t.Fatalf("derive the key id: %v", err)
+	}
+
+	// What a hostile peer writes. Nothing here is signed by the victim, and the
+	// attacker never holds its private key.
+	aged := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := c.Execute(ctx,
+		`INSERT INTO audit_signing_keys (key_id, host_name, cert_pem, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, NULL)`,
+		keyID, "victim", string(certPEM), aged, c.NowTS()); err != nil {
+		t.Fatalf("plant the certificate row: %v", err)
+	}
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	res := verify(t, c)
+
+	if res.Tampered() {
+		t.Fatalf("a peer holding only a PUBLIC certificate marked victim as TAMPERED: %+v\n"+
+			"an accusation anyone can manufacture, and that no operator can clear, is worse "+
+			"than no accusation — it is what teaches people to stop reading this command", res)
+	}
+	if len(res.NeverAdopted) == 0 {
+		t.Fatalf("the planted certificate was not reported at all: %+v\n"+
+			"it must stay visible — a genuine unreadable key produces the same shape", res)
+	}
+	if !res.Unverified() {
+		t.Errorf("`lv audit verify` exits 0 on a host declaring signed rows it cannot sign")
+	}
+}
+
+// TestNeverAdopted_ACASignedRetirementClearsIt.
+//
+// The remedy has to be an authenticated one. Making the certificate row simply
+// deletable would let the same attacker who planted it ALSO suppress a genuine
+// finding, so the way out is the way in: a retirement signed by the cluster CA,
+// which only the CA holder can produce.
+func TestNeverAdopted_ACASignedRetirementClearsIt(t *testing.T) {
+	ctx := context.Background()
+	c, _, dir := signedClient(t, "node-0")
+	publishCertOnlyAged(t, c, dir, "node-0")
+
+	kr, err := LoadAuditVerifier(dir)
+	if err != nil {
+		t.Fatalf("LoadAuditVerifier: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	before := verify(t, c)
+	if len(before.NeverAdopted) == 0 {
+		t.Fatalf("nothing to clear — the finding did not fire: %+v", before)
+	}
+
+	rows, err := c.Query(ctx, `SELECT key_id FROM audit_signing_keys WHERE host_name = ?`, "node-0")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("read the published key id: %v (rows=%d)", err, len(rows))
+	}
+	keyID := rows[0].String("key_id")
+
+	sig, err := SignLifecycleWithCA(dir, "node-0", keyID, auditLifecycleRetired, 0)
+	if err != nil {
+		t.Fatalf("SignLifecycleWithCA: %v", err)
+	}
+	if err := c.Execute(ctx,
+		`INSERT OR IGNORE INTO audit_key_lifecycle
+		   (host_name, key_id, event, at_seq, by_key_id, signature, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		"node-0", keyID, auditLifecycleRetired, int64(0), auditCASigner, sig,
+		c.NowWall(), c.NowTS()); err != nil {
+		t.Fatalf("record the CA retirement: %v", err)
+	}
+
+	after := verify(t, c)
+	if len(after.NeverAdopted) > 0 {
+		t.Fatalf("a CA-signed retirement did not clear the finding: %+v\n"+
+			"with no authenticated way out, an operator is stuck with it forever", after)
+	}
+	if after.Unverified() {
+		t.Errorf("still reported as unverified after the key was retired: %+v", after)
+	}
+}

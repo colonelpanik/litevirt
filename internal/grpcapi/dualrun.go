@@ -13,10 +13,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/lb"
-	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -29,6 +27,7 @@ const (
 	kindOwnerMismatch   = "ha.owner.mismatch"   // the DB owner is not the sole runtime holder
 	kindLWWUnresolved   = "ha.lww.unresolved"   // a node is tracking unresolved LWW ties
 	kindDualRunCoverage = "ha.dualrun.coverage" // a workload-capable host could not be probed
+	kindEpochMismatch   = "ha.owner.epoch_mismatch" // the owner's runtime marker disagrees with its DB epoch
 )
 
 // dualRunLeaseKey elects the single node that runs the detector, so a fleet-wide
@@ -39,7 +38,7 @@ const dualRunLeaseKey = "dual_run_detector"
 // pages: a real dual-run holds for >=1 interval; a migration/cutover clears within one.
 const dualRunDebounce = 2
 
-// dualRunPeerTimeout bounds each peer ReportRuntime call so one hung/segmented peer can't
+// dualRunPeerTimeout bounds each peer GetRuntimeInventory call so one hung/segmented peer can't
 // stall a whole pass (which, if it exceeded the lease TTL, would let a second node also
 // take leadership). Mirrors the 5s bound other periodic peer probes use.
 const dualRunPeerTimeout = 5 * time.Second
@@ -69,13 +68,18 @@ var migrationStates = map[string]bool{
 
 // runtimeSnapshot is one host's local ground-truth runtime view: which VMs are active
 // disk-holders, which containers are running, which VIPs are assigned on its kernel, and
-// how many unresolved LWW ties it is tracking. Built locally for self, or fetched from a
-// peer via ReportRuntime.
+// how many unresolved LWW ties it is tracking. Derived from the unified runtime
+// inventory (see runtime_inventory.go) — locally for self, via GetRuntimeInventory
+// for a peer.
 type runtimeSnapshot struct {
 	diskHolderVMs  []string
 	runningCTs     []string
 	kernelVIPs     []string // bare IPs (prefix stripped) so cross-host grouping is consistent
 	unresolvedTies int
+	// Owner-epoch markers for RUNNING workloads (nil in fixtures that predate
+	// them — the epoch check simply cannot evaluate those hosts).
+	vmMarkers map[string]markerInfo
+	ctMarkers map[string]markerInfo
 	// partial is true when ANY local probe errored (libvirt list/state, container
 	// list/state, LB-config read, or the `ip` dump). Positive holders are still real, but
 	// ABSENCE is unreliable: the leader must not treat a partial snapshot as absence proof
@@ -83,133 +87,22 @@ type runtimeSnapshot struct {
 	partial bool
 }
 
-// ReportRuntime returns THIS host's local runtime ground truth for the leader-gated
-// dual-run detector. Peer-only (host-cert mTLS); never consults the cluster DB — the
-// leader cross-references the DB itself.
-func (s *Server) ReportRuntime(ctx context.Context, _ *pb.ReportRuntimeRequest) (*pb.ReportRuntimeResponse, error) {
-	if err := s.requirePeerCert(ctx); err != nil {
-		return nil, err
-	}
-	snap := s.localRuntimeSnapshot(ctx)
-	return &pb.ReportRuntimeResponse{
-		DiskHolderVms:      snap.diskHolderVMs,
-		RunningContainers:  snap.runningCTs,
-		KernelAssignedVips: snap.kernelVIPs,
-		UnresolvedTieCount: int32(snap.unresolvedTies),
-		Partial:            snap.partial,
-	}, nil
-}
-
-// localRuntimeSnapshot builds this host's runtime snapshot from libvirt + LXC + the
-// kernel VIP state. It never consults the DB except to enumerate the CONFIGURED LBs
-// whose VIPs to kernel-check.
-//
-// Any probe error sets snap.partial rather than being swallowed into a false-empty
-// result: a reachable host with broken libvirt/`ip` must NOT read as "positively probed
-// and absent" (which would both mask a dual-run and forge owner-mismatch evidence). The
-// positive holders gathered before an error are still valid; only ABSENCE becomes
-// unreliable. A per-item state error marks partial but does not blind the whole host, so
-// one wedged domain can't hide the rest.
-func (s *Server) localRuntimeSnapshot(ctx context.Context) runtimeSnapshot {
-	var snap runtimeSnapshot
-
-	// VMs that are ACTIVE DISK-HOLDERS. DomainState=="running" is precisely RUNNING|BLOCKED
-	// (coarseDomainState collapses both to "running"); a PAUSED incoming-migration target
-	// reads as not-running and is correctly excluded — two hosts must never both be
-	// writing the same disk.
-	if s.virt != nil {
-		names, err := s.virt.ListDomains()
-		if err != nil {
-			snap.partial = true // can't enumerate → this host's VM absence is unreliable
-		}
-		for _, n := range names {
-			st, err := s.virt.DomainState(n)
-			if err != nil {
-				snap.partial = true // one domain's state is unknown → don't assert it's absent
-				continue
-			}
-			if st == "running" {
-				snap.diskHolderVMs = append(snap.diskHolderVMs, n)
-			}
-		}
-	}
-
-	// Running containers — only on an LXC-capable host (see lxcCapable). A non-LXC host has
-	// no local containers to miss, so it is neither probed nor marked partial. On a capable
-	// host a probe error IS a real gap → partial.
-	if s.containerRuntime != nil && lxcCapable() {
-		names, err := s.containerRuntime.ListContainers(ctx)
-		if err != nil {
-			snap.partial = true
-		}
-		for _, n := range names {
-			st, err := s.containerRuntime.StateContainer(ctx, n)
-			if err != nil {
-				snap.partial = true
-				continue
-			}
-			if st == "running" {
-				snap.runningCTs = append(snap.runningCTs, n)
-			}
-		}
-	}
-
-	// VIP addresses assigned on THIS host's KERNEL. The kernel check is authoritative — a
-	// VRRP backup renders the config but holds no address, so a participant-claims signal
-	// would falsely count it. Collect every enabled LB's VIP and check them against a
-	// SINGLE `ip addr` dump; a config-less orphan keepalived on a deleted LB's VIP is out
-	// of scope here (the Phase-2 orphan sweep covers that).
-	cfgs, err := corrosion.ListLBConfigs(ctx, s.db)
-	if err != nil {
-		snap.partial = true // can't read the LB set → VIP absence is unreliable
-	} else {
-		var vips []string
-		for _, cfg := range cfgs {
-			if cfg.Enabled && cfg.VIP != "" {
-				vips = append(vips, cfg.VIP)
-			}
-		}
-		if assigned, err := lb.NewManager().AssignedVIPs(vips); err != nil {
-			snap.partial = true // `ip` failed → kernel VIP state unknown on this host
-		} else {
-			for v := range assigned {
-				snap.kernelVIPs = append(snap.kernelVIPs, v)
-			}
-		}
-	}
-
-	if s.db != nil {
-		snap.unresolvedTies = s.db.UnresolvedTieCount()
-	}
-	return snap
-}
-
-// reportPeerRuntime dials a peer for its local runtime snapshot.
+// reportPeerRuntime fetches a peer's full runtime inventory and derives the
+// detector's grouping snapshot from it.
 func (s *Server) reportPeerRuntime(ctx context.Context, host string) (runtimeSnapshot, error) {
-	client, conn, err := s.peerClient(ctx, host)
+	inv, err := s.getPeerRuntimeInventory(ctx, host, "", "")
 	if err != nil {
 		return runtimeSnapshot{}, err
 	}
-	defer conn.Close()
-	resp, err := client.ReportRuntime(ctx, &pb.ReportRuntimeRequest{})
-	if err != nil {
-		return runtimeSnapshot{}, err
-	}
-	return runtimeSnapshot{
-		diskHolderVMs:  resp.GetDiskHolderVms(),
-		runningCTs:     resp.GetRunningContainers(),
-		kernelVIPs:     resp.GetKernelAssignedVips(),
-		unresolvedTies: int(resp.GetUnresolvedTieCount()),
-		partial:        resp.GetPartial(),
-	}, nil
+	return snapshotFromInventory(inv), nil
 }
 
 // gatherRuntime collects a runtime snapshot from every host in the probe set: self is
-// built locally, peers are probed via ReportRuntime IN PARALLEL, each under a bounded
+// built locally, peers are probed via GetRuntimeInventory IN PARALLEL, each under a bounded
 // timeout so one hung/segmented peer can't stall the pass. It returns the snapshot per
 // successfully-gathered host, the hosts that could not be REACHED (a coverage gap — a
 // probe_failed gauge + a debounced coverage page), and the hosts on an OLDER binary that
-// does not implement ReportRuntime (surfaced in the gauge but NOT paged as a coverage gap
+// does not implement GetRuntimeInventory (surfaced in the gauge but NOT paged as a coverage gap
 // — that is expected version skew during a rolling upgrade, not a segmentation).
 func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string) {
 	if s.gatherRuntimeOverride != nil {
@@ -225,7 +118,7 @@ func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[s
 	var wg sync.WaitGroup
 	for i, h := range hosts {
 		if h == s.hostName {
-			results[i] = result{host: h, snap: s.localRuntimeSnapshot(ctx)}
+			results[i] = result{host: h, snap: snapshotFromInventory(s.collectRuntimeInventory(ctx))}
 			continue
 		}
 		wg.Add(1)
@@ -245,7 +138,7 @@ func (s *Server) gatherRuntime(ctx context.Context, hosts []string) (snaps map[s
 		case r.err == nil:
 			snaps[r.host] = r.snap
 		case r.unsupported:
-			// An older peer without the ReportRuntime handler — expected mid-upgrade.
+			// An older peer without the GetRuntimeInventory handler — expected mid-upgrade.
 			unsupported = append(unsupported, r.host)
 		default:
 			// docker->kvm gRPC is permanently segmented on some clusters, so whenever the
@@ -264,51 +157,34 @@ type finding struct {
 	target string
 }
 
-// dualRunState is the detector's per-leader debounce state, held across passes.
-type dualRunState struct {
-	seen      map[finding]int  // consecutive passes each current finding has been present
-	confirmed map[finding]bool // findings currently past the debounce threshold (paged)
-}
-
-func newDualRunState() *dualRunState {
-	return &dualRunState{seen: map[finding]int{}, confirmed: map[finding]bool{}}
-}
-
 // stepDownDualRun is called when this node is NOT the dual-run leader: it clears this
-// node's process gauges (so a former leader leaves no stale series) and returns fresh
-// debounce state (so a future leadership acquisition starts clean). Both gauges are
-// cleared UNCONDITIONALLY — the probe_failed gauge can be set by unsupported-only
-// (older-binary) peers that populate neither seen nor confirmed, so gating the clear on
-// those maps would strand a stale probe_failed series after a handoff. Reset on an
-// already-empty vector is a no-op.
-func (s *Server) stepDownDualRun() *dualRunState {
+// node's process gauges so a former leader leaves no stale series. The condition
+// LIFECYCLE needs nothing here — it lives in health_conditions rows, so the new
+// leader's first pass continues the counts exactly where this one left them.
+func (s *Server) stepDownDualRun() {
 	s.dualRunMetrics.SetDetected(nil)
 	s.dualRunMetrics.SetProbeFailed(nil)
-	return newDualRunState()
 }
 
 // RunDualRunDetector runs the leader-gated dual-run detector on a fixed interval. Only
 // the node holding the dual_run_detector lease does work; the rest hold no state and
 // keep their local gauges clear, so the fleet pages once (from the leader).
 //
-// Debounce state is per-leader and in-memory (not replicated), so a leadership handover
-// re-arms the debounce on the new leader: a still-active finding is re-paged once after
-// the new leader's own two-pass debounce, and the old leader emits no `.cleared` for it
-// (emitting a clear would falsely imply the condition resolved). This is an accepted
-// trade for an alert-only detector — the alternative (replicated debounce state) is not
-// worth the complexity. The per-peer timeout keeps a pass well under the lease TTL, so
-// leadership only moves on a genuine failover, not on a slow pass.
+// Lifecycle state is DURABLE (health_conditions rows), so a leadership handover
+// preserves observation counts and confirmed state: the new leader's first pass picks
+// up exactly where the old one stopped — no re-arm, no false `.cleared`, no re-page.
+// The per-peer timeout keeps a pass well under the lease TTL, so leadership only moves
+// on a genuine failover, not on a slow pass.
 func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	st := newDualRunState()
 	eval := func() {
 		if !s.acquireDualRunLease(ctx, interval) {
-			st = s.stepDownDualRun()
+			s.stepDownDualRun()
 			return
 		}
-		s.detectDualRunPass(ctx, st)
+		s.detectDualRunPass(ctx)
 	}
 	eval()
 	t := time.NewTicker(interval)
@@ -352,7 +228,7 @@ func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration
 // detectDualRunPass runs one detector pass: gather runtime across workload-capable hosts,
 // cross-reference against the DB, debounce, and emit metrics + set-transition
 // notifications. It NEVER destroys or reconciles anything — alert-only.
-func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
+func (s *Server) detectDualRunPass(ctx context.Context) {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
 		slog.Warn("dual-run detector: list hosts", "error", err)
@@ -393,14 +269,18 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
+	// DB view for container-holder legitimacy (names are not cluster-unique).
+	ctBacked, ctIndexOK := s.dbCTIndex(ctx)
 
 	current := map[finding]bool{}
 	details := map[finding]string{}
-	add := func(kind, target, detail string) {
+	evidenceHosts := map[finding][]string{}
+	add := func(kind, target, detail string, hosts ...string) {
 		f := finding{kind: kind, target: target}
 		current[f] = true
 		details[f] = detail
+		evidenceHosts[f] = hosts
 	}
 
 	// 1. Same VM an ACTIVE DISK-HOLDER on >1 host. This does NOT exempt DB "migrating"
@@ -413,25 +293,51 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		if len(hs) > 1 {
 			add(kindDualRunVM, vm, fmt.Sprintf(
 				"VM %q is an active disk-holder on %d hosts (%s) — possible split-brain; the disk can corrupt if both write.",
-				vm, len(hs), strings.Join(hs, ", ")))
+				vm, len(hs), strings.Join(hs, ", ")), hs...)
 		}
 	}
 	// 2. Same container running on >1 host. Same reasoning as VMs: a cold CT migration
 	//    stops the source before starting the target (never two running at once beyond a
 	//    debounce window), so a sustained two-holder state is a real dual-run, not a migration.
+	//    BUT: container names are NOT cluster-unique — the schema keys rows by
+	//    (host_name, name), and two unrelated containers named "web" on two hosts
+	//    are a legitimate steady state. Multiple runtime holders alone therefore
+	//    prove nothing, and paging them critical would freeze admission on BOTH
+	//    hosts (ct_dual_run is admission-gating, with no operator force-clear).
+	//    A holder is LEGITIMATE when its own host's DB row backs it — present and
+	//    not marked as relocating away. The dual-run signal is a same-named copy
+	//    running where NO row claims it while the name also runs elsewhere:
+	//    exactly the split a crashed relocation, a failover of a
+	//    still-live-but-fenced host, or a re-key leaves behind.
 	for ct, hs := range ctHolders {
-		if len(hs) > 1 {
-			add(kindDualRunCT, ct, fmt.Sprintf(
-				"container %q is running on %d hosts (%s) — possible split-brain.",
-				ct, len(hs), strings.Join(hs, ", ")))
+		if len(hs) <= 1 {
+			continue
 		}
+		// With an unreadable container index, legitimacy cannot be judged —
+		// raise nothing new from this heuristic (coverage is gated below, so
+		// nothing resolves either).
+		if !ctIndexOK {
+			continue
+		}
+		var unbacked []string
+		for _, h := range hs {
+			if !ctBacked[ctHostName{host: h, name: ct}] {
+				unbacked = append(unbacked, h)
+			}
+		}
+		if len(unbacked) == 0 {
+			continue // distinct DB-backed containers sharing a name
+		}
+		add(kindDualRunCT, ct, fmt.Sprintf(
+			"container %q is running on %d hosts (%s) but no DB row backs it on %s — possible split-brain.",
+			ct, len(hs), strings.Join(hs, ", "), strings.Join(unbacked, ", ")), hs...)
 	}
 	// 3. Same VIP kernel-assigned on >1 host.
 	for vip, hs := range vipHolders {
 		if len(hs) > 1 {
 			add(kindDualRunVIP, vip, fmt.Sprintf(
 				"VIP %s is kernel-assigned on %d hosts (%s) — dual VIP holder; traffic will split.",
-				vip, len(hs), strings.Join(hs, ", ")))
+				vip, len(hs), strings.Join(hs, ", ")), hs...)
 		}
 	}
 	// 4. DB owner != the sole runtime holder (VM-only), COVERAGE-GATED: flag ONLY when the
@@ -453,107 +359,123 @@ func (s *Server) detectDualRunPass(ctx context.Context, st *dualRunState) {
 		}
 		add(kindOwnerMismatch, vm, fmt.Sprintf(
 			"VM %q DB owner is %q but the sole runtime holder is %q — ownership drift; the DB and runtime disagree.",
-			vm, owner, hs[0]))
+			vm, owner, hs[0]), owner, hs[0])
 	}
 	// 5. Any host tracking unresolved LWW ties.
 	for h, n := range tieHosts {
 		add(kindLWWUnresolved, h, fmt.Sprintf(
-			"host %q reports %d unresolved LWW tie(s) — an equal-timestamp merge conflict was not resolved.", h, n))
+			"host %q reports %d unresolved LWW tie(s) — an equal-timestamp merge conflict was not resolved.", h, n), h)
 	}
 	// 6. Coverage: a host whose runtime the leader could not fully establish this pass —
 	//    either UNREACHABLE (no data) or PARTIAL (a local probe errored, so its absence is
 	//    unreliable). Both are real coverage gaps and page (debounced). An older binary
-	//    without the ReportRuntime handler is NOT paged — that is expected version skew
+	//    without the GetRuntimeInventory handler is NOT paged — that is expected version skew
 	//    during a rolling upgrade; it still shows in the probe_failed gauge below.
 	for _, h := range unreachable {
 		add(kindDualRunCoverage, h, fmt.Sprintf(
-			"host %q could not be probed this pass — dual-run coverage gap; a segmented or down host cannot be checked for split-brain.", h))
+			"host %q could not be probed this pass — dual-run coverage gap; a segmented or down host cannot be checked for split-brain.", h), h)
 	}
 	for _, h := range partialHosts {
 		add(kindDualRunCoverage, h, fmt.Sprintf(
-			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h))
+			"host %q returned a PARTIAL runtime (a local libvirt/container/ip probe errored) — its workload absence is unreliable, so split-brain cannot be ruled out there.", h), h)
+	}
+
+	// 7. OWNER-EPOCH MISMATCH, active only once owner_epoch_v1 is latched (before
+	//    that, markers legitimately do not exist). Judged on the DB OWNER's runtime
+	//    only — a non-owner running the workload is already conditions 1/2/4. A
+	//    marker that is missing, corrupt, unreadable, or unequal to the DB epoch is
+	//    a violation of the regime: this host's runtime cannot prove it belongs to
+	//    the generation the cluster believes is running there.
+	if s.gate != nil && s.gate.Enforced(ctx, capabilities.OwnerEpochV1) {
+		for vm, owner := range vmOwner {
+			if migrationStates[vmState[vm]] {
+				continue
+			}
+			snap, probed := snaps[owner]
+			if !probed || snap.vmMarkers == nil {
+				continue // owner unprobed (coverage covers it) or a fixture without markers
+			}
+			mi, running := snap.vmMarkers[vm]
+			if !running {
+				continue // not running on its owner — conditions 1/4 territory
+			}
+			if mi.status == MarkerValid && mi.epoch == vmEpoch[vm] {
+				continue
+			}
+			add(kindEpochMismatch, vm, fmt.Sprintf(
+				"VM %q on its DB owner %q carries an owner-epoch marker that is %s (marker %d, DB epoch %d) — "+
+					"the runtime cannot prove it belongs to the current ownership generation.",
+				vm, owner, mi.status, mi.epoch, vmEpoch[vm]), owner)
+		}
 	}
 
 	// The probe_failed gauge shows every host we could not fully gather from — unreachable,
 	// partial, OR on an older binary — so the gap is visible immediately even though only
 	// unreachable/partial hosts page.
 	probeFailed := append(append(append([]string(nil), unreachable...), unsupported...), partialHosts...)
-	s.applyDualRunDebounce(ctx, st, current, details, probeFailed)
+
+	// Coverage this pass: COMPLETE only when every probe target answered fully
+	// AND the DB index was readable. Unsupported (older-binary) peers block
+	// resolution too — a peer that cannot report its runtime cannot prove a
+	// workload is absent from it. And a failed DB read blinds the owner- and
+	// epoch-mismatch checks entirely (they iterate the index), so it must gate
+	// resolution exactly like an unreachable host: the pass proved nothing.
+	coverageComplete := len(unreachable) == 0 && len(partialHosts) == 0 && len(unsupported) == 0 &&
+		dbIndexOK && ctIndexOK
+	coverageDetail := ""
+	if !coverageComplete {
+		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
+			unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
+	}
+	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
 }
 
-// applyDualRunDebounce advances the debounce counters, emits set-transition
-// notifications + events for findings crossing (or leaving) the confirmed threshold, and
-// rebuilds both gauges. The probe-failed gauge reflects the CURRENT pass immediately (a
-// coverage gap must be visible at once); the detected gauge reflects only DEBOUNCED
-// findings (a real dual-run persists).
-func (s *Server) applyDualRunDebounce(ctx context.Context, st *dualRunState, current map[finding]bool, details map[finding]string, probeFailed []string) {
-	// Advance counters: present this pass -> prevCount+1; absent -> dropped (resets to 0).
-	seen := make(map[finding]int, len(current))
-	for f := range current {
-		seen[f] = st.seen[f] + 1
-	}
-	st.seen = seen
+// ctHostName keys a container by the pair the schema keys it by.
+type ctHostName struct{ host, name string }
 
-	confirmedNow := map[finding]bool{}
-	for f, n := range seen {
-		if n >= dualRunDebounce {
-			confirmedNow[f] = true
-		}
+// dbCTIndex returns the set of (host, name) pairs whose live DB container row
+// LEGITIMATELY backs a runtime copy on that host — present, and not marked as
+// relocating away (a mid-relocation source row describes the copy being MOVED,
+// so a runtime still holding it is exactly the split a crashed relocation
+// leaves, and must not be legitimized by it). ok=false means the read failed
+// and the caller must gate coverage, exactly like dbVMIndex.
+func (s *Server) dbCTIndex(ctx context.Context) (backed map[ctHostName]bool, ok bool) {
+	backed = map[ctHostName]bool{}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		slog.Warn("dual-run detector: list containers", "error", err)
+		return backed, false
 	}
-	// Set transitions (newly confirmed) — page + event.
-	for f := range confirmedNow {
-		if !st.confirmed[f] {
-			s.publish("ha.dualrun", f.kind+":"+f.target, details[f])
-			s.notify(ctx, notify.Notification{
-				Kind:     f.kind,
-				Severity: dualRunSeverity(f.kind),
-				Subject:  f.target,
-				Detail:   details[f],
-			})
-			slog.Warn("dual-run detector: finding confirmed", "kind", f.kind, "target", f.target, "detail", details[f])
-		}
-	}
-	// Clear transitions (was confirmed, no longer) — recovery event.
-	for f := range st.confirmed {
-		if !confirmedNow[f] {
-			s.publish("ha.dualrun.cleared", f.kind+":"+f.target, "")
-		}
-	}
-	st.confirmed = confirmedNow
-
-	// Rebuild gauges. detected = confirmed dual-run conditions (coverage has its own gauge).
-	// probe_failed = the current unprobed set (immediate, not debounced).
-	s.dualRunMetrics.SetDetected(detectedLabels(confirmedNow))
-	sort.Strings(probeFailed)
-	s.dualRunMetrics.SetProbeFailed(probeFailed)
-}
-
-// detectedLabels maps the confirmed findings to the litevirt_dual_run_detected gauge
-// labels, EXCLUDING coverage findings (those have their own probe_failed gauge).
-func detectedLabels(confirmed map[finding]bool) []metrics.DualRunLabel {
-	var labels []metrics.DualRunLabel
-	for f := range confirmed {
-		if f.kind == kindDualRunCoverage {
+	for _, ct := range cts {
+		if _, _, relocating := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); relocating {
 			continue
 		}
-		labels = append(labels, metrics.DualRunLabel{Kind: dualRunKindLabel(f.kind), Target: f.target})
+		backed[ctHostName{host: ct.HostName, name: ct.Name}] = true
 	}
-	return labels
+	return backed, true
 }
 
 // dbVMIndex returns per-VM DB state and owner (host_name) maps for all non-deleted VMs.
-func (s *Server) dbVMIndex(ctx context.Context) (state map[string]string, owner map[string]string) {
-	state, owner = map[string]string{}, map[string]string{}
+//
+// ok=false means the read FAILED: the maps are then empty because nothing could
+// be read, not because no VMs exist, and the caller must treat this pass's
+// coverage as PARTIAL. The owner-mismatch and epoch-mismatch checks iterate
+// these maps, so an unreadable index silently detects nothing — and two such
+// passes counted as "clean" would auto-resolve a confirmed ownership condition
+// the detector simply could not see.
+func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64, ok bool) {
+	state, owner, epoch = map[string]string{}, map[string]string{}, map[string]int64{}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
-		return
+		return state, owner, epoch, false
 	}
 	for _, vm := range vms {
 		state[vm.Name] = vm.State
 		owner[vm.Name] = vm.HostName
+		epoch[vm.Name] = vm.OwnerEpoch
 	}
-	return
+	return state, owner, epoch, true
 }
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy
@@ -582,7 +504,7 @@ func dualRunProbeTargets(hosts []corrosion.HostRecord) []string {
 // conditions page as errors; coverage gaps and unresolved ties are advisory warnings.
 func dualRunSeverity(kind string) notify.Severity {
 	switch kind {
-	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch:
+	case kindDualRunVM, kindDualRunCT, kindDualRunVIP, kindOwnerMismatch, kindEpochMismatch:
 		return notify.SevError
 	default:
 		return notify.SevWarn
@@ -602,6 +524,8 @@ func dualRunKindLabel(kind string) string {
 		return "owner_mismatch"
 	case kindLWWUnresolved:
 		return "lww_unresolved"
+	case kindEpochMismatch:
+		return "epoch_mismatch"
 	default:
 		return kind
 	}

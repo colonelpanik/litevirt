@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,11 +20,24 @@ import (
 // add it here WITH a comment justifying why it can't use the sanctioned APIs.
 var sanctionedSpecWriters = map[string]string{
 	"InsertVMWithHardware":      "creates the row (InsertVM delegates here with nics/pciIntents nil)",
+	"BeginVMCreateOperation":    "creates the provisional row with its operation barrier in the same transaction",
+	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
 	"RenameVM":                  "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
 	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",
 	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
 	"migrateVMSpecNetworkNames": "one-time schema migration, runs before serving (no barrier to honor)",
+	"isGuardedTransitionSQL":    "fingerprints audited transition constants; it does not execute a write",
+	"validateGuardedTransitionStatement": "validates replicated transition params against their guard; " +
+		"it does not execute a write",
+	"validateGuardedMutationEntry": "fingerprints the final guarded transition to validate batch protocol completeness; " +
+		"it does not execute a write",
+	"guardedEntryRoleAllowed": "fingerprints audited guarded-entry roles to reject statement smuggling; " +
+		"it does not execute a write",
+	"validateGuardedCreateBeginEntry": "fingerprints the exact create-begin batch envelope; " +
+		"it does not execute a write",
+	"HistoricalShapes": "enumerates retained SQL strings for compatibility-ledger generation; " +
+		"it does not execute a write",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package
@@ -36,7 +50,8 @@ func TestSpecWritersAreSanctioned(t *testing.T) {
 		t.Fatalf("read package dir: %v", err)
 	}
 
-	found := map[string]bool{}
+	var files []*ast.File
+	sqlConstants := map[string]string{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -46,18 +61,45 @@ func TestSpecWritersAreSanctioned(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
+		files = append(files, f)
+		for _, decl := range f.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+					continue
+				}
+				lit, ok := value.Values[0].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if decoded, err := strconv.Unquote(lit.Value); err == nil {
+					sqlConstants[value.Names[0].Name] = decoded
+				}
+			}
+		}
+	}
+
+	found := map[string]bool{}
+	for _, f := range files {
 		for _, decl := range f.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				lit, ok := n.(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					return true
-				}
-				if writesVMSpecColumns(lit.Value) {
-					found[fn.Name.Name] = true
+				switch value := n.(type) {
+				case *ast.BasicLit:
+					if value.Kind == token.STRING && writesVMSpecColumns(value.Value) {
+						found[fn.Name.Name] = true
+					}
+				case *ast.Ident:
+					if writesVMSpecColumns(sqlConstants[value.Name]) {
+						found[fn.Name.Name] = true
+					}
 				}
 				return true
 			})

@@ -197,3 +197,45 @@ func TestSumProjectUsage_BackupGiB(t *testing.T) {
 		t.Errorf("BackupGiBUsed = %d, want 9", u.BackupGiBUsed)
 	}
 }
+
+// TestProjectDiskGiB_RoundsEachDiskUp pins the ONE bytes→GiB rule quota
+// accounting uses. Admission has always rounded a partial GiB up to a whole one
+// (a 512 MiB disk occupies a GiB of budget), but usage truncated the summed
+// bytes — so a sub-GiB disk was charged 1 at admission and counted 0 forever
+// after, and the lease that admitted it could never settle against a
+// contribution that would not reach the amount charged.
+func TestProjectDiskGiB_RoundsEachDiskUp(t *testing.T) {
+	c := newProjectTestClient(t)
+	ctx := context.Background()
+
+	// Two disks that each truncate to 0 GiB and, summed, still truncate to 1 —
+	// so aggregate-truncation and per-disk round-up give different answers.
+	if err := InsertVM(ctx, c,
+		VMRecord{Name: "frac-vm", HostName: "h1", Spec: `{"cpu":1,"memory_mib":512}`, State: "running", Project: "/acme"},
+		nil, []DiskRecord{
+			{VMName: "frac-vm", DiskName: "root", HostName: "h1", Path: "/d/root.qcow2", SizeBytes: 512 * (1 << 20)},
+			{VMName: "frac-vm", DiskName: "data", HostName: "h1", Path: "/d/data.qcow2", SizeBytes: 512 * (1 << 20)},
+		}); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	u, err := SumProjectUsage(ctx, c, "/acme")
+	if err != nil {
+		t.Fatalf("SumProjectUsage: %v", err)
+	}
+	if u.DiskGiBUsed != 2 {
+		t.Errorf("DiskGiBUsed = %d, want 2 — each partial GiB occupies a whole one", u.DiskGiBUsed)
+	}
+
+	// The settle rule compares a workload's contribution against what it was
+	// admitted for, so the two must be measured the same way or a charge that
+	// was made can never be observed as paid.
+	got, found, err := WorkloadQuotaContribution(ctx, c, "/acme", WorkloadVM, "h1", "frac-vm")
+	if err != nil || !found {
+		t.Fatalf("WorkloadQuotaContribution: got=%+v found=%v err=%v", got, found, err)
+	}
+	if got.DiskGiB != u.DiskGiBUsed {
+		t.Errorf("contribution DiskGiB = %d but usage counts %d — a lease charged the admission "+
+			"amount can never settle against a smaller contribution", got.DiskGiB, u.DiskGiBUsed)
+	}
+}

@@ -198,3 +198,65 @@ func TestContainerVethName_DeterministicAndIfnameSafe(t *testing.T) {
 		t.Fatal("different ordinals must yield different veth names")
 	}
 }
+
+// TestCreateContainer_NICQuotaEnforced: a container's managed NICs land in
+// container_interfaces, which SumProjectUsage counts against the project's NIC
+// budget — but admission charged only cpu/memory, so a container could walk past
+// the NIC limit with no concurrency at all. The charge now rides the same
+// serialized reservation as cpu/memory, and a refusal leaves no IPAM lease, no
+// interface row and no runtime container behind.
+func TestCreateContainer_NICQuotaEnforced(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	mkManagedNetwork(t, s, "net1", "br-test", "10.9.0.0/24")
+	mkManagedNetwork(t, s, "net2", "br-test2", "10.9.1.0/24")
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "acme"}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{
+		ProjectName: "acme", NICLimit: 1,
+	}); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+
+	// Two managed NICs against a 1-NIC budget — refused on the request alone.
+	_, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "twonic", Template: "download", Distro: "alpine", Release: "3.19", Project: "acme",
+		Networks: []*pb.ContainerNetwork{
+			{Name: "eth0", NetworkName: "net1"},
+			{Name: "eth1", NetworkName: "net2"},
+		},
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("container create with 2 NICs against a 1-NIC quota: got %v, want ResourceExhausted", err)
+	}
+	if rec, _ := corrosion.GetContainer(ctx, s.db, "test-host", "twonic"); rec != nil {
+		t.Fatalf("refused create still persisted a row: %+v", rec)
+	}
+	if ifs, _ := corrosion.GetContainerInterfaces(ctx, s.db, "test-host", "twonic"); len(ifs) != 0 {
+		t.Fatalf("refused create left %d interface rows behind", len(ifs))
+	}
+	for _, net := range []string{"net1", "net2"} {
+		if al, _ := network.GetAllocationFor(ctx, s.db, net, "ct", "test-host", "twonic"); al != nil {
+			t.Fatalf("refused create leaked an IPAM lease on %s: %+v", net, al)
+		}
+	}
+
+	// One NIC fits.
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "onenic", Template: "download", Distro: "alpine", Release: "3.19", Project: "acme",
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: "net1"}},
+	}); err != nil {
+		t.Fatalf("container create with 1 NIC against a 1-NIC quota: %v", err)
+	}
+
+	// ...and the next one does not, now that the first is committed usage.
+	_, err = s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "onemore", Template: "download", Distro: "alpine", Release: "3.19", Project: "acme",
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: "net2"}},
+	})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("second 1-NIC container against a 1-NIC quota: got %v, want ResourceExhausted", err)
+	}
+}

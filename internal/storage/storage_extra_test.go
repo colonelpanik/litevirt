@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,9 +151,16 @@ func TestNFSDriver_Prepare_MountDir(t *testing.T) {
 		source:    "10.0.0.1:/export/vms",
 		mountBase: tmp,
 		opts:      map[string]string{"options": "vers=4.1"},
+		run: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			if name == "mountpoint" {
+				return nil, errors.New("not mounted")
+			}
+			return nil, nil
+		},
 	}
-	// Prepare will fail (no NFS server), but mountDir should be set.
-	_ = d.Prepare(context.Background())
+	if err := d.Prepare(context.Background()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 	if d.mountDir == "" {
 		t.Error("mountDir should be set after Prepare")
 	}

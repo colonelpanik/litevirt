@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,7 +13,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
-	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
@@ -103,6 +101,32 @@ func (s *Server) autoDefineRestoredVM(
 			"domain %q already defined; pass --name to restore alongside it", targetName)
 	}
 
+	// Capacity + quota admission. A live-restore reconstructs a full-sized VM from
+	// a manifest and BOOTS it, so it consumes exactly what CreateVM of the same
+	// spec would — and nothing admitted it. Backup data is the one input an
+	// operator can replay at will, which made this the cheapest way to overfill a
+	// host or walk a project past its quota while every other create path refused
+	// correctly.
+	//
+	// FULL admission (quota included, unlike a migrate or a start): this is a NEW
+	// allocation the project does not yet carry — the row written below is a VM
+	// that did not exist a moment ago, even when it restores alongside a still-
+	// running original. resourceID names it so a DELEGATED quota holder can tell
+	// the admission it granted has landed, instead of guessing from a clock.
+	//
+	// Placed after the name-collision guard and before materializeFirmwareBundle /
+	// DefineDomain, so a refusal costs no disk I/O and defines nothing. The lease
+	// is released when this function returns — i.e. after InsertVMWithHardware
+	// below, so the provisional reservation is only dropped once the VM's own row
+	// accounts for the same capacity.
+	lease, aerr := s.admitWithReservation(
+		ctx, "RestoreLive", s.hostName, project, "vm:"+targetName,
+		int(spec.Cpu), int(spec.MemoryMib), vmSpecQuotaAmount(spec), intentVMResident)
+	if aerr != nil {
+		return "", "", aerr
+	}
+	defer lease.release(ctx)
+
 	renamed := targetName != originalName
 	spec.Name = targetName
 	// Force the restored VM into the authorized restore project — never let it
@@ -189,11 +213,9 @@ func (s *Server) autoDefineRestoredVM(
 			mac = lv.GenerateMAC()
 		}
 		bridge := n.Name
-		if _, err := net.InterfaceByName(bridge); err != nil {
-			if err := network.EnsureBridge(bridge); err != nil {
-				return "", "", status.Errorf(codes.FailedPrecondition,
-					"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
-			}
+		if err := s.ensureBridge(bridge); err != nil {
+			return "", "", status.Errorf(codes.FailedPrecondition,
+				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
@@ -274,8 +296,34 @@ func (s *Server) autoDefineRestoredVM(
 		TargetPath: overlayPath, Status: "VM started off overlay",
 	})
 
+	// FENCE, immediately before the durable write (see allowCommit). Firmware
+	// materialisation, define, hardware prepare, and the start off the overlay
+	// all sit between admission and here, so the project's quota authority can
+	// move mid-restore. The VM is already running, so a refusal must tear it
+	// down like a start failure would — a running domain with no cluster row is
+	// strictly worse than the retry this costs. The overlay + NBD are kept, as
+	// on a start failure, so a retry restores against the still-valid source;
+	// for a firmware VM the deferred rollback (restoreOK=false) also wipes the
+	// materialized NVRAM/swtpm.
+	s.fireCommitFenceHook("RestoreLive")
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		if derr := s.virt.DestroyDomain(targetName); derr != nil {
+			slog.Error("live-restore: fence refused the commit but the running domain could not be destroyed — manual cleanup needed",
+				"vm", targetName, "error", derr)
+		}
+		releaseHW()
+		_ = s.virt.UndefineDomain(targetName, false)
+		return "", "", ferr
+	}
+
 	// Persist the VM so lifecycle / migration / UI treat it like any
 	// other. Best-effort: the VM is already running.
+	//
+	// The define above resolved any machine alias against this host's qemu.
+	// Persist that concrete value, or a VM restored from a backup taken on a
+	// different qemu carries an alias whose meaning changes the next time it
+	// moves — the same guest-ABI hazard create/import/promote/clone pin against.
+	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	vmRecord := corrosion.VMRecord{
 		Name: targetName, HostName: s.hostName, Spec: string(specJSON),

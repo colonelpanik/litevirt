@@ -178,37 +178,14 @@ enforcement:
                               # best-effort SSH fence is rejected. Local-disk transfers keep
                               # today's gate. Enable fleet-uniformly (changes failover behavior).
                               # See docs/migration-failover.md → "Shared-disk fence gating".
-  project_quota_authority: false
-                              # route PROJECT-QUOTA admission to the project's deterministic
-                              # authority holder, so ONE node serializes it. Project quota is a
-                              # cluster-wide limit but usage lives in a CRDT store, so without this
-                              # two daemons admitting requests for the same project against
-                              # DIFFERENT hosts each read their own snapshot, both pass, and the
-                              # project ends up over its limit. Routing collapses that into a
-                              # process-local problem the holder serializes with a mutex plus an
-                              # in-flight ledger.
-                              #
-                              # Advertised CONDITIONALLY on this flag (like operation_protocol), so
-                              # the cluster-wide latch only forms once EVERY node has opted in — a
-                              # flag-off node would keep admitting locally and unserialized. Until
-                              # then behaviour is exactly the previous local check.
-                              #
-                              # FAILS OPEN. If the holder is unreachable, admission falls back to
-                              # the unserialized local check and emits a `quota.unserialized`
-                              # notification plus an audit entry. Quota is a tenancy limit, not a
-                              # safety invariant: failing closed would let one dead node block every
-                              # VM create in every project it holds, which is worse than the
-                              # over-admission it would prevent. Authority is never reassigned on
-                              # mere unreachability — an unplanned takeover needs a fence proof.
-                              #
-                              # Serializes vCPU and memory only. The disk / NIC / public-IP /
-                              # backup-GiB dimensions are still admitted without reservations.
-  operation_protocol: false   # rely on the v41 F1 operation protocol (operations journal, per-VM
-                              # epoch/generation, active_operation_id mutation barrier, durable
-                              # device-lease recovery). Advertised CONDITIONALLY on this flag, so the
-                              # cluster-wide latch only forms once EVERY node has it enabled — the
-                              # barrier is never relied upon until the whole fleet has opted in. Enable
-                              # fleet-uniformly; the flag is the reversible kill switch.
+  operation_protocol: false   # rely on the operation journal, VM/container
+                              # epoch/generation + active_operation_id barriers, durable
+                              # device-lease recovery, and operation-backed capacity admission.
+                              # Both operation_protocol_v1 and capacity_admission_v1 are advertised
+                              # CONDITIONALLY on this flag, so their cluster-wide latches only form
+                              # once EVERY node has opted in. capacity_admission_v1 deliberately has
+                              # no standalone user flag. Enable fleet-uniformly; this flag is the
+                              # reversible kill switch.
                               #
                               # REQUIRED FOR HOTPLUG. Device attach/detach — disk, NIC, and
                               # concrete-address PCI — refuse while this is off, because each
@@ -259,6 +236,72 @@ enforcement:
                               # until the deferred operator-run contract (see docs/diagnostics.md).
                               # The flag gates advertisement/opt-in only; it does not revoke an
                               # already-formed latch. Advertised only while on; enable fleet-uniformly.
+  project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
+                              # admission-authority holder instead of deciding from this node's
+                              # replica. Admission counts in-flight reservations, but two nodes
+                              # that have not yet exchanged those rows each see only their own
+                              # and can both admit — together exceeding the quota. One decider
+                              # per project closes that window; HOST capacity is unaffected
+                              # (only the target host's owner reserves against it, so it is
+                              # already serialized). A holder that cannot be reached REFUSES the
+                              # admission rather than falling back to the stale local view, so
+                              # enabling this trades a little availability for the guarantee.
+                              # Advertised only while on (like operation_protocol) and active
+                              # only once the flag is set AND project_authority_v1 has latched
+                              # fleet-wide — a peer still deciding locally would bypass the
+                              # single decider entirely. Enable fleet-uniformly; the flag is the
+                              # reversible kill switch.
+  audit_signature: false      # sign every audit row this host writes with its cluster key
+                              # (the same host.key that identifies it on the wire, under a
+                              # separate signing domain). The pre-v45 chain is an UNKEYED
+                              # hash: anyone who can write the database can edit a row,
+                              # recompute the hashes after it, and `lv audit verify` comes
+                              # back clean. A signature makes that require the host's private
+                              # key instead of just the algorithm, and any OTHER node can
+                              # check it — a compromised host can no longer certify its own
+                              # rewritten history. Setting this flag turns SIGNING on by
+                              # itself (signed rows are backward-compatible; old peers
+                              # replicate the new columns untouched). The token is advertised
+                              # only while the flag is on, and once it latches fleet-wide a
+                              # write this node cannot sign is logged as an error and still
+                              # RECORDED — dropping the row would lose the record of an
+                              # operation that happened, which is the outcome an attacker
+                              # would pick. It is caught instead by the verifier: while a
+                              # host's published signing certificate stands, an unsigned row
+                              # from it is reported as tampering on every node.
+                              # Turning the flag back OFF is a real rollback, not a silent
+                              # one: on the next start the daemon signs a retirement of its
+                              # own key at the sequence its chain had reached, so rows after
+                              # it are unsigned and expected. A host that cannot sign that
+                              # retirement keeps its contract — that is the case it exists
+                              # for — and `lv host retire-audit-key` closes it out from the
+                              # machine holding the cluster CA. Enable fleet-uniformly.
+  owner_epoch: false          # activate the ownership-generation regime on this host
+                              # (owner_epoch_v1). With the flag on, the health sweeps
+                              # backfill every workload this host owns from the pre-epoch 0
+                              # to a real generation, stamping its runtime marker (libvirt
+                              # domain metadata / the container marker file) in the same
+                              # pass. The token is advertised only once this node is READY —
+                              # flag on and no owned workload left at epoch 0 — so the fleet
+                              # can never latch across a node whose workloads are still
+                              # ungraduated. Enforcement (refusing a stale rejoined replica's
+                              # self-heal restarts on a marker/epoch mismatch) activates only
+                              # after the fleet-wide latch. Enable fleet-uniformly; the flag
+                              # is the reversible kill switch.
+  isolation_epoch: false      # activate the isolation regime on this host
+                              # (isolation_epoch_v1). A node whose local state was produced
+                              # OUTSIDE the cluster's current compatibility regime — rolled
+                              # back below a capability token it had already latched, or
+                              # isolated by an operator — is recorded as isolated BY A
+                              # HEALTHY PEER in cluster state (hosts.isolation_epoch), not
+                              # by itself: a node that cannot be trusted to replicate cannot
+                              # be trusted to record its own quarantine. With the flag on and
+                              # the token latched, this node REFUSES that host's mutation
+                              # pushes and will not merge from it via anti-entropy, until
+                              # `lv host reseed` replaces its state and verifies convergence.
+                              # Deliberately not a version check — mixed-version rolling
+                              # upgrades keep working. Pre-latch clusters behave exactly as
+                              # before. Enable fleet-uniformly; reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
@@ -465,9 +508,23 @@ past a retention floor (`tombstone_gc_retention_hours` /
 `tombstone_gc_orphan_retention_hours` in the reference above); the count is exported
 as `litevirt_gc_rows_deleted_total` (labeled by `table`).
 
+The same hourly sweep retires admission authority still held by projects that no
+longer exist, and expires capacity leases abandoned by a crash between reserve and
+release. Both are reported in the journal when they find anything.
+
 The sweep is local-only and deterministic (each node prunes its own copy; it
 never touches a current-active-set or current-generation row), so it is safe on a
 live cluster.
+
+### Signals the daemon ignores
+
+The daemon deliberately does not terminate on `SIGHUP` or `SIGPIPE`, and does not
+treat `SIGHUP` as a config reload. systemd counts death by either as a *clean*
+exit, so a `SIGHUP` from `needrestart` or `unattended-upgrades` would leave the
+node down with the unit reporting success. Each ignored signal is logged and
+counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising count
+means something on the host keeps trying to bounce the orchestrator, which is
+worth chasing even though the daemon now survives it.
 
 ## Capacity and overcommit
 
@@ -483,6 +540,8 @@ capacity:
   host_memory_reserve_mib: 1024    # default 1024
   host_memory_reserve_pct: 5       # default 5
   vm_memory_overhead_mib: 128      # default 128
+  disk_overcommit_ratio: 3.0       # default 3.0
+  pool_reserve_pct: 5              # default 5
 ```
 
 **CPU and memory are deliberately different.** vCPU is time-sliced: running more
@@ -501,6 +560,22 @@ fixed floor protects small nodes while the percentage scales with large ones.
 `vm_memory_overhead_mib` is charged per running VM on top of its configured
 memory, covering qemu's own footprint (device models, video, page tables).
 Ignoring it under-counts usage, and by more the denser the host.
+
+**Disk is admitted per POOL, not per host.** `hosts.disk_total` is the wrong
+denominator for anything shared — a Ceph or NFS pool's capacity has nothing to do
+with the host's local disk — while every managed pool carries its own
+statfs-sampled total and used. A new disk is charged against its pool's **actual**
+free space, less `pool_reserve_pct`, after dividing the declared size by
+`disk_overcommit_ratio`.
+
+That ratio defaults above 1 for the opposite reason memory's defaults to exactly
+1: thin provisioning is the norm, so a declared 100 GiB qcow2 may occupy 2 GiB,
+and charging it in full against real free space would refuse ordinary practice.
+Both knobs count what is really taken.
+
+A pool with **no capacity sample** (total 0 — never sampled, or a driver that
+reports nothing) is treated as UNKNOWN and skipped, never as full. Refusing on
+missing telemetry would break every cluster whose pools have not been sampled yet.
 
 **Containers count too, for memory.** A running container's memory cap is
 subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
@@ -547,6 +622,7 @@ and the bypass is audited.
 | `LV_HOST` | CLI: default remote gRPC/mTLS target (`host` or `host:port`; a legacy `user@host` prefix is ignored) |
 | `LV_TOKEN` | CLI: bearer token to authenticate gRPC calls. Overrides the credential stored by `lv login`. |
 | `LITEVIRT_UNSAFE_NO_KILLMODE_CHECK` | Skip startup `KillMode=process` self-check (development / non-systemd hosts only). Default check protects against unit-file regressions that would kill child QEMU processes on daemon stop. |
+| `LITEVIRT_UNSAFE_SKIP_ROLLBACK_CHECK` | Skip the startup capability-rollback self-check. That check looks for durable activation markers naming tokens this binary has never heard of — proof a newer binary ran here — and puts the node under WAL quarantine: it stays up and reachable but emits no replicated writes and advertises no capabilities, so peers see it degraded and nothing new latches across it. Set this only after reseeding the node's state, or to start a rolled-back binary deliberately. |
 | `LITEVIRT_OTEL_ENDPOINT` | Telemetry: OTLP endpoint; turns logs+traces export on. Overrides `telemetry.otlp_endpoint`. |
 | `LITEVIRT_OTEL_HEADERS` | Telemetry: OTLP headers, e.g. `Authorization=Basic <b64>` (collector auth — keep in env, not the config file). |
 | `LITEVIRT_LOG_LEVEL` | Telemetry: log level `TRACE`\|`DEBUG`\|`INFO`\|`WARNING`\|`ERROR`\|`CRITICAL`. |

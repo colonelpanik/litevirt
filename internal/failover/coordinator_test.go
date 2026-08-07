@@ -635,7 +635,14 @@ func TestCoordinator_MixedVMContainerPoliciesWithPlacementConstraints(t *testing
 	}
 }
 
-func TestCoordinator_FallbackToRoundRobin(t *testing.T) {
+// TestCoordinator_NoEligibleHost_SkipsInsteadOfRoundRobin: a VM whose hard
+// constraints no surviving host satisfies must be LEFT on the fenced host,
+// loudly, for operator recovery. The previous behavior round-robined it onto
+// whatever candidate was healthy — here an 8 vCPU / 32 GiB VM onto a 1 vCPU /
+// 512 MiB host — blind to capacity, labels, affinity, and incomplete-inventory
+// exclusions, and the target reconciler re-checks none of those before
+// starting.
+func TestCoordinator_NoEligibleHost_SkipsInsteadOfRoundRobin(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
@@ -685,12 +692,15 @@ func TestCoordinator_FallbackToRoundRobin(t *testing.T) {
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v %v", err, vm)
 	}
-	// Placement will fail (tiny can't fit), but round-robin fallback should rescue the VM.
-	if vm.HostName != "tiny" {
-		t.Errorf("expected VM rescheduled to 'tiny' via round-robin fallback, got %q", vm.HostName)
+	// No host can hold 8 vCPU / 32 GiB. The VM must NOT be moved to "tiny".
+	if vm.HostName != "bad" {
+		t.Errorf("VM with no eligible host was relocated to %q — hard constraints must strand it, not round-robin it", vm.HostName)
 	}
-	if vm.State != "pending" {
-		t.Errorf("expected VM state 'pending', got %q", vm.State)
+	// And the skip is loud: an audit row names the VM and the reason.
+	rows, qerr := db.Query(ctx,
+		`SELECT detail FROM audit_log WHERE action = 'failover.skip' AND target = 'big-vm'`)
+	if qerr != nil || len(rows) == 0 {
+		t.Errorf("expected a failover.skip audit row for big-vm (err=%v rows=%d) — a stranded VM must be loud", qerr, len(rows))
 	}
 }
 
@@ -698,11 +708,14 @@ func TestCoordinator_MultipleVMsPlacement(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
-	// 3 hosts: "bad" (failing), "node-a" and "node-b" (healthy, large).
+	// 3 hosts: "bad" (failing), "node-a" and "node-b" (healthy). Each survivor
+	// genuinely holds two 4096 MiB VMs (16384 - 1024 reserve - 2×(4096+overhead)),
+	// so all three VMs place under the REAL capacity model — placement must
+	// spread them, not a fallback.
 	for _, h := range []corrosion.HostRecord{
 		{Name: "bad", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual"},
-		{Name: "node-a", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
-		{Name: "node-b", Address: "10.0.0.3", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 16, MemTotal: 65536},
+		{Name: "node-a", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 8, MemTotal: 16384},
+		{Name: "node-b", Address: "10.0.0.3", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 8, MemTotal: 16384},
 	} {
 		if err := corrosion.InsertHost(ctx, db, h); err != nil {
 			t.Fatalf("InsertHost %s: %v", h.Name, err)
@@ -757,16 +770,17 @@ func TestCoordinator_MultipleVMsPlacement(t *testing.T) {
 		hostCounts[vm.HostName]++
 	}
 
-	// All VMs must have been placed on healthy hosts. The placement engine
-	// uses bin-packing by default (preferring hosts with more used resources),
-	// so all VMs may land on the same host. Verify at least one healthy host
-	// received VMs and total count is correct.
+	// With constrained host capacity, no single host can hold all 3 VMs.
+	// Enforce true spread across at least two healthy hosts.
 	total := 0
 	for host, cnt := range hostCounts {
 		if host != "node-a" && host != "node-b" {
 			t.Errorf("unexpected host %q in distribution", host)
 		}
 		total += cnt
+	}
+	if len(hostCounts) != 2 {
+		t.Errorf("expected rescheduled VMs to span both healthy hosts, got distribution: %v", hostCounts)
 	}
 	if total != 3 {
 		t.Errorf("expected 3 VMs rescheduled, got %d (distribution: %v)", total, hostCounts)

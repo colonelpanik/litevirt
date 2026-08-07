@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -158,5 +159,125 @@ func TestOperationCurrentState(t *testing.T) {
 	state, faulted, err := OperationCurrentState(ctx, c, "op1", 1, OpDeviceLease)
 	if err != nil || faulted || state != OpStepClaimed {
 		t.Fatalf("state=%q faulted=%v err=%v, want claimed", state, faulted, err)
+	}
+}
+
+func TestWorkloadCreateOperationState(t *testing.T) {
+	want := []string{
+		OpStepPlanned,
+		OpStepReserved,
+		OpStepDesiredPersisted,
+		OpStepPrepared,
+		OpStepRuntimeStarted,
+		OpStepObserved,
+	}
+	if got := opHappyPath[OpWorkloadCreate]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("workload-create happy path = %v, want %v", got, want)
+	}
+	if !IsOperationKind(OpWorkloadCreate) {
+		t.Fatal("workload_create must be a recognized operation kind")
+	}
+	for _, step := range want {
+		if !IsLegalStep(OpWorkloadCreate, step) {
+			t.Errorf("%q must be legal for workload_create", step)
+		}
+	}
+	if IsLegalStep(OpWorkloadCreate, OpStepConfigApplied) {
+		t.Fatal("config_applied must not be legal for workload_create")
+	}
+
+	state, faulted := ReduceOperationState(OpWorkloadCreate, want[:len(want)-1])
+	if state != OpStepRuntimeStarted || faulted {
+		t.Fatalf("pre-observation state = (%q,%v), want (%q,false)", state, faulted, OpStepRuntimeStarted)
+	}
+	state, faulted = ReduceOperationState(OpWorkloadCreate,
+		[]string{OpStepPlanned, OpStepRuntimeStarted, OpStepRollbackCompleted})
+	if state != OpStepRollbackCompleted || faulted {
+		t.Fatalf("rollback precedence = (%q,%v), want (%q,false)", state, faulted, OpStepRollbackCompleted)
+	}
+	state, faulted = ReduceOperationState(OpWorkloadCreate,
+		[]string{OpStepCompleted, OpStepFailed, OpStepRollbackCompleted})
+	if state != OpStepCompleted || !faulted {
+		t.Fatalf("terminal conflict = (%q,%v), want (%q,true)", state, faulted, OpStepCompleted)
+	}
+}
+
+func TestWorkloadStartOperationState(t *testing.T) {
+	want := []string{
+		OpStepPlanned,
+		OpStepReserved,
+		OpStepRuntimeStarted,
+		OpStepObserved,
+	}
+	if got := opHappyPath[OpWorkloadStart]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("workload-start happy path = %v, want %v", got, want)
+	}
+	if !IsOperationKind(OpWorkloadStart) {
+		t.Fatal("workload_start must be a recognized operation kind")
+	}
+	for _, step := range want {
+		if !IsLegalStep(OpWorkloadStart, step) {
+			t.Errorf("%q must be legal for workload_start", step)
+		}
+	}
+	if IsLegalStep(OpWorkloadStart, OpStepDesiredPersisted) {
+		t.Fatal("desired_persisted must not be legal for workload_start")
+	}
+
+	state, faulted := ReduceOperationState(OpWorkloadStart,
+		[]string{OpStepPlanned, OpStepReserved, OpStepRuntimeStarted})
+	if state != OpStepRuntimeStarted || faulted {
+		t.Fatalf("start progress = (%q,%v), want (%q,false)", state, faulted, OpStepRuntimeStarted)
+	}
+	state, faulted = ReduceOperationState(OpWorkloadStart,
+		[]string{OpStepObserved, OpStepCancelled, OpStepRollbackCompleted})
+	if state != OpStepCancelled || faulted {
+		t.Fatalf("terminal precedence = (%q,%v), want (%q,false)", state, faulted, OpStepCancelled)
+	}
+}
+
+func TestWorkloadCreateAndStartTerminalReleasesReservation(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+
+	for _, tc := range []struct {
+		id   string
+		kind OperationKind
+	}{
+		{id: "create", kind: OpWorkloadCreate},
+		{id: "start", kind: OpWorkloadStart},
+	} {
+		reservation, err := (ReservationVector{
+			TargetHost: "h1",
+			TargetCPU:  2,
+		}).Encode()
+		if err != nil {
+			t.Fatalf("%s encode reservation: %v", tc.id, err)
+		}
+		mustOp(t, db, tc.id, string(tc.kind), reservation, false)
+	}
+
+	cpu, _, err := HostReserved(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostReserved before terminal: %v", err)
+	}
+	if cpu != 4 {
+		t.Fatalf("reserved CPU before terminal = %d, want 4", cpu)
+	}
+
+	for _, id := range []string{"create", "start"} {
+		if err := AppendOperationStep(ctx, db, OperationStepRecord{
+			OperationID: id,
+			StepName:    OpStepCompleted,
+		}); err != nil {
+			t.Fatalf("%s complete: %v", id, err)
+		}
+	}
+	cpu, _, err = HostReserved(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostReserved after terminal: %v", err)
+	}
+	if cpu != 0 {
+		t.Fatalf("reserved CPU after terminal = %d, want 0", cpu)
 	}
 }

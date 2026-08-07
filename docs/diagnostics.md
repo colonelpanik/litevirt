@@ -121,7 +121,7 @@ illegal:
 > **Not yet covered (deferred to a later phase):** *duplicate runtime ownership*
 > and *runtime-vs-DB owner mismatch* — i.e. the DB rows have converged but disagree
 > with which host actually runs the workload. Detecting those requires per-host
-> runtime introspection (`CheckVMRuntime`/`CheckContainerRuntime`), which lands with
+> runtime introspection (the peer-only `GetRuntimeInventory`), which lands with
 > the runtime-repair phases; until then `lv doctor divergence` checks only the
 > DB-level invariants above. A clean report does **not** yet prove the DB agrees
 > with runtime truth.
@@ -357,6 +357,30 @@ Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
 
+## `lv doctor machine-types`
+
+Read-only. Lists VMs whose **persisted spec** carries an unversioned machine
+alias (`q35`, `pc-q35`, or empty) rather than a concrete versioned type such as
+`pc-q35-9.0`.
+
+```
+lv doctor machine-types
+```
+
+An alias is resolved by libvirt against the **local** qemu, so a VM carrying one
+can have its guest ABI shift underneath it when it migrates or fails over to a
+host running a different qemu version. Two paths already pin the concrete type
+at define time — `lv run` (create) and the stopped-VM redefine — and the
+reconciler backfills the pin for any VM it sweeps on its current host. A VM
+listed here therefore came from another path (clone, import, restore, promote)
+and has not yet been swept where it now lives.
+
+To pin one: start it (the reconciler pins on its next sweep) or, while it is
+stopped, run `lv update <vm> --machine <concrete-type>`. Neither is urgent on a
+homogeneous cluster — every host resolving the alias identically is why this is
+a warning and not an error — but it should be cleared before introducing a host
+with a different qemu version.
+
 ## Persisted LWW clock & backward-clock protection
 
 The `updated_at` conflict key is minted from a **monotonic** clock whose high-water
@@ -494,7 +518,7 @@ local (never picks an owner by value) and defers to runtime repair.
 - **Automatic (runtime owner-assert).** Each host's reconciler watches for a VM
   that runs **locally** but whose DB row points at another host. Before
   reclaiming it, it queries **every workload-capable peer's local libvirt** (the
-  peer-only `CheckVMRuntime` RPC) and re-stamps ownership to itself **only when
+  peer-only `GetRuntimeInventory` RPC) and re-stamps ownership to itself **only when
   all of them answer `absent`**, no migration/lease marker is present, and the
   condition has persisted past a short debounce. If any host reports `running`
   it's a true split-brain → it refuses to act and logs an alert (destruction
@@ -516,7 +540,7 @@ ownership split is **two distinct rows**, not a single-row tie — the row resol
 can't see it (it's surfaced as `duplicate_live_container` above). The container
 reconciler repairs it directly: when a container runs **locally** but its only
 live DB row points at another host (and no live local row exists), it queries
-**every workload-capable peer's local LXC** (the peer-only `CheckContainerRuntime`
+**every workload-capable peer's local LXC** (the peer-only `GetRuntimeInventory`
 RPC) and, only if none reports it running (a peer's stale *stopped* leftover does
 not block; an unreachable/unknown peer does), performs an atomic **PK re-key** of
 the container's whole ownership footprint: in one transaction it tombstones the
@@ -567,3 +591,51 @@ converged-wrong `host_name` could drive a node to destroy a live workload.
 > write or an audited `lv doctor` command) so it replicates and is auditable. A
 > direct SQLite edit isn't replicated, isn't audited, and re-creates the very
 > divergence you're fixing.
+
+## Cluster health: durable conditions and the admission gate (v50)
+
+Health is durable cluster state, not a per-leader memory. Detector findings
+(dual-run, owner mismatch, owner-epoch mismatch, coverage gaps, unresolved
+ties) live in replicated `health_conditions` rows with an
+observed → confirmed → resolved lifecycle:
+
+- first positive scan → **observed** (warning); second consecutive scan →
+  **confirmed** (critical for the corruption-class codes);
+- resolution needs **two consecutive clean scans with complete coverage** by
+  the detector lease holder under a valid decision gate — an unreachable,
+  partial, or older-binary peer blocks resolution (blind is not clean);
+- leadership changes and restarts preserve counts and confirmed state;
+- resolved conditions stay readable for 30 days (`lv health --resolved`),
+  then are tombstoned;
+- there is **no force-clear**: remove the cause, and the evaluator proves
+  the resolution.
+
+`lv health` prints the overall state (HEALTHY / DEGRADED / CRITICAL /
+UNKNOWN), every active condition with its involved hosts, evaluator
+coverage, peer connectivity, and per-host effective capacity — and exits
+0 / 1 / 2 so scripts can gate on it.
+
+**The same rows drive admission.** An active ownership condition blocks
+capacity-growing admission to every involved host and runtime-changing
+actions on the affected workload; an incomplete local runtime inventory
+blocks new workloads on that host; a VIP dual-holder freezes that VIP's LB
+changes (and only those). `--allow-overcommit` bypasses numeric headroom
+only. Automated recovery (self-heal restarts, owner assertion, container
+re-key) refuses any workload with an active ownership condition, and owner
+assertion additionally demands the host-local owner-epoch marker be valid
+and exactly equal to the DB epoch being superseded — missing, corrupt,
+unreadable, or unequal evidence refuses with a distinct reason.
+
+Effective capacity: every host samples the union of its database and
+runtime workloads each minute into `host_capacity_observations` — a rogue
+runtime the database does not know about still consumes headroom in
+placement, and an uncapped rogue container makes the host's capacity
+explicitly *incomplete*, which disqualifies it as a placement target until
+resolved.
+
+Automatic containment is intentionally not implemented: no path destroys a
+disputed runtime. Any future containment mechanism must first prove complete
+fleet runtime coverage, a current-epoch authoritative holder, a strictly older
+conflicting holder, no in-flight migration/operation/lock/failover, and quorum
+or explicit fencing authorization. The evidence and decision must be durable
+before any stop is issued.

@@ -36,7 +36,7 @@ func TestCoordinator_SharedDiskRefusedWithoutProofGradeFence(t *testing.T) {
 	for _, h := range []string{"bad", "good"} {
 		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort", CPUTotal: 8, MemTotal: 8192,
 		}); err != nil {
 			t.Fatalf("InsertHost %s: %v", h, err)
 		}
@@ -111,7 +111,7 @@ func TestCoordinator_AutoPromote_RetryableFallsThroughToReschedule(t *testing.T)
 	for _, h := range []string{"bad", "good"} {
 		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+			GRPCPort: 7443, State: "active", FenceStrategy: "manual", CPUTotal: 8, MemTotal: 8192,
 		}); err != nil {
 			t.Fatalf("InsertHost %s: %v", h, err)
 		}

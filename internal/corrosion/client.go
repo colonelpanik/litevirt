@@ -86,12 +86,17 @@ type Config struct {
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	db       *sql.DB
-	mu       sync.RWMutex
-	list     *memberlist.Memberlist
-	hostName string
-	clock    *hlc.Clock
-	version  string // local litevirtd binary version, for skew checks
+	db   *sql.DB
+	mu   sync.RWMutex
+	list *memberlist.Memberlist
+	// membersForTests overrides gossip membership. Test seam only: the gossip
+	// fallback in ResolvePeerTarget is what lets a node dial a peer whose hosts row
+	// has not replicated yet — the bootstrap case — and it had no test at all,
+	// because a harness without a real memberlist can never reach that branch.
+	membersForTests func() []PeerInfo
+	hostName        string
+	clock           *hlc.Clock
+	version         string // local litevirtd binary version, for skew checks
 
 	// dataDir is where the durable monotonic-clock high-water lives
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:
@@ -218,6 +223,55 @@ type Client struct {
 	// already-emitted canonical wire shape must never be revoked (turning the flag off would
 	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
 	canonicalRegistryAccept func() bool
+
+	// auditChain holds the in-flight tail of each audit sub-chain this client
+	// appends to, keyed by host_name. Per-client, not package-global: a global
+	// is only correct while one Client exists per process, which is false in
+	// tests/fleet where N daemons share a process. See audit.go.
+	auditChain chainState
+
+	// auditKeyring signs this host's audit rows and verifies any host's. Nil ⇒
+	// rows are written unsigned (the pre-v45 behaviour, and what a cluster does
+	// until enforcement.audit_signature is turned on). Guarded by mu.
+	auditKeyring *AuditKeyring
+
+	// auditSignatureRequired reports whether the cluster has latched
+	// audit_signature_v1 with this node's flag on. When it does, an audit write
+	// that cannot be signed FAILS instead of degrading to an unsigned row.
+	// Guarded by mu.
+	auditSignatureRequired func() bool
+
+	// writeQuarantine, when set and returning a non-empty reason, makes every
+	// REPLICATED write refuse. Wired at daemon start to the capability-rollback
+	// self-check: a node running a binary below a token it already latched must
+	// stop emitting, because the rest of the cluster has moved past it. Nil ⇒ no
+	// quarantine, which is every healthy node.
+	writeQuarantine func() string
+}
+
+// SetWriteQuarantine injects the predicate that refuses replicated writes, returning
+// the reason to report or "" to allow them. Nil-safe: unset means no quarantine.
+//
+// It gates the two REPLICATED batch writers only. The local-only exec helpers stay
+// open on purpose — they carry incoming replication and a reseed, and a node that
+// cannot receive could never be repaired, only rebuilt.
+func (c *Client) SetWriteQuarantine(fn func() string) { c.writeQuarantine = fn }
+
+// quarantineReason returns why replicated writes are currently refused, or "".
+func (c *Client) quarantineReason() string {
+	if c.writeQuarantine == nil {
+		return ""
+	}
+	return c.writeQuarantine()
+}
+
+// errQuarantined is the refusal both replicated writers return. It fails the WHOLE
+// write rather than just suppressing the mutation-log row: committing the
+// application statements while dropping the log entry would leave this node
+// carrying changes no peer will ever see, which is the precise failure the
+// quarantine exists to prevent.
+func errQuarantined(reason string) error {
+	return fmt.Errorf("write refused: node is under WAL quarantine (%s); operator reseed required", reason)
 }
 
 // SetCanonicalIdentity injects the predicate that enables natural-key identity resolution.
@@ -361,6 +415,15 @@ const nowTSLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // fractional value sorts lexically BEFORE a bare same-second one, which would
 // mis-order mixed old/new rows. Only updated_at (the LWW key) uses NowTS.
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// nowRFC3339Nano stamps a FRESH workload incarnation (created_at on create /
+// recreate paths). Nanosecond precision is load-bearing there: anti-entropy
+// treats created_at as the incarnation identity, so a delete + recreate inside
+// one wall-clock second must still produce two distinguishable stamps — at
+// bare-second precision the recreate would equal the tombstone's stamp and be
+// misread as the incarnation the delete killed. RFC3339 readers parse the
+// fractional second transparently (Go's time.Parse accepts it for any layout).
+func nowRFC3339Nano() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // NowWall returns a bare-second RFC3339 UTC wall-clock timestamp for NON-LWW columns
 // (created_at, deleted_at, last_seen, and other *_at display/expiry/age markers). It is
@@ -690,6 +753,12 @@ type Row struct {
 type Statement struct {
 	SQL    string
 	Params []interface{}
+	// Guard is additive replication metadata for operation-protocol mutations
+	// whose local ExecuteBatchGuarded closure cannot travel in the WAL. A
+	// receiver evaluates this fixed, structured predicate inside its apply
+	// transaction before executing the statement. Nil preserves the historical
+	// statement wire format and behavior.
+	Guard *MutationGuard `json:",omitempty"`
 }
 
 // Query executes a read query against the local SQLite database.
@@ -772,6 +841,9 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 // the writes. Returns applied=false (no error) when the guard declines, so the
 // caller treats that as "preconditions no longer hold — skip and retry later".
 func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement) (bool, error) {
+	if reason := c.quarantineReason(); reason != "" {
+		return false, errQuarantined(reason)
+	}
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -791,11 +863,29 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	}
 	var mutated []Statement
 	for _, s := range stmts {
+		if s.Guard != nil {
+			matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+			if err != nil {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, fmt.Errorf("statement guard: %w", err)
+			}
+			if !matches {
+				tx.Rollback()
+				c.mu.Unlock()
+				return false, nil
+			}
+		}
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, fmt.Errorf("exec guarded batch: %w", err)
+		}
+		if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, invalidf("guarded workload transition matched authority but changed no row")
 		}
 		if n, e := res.RowsAffected(); e == nil && n > 0 {
 			mutated = append(mutated, s)
@@ -833,7 +923,23 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	return true, nil
 }
 
+func isGuardedTransitionSQL(sql string) bool {
+	fp, err := FingerprintSQL(sql)
+	if err != nil {
+		return false
+	}
+	return fp == mustStatementFingerprint(vmCreateCommitSQL) ||
+		fp == mustStatementFingerprint(vmCreateRollbackSQL) ||
+		fp == mustStatementFingerprint(containerCreateCommitSQL) ||
+		fp == mustStatementFingerprint(containerCreateRollbackSQL) ||
+		fp == mustStatementFingerprint(vmDeleteSQL) ||
+		fp == mustStatementFingerprint(containerDeleteSQL)
+}
+
 func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
+	if reason := c.quarantineReason(); reason != "" {
+		return 0, errQuarantined(reason)
+	}
 	c.mu.Lock()
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -990,6 +1096,9 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 }
 
 func (c *Client) Members() []PeerInfo {
+	if fn := c.membersForTests; fn != nil {
+		return fn()
+	}
 	if c.list == nil {
 		return nil
 	}
@@ -1002,6 +1111,10 @@ func (c *Client) Members() []PeerInfo {
 	}
 	return peers
 }
+
+// SetMembersForTests injects gossip membership. Test-only; production membership
+// comes from memberlist.
+func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
 
 // PeerInfo holds basic peer identity from memberlist.
 type PeerInfo struct {

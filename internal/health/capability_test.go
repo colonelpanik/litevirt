@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
@@ -23,8 +24,8 @@ func TestCapabilityActive(t *testing.T) {
 
 	t.Run("all support -> active", func(t *testing.T) {
 		c := setup(t)
-		c.SetPeerPinger(func(_ context.Context, host string) ([]string, error) {
-			return []string{tok}, nil
+		c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
+			return []string{tok}, time.Time{}, nil
 		})
 		if ok, reason := c.CapabilityActive(context.Background(), tok); !ok {
 			t.Fatalf("all-support: got inactive reason=%q; want active", reason)
@@ -33,11 +34,11 @@ func TestCapabilityActive(t *testing.T) {
 
 	t.Run("unreachable relevant member -> inactive (fail closed)", func(t *testing.T) {
 		c := setup(t)
-		c.SetPeerPinger(func(_ context.Context, host string) ([]string, error) {
+		c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
 			if host == "host-b" {
-				return nil, errors.New("dial timeout")
+				return nil, time.Time{}, errors.New("dial timeout")
 			}
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		})
 		if ok, reason := c.CapabilityActive(context.Background(), tok); ok || reason != ReasonActivationUnconfirm {
 			t.Fatalf("unreachable: got ok=%v reason=%q; want inactive/activation_unconfirmed", ok, reason)
@@ -46,11 +47,11 @@ func TestCapabilityActive(t *testing.T) {
 
 	t.Run("member lacks token -> inactive", func(t *testing.T) {
 		c := setup(t)
-		c.SetPeerPinger(func(_ context.Context, host string) ([]string, error) {
+		c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
 			if host == "host-b" {
-				return []string{}, nil // old peer, no capabilities
+				return []string{}, time.Time{}, nil // old peer, no capabilities
 			}
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		})
 		if ok, reason := c.CapabilityActive(context.Background(), tok); ok || reason != ReasonUnsupportedCapability {
 			t.Fatalf("unsupported: got ok=%v reason=%q; want inactive/unsupported_capability", ok, reason)
@@ -59,11 +60,11 @@ func TestCapabilityActive(t *testing.T) {
 
 	t.Run("fenced member is not consulted", func(t *testing.T) {
 		c := setup(t)
-		c.SetPeerPinger(func(_ context.Context, host string) ([]string, error) {
+		c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
 			if host == "host-c" {
 				t.Errorf("fenced host-c must not be pinged for activation")
 			}
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		})
 		if ok, _ := c.CapabilityActive(context.Background(), tok); !ok {
 			t.Fatalf("fenced-skipped: want active (fenced member excluded)")
@@ -91,9 +92,9 @@ func TestCapabilityActiveForHealth_PositiveCached(t *testing.T) {
 	c := NewChecker("host-a", "/etc/litevirt/pki", db)
 
 	var calls int
-	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) {
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) {
 		calls++
-		return []string{tok}, nil
+		return []string{tok}, time.Time{}, nil
 	})
 
 	if ok, _ := c.CapabilityActiveForHealth(context.Background(), tok); !ok {
@@ -131,11 +132,11 @@ func TestEnforced_Latches(t *testing.T) {
 	c := NewChecker("host-a", "/etc/litevirt/pki", db)
 
 	supporting := true
-	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) {
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) {
 		if supporting {
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		}
-		return nil, errors.New("partitioned")
+		return nil, time.Time{}, errors.New("partitioned")
 	})
 
 	if !c.Enforced(ctx, tok) {
@@ -169,7 +170,7 @@ func TestDurablyLatched_PersistRetryAndReload(t *testing.T) {
 	base := filepath.Join(badParent, "activated")
 	c := NewChecker("host-a", "/etc/litevirt/pki", db)
 	c.SetActivationMarker(base)
-	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) { return []string{tok}, nil })
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) { return []string{tok}, time.Time{}, nil })
 
 	// Activate: latches in memory, but the marker write fails → NOT durable, so a durable-gated
 	// contract (canonical registry acceptance) stays fail-closed.
@@ -204,7 +205,7 @@ func TestDurablyLatched_PersistRetryAndReload(t *testing.T) {
 
 	// An unset marker base is never durable, even if the in-memory latch is set.
 	c3 := NewChecker("host-a", "/etc/litevirt/pki", db)
-	c3.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) { return []string{tok}, nil })
+	c3.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) { return []string{tok}, time.Time{}, nil })
 	c3.Enforced(ctx, tok)
 	if c3.DurablyLatched(tok) {
 		t.Fatal("no marker base ⇒ never durable (nothing can persist)")
@@ -240,9 +241,9 @@ func TestPeerSupports(t *testing.T) {
 	t.Run("supporting peer -> true, and caches", func(t *testing.T) {
 		c := NewChecker("host-a", "/etc/litevirt/pki", testCheckHostDB(t))
 		var pings int
-		c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) {
+		c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) {
 			pings++
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		})
 		if !c.PeerSupports(ctx, "host-b", tok) {
 			t.Fatal("host-b advertises the token; want supported")
@@ -257,11 +258,11 @@ func TestPeerSupports(t *testing.T) {
 		if c.PeerSupports(ctx, "host-b", tok) {
 			t.Fatal("no pinger: must be false (fail-closed)")
 		}
-		c.SetPeerPinger(func(_ context.Context, host string) ([]string, error) {
+		c.SetPeerPinger(func(_ context.Context, host string) ([]string, time.Time, error) {
 			if host == "down" {
-				return nil, errors.New("timeout")
+				return nil, time.Time{}, errors.New("timeout")
 			}
-			return []string{}, nil // advertises nothing
+			return []string{}, time.Time{}, nil // advertises nothing
 		})
 		if c.PeerSupports(ctx, "host-b", tok) {
 			t.Fatal("peer advertises nothing: want false")
@@ -282,11 +283,11 @@ func TestPeerSupportsFresh_BypassesStalePositive(t *testing.T) {
 	c := NewChecker("host-a", "/etc/litevirt/pki", testCheckHostDB(t))
 
 	advertises := true
-	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, error) {
+	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) {
 		if advertises {
-			return []string{tok}, nil
+			return []string{tok}, time.Time{}, nil
 		}
-		return []string{}, nil // downgraded: advertises nothing
+		return []string{}, time.Time{}, nil // downgraded: advertises nothing
 	})
 
 	// Seed a positive into the cache.

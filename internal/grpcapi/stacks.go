@@ -943,6 +943,29 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName string, keepDisks bo
 	return fmt.Errorf("VM %q not found on any peer", vmName)
 }
 
+// DeleteVMForStackCleanup exposes DeleteVM to the StackReconciler with a SYSTEM
+// principal attached.
+//
+// The reconciler is a background loop, so its context carries no identity — and
+// DeleteVM is RBAC-gated. Calling the handler directly therefore failed every single
+// time with "no authenticated principal", and because the reconciler treats a failure
+// as retryable it looped every 30s forever: the stack never finished deleting and the
+// VM could not be removed through the UI either. Observed in production on
+// 2026-08-06 (stack przemek-sfs, vm przemek-sfs-test).
+//
+// Both values are required. RequirePerm rejects an empty username BEFORE it reaches
+// the role fallback, so a role alone is not enough — same reasoning as the
+// health-checker-driven migrate path in migrate.go.
+//
+// The username is deliberately a distinguishable system principal rather than a real
+// user, so the audit trail attributes the deletion to stack cleanup instead of
+// implying an operator did it.
+func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	return s.DeleteVM(authCtx, req)
+}
+
 // RemoveLBForStack exposes removeLBForStack for the StackReconciler.
 func (s *Server) RemoveLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord) {
 	s.removeLBForStack(ctx, stackName, vms)

@@ -16,7 +16,7 @@ func TestRelocateContainers(t *testing.T) {
 	ctx := context.Background()
 
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active",
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", CPUTotal: 8, MemTotal: 8192,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -33,9 +33,8 @@ func TestRelocateContainers(t *testing.T) {
 	mk("noop", "alpine:3.19", "none")          // skipped: policy none
 
 	c := newTestCoordinator("coord", db)
-	idx := 0
 	candidates := []corrosion.HostRecord{{Name: "live", State: "active"}}
-	c.relocateContainers(ctx, &corrosion.HostRecord{Name: "dead"}, candidates, &idx)
+	c.relocateContainers(ctx, &corrosion.HostRecord{Name: "dead"}, candidates)
 
 	// web → relocated to live, pending+relocate-recreate, source row gone.
 	if g, _ := corrosion.GetContainer(ctx, db, "dead", "web"); g != nil {

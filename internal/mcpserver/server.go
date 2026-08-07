@@ -187,11 +187,11 @@ func (s *Server) tool(name string) string {
 func (s *Server) registerTools(m *mcp.Server) {
 	s.addTool(m, "ping", "Connectivity self-test against the configured litevirt daemon.", emptySchema(), s.handlePing)
 	s.addTool(m, "whoami", "Show the authenticated litevirt identity and role.", emptySchema(), s.handleWhoami)
-	s.addTool(m, "cluster_status", "Return a safe cluster status summary with host counts, VM counts, and alert counts.", emptySchema(), s.handleClusterStatus)
+	s.addTool(m, "cluster_status", "Return a safe cluster status summary with host counts and VM counts.", emptySchema(), s.handleClusterStatus)
 	s.addTool(m, "list_hosts", "List hosts with coarse capacity and placement information.", objectSchema(map[string]any{"limit": integerSchema("Maximum hosts to return.")}), s.handleListHosts)
 	s.addTool(m, "inspect_host", "Inspect one host with safe fields only.", objectSchema(map[string]any{"name": stringSchema("Host name.")}, "name"), s.handleInspectHost)
 	s.addTool(m, "host_stats", "Fetch live aggregate stats for one host.", objectSchema(map[string]any{"name": stringSchema("Host name.")}, "name"), s.handleHostStats)
-	s.addTool(m, "host_health", "Return the host health matrix.", emptySchema(), s.handleHostHealth)
+	s.addTool(m, "cluster_health", "Return the cluster health: overall state, active conditions, evaluator coverage, connectivity, and per-host capacity.", objectSchema(map[string]any{"include_resolved": booleanSchema("Include recently-resolved conditions (30-day history).")}), s.handleClusterHealth)
 	s.addTool(m, "list_vms", "List VMs with safe placement and state fields; VM specs and cloud-init are never returned.", objectSchema(map[string]any{
 		"host_name":  stringSchema("Optional host filter."),
 		"stack_name": stringSchema("Optional stack filter."),
@@ -469,14 +469,14 @@ func (s *Server) handleHostStats(ctx context.Context, args map[string]any) *mcp.
 	return s.ok("host stats", hostStatsDTO(out.(*pb.HostResourceStats), s.opts.MaxListItems), len(out.(*pb.HostResourceStats).GetVmStats()) > s.opts.MaxListItems)
 }
 
-func (s *Server) handleHostHealth(ctx context.Context, _ map[string]any) *mcp.CallToolResult {
+func (s *Server) handleClusterHealth(ctx context.Context, args map[string]any) *mcp.CallToolResult {
 	out, err := s.rpc(ctx, true, func(ctx context.Context, c pb.LiteVirtClient) (any, error) {
-		return c.GetHostHealth(ctx, &emptypb.Empty{})
+		return c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{IncludeResolved: boolArg(args, "include_resolved")})
 	})
 	if err != nil {
 		return s.fail(err)
 	}
-	return s.ok("host health", hostHealthDTO(out.(*pb.HostHealthMatrix)), false)
+	return s.ok("cluster health", clusterHealthDTO(out.(*pb.ClusterHealth)), false)
 }
 
 func (s *Server) handleListVMs(ctx context.Context, args map[string]any) *mcp.CallToolResult {

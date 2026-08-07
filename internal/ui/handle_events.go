@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -120,12 +121,82 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case resp.Error != "":
 		sendToast(w, "Verify error: "+resp.Error, "error")
-	case resp.BrokenAtId != "":
-		sendToast(w, fmt.Sprintf("Chain broken at row %s (%d rows checked)", resp.BrokenAtId, resp.RowsChecked), "error")
+	case resp.Tampered:
+		sendToast(w, "Audit chain TAMPERED: "+auditTamperSummary(resp)+
+			fmt.Sprintf(" (%d rows checked) — run `lv audit verify` for the affected rows", resp.RowsChecked), "error")
+	case resp.Unverified:
+		// The third outcome, and a warning rather than an error: part of the log
+		// could not be checked, which is not a pass and is not an accusation. It
+		// was briefly neither — when `never adopted` stopped counting as tampering
+		// this branch did not exist, so a host that had published a signing
+		// certificate and could not sign produced a GREEN "intact, all signed"
+		// toast here while `lv audit verify` exited 1 on the same result.
+		sendToast(w, fmt.Sprintf("Audit chain PARTLY UNVERIFIED (%d rows checked): %s — "+
+			"run `lv audit verify` for the detail", resp.RowsChecked, auditUnverifiedSummary(resp)), "warning")
+	case resp.UnsignedRows > 0:
+		// Deliberately "success", not a warning: unsigned rows are what every
+		// cluster looks like before signing was switched on, and colouring that
+		// red teaches operators that a red audit toast means nothing.
+		sendToast(w, fmt.Sprintf("Audit chain intact: %d rows verified (%d predate tamper-evidence, chain-checked only)",
+			resp.RowsChecked, resp.UnsignedRows), "success")
 	default:
-		sendToast(w, fmt.Sprintf("Audit chain intact: %d rows verified", resp.RowsChecked), "success")
+		sendToast(w, fmt.Sprintf("Audit chain intact: %d rows verified, all signed", resp.RowsChecked), "success")
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// auditTamperSummary names every category that fired, with counts. A toast
+// cannot hold one line per affected row, so it must at least say WHICH kind of
+// interference was found — "chain broken" alone hides a bad signature sitting
+// next to it, and those two call for very different responses.
+func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
+	var parts []string
+	if resp.BrokenAtId != "" {
+		parts = append(parts, "hash mismatch at row "+resp.BrokenAtId)
+	}
+	for _, c := range []struct {
+		label string
+		n     int
+	}{
+		{"bad signature", len(resp.BadSignature)},
+		{"unknown key", len(resp.UnknownKeyId)},
+		{"sequence gap", len(resp.SeqGaps)},
+		{"laundered row", len(resp.Laundered)},
+		{"truncated host", len(resp.TruncatedHosts)},
+		// The categories a rotation produces. Without them a log rewritten by
+		// someone holding a rotated-out key — the case the whole rotation
+		// mechanism exists to catch — reached the operator as "unspecified
+		// finding", which is the least actionable thing this toast can say.
+		{"retired key use", len(resp.RetiredKeyUse)},
+		{"chain head mismatch", len(resp.HeadMismatch)},
+		{"unsigned row after signing began", len(resp.UnsignedAfterSigned)},
+	} {
+		if c.n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s(s)", c.n, c.label))
+		}
+	}
+	if len(parts) == 0 {
+		return "unspecified finding"
+	}
+	return strings.Join(parts, "; ")
+}
+
+// auditUnverifiedSummary names what went unchecked. Kept separate from
+// auditTamperSummary rather than folded into it, because the two answer different
+// questions and merging them is how `never adopted` ended up being reported as
+// evidence of interference in the first place.
+func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
+	var parts []string
+	if n := len(resp.NeverAdopted); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d host(s) declaring signed rows they cannot sign", n))
+	}
+	if resp.UnverifiableRows > 0 {
+		parts = append(parts, fmt.Sprintf("%d signed row(s) this daemon has no keyring to check", resp.UnverifiableRows))
+	}
+	if len(parts) == 0 {
+		return "part of the log went unchecked"
+	}
+	return strings.Join(parts, "; ")
 }
 
 // handleAuditExport streams the audit chain as a downloadable JSON blob suitable

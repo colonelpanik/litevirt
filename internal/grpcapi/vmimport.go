@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -161,6 +162,48 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// Reserve-then-verify admission across ALL FOUR quota dimensions, with
+	// residency safety and the commit fence — the same contract every other path
+	// that lands a VM carries. admitImport above stays as the cheap pre-convert
+	// fail-fast, but a glance cannot see in-flight reservations, holds nothing
+	// across the commit below, and never consulted host capacity or host safety
+	// at all.
+	//
+	// Disk and NIC are reserved here rather than left to that glance. Leaving
+	// them there made those two limits enforceable one request at a time: two
+	// imports (or an import racing a create) each read a view without the
+	// other's claim, each fit the remaining disk or NIC budget, and both
+	// committed — over the limit, with neither request having done anything
+	// wrong. The converted sizes are authoritative by this point, so the
+	// reservation charges what the row will actually contribute.
+	//
+	// Quota is charged for stopped AND started imports alike — the row written
+	// below counts toward project usage the moment it lands. HOST capacity and
+	// residency safety apply only to --start: a stopped import is a durable
+	// record, not runtime residency, and its host charge is StartVM's job.
+	importIntent := intentResourceGrow
+	if first.Start {
+		importIntent = intentVMResident
+	}
+	// A create's absolute contribution IS its delta — the VM does not exist yet.
+	importAmount := importQuotaAmount(fv)
+	importQuotaLease, qerr := s.admitQuotaWithReservation(ctx, "ImportVM", s.hostName, project,
+		corrosion.WorkloadVM, name, importAmount, importAmount, importIntent)
+	if qerr != nil {
+		cleanupDisks()
+		return qerr
+	}
+	defer importQuotaLease.release(ctx)
+	if first.Start {
+		hostLease, herr := s.admitHostWithReservation(ctx, "ImportVM", s.hostName, project,
+			"vm:"+name, fv.CPUs, fv.MemoryMiB, intentVMResident)
+		if herr != nil {
+			cleanupDisks()
+			return herr
+		}
+		defer hostLease.release(ctx)
+	}
+
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
 	spec := fv.ToVMSpec(project)
@@ -207,6 +250,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
 
+	// The define above resolved any machine alias against this host's qemu;
+	// persist the concrete value so the imported VM's guest ABI travels with it.
+	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
 	diskRecords, ifaceRecords, nicRecords := importRecords(fv, name, s.hostName)
 	// pciIntents: the mapped spec's Devices, if the source format ever declares
@@ -214,6 +260,17 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	// import on the same canonicalized-BDF path as every other producer with a
 	// spec.Devices list, per the shared buildPCIIntents helper).
 	pciIntents := s.buildPCIIntents(name, spec.Devices)
+
+	// The quota-authority commit fence, immediately before the durable write.
+	// Unwind mirrors the insert-failure rollback below: nothing was persisted.
+	if err := importQuotaLease.allowCommit(ctx); err != nil {
+		_ = s.virt.UndefineDomain(name, false)
+		if fwImport {
+			lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
+		}
+		cleanupDisks()
+		return err
+	}
 
 	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
 	// self-certify adoption — the Phase-6 backfill audit confirms/reconciles
@@ -238,8 +295,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	stateMsg := "imported (stopped)"
 	if first.Start {
 		if err := s.virt.StartDomain(name); err != nil {
-			// Roll back fully: remove DB row, undefine, delete disks.
-			_ = corrosion.DeleteVM(ctx, s.db, name)
+			// Roll back fully: remove DB row, undefine, delete disks. The
+			// tombstone is best-effort inside a rollback that already fails the
+			// RPC — but a decline must at least be visible, since it leaves a
+			// live row for a VM whose disks the lines below delete.
+			if derr := corrosion.DeleteVM(ctx, s.db, name); derr != nil {
+				slog.Warn("import rollback: could not tombstone the just-created row — it stays live until a retry or delete",
+					"vm", name, "error", derr)
+			}
 			_ = s.virt.UndefineDomain(name, false)
 			if fwImport {
 				lv.WipeFirmwareState(s.dataDir, name, spec.Uuid)
@@ -514,14 +577,32 @@ func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM,
 	return nil
 }
 
-func (s *Server) admitImport(ctx context.Context, project string, fv *vmimport.ForeignVM) error {
+// importQuotaAmount is what an import will charge the project, in every
+// dimension the quota bounds. One derivation feeds BOTH the cheap pre-convert
+// fail-fast and the serialized reservation, so the two can never disagree about
+// what the import costs. Disk goes through corrosion.DiskQuotaGiB, the same rule
+// committed usage and the settle contribution use, so the charge is a number the
+// accounting can actually observe as paid.
+func importQuotaAmount(fv *vmimport.ForeignVM) corrosion.QuotaAmount {
 	diskGiB := 0
 	for _, d := range fv.Disks {
-		if !d.IsCDROM {
-			diskGiB += int((d.CapacityBytes + (1 << 30) - 1) >> 30)
+		if d.IsCDROM {
+			continue
 		}
+		// A parsed foreign descriptor is untrusted input; clamp rather than let
+		// an absurd declared size wrap negative and charge nothing.
+		size := d.CapacityBytes
+		if size > math.MaxInt64 {
+			size = math.MaxInt64
+		}
+		diskGiB += corrosion.DiskQuotaGiB(int64(size))
 	}
-	qreq := tenancy.QuotaRequest{VCPU: fv.CPUs, MemMiB: fv.MemoryMiB, DiskGiB: diskGiB, NIC: len(fv.NICs)}
+	return corrosion.QuotaAmount{VCPU: fv.CPUs, MemMiB: fv.MemoryMiB, DiskGiB: diskGiB, NIC: len(fv.NICs)}
+}
+
+func (s *Server) admitImport(ctx context.Context, project string, fv *vmimport.ForeignVM) error {
+	amt := importQuotaAmount(fv)
+	qreq := tenancy.QuotaRequest{VCPU: amt.VCPU, MemMiB: amt.MemMiB, DiskGiB: amt.DiskGiB, NIC: amt.NIC}
 	if s.tenancy != nil {
 		if err := s.tenancy.Admit(ctx, project, qreq); err != nil {
 			return status.Errorf(codes.ResourceExhausted, "%v", err)

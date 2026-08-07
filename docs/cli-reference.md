@@ -46,7 +46,7 @@ lv version                         # Print version
 lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
 lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
                                    #   (`lv cluster sync` is a deprecated alias)
-lv health                          # Cluster health matrix
+lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 
 ## Hosts
@@ -61,7 +61,8 @@ lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
-lv host rm <host> [--force]               # Remove host (--force with running VMs)
+lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices
@@ -97,6 +98,7 @@ lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
+  --project <name>      # Tenancy project to create in (default _default); charges its quota
   --secure-boot         # UEFI Secure Boot (MS keys; q35 + UEFI). Windows 11 ready
   --tpm                 # Attach a TPM 2.0 emulator (vTPM) — required for Win11/BitLocker
 
@@ -697,7 +699,10 @@ See `docs/audit-log.md` for the chain semantics.
 ## Monitoring
 
 ```bash
-lv health                                    # Cluster health matrix
+lv health [--resolved]                       # Cluster health: overall state, active conditions,
+                                             #   evaluator coverage, connectivity, capacity.
+                                             #   --resolved includes the 30-day resolved history.
+                                             #   Exit code: 0 healthy · 1 degraded/unknown · 2 critical.
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since TS]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

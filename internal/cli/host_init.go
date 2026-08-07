@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,11 +11,15 @@ import (
 	osuser "os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/ssh"
+	"github.com/litevirt/litevirt/internal/systemdunit"
 )
 
 var (
@@ -86,14 +91,21 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
-	filesToPush := map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
-	}
-	for local, remote := range filesToPush {
-		if err := sc.CopyFile(local, remote); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(local), err)
+	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
+	// authenticates with it and audit rows are signed with it, so a local user
+	// who can read it can both impersonate the host to every peer and forge its
+	// audit history. It shipped 0644 because CopyFile's default mode was
+	// invisible at the call site.
+	for _, f := range []struct {
+		local, remote string
+		mode          os.FileMode
+	}{
+		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
+		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
+		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+	} {
+		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
+			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
 
@@ -135,7 +147,21 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 }
 
 // HostAdd adds a new host to an existing cluster.
-func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers []string) error {
+func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostName string, joinPeers []string) error {
+	// Before anything is generated or pushed, because a failure here must leave the
+	// target untouched.
+	//
+	// The peer list is gathered best-effort by the caller: it asks the local daemon
+	// for the current hosts and carries on if that fails. Carrying on means writing
+	// `join_peers: []` onto the new node — certificates, binary and a running daemon,
+	// and no way to find the cluster — and then reporting success. `add` always has
+	// at least one host to join by definition; if it did not, this would be `init`.
+	if len(joinPeers) == 0 {
+		return fmt.Errorf("no gossip peers to join: could not read the existing cluster's "+
+			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
+			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
+			"is not the first host — the first one is `lv host init`", hostName)
+	}
 	pkiDir := PKIDir()
 
 	// Verify CA exists
@@ -185,14 +211,21 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 		return fmt.Errorf("create remote PKI dir: %w", err)
 	}
 
-	filesToPush := map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
-	}
-	for local, remote := range filesToPush {
-		if err := sc.CopyFile(local, remote); err != nil {
-			return fmt.Errorf("push %s: %w", filepath.Base(local), err)
+	// The host KEY is 0600. It is the node's entire cluster identity: peer mTLS
+	// authenticates with it and audit rows are signed with it, so a local user
+	// who can read it can both impersonate the host to every peer and forge its
+	// audit history. It shipped 0644 because CopyFile's default mode was
+	// invisible at the call site.
+	for _, f := range []struct {
+		local, remote string
+		mode          os.FileMode
+	}{
+		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
+		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
+		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+	} {
+		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
+			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
 
@@ -234,8 +267,27 @@ func HostAdd(ctx context.Context, sshTarget string, hostName string, joinPeers [
 		peersYAML += "]"
 	}
 
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s JOIN_PEERS='%s' bash /tmp/litevirt-setup.sh", hostName, peersYAML)); err != nil {
-		return fmt.Errorf("run setup script: %w", err)
+	// hostAddr is the address this command just put in the certificate SAN and the
+	// address peers were told to dial, so it is also the address the node must
+	// advertise. Leaving the daemon to auto-detect meant it registered with its
+	// default-route source IP — a different interface on a multi-homed host — and
+	// that value was then copied into the join_peers of every host added after it.
+	serial, err := pki.CertSerial(hostCertPath)
+	if err != nil {
+		return fmt.Errorf("read generated host certificate serial: %w", err)
+	}
+	if _, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
+		Name: hostName, Address: hostAddr, CertSerial: serial,
+	}); err != nil {
+		return fmt.Errorf("admit host identity to the cluster: %w", err)
+	}
+	// Admission must replicate before setup starts the daemon. A re-added node's
+	// local database still contains its tombstone; starting it first lets its boot
+	// state update put a fresh timestamp on that tombstone and race the admission
+	// back out to the cluster.
+	if err := sc.Run(fmt.Sprintf("%s bash /tmp/litevirt-setup.sh",
+		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " "))); err != nil {
+		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
 	// Ensure the new host is listed as a gossip peer in the local daemon config.
@@ -320,7 +372,42 @@ func findDaemonBinary() (string, error) {
 
 // HostInitLocal bootstraps litevirt on the local machine (no SSH).
 // Intended for single-node standalone setups.
-func HostInitLocal(ctx context.Context, hostName string) error {
+// mintLocalHostCert issues the first host's certificate, covering the address
+// PEERS will dial as well as loopback.
+//
+// It used to pass 127.0.0.1 alone, which is the one address guaranteed to mean a
+// different machine to whoever dials it — so no peer could ever complete a
+// handshake with the first node, and the documented advice ("use the remote form")
+// is circular, because a node cannot init itself remotely. The only way through
+// was copying the CA to a second node and re-issuing the first node's certificate
+// from there.
+//
+// addr empty falls back to the default-route source IP. That is the wrong answer
+// on a multi-homed host, which is exactly why --address exists: on a box whose
+// cluster network is not the default route, the operator has to say so, and the
+// same value belongs in advertise_address.
+func mintLocalHostCert(pkiDir, hostName, addr string) error {
+	caPath := filepath.Join(pkiDir, "ca.crt")
+	caKeyPath := filepath.Join(pkiDir, "ca.key")
+	if addr == "" {
+		addr = netutil.OutboundIP()
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		// Not an IP (a name, or nothing detectable). GenerateHostCert always adds
+		// loopback and the DNS name, so this stays usable for a single-node install
+		// while still being honest in the log about what peers will and will not
+		// be able to verify.
+		slog.Warn("no usable IP address for this host's certificate; peers dialling it by "+
+			"address will fail TLS verification. Pass --address <ip>", "host", hostName, "addr", addr)
+	}
+	slog.Info("generating host certificate", "host", hostName, "address", addr)
+	return pki.GenerateHostCert(caPath, caKeyPath,
+		filepath.Join(pkiDir, hostName+".crt"), filepath.Join(pkiDir, hostName+".key"),
+		hostName, ip)
+}
+
+func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -346,13 +433,11 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		}
 	}
 
-	// 3. Generate host certificate with 127.0.0.1 + outbound IP as SANs
-	slog.Info("generating host certificate", "host", hostName)
+	// 3. Generate the host certificate.
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
 	hostKeyPath := filepath.Join(pkiDir, hostName+".key")
-
-	if err := pki.GenerateHostCert(caPath, caKeyPath, hostCertPath, hostKeyPath, hostName, net.ParseIP("127.0.0.1")); err != nil {
-		return fmt.Errorf("generate host cert: %w", err)
+	if err := mintLocalHostCert(pkiDir, hostName, advertiseAddr); err != nil {
+		return err
 	}
 
 	// 4. Copy daemon certs to system PKI dir. The daemon host key stays
@@ -373,6 +458,12 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 		if err := os.WriteFile(dst, data, 0600); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
 		}
+		// WriteFile only applies its mode when it CREATES the file, so a
+		// re-init over an existing loose-permissioned key would silently keep
+		// the old mode.
+		if err := os.Chmod(dst, 0600); err != nil {
+			return fmt.Errorf("chmod %s: %w", filepath.Base(dst), err)
+		}
 	}
 
 	if err := installLocalCLIClientBundle(pkiDir); err != nil {
@@ -392,14 +483,7 @@ func HostInitLocal(ctx context.Context, hostName string) error {
 	}
 
 	cmd := execCommand("bash", scriptPath)
-	cmd.Env = append(os.Environ(),
-		"HOST_NAME="+hostName,
-		"JOIN_PEERS=[]",
-		"PCI_RESCAN_INTERVAL=0",
-		"PCI_UDEV_HOOK=false",
-		"SRIOV_MANAGED=false",
-		"SRIOV_MAX_VFS=8",
-	)
+	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -574,6 +658,66 @@ func resolveHost(host string) (string, error) {
 		host, addrs)
 }
 
+// setupScriptEnv is the environment the setup script reads to write the daemon
+// config. One place, so the local and remote paths cannot disagree about it —
+// they already had, which is how the local path shipped with no advertise_address.
+func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
+	return []string{
+		"HOST_NAME=" + hostName,
+		// The address that just went into the certificate SAN. Without it the daemon
+		// auto-detects, registers with its default-route source IP — the wrong
+		// interface on a multi-homed host — and the operator has to notice and
+		// correct it, which needed a genuine RESTART, because init leaves the daemon
+		// running and `systemctl start` is then a no-op.
+		"ADVERTISE_ADDRESS=" + advertiseAddr,
+		"JOIN_PEERS=" + joinPeers,
+		"PCI_RESCAN_INTERVAL=0",
+		"PCI_UDEV_HOOK=false",
+		"SRIOV_MANAGED=false",
+		"SRIOV_MAX_VFS=8",
+		// The capability-latch model requires config uniformity: a token is
+		// advertised only while a host's enforcement.* flag is on, so a host
+		// added with a config missing the block silently weakens the cluster.
+		// A re-admitted signer with no enforcement.audit_signature wrote
+		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
+		// Base64: the remote path joins this env into one shell command line,
+		// so a multi-line YAML block must travel as a single token.
+		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAMLFrom(daemonConfigPath))),
+	}
+}
+
+// enforcementYAMLFrom extracts the `enforcement:` mapping from a daemon config
+// verbatim — the key line plus every following line indented deeper. Empty on a
+// missing file or absent block: adding a host must never fail on this, and an
+// empty value makes the setup script append nothing.
+func enforcementYAMLFrom(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(raw), "\n")
+	var b strings.Builder
+	in := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "enforcement:") {
+			in = true
+			b.WriteString("enforcement:\n")
+			continue
+		}
+		if in {
+			if line == "" || (!strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t")) {
+				break
+			}
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	if !in {
+		return ""
+	}
+	return b.String()
+}
+
 func getSetupScript() (string, error) {
 	// Try to read from embedded or local path
 	// For now, return the script inline
@@ -645,6 +789,7 @@ metrics_port: 7444
 gossip_port: 7946
 pki_dir: /etc/litevirt/pki
 data_dir: /var/lib/litevirt
+${ADVERTISE_ADDRESS:+advertise_address: "${ADVERTISE_ADDRESS}"}
 join_peers: ${JOIN_PEERS:-[]}
 pci:
   rescan_interval: "${PCI_RESCAN_INTERVAL:-0}"
@@ -654,6 +799,15 @@ pci:
     max_vfs_per_pf: ${SRIOV_MAX_VFS:-8}
 CONF
 
+# Propagate the adding node's enforcement block: capability latches require
+# config uniformity, and a host that boots without the flags silently weakens
+# the cluster (a re-admitted signer without enforcement.audit_signature writes
+# unsigned audit rows that every node reports as tampering).
+if [ -n "${ENFORCEMENT_B64:-}" ]; then
+    echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
+    echo "enforcement config propagated from the adding node"
+fi
+
 # pci.udev_hook is deprecated: real-time PCI events are covered by
 # pci.rescan_interval, and the old curl-to-REST udev rule was unreliable. This
 # installer no longer writes a udev rule; the daemon warns if the flag is set.
@@ -661,42 +815,18 @@ CONF
 # Load vfio-pci kernel module (needed for PCI passthrough).
 modprobe vfio-pci 2>/dev/null || true
 
-# Install systemd unit file for litevirtd.
-# Mirror of internal/grpcapi/upgrade.go's litevirtdUnit + rollback unit —
-# both should drift together.
-cat > /etc/systemd/system/litevirt.service << 'UNIT'
-[Unit]
-Description=litevirt daemon
-After=network-online.target libvirtd.service
-Wants=network-online.target
-Wants=libvirtd.service
-StartLimitBurst=3
-StartLimitIntervalSec=600
-OnFailure=litevirt-rollback.service
+# Install the systemd units. The text comes from internal/systemdunit so this
+# script and the upgrade path cannot disagree; they previously drifted, leaving
+# this copy with a tight start limit and a rollback with NO sentinel gate.
+cat > ` + systemdunit.MainPath + ` << 'UNIT'
+` + systemdunit.Main + `UNIT
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/litevirt daemon
-KillMode=process
-Delegate=no
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
+cat > ` + systemdunit.RollbackPath + ` << 'UNIT'
+` + systemdunit.Rollback + `UNIT
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# Rollback companion: fires when litevirtd hits StartLimitBurst (a bad
-# upgrade panicking on every start). Restores .old binary and restarts.
-cat > /etc/systemd/system/litevirt-rollback.service << 'UNIT'
-[Unit]
-Description=litevirt daemon rollback (auto-restore previous binary on failed upgrade)
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'if [ -f /usr/local/bin/litevirt.old ]; then logger -t litevirt-rollback "RESTORING previous litevirtd binary after failed upgrade"; mv /usr/local/bin/litevirt.old /usr/local/bin/litevirt; systemctl reset-failed litevirt.service; systemctl start litevirt.service; else logger -t litevirt-rollback "no .old binary to roll back to; leaving litevirtd in failed state"; exit 1; fi'
-UNIT
+mkdir -p "$(dirname ` + systemdunit.NeedrestartPath + `)"
+cat > ` + systemdunit.NeedrestartPath + ` << 'DROPIN'
+` + systemdunit.Needrestart + `DROPIN
 systemctl daemon-reload
 systemctl enable litevirt.service
 systemctl restart litevirt.service

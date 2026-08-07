@@ -73,10 +73,13 @@ type Driver interface {
 // Config is the parsed VolumeDef from a compose file or host pool config.
 // Each pool produces one Driver via New().
 type Config struct {
-	Driver  string            // see SupportedDrivers
-	Source  string            // driver-specific (NFS server:/path, Ceph pool, ZFS dataset, …)
-	Target  string            // local mount/path override; empty = derive
-	Options map[string]string // driver-specific key/value options
+	Driver string // see SupportedDrivers
+	Source string // driver-specific (NFS server:/path, Ceph pool, ZFS dataset, …)
+	Target string // local mount/path override; empty = derive
+	// Options holds driver-specific key/value options. NFS accepts "options"
+	// for mount flags and "command_timeout" as a positive Go duration. A blank
+	// command_timeout uses the default control-command timeout.
+	Options map[string]string
 }
 
 // SupportedDrivers lists every storage driver known to New(). Update this

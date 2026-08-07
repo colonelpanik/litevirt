@@ -94,18 +94,6 @@ type hostStatsOut struct {
 	VMStats        []vmStatsOut `json:"vm_stats,omitempty"`
 }
 
-type hostHealthOut struct {
-	Entries []hostHealthEntryOut `json:"entries"`
-}
-
-type hostHealthEntryOut struct {
-	Observer            string `json:"observer"`
-	Target              string `json:"target"`
-	Status              string `json:"status"`
-	ConsecutiveFailures int32  `json:"consecutive_failures"`
-	LastSeen            string `json:"last_seen,omitempty"`
-}
-
 type containerOut struct {
 	HostName    string `json:"host_name"`
 	Name        string `json:"name"`
@@ -335,18 +323,50 @@ func hostStatsDTO(h *pb.HostResourceStats, limit int) hostStatsOut {
 	return out
 }
 
-func hostHealthDTO(h *pb.HostHealthMatrix) hostHealthOut {
-	out := hostHealthOut{Entries: make([]hostHealthEntryOut, 0, len(h.GetEntries()))}
-	for _, e := range h.GetEntries() {
-		out.Entries = append(out.Entries, hostHealthEntryOut{
-			Observer:            e.GetObserver(),
-			Target:              e.GetTarget(),
-			Status:              e.GetStatus(),
-			ConsecutiveFailures: e.GetConsecutiveFailures(),
-			LastSeen:            ts(e.GetLastSeen()),
+func clusterHealthDTO(h *pb.ClusterHealth) map[string]any {
+	conditions := make([]map[string]any, 0, len(h.GetConditions()))
+	for _, c := range h.GetConditions() {
+		conditions = append(conditions, map[string]any{
+			"evaluator": c.GetEvaluator(), "code": c.GetCode(),
+			"subject_kind": c.GetSubjectKind(), "subject_id": c.GetSubjectId(),
+			"lifecycle": c.GetLifecycle(), "severity": c.GetSeverity(),
+			"hosts": c.GetHosts(), "first_seen": c.GetFirstSeen(),
+			"last_seen": c.GetLastSeen(), "confirmed_at": c.GetConfirmedAt(),
+			"resolved_at": c.GetResolvedAt(),
 		})
 	}
-	return out
+	evaluators := make([]map[string]any, 0, len(h.GetEvaluators()))
+	for _, e := range h.GetEvaluators() {
+		evaluators = append(evaluators, map[string]any{
+			"evaluator": e.GetEvaluator(), "last_scan": e.GetLastScan(),
+			"coverage": e.GetCoverage(), "detail": e.GetDetail(),
+		})
+	}
+	connectivity := make([]map[string]any, 0, len(h.GetConnectivity()))
+	for _, e := range h.GetConnectivity() {
+		connectivity = append(connectivity, map[string]any{
+			"observer": e.GetObserver(), "target": e.GetTarget(),
+			"status": e.GetStatus(), "consecutive_failures": e.GetConsecutiveFailures(),
+			"last_seen": e.GetLastSeen(),
+		})
+	}
+	capacity := make([]map[string]any, 0, len(h.GetCapacity()))
+	for _, c := range h.GetCapacity() {
+		capacity = append(capacity, map[string]any{
+			"host_name": c.GetHostName(), "effective_cpu": c.GetEffectiveCpu(),
+			"effective_mem_mib": c.GetEffectiveMemMib(), "extra_cpu": c.GetExtraCpu(),
+			"extra_mem_mib": c.GetExtraMemMib(), "complete": c.GetComplete(),
+			"detail": c.GetDetail(), "sampled_at": c.GetSampledAt(),
+		})
+	}
+	return map[string]any{
+		"overall":      h.GetOverall(),
+		"conditions":   conditions,
+		"evaluators":   evaluators,
+		"connectivity": connectivity,
+		"capacity":     capacity,
+		"generated_at": h.GetGeneratedAt(),
+	}
 }
 
 func mapContainers(in []*pb.Container) []containerOut {
@@ -522,7 +542,7 @@ func clusterDTO(c *pb.ClusterStatus, limit int) map[string]any {
 		"vms_total":    c.GetVmsTotal(),
 		"vms_running":  c.GetVmsRunning(),
 		"vms_error":    c.GetVmsError(),
-		"alerts_count": len(c.GetAlerts()),
+
 		"events_count": len(c.GetRecentEvents()),
 		"hosts":        mapHosts(truncate(c.GetHosts(), limit)),
 	}

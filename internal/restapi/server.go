@@ -93,6 +93,12 @@ type Server struct {
 	mux   *http.ServeMux
 }
 
+// maxRequestBodyBytes is deliberately larger than ordinary API payloads while
+// keeping authenticated clients from using JSON decoding as an unbounded
+// memory-allocation primitive. Bulk image/backup data uses streaming gRPC RPCs,
+// not these JSON endpoints.
+const maxRequestBodyBytes int64 = 4 << 20
+
 // NewServer creates a REST gateway that forwards to the given gRPC client.
 // token is an optional static bearer token; if empty, no auth is enforced
 // (caller should bind the listener to localhost only).
@@ -149,6 +155,7 @@ func (s *Server) registerRoutes() {
 // noAuth wraps a handler with content-type but no auth (health, login).
 func (s *Server) noAuth(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		w.Header().Set("Content-Type", "application/json")
 		h(w, r)
 	}
@@ -157,6 +164,7 @@ func (s *Server) noAuth(h func(http.ResponseWriter, *http.Request)) http.Handler
 // wrap adds auth check and sets content-type around a handler.
 func (s *Server) wrap(h func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 		auth := r.Header.Get("Authorization")
 		bearer := strings.TrimPrefix(auth, "Bearer ")
 
@@ -312,7 +320,12 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		jsonProto(w, resp)
 
 	case action == "health" && r.Method == http.MethodGet:
-		resp, err := s.grpc.GetHostHealth(ctx, &emptypb.Empty{})
+		// Health is a CLUSTER property (conditions, coverage, connectivity,
+		// capacity); the response is the same GetClusterHealth every other
+		// consumer reads. ?resolved=1 includes the 30-day resolved history.
+		resp, err := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{
+			IncludeResolved: r.URL.Query().Get("resolved") == "1",
+		})
 		if err != nil {
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return

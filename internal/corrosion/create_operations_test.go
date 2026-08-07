@@ -1,0 +1,3740 @@
+package corrosion
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+)
+
+func createOp(id, resourceKind, resourceID, requestHash, reservation string, ownerEpoch int64) OperationRecord {
+	return OperationRecord{
+		ID: id, Method: "Create" + resourceKind, Principal: "alice", Project: "p1",
+		ResourceKind: resourceKind, ResourceID: resourceID,
+		OperationKind: string(OpWorkloadCreate), RequestHash: requestHash,
+		IdempotencyKey: id, ReservationJSON: reservation, VMOwnerEpoch: ownerEpoch,
+	}
+}
+
+func TestBeginVMCreateOperationIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-vm", "vm", "vm1", "hash", "", 7)
+	vm := VMRecord{Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, State: "creating", Project: "p1", OwnerEpoch: 7}
+
+	applied, err := c.BeginVMCreateOperation(ctx, op, vm)
+	if err != nil || !applied {
+		t.Fatalf("BeginVMCreateOperation: applied=%v err=%v", applied, err)
+	}
+	got, err := GetVM(ctx, c, "vm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.State != "creating" || got.ActiveOperationID != op.ID ||
+		got.OwnerEpoch != 7 || got.SpecGeneration != 0 {
+		t.Fatalf("provisional vm = %+v", got)
+	}
+	header, err := GetOperation(ctx, c, op.ID)
+	if err != nil || header == nil {
+		t.Fatalf("operation = %+v err=%v", header, err)
+	}
+	steps, err := ListOperationSteps(ctx, c, op.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stepNames(steps); !equalStrings(got, []string{OpStepDesiredPersisted, OpStepPlanned, OpStepReserved}) {
+		t.Fatalf("steps = %v", got)
+	}
+}
+
+func TestBeginVMCreateOperationRollsBackOnStatementFailure(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if _, err := c.db.Exec(`CREATE TRIGGER fail_vm_create BEFORE INSERT ON vms
+		BEGIN SELECT RAISE(ABORT, 'injected vm insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	op := createOp("op-fail", "vm", "vm-fail", "hash", "", 1)
+	if applied, err := c.BeginVMCreateOperation(ctx, op, VMRecord{Name: "vm-fail", HostName: "h1", State: "creating", OwnerEpoch: 1}); err == nil || applied {
+		t.Fatalf("BeginVMCreateOperation: applied=%v err=%v, want transactional failure", applied, err)
+	}
+	if got, _ := GetOperation(ctx, c, op.ID); got != nil {
+		t.Fatalf("operation survived rollback: %+v", got)
+	}
+	if rows, _ := c.Query(ctx, `SELECT 1 FROM operation_steps WHERE operation_id = ?`, op.ID); len(rows) != 0 {
+		t.Fatalf("steps survived rollback: %v", rows)
+	}
+	if got, _ := GetVM(ctx, c, "vm-fail"); got != nil {
+		t.Fatalf("vm survived rollback: %+v", got)
+	}
+}
+
+func TestExecuteBatchGuardedEvaluatesStructuredGuardsSequentially(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-local-guards", "vm", "vm1", "hash", "", 1)
+	vm := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	good, err := vmCreateMutationGuard(op.ID, 1, vm, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	good.OperationClaimHash = operationClaimHash(op)
+	bad := *good
+	bad.IdentityHash = "not-the-provisional-identity"
+	applied, err := c.ExecuteBatchGuarded(ctx, func(*sql.Tx) (bool, error) {
+		return true, nil
+	}, []Statement{
+		{SQL: `UPDATE vms SET state_detail = ? WHERE name = ?`, Params: []interface{}{"must-roll-back", "vm1"}, Guard: good},
+		{SQL: `UPDATE vms SET state_detail = ? WHERE name = ?`, Params: []interface{}{"must-not-apply", "vm1"}, Guard: &bad},
+	})
+	if err != nil || applied {
+		t.Fatalf("guarded batch: applied=%v err=%v, want declined without error", applied, err)
+	}
+	got, err := GetVM(ctx, c, "vm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.StateDetail != "" {
+		t.Fatalf("structured-guard decline did not roll back prior statement: %+v", got)
+	}
+}
+
+func TestBeginVMCreateOperationIdempotencyAndConflicts(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-same", "vm", "vm1", "hash", "", 2)
+	vm := VMRecord{Name: "vm1", HostName: "h1", State: "creating", OwnerEpoch: 2}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("first begin: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || applied {
+		t.Fatalf("same retry: applied=%v err=%v, want idempotent not-new", applied, err)
+	}
+	differentHash := op
+	differentHash.RequestHash = "different"
+	if _, err := c.BeginVMCreateOperation(ctx, differentHash, vm); !errors.Is(err, ErrOperationHashConflict) {
+		t.Fatalf("different hash error = %v", err)
+	}
+	differentIdentity := op
+	differentIdentity.ResourceID = "vm2"
+	if _, err := c.BeginVMCreateOperation(ctx, differentIdentity, VMRecord{Name: "vm2", HostName: "h1", State: "creating", OwnerEpoch: 2}); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("different identity error = %v", err)
+	}
+	if got, _ := GetVM(ctx, c, "vm2"); got != nil {
+		t.Fatalf("conflicting identity created vm2: %+v", got)
+	}
+	wrongProjectReservation, _ := (ReservationVector{
+		Project: "other", ProjectCPU: 1,
+	}).Encode()
+	wrongProject := createOp("op-wrong-project", "vm", "vm3", "hash", wrongProjectReservation, 1)
+	if _, err := c.BeginVMCreateOperation(ctx, wrongProject,
+		VMRecord{Name: "vm3", HostName: "h1", Project: "p1", OwnerEpoch: 1}); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("wrong reservation project error = %v", err)
+	}
+	if got, _ := GetVM(ctx, c, "vm3"); got != nil {
+		t.Fatalf("wrong-project reservation created vm3: %+v", got)
+	}
+}
+
+func TestBeginCreateOperationRejectsReservationWorkloadBindingMismatch(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		begin func(*Client, string) (bool, error)
+	}{
+		{
+			name: "vm target host",
+			begin: func(c *Client, reservation string) (bool, error) {
+				op := createOp("op-vm-target-mismatch", "vm", "vm1", "hash", reservation, 1)
+				return c.BeginVMCreateOperation(ctx, op, VMRecord{
+					Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1,
+				})
+			},
+		},
+		{
+			name: "container target host",
+			begin: func(c *Client, reservation string) (bool, error) {
+				op := createOp("op-ct-target-mismatch", "container", "ct1", "hash", reservation, 1)
+				return c.BeginContainerCreateOperation(ctx, op, ContainerRecord{
+					HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1,
+				})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t)
+			reservation, err := (ReservationVector{
+				Project: "p1", ProjectCPU: 1, TargetHost: "h2", TargetCPU: 1,
+			}).Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if applied, err := tc.begin(c, reservation); !errors.Is(err, ErrOperationIdentityConflict) || applied {
+				t.Fatalf("mismatched target: applied=%v err=%v", applied, err)
+			}
+		})
+	}
+	t.Run("source host is invalid for create", func(t *testing.T) {
+		c := testClient(t)
+		reservation, err := (ReservationVector{
+			Project: "p1", TargetHost: "h1", TargetCPU: 1, SourceHost: "old-host",
+		}).Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		op := createOp("op-vm-source-host", "vm", "vm1", "hash", reservation, 1)
+		if applied, err := c.BeginVMCreateOperation(ctx, op, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1,
+		}); !errors.Is(err, ErrOperationIdentityConflict) || applied {
+			t.Fatalf("source host binding: applied=%v err=%v", applied, err)
+		}
+	})
+}
+
+func TestBeginCreateRetryBindsCompleteProvisionalIdentity(t *testing.T) {
+	ctx := context.Background()
+	t.Run("vm", func(t *testing.T) {
+		base := VMRecord{
+			Name: "vm1", StackName: "stack1", HostName: "h1", Spec: `{"cpu":2}`,
+			StateDetail: "requested", CPUActual: 2, MemActual: 1024, Project: "p1",
+			IsTemplate: true, OwnerEpoch: 2, SpecGeneration: 3,
+		}
+		mutations := map[string]func(*VMRecord){
+			"stack":      func(v *VMRecord) { v.StackName = "stack2" },
+			"host":       func(v *VMRecord) { v.HostName = "h2" },
+			"spec":       func(v *VMRecord) { v.Spec = `{"cpu":4}` },
+			"detail":     func(v *VMRecord) { v.StateDetail = "different" },
+			"cpu":        func(v *VMRecord) { v.CPUActual++ },
+			"memory":     func(v *VMRecord) { v.MemActual++ },
+			"template":   func(v *VMRecord) { v.IsTemplate = false },
+			"generation": func(v *VMRecord) { v.SpecGeneration++ },
+		}
+		for name, mutate := range mutations {
+			t.Run(name, func(t *testing.T) {
+				c := testClient(t)
+				op := createOp("op-vm-retry-"+name, "vm", "vm1", "same-hash", "", 2)
+				if applied, err := c.BeginVMCreateOperation(ctx, op, base); err != nil || !applied {
+					t.Fatalf("first begin: applied=%v err=%v", applied, err)
+				}
+				changed := base
+				mutate(&changed)
+				if applied, err := c.BeginVMCreateOperation(ctx, op, changed); !errors.Is(err, ErrOperationIdentityConflict) || applied {
+					t.Fatalf("variant retry: applied=%v err=%v", applied, err)
+				}
+			})
+		}
+	})
+	t.Run("container", func(t *testing.T) {
+		base := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", CPULimit: 2, MemMiB: 1024,
+			Labels: map[string]string{"role": "web"}, RestartPolicy: `{"name":"always"}`,
+			StateDetail: "requested", Project: "p1", IsTemplate: true,
+			OnHostFailure: "image-recreate", CreateSpec: `{"release":"edge"}`,
+			RelocateToken: "token1", OwnerEpoch: 2, SpecGeneration: 3,
+		}
+		mutations := map[string]func(*ContainerRecord){
+			"image":      func(v *ContainerRecord) { v.Image = "debian" },
+			"cpu":        func(v *ContainerRecord) { v.CPULimit++ },
+			"memory":     func(v *ContainerRecord) { v.MemMiB++ },
+			"labels":     func(v *ContainerRecord) { v.Labels = map[string]string{"role": "db"} },
+			"restart":    func(v *ContainerRecord) { v.RestartPolicy = "never" },
+			"detail":     func(v *ContainerRecord) { v.StateDetail = "different" },
+			"template":   func(v *ContainerRecord) { v.IsTemplate = false },
+			"on-failure": func(v *ContainerRecord) { v.OnHostFailure = "none" },
+			"create-spec": func(v *ContainerRecord) {
+				v.CreateSpec = `{"release":"stable"}`
+			},
+			"relocate":   func(v *ContainerRecord) { v.RelocateToken = "token2" },
+			"generation": func(v *ContainerRecord) { v.SpecGeneration++ },
+		}
+		for name, mutate := range mutations {
+			t.Run(name, func(t *testing.T) {
+				c := testClient(t)
+				op := createOp("op-ct-retry-"+name, "container", "ct1", "same-hash", "", 2)
+				if applied, err := c.BeginContainerCreateOperation(ctx, op, base); err != nil || !applied {
+					t.Fatalf("first begin: applied=%v err=%v", applied, err)
+				}
+				changed := base
+				mutate(&changed)
+				if applied, err := c.BeginContainerCreateOperation(ctx, op, changed); !errors.Is(err, ErrOperationIdentityConflict) || applied {
+					t.Fatalf("variant retry: applied=%v err=%v", applied, err)
+				}
+			})
+		}
+	})
+}
+
+func TestBeginVMCreateOperationNeverOverwritesLiveVM(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	live := VMRecord{Name: "vm1", HostName: "old", Spec: `{"cpu":8}`, State: "running", OwnerEpoch: 9}
+	if err := InsertVM(ctx, c, live, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := c.BeginVMCreateOperation(ctx, createOp("op-new", "vm", "vm1", "hash", "", 1),
+		VMRecord{Name: "vm1", HostName: "new", State: "creating", OwnerEpoch: 1})
+	if err != nil || applied {
+		t.Fatalf("begin over live vm: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetVM(ctx, c, "vm1")
+	if got == nil || got.HostName != "old" || got.State != "running" {
+		t.Fatalf("live vm overwritten: %+v", got)
+	}
+}
+
+func TestBeginCreateOperationReusesOnlyNewerTombstonedIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm ordinary delete cleans stale hardware", func(t *testing.T) {
+		c := testClient(t)
+		oldOp := createOp("op-old-vm", "vm", "vm1", "old", "", 1)
+		oldVM := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "creating",
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := c.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := c.CommitVMCreateOperation(ctx, oldOp.ID, 1, oldVM,
+			[]InterfaceRecord{{NetworkName: "old-net", MAC: "52:54:00:00:00:01"}},
+			[]DiskRecord{{DiskName: "old-disk", HostName: "h1", Path: "/old.img"}},
+			[]NICRecord{{ID: "old-nic", NetworkName: "old-net", MAC: "52:54:00:00:00:01"}},
+			[]PCIIntentRecord{{DeviceID: "old-pci", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "1234"}},
+		); err != nil || !applied {
+			t.Fatalf("old commit: applied=%v err=%v", applied, err)
+		}
+		if err := UpsertPCIRealization(ctx, c, PCIRealizationRecord{
+			VMName: "vm1", DeviceID: "old-pci", MemberID: "member-1", HostName: "h1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteVM(ctx, c, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Both axes are monotonic: advancing only one must not claim a tombstone.
+		for _, tc := range []struct {
+			id    string
+			owner int64
+			gen   int64
+		}{
+			{"same-owner", 1, 2},
+			{"same-generation", 2, 1},
+		} {
+			op := createOp("op-"+tc.id, "vm", "vm1", tc.id, "", tc.owner)
+			applied, err := c.BeginVMCreateOperation(ctx, op, VMRecord{
+				Name: "vm1", HostName: "h2", Project: "p1",
+				OwnerEpoch: tc.owner, SpecGeneration: tc.gen,
+			})
+			if err != nil || applied {
+				t.Fatalf("%s begin: applied=%v err=%v, want refused", tc.id, applied, err)
+			}
+			if got, _ := GetOperation(ctx, c, op.ID); got != nil {
+				t.Fatalf("%s left operation header: %+v", tc.id, got)
+			}
+		}
+
+		newOp := createOp("op-new-vm", "vm", "vm1", "new", "", 2)
+		newVM := VMRecord{
+			Name: "vm1", HostName: "h2", Project: "p1", Spec: `{"new":true}`,
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := c.BeginVMCreateOperation(ctx, newOp, newVM); err != nil || !applied {
+			t.Fatalf("new begin: applied=%v err=%v", applied, err)
+		}
+		got, err := GetVM(ctx, c, "vm1")
+		if err != nil || got == nil || got.State != "creating" ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 ||
+			got.SpecGeneration != 2 || got.HostName != "h2" {
+			t.Fatalf("new provisional VM=%+v err=%v", got, err)
+		}
+		for _, table := range []string{
+			"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations",
+		} {
+			rows, qerr := c.Query(ctx,
+				`SELECT COUNT(*) AS n FROM `+table+` WHERE vm_name = ? AND deleted_at IS NULL`,
+				"vm1")
+			if qerr != nil || len(rows) != 1 || rows[0].Int("n") != 0 {
+				t.Fatalf("%s live stale children=%v err=%v", table, rows, qerr)
+			}
+		}
+	})
+
+	t.Run("vm rollback", func(t *testing.T) {
+		c := testClient(t)
+		oldOp := createOp("op-old-vm-rb", "vm", "vm1", "old", "", 3)
+		oldVM := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 3, SpecGeneration: 4}
+		if applied, err := c.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := c.RollbackVMCreateOperation(ctx, "vm1", oldOp.ID, 3, "cleanup"); err != nil || !applied {
+			t.Fatalf("rollback: applied=%v err=%v", applied, err)
+		}
+		newOp := createOp("op-new-vm-rb", "vm", "vm1", "new", "", 4)
+		if applied, err := c.BeginVMCreateOperation(ctx, newOp,
+			VMRecord{Name: "vm1", HostName: "h2", Project: "p1", OwnerEpoch: 4, SpecGeneration: 5},
+		); err != nil || !applied {
+			t.Fatalf("recreate after rollback: applied=%v err=%v", applied, err)
+		}
+		if got, _ := GetVM(ctx, c, "vm1"); got == nil || got.ActiveOperationID != newOp.ID ||
+			got.OwnerEpoch != 4 || got.SpecGeneration != 5 {
+			t.Fatalf("new provisional VM=%+v", got)
+		}
+	})
+
+	t.Run("container ordinary delete cleans stale interfaces", func(t *testing.T) {
+		c := testClient(t)
+		oldOp := createOp("op-old-ct", "container", "ct1", "old", "", 1)
+		oldCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "old", Project: "p1",
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := c.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := c.CommitContainerCreateOperation(ctx, oldOp.ID, 1, oldCT,
+			[]ContainerInterfaceRecord{{NetworkName: "old-net", MAC: "52:00:00:00:00:01"}},
+		); err != nil || !applied {
+			t.Fatalf("old commit: applied=%v err=%v", applied, err)
+		}
+		// DeleteContainer intentionally does not cascade interfaces. Begin must
+		// supersede them before exposing the reused identity.
+		if err := DeleteContainer(ctx, c, "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			id    string
+			owner int64
+			gen   int64
+		}{
+			{"same-owner", 1, 2},
+			{"same-generation", 2, 1},
+		} {
+			op := createOp("op-ct-"+tc.id, "container", "ct1", tc.id, "", tc.owner)
+			applied, err := c.BeginContainerCreateOperation(ctx, op, ContainerRecord{
+				HostName: "h1", Name: "ct1", Image: "stale", Project: "p1",
+				OwnerEpoch: tc.owner, SpecGeneration: tc.gen,
+			})
+			if err != nil || applied {
+				t.Fatalf("%s begin: applied=%v err=%v, want refused", tc.id, applied, err)
+			}
+			if got, _ := GetOperation(ctx, c, op.ID); got != nil {
+				t.Fatalf("%s left operation header: %+v", tc.id, got)
+			}
+		}
+		newOp := createOp("op-new-ct", "container", "ct1", "new", "", 2)
+		newCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := c.BeginContainerCreateOperation(ctx, newOp, newCT); err != nil || !applied {
+			t.Fatalf("new begin: applied=%v err=%v", applied, err)
+		}
+		got, err := GetContainer(ctx, c, "h1", "ct1")
+		if err != nil || got == nil || got.State != "creating" ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 ||
+			got.SpecGeneration != 2 || got.Image != "new" {
+			t.Fatalf("new provisional container=%+v err=%v", got, err)
+		}
+		if ifaces, err := GetContainerInterfaces(ctx, c, "h1", "ct1"); err != nil || len(ifaces) != 0 {
+			t.Fatalf("stale interfaces=%+v err=%v", ifaces, err)
+		}
+	})
+
+	t.Run("container rollback", func(t *testing.T) {
+		c := testClient(t)
+		oldOp := createOp("op-old-ct-rb", "container", "ct1", "old", "", 3)
+		oldCT := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 3, SpecGeneration: 4}
+		if applied, err := c.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := c.RollbackContainerCreateOperation(ctx, "h1", "ct1", oldOp.ID, 3, "cleanup"); err != nil || !applied {
+			t.Fatalf("rollback: applied=%v err=%v", applied, err)
+		}
+		newOp := createOp("op-new-ct-rb", "container", "ct1", "new", "", 4)
+		if applied, err := c.BeginContainerCreateOperation(ctx, newOp,
+			ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 4, SpecGeneration: 5},
+		); err != nil || !applied {
+			t.Fatalf("recreate after rollback: applied=%v err=%v", applied, err)
+		}
+		if got, _ := GetContainer(ctx, c, "h1", "ct1"); got == nil ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 4 || got.SpecGeneration != 5 {
+			t.Fatalf("new provisional container=%+v", got)
+		}
+	})
+}
+
+func TestRecreatedIdentityRejectsDelayedOldTombstoneWALAndAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		if err := InsertVM(ctx, source, VMRecord{Name: "vm1", HostName: "old", Project: "p1", State: "running"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.db.Exec(`UPDATE vms SET vm_owner_epoch = 1, spec_generation = 1 WHERE name = ?`, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteVM(ctx, source, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		oldDelete := latestMutationEntry(t, source, "old-vm-delete", 1)
+
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		newOp := createOp("op-new-vm-replay", "vm", "vm1", "new", "", 2)
+		if applied, err := receiver.BeginVMCreateOperation(ctx, newOp,
+			VMRecord{Name: "vm1", HostName: "new", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2},
+		); err != nil || !applied {
+			t.Fatalf("new begin: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, receiver, oldDelete)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, receiver, "vm1"); got == nil ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("old tombstone defeated recreated VM: %+v", got)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		if err := UpsertContainer(ctx, source, ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "old", Project: "p1", State: "running",
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteContainer(ctx, source, "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		oldDelete := latestMutationEntry(t, source, "old-ct-delete", 1)
+
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		newOp := createOp("op-new-ct-replay", "container", "ct1", "new", "", 2)
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, newOp,
+			ContainerRecord{HostName: "h1", Name: "ct1", Image: "new", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2},
+		); err != nil || !applied {
+			t.Fatalf("new begin: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, receiver, oldDelete)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 || got.SpecGeneration != 2 ||
+			got.State != "creating" {
+			t.Fatalf("old tombstone defeated recreated container: %+v", got)
+		}
+	})
+}
+
+func TestReplicatedBeginResurrectsTombstoneAndReplaysSafely(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-old-vm-repl", "vm", "vm1", "old", "", 1)
+		oldVM := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1}
+		if applied, err := source.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+			t.Fatalf("source old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", oldOp.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		newOp := createOp("op-new-vm-repl", "vm", "vm1", "new", "", 2)
+		newVM := VMRecord{Name: "vm1", HostName: "h2", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2}
+		if applied, err := source.BeginVMCreateOperation(ctx, newOp, newVM); err != nil || !applied {
+			t.Fatalf("source new begin: applied=%v err=%v", applied, err)
+		}
+		entry := latestMutationEntry(t, source, "source-new-vm", 1)
+
+		receiver := testClient(t)
+		if applied, err := receiver.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+			t.Fatalf("receiver old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.RollbackVMCreateOperation(ctx, "vm1", oldOp.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("receiver rollback: applied=%v err=%v", applied, err)
+		}
+		if _, err := receiver.db.Exec(
+			`INSERT INTO vm_interfaces
+			 (vm_name, network_name, ordinal, mac, updated_at, deleted_at)
+			 VALUES (?, ?, 0, ?, ?, NULL)`,
+			"vm1", "stale-net", "52:54:00:00:00:01", "9000000000000-0000-stale"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, entry)
+		replay := &pb.MutationEntry{
+			Seq: entry.Seq, Hlc: entry.Hlc, Origin: "source-new-vm-replay", Stmts: entry.Stmts,
+		}
+		applyMutationEntry(t, receiver, replay)
+		if got, _ := GetVM(ctx, receiver, "vm1"); got == nil ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("replicated/replayed begin VM=%+v", got)
+		}
+		if got, _ := GetOperation(ctx, receiver, newOp.ID); got == nil {
+			t.Fatal("replicated begin did not install operation header")
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NULL`, "vm1"); len(rows) != 0 {
+			t.Fatalf("replicated begin inherited stale VM interfaces: %v", rows)
+		}
+
+		liveReceiver := testClient(t)
+		if err := InsertVM(ctx, liveReceiver, VMRecord{
+			Name: "vm1", HostName: "live", Project: "p1", State: "running",
+			OwnerEpoch: 9, SpecGeneration: 9,
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, liveReceiver, entry)
+		if got, _ := GetVM(ctx, liveReceiver, "vm1"); got == nil || got.HostName != "live" || got.State != "running" {
+			t.Fatalf("replicated begin overwrote live VM: %+v", got)
+		}
+		if got, _ := GetOperation(ctx, liveReceiver, newOp.ID); got != nil {
+			t.Fatalf("refused replicated begin installed operation: %+v", got)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-old-ct-repl", "container", "ct1", "old", "", 1)
+		oldCT := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1}
+		if applied, err := source.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("source old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", oldOp.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		newOp := createOp("op-new-ct-repl", "container", "ct1", "new", "", 2)
+		newCT := ContainerRecord{HostName: "h1", Name: "ct1", Image: "new", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2}
+		if applied, err := source.BeginContainerCreateOperation(ctx, newOp, newCT); err != nil || !applied {
+			t.Fatalf("source new begin: applied=%v err=%v", applied, err)
+		}
+		entry := latestMutationEntry(t, source, "source-new-ct", 1)
+
+		receiver := testClient(t)
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("receiver old begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.RollbackContainerCreateOperation(ctx, "h1", "ct1", oldOp.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("receiver rollback: applied=%v err=%v", applied, err)
+		}
+		if _, err := receiver.db.Exec(
+			`INSERT INTO container_interfaces
+			 (host_name, ct_name, network_name, ordinal, mac, updated_at, deleted_at)
+			 VALUES (?, ?, ?, 0, ?, ?, NULL)`,
+			"h1", "ct1", "stale-net", "52:00:00:00:00:01", "9000000000000-0000-stale"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, entry)
+		replay := &pb.MutationEntry{
+			Seq: entry.Seq, Hlc: entry.Hlc, Origin: "source-new-ct-replay", Stmts: entry.Stmts,
+		}
+		applyMutationEntry(t, receiver, replay)
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.ActiveOperationID != newOp.ID || got.OwnerEpoch != 2 || got.SpecGeneration != 2 ||
+			got.Image != "new" {
+			t.Fatalf("replicated/replayed begin container=%+v", got)
+		}
+		if got, _ := GetOperation(ctx, receiver, newOp.ID); got == nil {
+			t.Fatal("replicated begin did not install operation header")
+		}
+		if ifaces, err := GetContainerInterfaces(ctx, receiver, "h1", "ct1"); err != nil || len(ifaces) != 0 {
+			t.Fatalf("replicated begin inherited stale container interfaces=%+v err=%v", ifaces, err)
+		}
+
+		liveReceiver := testClient(t)
+		if err := UpsertContainer(ctx, liveReceiver, ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "live", Project: "p1", State: "running",
+			OwnerEpoch: 9, SpecGeneration: 9,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, liveReceiver, entry)
+		if got, _ := GetContainer(ctx, liveReceiver, "h1", "ct1"); got == nil ||
+			got.Image != "live" || got.State != "running" {
+			t.Fatalf("replicated begin overwrote live container: %+v", got)
+		}
+		if got, _ := GetOperation(ctx, liveReceiver, newOp.ID); got != nil {
+			t.Fatalf("refused replicated begin installed operation: %+v", got)
+		}
+	})
+}
+
+func TestCommitVMCreateOperationAtomicHardwareAndTerminalRelease(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	reservation, err := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, ProjectMemMiB: 1024,
+		TargetHost: "h1", TargetCPU: 2, TargetMemMiB: 1024,
+	}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := createOp("op-commit", "vm", "vm1", "hash", reservation, 4)
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, State: "creating",
+		Project: "p1", OwnerEpoch: 4, SpecGeneration: 3, CPUActual: 2, MemActual: 1024,
+	}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	if cpu, mem, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 2 || mem != 1024 {
+		t.Fatalf("reservation before commit = %d/%d err=%v", cpu, mem, err)
+	}
+	exclusive := "0000:01:00.0"
+	applied, err := c.CommitVMCreateOperation(ctx, op.ID, 4, vm,
+		[]InterfaceRecord{{NetworkName: "net1", Ordinal: 0, MAC: "52:54:00:00:00:01"}},
+		[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img", DeviceKind: "disk", DeleteWithVM: true}},
+		[]NICRecord{{ID: "nic1", NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "address", SelectorPayload: exclusive, ExclusiveKey: &exclusive}},
+	)
+	if err != nil || !applied {
+		t.Fatalf("commit: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetVM(ctx, c, "vm1")
+	if got == nil || got.State != "running" || got.ActiveOperationID != "" || got.OwnerEpoch != 4 || got.SpecGeneration != 3 {
+		t.Fatalf("committed VM = %+v", got)
+	}
+	for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+		rows, qerr := c.Query(ctx, `SELECT COUNT(*) AS n FROM `+table+` WHERE vm_name = ? AND deleted_at IS NULL`, "vm1")
+		if qerr != nil || len(rows) != 1 || rows[0].Int("n") != 1 {
+			t.Fatalf("%s rows = %v err=%v", table, rows, qerr)
+		}
+	}
+	steps, _ := ListOperationSteps(ctx, c, op.ID, 4)
+	state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps))
+	if state != OpStepCompleted || faulted {
+		t.Fatalf("terminal state = %q faulted=%v steps=%v", state, faulted, stepNames(steps))
+	}
+	if cpu, mem, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 0 || mem != 0 {
+		t.Fatalf("reservation after commit = %d/%d err=%v", cpu, mem, err)
+	}
+}
+
+func TestRecreatedVMCommitRevivesTombstonedHardwareKeysLocallyAndOnReceiver(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	oldOp := createOp("op-hw-old", "vm", "vm1", "old", "", 1)
+	oldVM := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+		t.Fatalf("old begin: applied=%v err=%v", applied, err)
+	}
+	if applied, err := source.CommitVMCreateOperation(ctx, oldOp.ID, 1, oldVM,
+		[]InterfaceRecord{{NetworkName: "net1", Ordinal: 0, MAC: "52:54:00:00:00:01"}},
+		[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/old.img"}},
+		[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+		[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "old"}},
+	); err != nil || !applied {
+		t.Fatalf("old commit: applied=%v err=%v", applied, err)
+	}
+	if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+		t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
+	}
+	newOp := createOp("op-hw-new", "vm", "vm1", "new", "", 2)
+	newVM := VMRecord{
+		Name: "vm1", HostName: "h2", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2,
+	}
+	if applied, err := source.BeginVMCreateOperation(ctx, newOp, newVM); err != nil || !applied {
+		t.Fatalf("new begin: applied=%v err=%v", applied, err)
+	}
+	if applied, err := source.CommitVMCreateOperation(ctx, newOp.ID, 2, newVM,
+		[]InterfaceRecord{{NetworkName: "net1", Ordinal: 0, MAC: "52:54:00:00:00:02"}},
+		[]DiskRecord{{DiskName: "root", HostName: "h2", Path: "/new.img"}},
+		[]NICRecord{{ID: "nic1", NetworkName: "net1", MAC: "52:54:00:00:00:02"}},
+		[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h2", SelectorKind: "vendor", SelectorPayload: "new"}},
+	); err != nil || !applied {
+		t.Fatalf("recreated commit: applied=%v err=%v", applied, err)
+	}
+	assertLiveHardware := func(t *testing.T, c *Client) {
+		t.Helper()
+		for table, wantColumn := range map[string]string{
+			"vm_interfaces": "52:54:00:00:00:02",
+			"vm_disks":      "/new.img",
+			"vm_nics":       "52:54:00:00:00:02",
+			"vm_pci_intent": "new",
+		} {
+			column := map[string]string{
+				"vm_interfaces": "mac",
+				"vm_disks":      "path",
+				"vm_nics":       "mac",
+				"vm_pci_intent": "selector_payload",
+			}[table]
+			rows, err := c.Query(ctx, `SELECT `+column+` AS value, deleted_at FROM `+table+` WHERE vm_name = ?`, "vm1")
+			if err != nil || len(rows) != 1 || rows[0].String("value") != wantColumn ||
+				rows[0].String("deleted_at") != "" {
+				t.Fatalf("%s not revived: rows=%v err=%v", table, rows, err)
+			}
+		}
+	}
+	assertLiveHardware(t, source)
+
+	receiver := testClient(t)
+	entries, err := source.Query(ctx, `SELECT seq, hlc, stmts FROM mutation_log ORDER BY seq`)
+	if err != nil || len(entries) != 5 {
+		t.Fatalf("source mutation entries=%d err=%v", len(entries), err)
+	}
+	for _, entry := range entries {
+		applyMutationEntry(t, receiver, &pb.MutationEntry{
+			Seq:    entry.Int64("seq"),
+			Hlc:    entry.String("hlc"),
+			Origin: "source-hw-recreate",
+			Stmts:  entry.String("stmts"),
+		})
+	}
+	assertLiveHardware(t, receiver)
+}
+
+func TestRecreatedWorkloadRejectsHigherClockOldDeleteWALAndAntiEntropy(t *testing.T) {
+	ctx := context.Background()
+	const future = "9000000000000-0000-old-delete"
+
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-delete-old-vm", "vm", "vm1", "old", "", 1)
+		oldVM := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1}
+		if applied, err := source.BeginVMCreateOperation(ctx, oldOp, oldVM); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "old-vm-source", 1)
+		if applied, err := source.CommitVMCreateOperation(ctx, oldOp.ID, 1, oldVM,
+			[]InterfaceRecord{{NetworkName: "old-net", MAC: "old-mac"}}, nil, nil, nil,
+		); err != nil || !applied {
+			t.Fatalf("old commit: applied=%v err=%v", applied, err)
+		}
+		commitEntry := latestMutationEntry(t, source, "old-vm-source", 2)
+		if err := UpsertPCIRealization(ctx, source, PCIRealizationRecord{
+			VMName: "vm1", DeviceID: "pci1", MemberID: "member1", HostName: "h1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
+		}
+		deleteEntry := latestMutationEntry(t, source, "delayed-old-vm-delete", 1)
+		var deleteStatements []Statement
+		if err := json.Unmarshal([]byte(deleteEntry.Stmts), &deleteStatements); err != nil {
+			t.Fatal(err)
+		}
+		for i := range deleteStatements {
+			if len(deleteStatements[i].Params) > 1 {
+				deleteStatements[i].Params[1] = future
+			}
+		}
+		rawDelete, _ := json.Marshal(deleteStatements)
+		deleteEntry.Stmts, deleteEntry.Hlc = string(rawDelete), future
+		if _, err := source.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`, future, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := source.db.Exec(
+			`UPDATE vm_pci_realizations SET updated_at = ? WHERE vm_name = ?`,
+			future, "vm1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		current := testClient(t)
+		applyMutationEntry(t, current, beginEntry)
+		applyMutationEntry(t, current, commitEntry)
+		applyMutationEntry(t, current, deleteEntry)
+		if got, _ := GetVM(ctx, current, "vm1"); got != nil {
+			t.Fatalf("current-authority WAL delete did not apply: %+v", got)
+		}
+
+		recreatedReceiver := func(t *testing.T) *Client {
+			t.Helper()
+			receiver := testClient(t)
+			applyMutationEntry(t, receiver, beginEntry)
+			applyMutationEntry(t, receiver, commitEntry)
+			if err := DeleteVM(ctx, receiver, "vm1"); err != nil {
+				t.Fatal(err)
+			}
+			newOp := createOp("op-delete-new-vm", "vm", "vm1", "new", "", 2)
+			newVM := VMRecord{Name: "vm1", HostName: "h2", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2}
+			if applied, err := receiver.BeginVMCreateOperation(ctx, newOp, newVM); err != nil || !applied {
+				t.Fatalf("new begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitVMCreateOperation(ctx, newOp.ID, 2, newVM,
+				[]InterfaceRecord{{NetworkName: "new-net", MAC: "new-mac"}}, nil, nil, nil,
+			); err != nil || !applied {
+				t.Fatalf("new commit: applied=%v err=%v", applied, err)
+			}
+			if err := UpsertPCIRealization(ctx, receiver, PCIRealizationRecord{
+				VMName: "vm1", DeviceID: "pci1", MemberID: "member1", HostName: "h2",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			return receiver
+		}
+		wal := recreatedReceiver(t)
+		applyMutationEntry(t, wal, deleteEntry)
+		if got, _ := GetVM(ctx, wal, "vm1"); got == nil || got.OwnerEpoch != 2 {
+			t.Fatalf("delayed old WAL delete killed recreated VM: %+v", got)
+		}
+		if rows, _ := wal.Query(ctx, `SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`, "vm1", "new-net"); len(rows) != 1 {
+			t.Fatalf("delayed old WAL delete killed recreated interface: %v", rows)
+		}
+		if rows, _ := wal.Query(ctx, `SELECT 1 FROM vm_pci_realizations WHERE vm_name = ? AND host_name = ? AND deleted_at IS NULL`, "vm1", "h2"); len(rows) != 1 {
+			t.Fatalf("delayed old WAL delete killed recreated PCI realization: %v", rows)
+		}
+
+		ae := recreatedReceiver(t)
+		if err := ae.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, ae, "vm1"); got == nil || got.OwnerEpoch != 2 {
+			t.Fatalf("old AE tombstone killed recreated VM: %+v", got)
+		}
+		if rows, _ := ae.Query(ctx, `SELECT 1 FROM vm_pci_realizations WHERE vm_name = ? AND host_name = ? AND deleted_at IS NULL`, "vm1", "h2"); len(rows) != 1 {
+			t.Fatalf("old AE tombstone killed recreated PCI realization: %v", rows)
+		}
+
+		currentAE := testClient(t)
+		applyMutationEntry(t, currentAE, beginEntry)
+		applyMutationEntry(t, currentAE, commitEntry)
+		if err := InsertInterface(ctx, currentAE, InterfaceRecord{
+			VMName: "vm1", NetworkName: "receiver-only", MAC: "receiver-only",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpsertPCIRealization(ctx, currentAE, PCIRealizationRecord{
+			VMName: "vm1", DeviceID: "pci1", MemberID: "member1", HostName: "h1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpsertPCIRealization(ctx, currentAE, PCIRealizationRecord{
+			VMName: "vm1", DeviceID: "pci2", MemberID: "receiver-only", HostName: "h1",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_pci_realizations"} {
+			if _, err := currentAE.db.Exec(
+				`UPDATE `+table+` SET updated_at = ? WHERE vm_name = ?`,
+				"9500000000000-0000-newer-child", "vm1",
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := currentAE.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, currentAE, "vm1"); got != nil {
+			t.Fatalf("current-authority AE delete did not apply: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_pci_realizations"} {
+			if rows, _ := currentAE.Query(ctx,
+				`SELECT 1 FROM `+table+` WHERE vm_name = ? AND deleted_at IS NULL`, "vm1",
+			); len(rows) != 0 {
+				t.Fatalf("current-authority AE delete left live %s: %v", table, rows)
+			}
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-delete-old-ct", "container", "ct1", "old", "", 1)
+		oldCT := ContainerRecord{HostName: "h1", Name: "ct1", Image: "old", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1}
+		if applied, err := source.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("old begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "old-ct-source", 1)
+		if applied, err := source.CommitContainerCreateOperation(ctx, oldOp.ID, 1, oldCT,
+			[]ContainerInterfaceRecord{{NetworkName: "old-net", MAC: "old-mac"}},
+		); err != nil || !applied {
+			t.Fatalf("old commit: applied=%v err=%v", applied, err)
+		}
+		commitEntry := latestMutationEntry(t, source, "old-ct-source", 2)
+		if outcome, err := deleteContainerGuarded(ctx, source, "h1", "ct1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
+		}
+		deleteEntry := latestMutationEntry(t, source, "delayed-old-ct-delete", 1)
+		var deleteStatements []Statement
+		if err := json.Unmarshal([]byte(deleteEntry.Stmts), &deleteStatements); err != nil {
+			t.Fatal(err)
+		}
+		for i := range deleteStatements {
+			if len(deleteStatements[i].Params) > 1 {
+				deleteStatements[i].Params[1] = future
+			}
+		}
+		rawDelete, _ := json.Marshal(deleteStatements)
+		deleteEntry.Stmts, deleteEntry.Hlc = string(rawDelete), future
+		if _, err := source.db.Exec(`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`, future, "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		current := testClient(t)
+		applyMutationEntry(t, current, beginEntry)
+		applyMutationEntry(t, current, commitEntry)
+		applyMutationEntry(t, current, deleteEntry)
+		if got, _ := GetContainer(ctx, current, "h1", "ct1"); got != nil {
+			t.Fatalf("current-authority WAL delete did not apply: %+v", got)
+		}
+
+		recreatedReceiver := func(t *testing.T) *Client {
+			t.Helper()
+			receiver := testClient(t)
+			applyMutationEntry(t, receiver, beginEntry)
+			applyMutationEntry(t, receiver, commitEntry)
+			if err := DeleteContainer(ctx, receiver, "h1", "ct1"); err != nil {
+				t.Fatal(err)
+			}
+			newOp := createOp("op-delete-new-ct", "container", "ct1", "new", "", 2)
+			newCT := ContainerRecord{HostName: "h1", Name: "ct1", Image: "new", Project: "p1", OwnerEpoch: 2, SpecGeneration: 2}
+			if applied, err := receiver.BeginContainerCreateOperation(ctx, newOp, newCT); err != nil || !applied {
+				t.Fatalf("new begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitContainerCreateOperation(ctx, newOp.ID, 2, newCT,
+				[]ContainerInterfaceRecord{{NetworkName: "new-net", MAC: "new-mac"}},
+			); err != nil || !applied {
+				t.Fatalf("new commit: applied=%v err=%v", applied, err)
+			}
+			return receiver
+		}
+		wal := recreatedReceiver(t)
+		applyMutationEntry(t, wal, deleteEntry)
+		if got, _ := GetContainer(ctx, wal, "h1", "ct1"); got == nil || got.OwnerEpoch != 2 {
+			t.Fatalf("delayed old WAL delete killed recreated container: %+v", got)
+		}
+		if rows, _ := wal.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ? AND network_name = ? AND deleted_at IS NULL`, "h1", "ct1", "new-net"); len(rows) != 1 {
+			t.Fatalf("delayed old WAL delete killed recreated interface: %v", rows)
+		}
+
+		ae := recreatedReceiver(t)
+		if err := ae.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, ae, "h1", "ct1"); got == nil || got.OwnerEpoch != 2 {
+			t.Fatalf("old AE tombstone killed recreated container: %+v", got)
+		}
+
+		currentAE := testClient(t)
+		applyMutationEntry(t, currentAE, beginEntry)
+		applyMutationEntry(t, currentAE, commitEntry)
+		if err := UpsertContainerInterface(ctx, currentAE, ContainerInterfaceRecord{
+			HostName: "h1", CtName: "ct1", NetworkName: "receiver-only",
+			Ordinal: 99, MAC: "receiver-only",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := currentAE.db.Exec(
+			`UPDATE container_interfaces SET updated_at = ?
+			 WHERE host_name = ? AND ct_name = ?`,
+			"9500000000000-0000-newer-child", "h1", "ct1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := currentAE.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, currentAE, "h1", "ct1"); got != nil {
+			t.Fatalf("current-authority AE delete did not apply: %+v", got)
+		}
+		if rows, _ := currentAE.Query(ctx,
+			`SELECT 1 FROM container_interfaces
+			 WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`,
+			"h1", "ct1",
+		); len(rows) != 0 {
+			t.Fatalf("current-authority AE delete left live interfaces: %v", rows)
+		}
+	})
+}
+
+func TestLegacyWorkloadDeleteCannotCrossAuthorityBoundary(t *testing.T) {
+	ctx := context.Background()
+	const future = "9000000000000-0000-legacy-delete"
+	entry := func(t *testing.T, origin, sqlText string, params ...interface{}) *pb.MutationEntry {
+		t.Helper()
+		raw, err := json.Marshal([]Statement{{SQL: sqlText, Params: params}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &pb.MutationEntry{Seq: 1, Hlc: future, Origin: origin, Stmts: string(raw)}
+	}
+
+	t.Run("vm", func(t *testing.T) {
+		legacyVMDeleteBatch := func(t *testing.T, origin string) *pb.MutationEntry {
+			t.Helper()
+			stmts := []Statement{
+				{SQL: legacyVMDeleteSQL, Params: []interface{}{future, future, "vm1"}},
+				{SQL: vmInterfacesCreateCleanupSQL, Params: []interface{}{future, future, "vm1"}},
+				{SQL: vmDisksCreateCleanupSQL, Params: []interface{}{future, future, "vm1"}},
+				{SQL: vmNICsCreateCleanupSQL, Params: []interface{}{future, future, "vm1"}},
+				{SQL: vmPCIIntentCreateCleanupSQL, Params: []interface{}{future, future, "vm1"}},
+				{SQL: vmPCIRealCreateCleanupSQL, Params: []interface{}{future, future, "vm1"}},
+			}
+			raw, err := json.Marshal(stmts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return &pb.MutationEntry{Seq: 1, Hlc: future, Origin: origin, Stmts: string(raw)}
+		}
+		recreated := testClient(t)
+		if err := InsertVM(ctx, recreated, VMRecord{
+			Name: "vm1", HostName: "h2", Project: "p1", State: "running",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}, []InterfaceRecord{{
+			VMName: "vm1", NetworkName: "new-net", MAC: "new-mac",
+		}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recreated.db.Exec(
+			`UPDATE vms SET vm_owner_epoch = 2, spec_generation = 2 WHERE name = ?`,
+			"vm1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, recreated, legacyVMDeleteBatch(t, "legacy-vm-new"))
+		if got, _ := GetVM(ctx, recreated, "vm1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("legacy delete crossed recreated VM authority: %+v", got)
+		}
+		if rows, _ := recreated.Query(ctx,
+			`SELECT 1 FROM vm_interfaces
+			 WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			"vm1", "new-net",
+		); len(rows) != 1 {
+			t.Fatalf("legacy delete batch crossed recreated VM child authority: %v", rows)
+		}
+
+		legacy := testClient(t)
+		if err := InsertVM(ctx, legacy, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "running",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, legacy, legacyVMDeleteBatch(t, "legacy-vm-old"))
+		if got, _ := GetVM(ctx, legacy, "vm1"); got != nil {
+			t.Fatalf("legacy delete did not apply to pre-authority VM: %+v", got)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		recreated := testClient(t)
+		if err := UpsertContainer(ctx, recreated, ContainerRecord{
+			HostName: "h2", Name: "ct1", Project: "p1", State: "running",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recreated.db.Exec(
+			`UPDATE containers SET owner_epoch = 2, spec_generation = 2
+			 WHERE host_name = ? AND name = ?`,
+			"h2", "ct1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, recreated, entry(t, "legacy-ct-new",
+			legacyContainerDeleteSQL, future, future, "h2", "ct1"))
+		if got, _ := GetContainer(ctx, recreated, "h2", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("legacy delete crossed recreated container authority: %+v", got)
+		}
+
+		legacy := testClient(t)
+		if err := UpsertContainer(ctx, legacy, ContainerRecord{
+			HostName: "h1", Name: "ct1", Project: "p1", State: "running",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, legacy, entry(t, "legacy-ct-old",
+			legacyContainerDeleteSQL, future, future, "h1", "ct1"))
+		if got, _ := GetContainer(ctx, legacy, "h1", "ct1"); got != nil {
+			t.Fatalf("legacy delete did not apply to pre-authority container: %+v", got)
+		}
+	})
+}
+
+func TestCommitVMCreateOperationHardwareFailureRollsBackEverything(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-hw-fail", "vm", "vm1", "hash", "", 1)
+	vm := VMRecord{Name: "vm1", HostName: "h1", State: "creating", Project: "p1", OwnerEpoch: 1}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	dupe := []InterfaceRecord{
+		{NetworkName: "net1", Ordinal: 0, MAC: "52:54:00:00:00:01"},
+		{NetworkName: "net1", Ordinal: 1, MAC: "52:54:00:00:00:02"},
+	}
+	if applied, err := c.CommitVMCreateOperation(ctx, op.ID, 1, vm, dupe, nil, nil, nil); err == nil || applied {
+		t.Fatalf("commit with duplicate hardware: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetVM(ctx, c, "vm1")
+	if got == nil || got.State != "creating" || got.ActiveOperationID != op.ID {
+		t.Fatalf("provisional row changed after rollback: %+v", got)
+	}
+	if rows, _ := c.Query(ctx, `SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+		t.Fatalf("partial hardware survived: %v", rows)
+	}
+	steps, _ := ListOperationSteps(ctx, c, op.ID, 1)
+	for _, name := range stepNames(steps) {
+		if name == OpStepCompleted || name == OpStepPrepared || name == OpStepRuntimeStarted || name == OpStepObserved {
+			t.Fatalf("commit step %q survived rolled-back transaction", name)
+		}
+	}
+}
+
+func TestCommitVMCreateOperationRejectsAdmissionIdentityDrift(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*VMRecord)
+	}{
+		{"host", func(vm *VMRecord) { vm.HostName = "h2" }},
+		{"project", func(vm *VMRecord) { vm.Project = "p2" }},
+		{"spec", func(vm *VMRecord) { vm.Spec = `{"cpu":8}` }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t)
+			reservation, _ := (ReservationVector{
+				Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+			}).Encode()
+			op := createOp("op-drift-"+tc.name, "vm", "vm1", "hash", reservation, 3)
+			vm := VMRecord{
+				Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+				State: "creating", OwnerEpoch: 3, SpecGeneration: 1,
+			}
+			if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+				t.Fatalf("begin: applied=%v err=%v", applied, err)
+			}
+			drifted := vm
+			tc.mutate(&drifted)
+			applied, err := c.CommitVMCreateOperation(ctx, op.ID, 3, drifted,
+				[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+				nil, nil, nil)
+			if err != nil || applied {
+				t.Fatalf("drifted commit: applied=%v err=%v", applied, err)
+			}
+			got, _ := GetVM(ctx, c, "vm1")
+			if got == nil || got.HostName != "h1" || got.Project != "p1" ||
+				got.Spec != `{"cpu":2}` || got.ActiveOperationID != op.ID {
+				t.Fatalf("provisional VM mutated: %+v", got)
+			}
+			if rows, _ := c.Query(ctx, `SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Fatalf("drifted commit wrote hardware: %v", rows)
+			}
+			assertNoCreateTerminalSteps(t, c, op.ID, 3)
+		})
+	}
+}
+
+func TestVMCreateOperationStaleCommitAndRollbackAreNoOps(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-fence", "vm", "vm1", "hash", "", 5)
+	vm := VMRecord{Name: "vm1", HostName: "h1", State: "creating", Project: "p1", OwnerEpoch: 5, SpecGeneration: 2}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	staleGeneration := vm
+	staleGeneration.SpecGeneration = 1
+	if applied, err := c.CommitVMCreateOperation(ctx, op.ID, 5, staleGeneration, nil, nil, nil, nil); err != nil || applied {
+		t.Fatalf("stale-generation commit: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.CommitVMCreateOperation(ctx, "other-op", 5, vm, nil, nil, nil, nil); err != nil || applied {
+		t.Fatalf("stale-operation commit: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.RollbackVMCreateOperation(ctx, "vm1", op.ID, 4, "stale"); err != nil || applied {
+		t.Fatalf("stale-owner rollback: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetVM(ctx, c, "vm1")
+	if got == nil || got.State != "creating" || got.ActiveOperationID != op.ID {
+		t.Fatalf("stale mutation changed VM: %+v", got)
+	}
+}
+
+func TestRollbackVMCreateOperationTombstonesAndReleasesReservation(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	reservation, _ := (ReservationVector{Project: "p1", TargetHost: "h1", TargetCPU: 1}).Encode()
+	op := createOp("op-rollback", "vm", "vm1", "hash", reservation, 3)
+	vm := VMRecord{Name: "vm1", HostName: "h1", State: "creating", Project: "p1", OwnerEpoch: 3}
+	if applied, err := c.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.RollbackVMCreateOperation(ctx, "vm1", op.ID, 3, "disk=/tmp/vm1"); err != nil || !applied {
+		t.Fatalf("rollback: applied=%v err=%v", applied, err)
+	}
+	if got, _ := GetVM(ctx, c, "vm1"); got != nil {
+		t.Fatalf("rolled-back provisional VM remains live: %+v", got)
+	}
+	rows, err := c.Query(ctx, `SELECT deleted_at FROM vms WHERE name = ?`, "vm1")
+	if err != nil || len(rows) != 1 || rows[0].String("deleted_at") == "" {
+		t.Fatalf("provisional tombstone = %v err=%v", rows, err)
+	}
+	steps, _ := ListOperationSteps(ctx, c, op.ID, 3)
+	state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps))
+	if state != OpStepFailed || faulted {
+		t.Fatalf("rollback terminal = %q faulted=%v steps=%v", state, faulted, stepNames(steps))
+	}
+	for _, step := range steps {
+		if (step.StepName == OpStepRollbackCompleted || step.StepName == OpStepFailed) &&
+			step.Facts != "disk=/tmp/vm1" {
+			t.Fatalf("%s facts = %q", step.StepName, step.Facts)
+		}
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 0 {
+		t.Fatalf("reservation after rollback cpu=%d err=%v", cpu, err)
+	}
+}
+
+func TestContainerCreateOperationAtomicCommitAndFencing(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-ct", "container", "ct1", "hash", "", 6)
+	ct := ContainerRecord{
+		HostName: "h1", Name: "ct1", State: "creating", Image: "alpine",
+		CPULimit: 2, MemMiB: 512, Project: "p1", OwnerEpoch: 6, SpecGeneration: 2,
+		Labels: map[string]string{"app": "web"},
+	}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("begin container: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || applied {
+		t.Fatalf("retry container: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 5, ct, nil); err != nil || applied {
+		t.Fatalf("stale container commit: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 5, "stale"); err != nil || applied {
+		t.Fatalf("stale container rollback: applied=%v err=%v", applied, err)
+	}
+	if applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 6, ct,
+		[]ContainerInterfaceRecord{{NetworkName: "net1", Ordinal: 0, MAC: "52:00:00:00:00:01"}}); err != nil || !applied {
+		t.Fatalf("commit container: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetContainer(ctx, c, "h1", "ct1")
+	if got == nil || got.State != "running" || got.ActiveOperationID != "" ||
+		got.OwnerEpoch != 6 || got.SpecGeneration != 2 || got.Labels["app"] != "web" {
+		t.Fatalf("committed container = %+v", got)
+	}
+	ifaces, err := GetContainerInterfaces(ctx, c, "h1", "ct1")
+	if err != nil || len(ifaces) != 1 {
+		t.Fatalf("container interfaces = %+v err=%v", ifaces, err)
+	}
+}
+
+func TestCommitContainerCreateOperationRejectsAdmissionIdentityDrift(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ContainerRecord)
+	}{
+		{"host", func(ct *ContainerRecord) { ct.HostName = "h2" }},
+		{"project", func(ct *ContainerRecord) { ct.Project = "p2" }},
+		{"create_spec", func(ct *ContainerRecord) { ct.CreateSpec = `{"template":"other"}` }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := testClient(t)
+			reservation, _ := (ReservationVector{
+				Project: "p1", ProjectCPU: 1, TargetHost: "h1", TargetCPU: 1,
+			}).Encode()
+			op := createOp("op-ct-drift-"+tc.name, "container", "ct1", "hash", reservation, 2)
+			ct := ContainerRecord{
+				HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+				CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 2, SpecGeneration: 1,
+			}
+			if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+				t.Fatalf("begin: applied=%v err=%v", applied, err)
+			}
+			drifted := ct
+			tc.mutate(&drifted)
+			applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 2, drifted,
+				[]ContainerInterfaceRecord{{NetworkName: "net1"}})
+			if err != nil || applied {
+				t.Fatalf("drifted commit: applied=%v err=%v", applied, err)
+			}
+			got, _ := GetContainer(ctx, c, "h1", "ct1")
+			if got == nil || got.Project != "p1" || got.CreateSpec != `{"template":"alpine"}` ||
+				got.ActiveOperationID != op.ID {
+				t.Fatalf("provisional container mutated: %+v", got)
+			}
+			if rows, _ := c.Query(ctx, `SELECT 1 FROM container_interfaces WHERE ct_name = ?`, "ct1"); len(rows) != 0 {
+				t.Fatalf("drifted commit wrote interfaces: %v", rows)
+			}
+			assertNoCreateTerminalSteps(t, c, op.ID, 2)
+		})
+	}
+}
+
+func TestBeginContainerCreateOperationRetryOnDifferentHostConflicts(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-ct-host", "container", "ct1", "hash", "", 1)
+	ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	ct.HostName = "h2"
+	if _, err := c.BeginContainerCreateOperation(ctx, op, ct); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("different-host retry error = %v, want identity conflict", err)
+	}
+	if got, _ := GetContainer(ctx, c, "h2", "ct1"); got != nil {
+		t.Fatalf("different-host retry created a row: %+v", got)
+	}
+	ct.HostName = "h1"
+	if applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 1, ct, nil); err != nil || !applied {
+		t.Fatalf("commit original host: applied=%v err=%v", applied, err)
+	}
+	ct.HostName = "h2"
+	if _, err := c.BeginContainerCreateOperation(ctx, op, ct); !errors.Is(err, ErrOperationIdentityConflict) {
+		t.Fatalf("different-host retry after commit error = %v, want identity conflict", err)
+	}
+}
+
+func TestReplicatedVMCreateCommitIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	op := createOp("op-repl-vm", "vm", "vm1", "hash", "", 1)
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+		OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "source-vm", 1)
+	if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+		[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+		[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+		[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "1234"}},
+	); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "source-vm", 2)
+
+	t.Run("stale receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET state = 'running', active_operation_id = 'new-op',
+			 vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE name = ?`, "9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("stale commit changed newer VM: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Fatalf("stale commit wrote %s: %v", table, rows)
+			}
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("valid receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("valid commit did not apply: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 1 {
+				t.Fatalf("valid commit %s rows = %v", table, rows)
+			}
+		}
+	})
+	t.Run("same authority with newer local clock still transitions atomically", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("semantic commit was clock-skipped: %+v", got)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 1 {
+				t.Fatalf("atomic commit %s rows = %v", table, rows)
+			}
+		}
+	})
+}
+
+func TestReplicatedContainerCreateCommitIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	op := createOp("op-repl-ct", "container", "ct1", "hash", "", 1)
+	ct := ContainerRecord{
+		HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+		CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "source-ct", 1)
+	if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 1, ct,
+		[]ContainerInterfaceRecord{{NetworkName: "net1", MAC: "52:00:00:00:00:01"}}); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "source-ct", 2)
+
+	t.Run("stale receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET state = 'running', active_operation_id = 'new-op',
+			 owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("stale commit changed newer container: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`, "h1", "ct1"); len(rows) != 0 {
+			t.Fatalf("stale commit wrote interfaces: %v", rows)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("valid receiver", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("valid commit did not apply: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`, "h1", "ct1"); len(rows) != 1 {
+			t.Fatalf("valid commit interface rows = %v", rows)
+		}
+	})
+	t.Run("same authority with newer local clock still transitions atomically", func(t *testing.T) {
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, commitEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("semantic commit was clock-skipped: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`, "h1", "ct1"); len(rows) != 1 {
+			t.Fatalf("atomic commit interface rows = %v", rows)
+		}
+	})
+}
+
+func TestReplicatedCreateRollbackIsSelfGuarded(t *testing.T) {
+	ctx := context.Background()
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-vm-rollback", "vm", "vm1", "hash", "", 1)
+		vm := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-vm-rollback", 1)
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-vm-rollback", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET state = 'running', active_operation_id = 'new-op',
+			 vm_owner_epoch = 2, updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 {
+			t.Fatalf("stale rollback changed newer VM: %+v", got)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-ct-rollback", "container", "ct1", "hash", "", 1)
+		ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-ct-rollback", 1)
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-ct-rollback", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET state = 'running', active_operation_id = 'new-op',
+			 owner_epoch = 2, updated_at = ? WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		got, _ := GetContainer(ctx, receiver, "h1", "ct1")
+		if got == nil || got.ActiveOperationID != "new-op" || got.OwnerEpoch != 2 {
+			t.Fatalf("stale rollback changed newer container: %+v", got)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+	})
+	t.Run("vm same authority with newer local clock", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-vm-rollback-clock", "vm", "vm1", "hash", "", 1)
+		vm := VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-vm-rollback-clock", 1)
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-vm-rollback-clock", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET updated_at = ? WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		if got, _ := GetVM(ctx, receiver, "vm1"); got != nil {
+			t.Fatalf("semantic rollback was clock-skipped: %+v", got)
+		}
+	})
+	t.Run("container same authority with newer local clock", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-repl-ct-rollback-clock", "container", "ct1", "hash", "", 1)
+		ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		beginEntry := latestMutationEntry(t, source, "source-ct-rollback-clock", 1)
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 1, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, source, "source-ct-rollback-clock", 2)
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if _, err := receiver.db.Exec(
+			`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, rollbackEntry)
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+			t.Fatalf("semantic rollback was clock-skipped: %+v", got)
+		}
+	})
+}
+
+func TestReplicatedGuardedEntryRejectsReorderedBarrierAndMisbinding(t *testing.T) {
+	ctx := context.Background()
+	source := testClient(t)
+	op := createOp("op-entry-validation", "vm", "vm1", "hash", "", 1)
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1, SpecGeneration: 1,
+	}
+	if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "entry-validation-source", 1)
+	if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+		[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		nil, nil, nil,
+	); err != nil || !applied {
+		t.Fatalf("commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "entry-validation-source", 2)
+
+	t.Run("begin entry rejects unguarded tail", func(t *testing.T) {
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(beginEntry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		stmts = append(stmts, operationStepInsertStatement(
+			op.ID, 1, OpStepCompleted, "", nowRFC3339(), source.NowTS(), nil,
+		))
+		raw, _ := json.Marshal(stmts)
+		bad := &pb.MutationEntry{
+			Seq: 1, Hlc: beginEntry.Hlc, Origin: "malformed-begin", Stmts: string(raw),
+		}
+		receiver := testClient(t)
+		if _, err := NewReplicator(receiver, "", RelayConfig{}).ApplyRemoteMutations(
+			ctx, []*pb.MutationEntry{bad},
+		); err == nil {
+			t.Fatal("begin entry with unguarded tail applied")
+		}
+		if got, _ := GetVM(ctx, receiver, "vm1"); got != nil {
+			t.Fatalf("malformed begin left provisional workload: %+v", got)
+		}
+	})
+
+	mutateAndApply := func(t *testing.T, setup func(*Client), mutate func([]Statement) []Statement) *Client {
+		t.Helper()
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		if setup != nil {
+			setup(receiver)
+		}
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(commitEntry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		stmts = mutate(stmts)
+		raw, _ := json.Marshal(stmts)
+		bad := &pb.MutationEntry{
+			Seq: commitEntry.Seq, Hlc: commitEntry.Hlc,
+			Origin: "malformed-" + t.Name(), Stmts: string(raw),
+		}
+		if _, err := NewReplicator(receiver, "", RelayConfig{}).ApplyRemoteMutations(
+			ctx, []*pb.MutationEntry{bad}); err == nil {
+			t.Fatal("malformed guarded entry applied without back-pressure")
+		}
+		got, _ := GetVM(ctx, receiver, "vm1")
+		if got == nil || got.State != "creating" || got.ActiveOperationID != op.ID {
+			t.Fatalf("malformed entry changed parent: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx, `SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+			t.Fatalf("malformed entry wrote hardware: %v", rows)
+		}
+		assertNoCreateTerminalSteps(t, receiver, op.ID, 1)
+		return receiver
+	}
+	t.Run("barrier must be last", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			last := stmts[len(stmts)-1]
+			return append([]Statement{last}, stmts[:len(stmts)-1]...)
+		})
+	})
+	t.Run("hardware identity must match guard", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			stmts[0].Params[0] = "other-vm"
+			return stmts
+		})
+	})
+	t.Run("all guards must share one identity", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			other := *stmts[0].Guard
+			other.ResourceID = "other-vm"
+			other.OperationID = "other-op"
+			stmts[0].Guard = &other
+			stmts[0].Params[0] = other.ResourceID
+			return stmts
+		})
+	})
+	t.Run("commit terminal sequence is required", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			return stmts[len(stmts)-1:]
+		})
+	})
+	t.Run("commit guard cannot omit provisional identity", func(t *testing.T) {
+		mutateAndApply(t, func(receiver *Client) {
+			if _, err := receiver.db.Exec(
+				`UPDATE vms SET host_name = ?, spec = ? WHERE name = ?`,
+				"h2", `{"unexpected":true}`, "vm1",
+			); err != nil {
+				t.Fatal(err)
+			}
+		}, func(stmts []Statement) []Statement {
+			for i := range stmts {
+				weak := *stmts[i].Guard
+				weak.HostName = ""
+				weak.IdentityHash = ""
+				weak.CheckSpecGeneration = false
+				stmts[i].Guard = &weak
+			}
+			return stmts
+		})
+	})
+	t.Run("unguarded statement cannot ride a guarded barrier", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			extra := stmts[0]
+			extra.Guard = nil
+			return append(append(stmts[:len(stmts)-1], extra), stmts[len(stmts)-1])
+		})
+	})
+	t.Run("unrelated same-guard role cannot ride a guarded barrier", func(t *testing.T) {
+		mutateAndApply(t, nil, func(stmts []Statement) []Statement {
+			extra := stmts[len(stmts)-2]
+			extra.Params = append([]interface{}(nil), extra.Params...)
+			extra.Params[2] = OpStepPlanned
+			return append(append(stmts[:len(stmts)-1], extra), stmts[len(stmts)-1])
+		})
+	})
+	t.Run("rollback terminal sequence is required", func(t *testing.T) {
+		rollbackSource := testClient(t)
+		rollbackOp := createOp("op-entry-rollback", "vm", "vm-rollback", "hash", "", 1)
+		rollbackVM := VMRecord{Name: "vm-rollback", HostName: "h1", Project: "p1", OwnerEpoch: 1}
+		if applied, err := rollbackSource.BeginVMCreateOperation(ctx, rollbackOp, rollbackVM); err != nil || !applied {
+			t.Fatalf("begin rollback source: applied=%v err=%v", applied, err)
+		}
+		rollbackBegin := latestMutationEntry(t, rollbackSource, "entry-rollback-source", 1)
+		if applied, err := rollbackSource.RollbackVMCreateOperation(
+			ctx, rollbackVM.Name, rollbackOp.ID, 1, "cleanup",
+		); err != nil || !applied {
+			t.Fatalf("rollback source: applied=%v err=%v", applied, err)
+		}
+		rollbackEntry := latestMutationEntry(t, rollbackSource, "entry-rollback-source", 2)
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(rollbackEntry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(stmts[len(stmts)-1:])
+		bad := &pb.MutationEntry{
+			Seq: rollbackEntry.Seq, Hlc: rollbackEntry.Hlc,
+			Origin: "malformed-rollback", Stmts: string(raw),
+		}
+
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, rollbackBegin)
+		if _, err := NewReplicator(receiver, "", RelayConfig{}).ApplyRemoteMutations(
+			ctx, []*pb.MutationEntry{bad},
+		); err == nil {
+			t.Fatal("rollback barrier without terminal steps applied")
+		}
+		if got, _ := GetVM(ctx, receiver, rollbackVM.Name); got == nil ||
+			got.State != "creating" || got.ActiveOperationID != rollbackOp.ID {
+			t.Fatalf("truncated rollback changed parent: %+v", got)
+		}
+		assertNoCreateTerminalSteps(t, receiver, rollbackOp.ID, 1)
+	})
+	t.Run("delete cleanup sequence is required", func(t *testing.T) {
+		if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded delete: outcome=%v err=%v", outcome, err)
+		}
+		deleteEntry := latestMutationEntry(t, source, "entry-delete-source", 3)
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(deleteEntry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(stmts[len(stmts)-1:])
+		bad := &pb.MutationEntry{
+			Seq: 3, Hlc: deleteEntry.Hlc, Origin: "malformed-delete", Stmts: string(raw),
+		}
+		receiver := testClient(t)
+		applyMutationEntry(t, receiver, beginEntry)
+		applyMutationEntry(t, receiver, commitEntry)
+		if _, err := NewReplicator(receiver, "", RelayConfig{}).ApplyRemoteMutations(
+			ctx, []*pb.MutationEntry{bad},
+		); err == nil {
+			t.Fatal("delete parent barrier without child cleanup applied")
+		}
+		if got, _ := GetVM(ctx, receiver, "vm1"); got == nil || got.State != "running" {
+			t.Fatalf("truncated delete changed parent: %+v", got)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NULL`, "vm1",
+		); len(rows) != 1 {
+			t.Fatalf("truncated delete changed hardware: %v", rows)
+		}
+
+		if err := json.Unmarshal([]byte(deleteEntry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		stmts[0].Params[1] = "9900000000000-0000-poison"
+		raw, _ = json.Marshal(stmts)
+		badClock := &pb.MutationEntry{
+			Seq: 3, Hlc: deleteEntry.Hlc, Origin: "malformed-delete-clock", Stmts: string(raw),
+		}
+		clockReceiver := testClient(t)
+		applyMutationEntry(t, clockReceiver, beginEntry)
+		applyMutationEntry(t, clockReceiver, commitEntry)
+		if _, err := NewReplicator(clockReceiver, "", RelayConfig{}).ApplyRemoteMutations(
+			ctx, []*pb.MutationEntry{badClock},
+		); err == nil {
+			t.Fatal("delete cleanup with a clock different from its barrier applied")
+		}
+		if rows, _ := clockReceiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NULL`, "vm1",
+		); len(rows) != 1 {
+			t.Fatalf("mismatched delete clock changed hardware: %v", rows)
+		}
+	})
+}
+
+func TestCreateOperationAntiEntropyFencesStaleWorkloadAuthority(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm commit hardware and steps", func(t *testing.T) {
+		source := testClient(t)
+		reservation, _ := (ReservationVector{
+			Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+		}).Encode()
+		op := createOp("op-ae-vm", "vm", "vm1", "hash", reservation, 1)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		exclusive := "0000:01:00.0"
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+			[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+			[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+			[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+			[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "address", SelectorPayload: exclusive, ExclusiveKey: &exclusive}},
+		); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+
+		receiver := testClient(t)
+		if err := InsertVM(ctx, receiver, VMRecord{
+			Name: "vm1", HostName: "h2", Project: "p1", Spec: `{"cpu":8}`,
+			State: "running", OwnerEpoch: 2, SpecGeneration: 2,
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := receiver.db.Exec(
+			`UPDATE vms SET vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE name = ?`,
+			"9000000000000-0000-newer", "vm1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+				t.Errorf("stale anti-entropy commit wrote %s: %v", table, rows)
+			}
+		}
+		assertNoOperationSteps(t, receiver, op.ID)
+		if got, _ := GetOperation(ctx, receiver, op.ID); got == nil {
+			t.Fatal("immutable operation header was not retained")
+		}
+		if cpu, _, err := HostReserved(ctx, receiver, "h1"); err != nil || cpu != 0 {
+			t.Fatalf("stale header reserved capacity: cpu=%d err=%v", cpu, err)
+		}
+	})
+
+	t.Run("container commit hardware and steps", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-ct", "container", "ct1", "hash", "", 1)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+			CreateSpec: `{"template":"alpine"}`, OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 1, ct,
+			[]ContainerInterfaceRecord{{NetworkName: "net1", MAC: "52:00:00:00:00:01"}}); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+
+		receiver := testClient(t)
+		if err := UpsertContainer(ctx, receiver, ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "debian", Project: "p1",
+			State: "running", OwnerEpoch: 2, SpecGeneration: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := receiver.db.Exec(
+			`UPDATE containers
+			 SET owner_epoch = 2, spec_generation = 2, updated_at = ?
+			 WHERE host_name = ? AND name = ?`,
+			"9000000000000-0000-newer", "h1", "ct1",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`,
+			"h1", "ct1"); len(rows) != 0 {
+			t.Errorf("stale anti-entropy commit wrote container interfaces: %v", rows)
+		}
+		assertNoOperationSteps(t, receiver, op.ID)
+	})
+
+	for _, kind := range []string{"vm", "container"} {
+		t.Run(kind+" rollback steps", func(t *testing.T) {
+			source := testClient(t)
+			op := createOp("op-ae-"+kind+"-rollback", kind, "workload1", "hash", "", 1)
+			if kind == "vm" {
+				if applied, err := source.BeginVMCreateOperation(ctx, op,
+					VMRecord{Name: "workload1", HostName: "h1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+					t.Fatalf("source begin: applied=%v err=%v", applied, err)
+				}
+				if applied, err := source.RollbackVMCreateOperation(ctx, "workload1", op.ID, 1, "cleanup"); err != nil || !applied {
+					t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+				}
+			} else {
+				if applied, err := source.BeginContainerCreateOperation(ctx, op,
+					ContainerRecord{HostName: "h1", Name: "workload1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+					t.Fatalf("source begin: applied=%v err=%v", applied, err)
+				}
+				if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "workload1", op.ID, 1, "cleanup"); err != nil || !applied {
+					t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+				}
+			}
+
+			receiver := testClient(t)
+			if kind == "vm" {
+				if err := InsertVM(ctx, receiver, VMRecord{
+					Name: "workload1", HostName: "h2", Project: "p1", State: "running",
+					OwnerEpoch: 2, SpecGeneration: 2,
+				}, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = receiver.db.Exec(
+					`UPDATE vms
+					 SET vm_owner_epoch = 2, spec_generation = 2, updated_at = ?
+					 WHERE name = ?`,
+					"9000000000000-0000-newer", "workload1",
+				)
+			} else {
+				if err := UpsertContainer(ctx, receiver, ContainerRecord{
+					HostName: "h1", Name: "workload1", Project: "p1", State: "running",
+					OwnerEpoch: 2, SpecGeneration: 2,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				_, _ = receiver.db.Exec(
+					`UPDATE containers
+					 SET owner_epoch = 2, spec_generation = 2, updated_at = ?
+					 WHERE host_name = ? AND name = ?`,
+					"9000000000000-0000-newer", "h1", "workload1",
+				)
+			}
+			if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+			assertNoOperationSteps(t, receiver, op.ID)
+		})
+	}
+}
+
+func TestCreateOperationAntiEntropyCurrentAuthorityConverges(t *testing.T) {
+	ctx := context.Background()
+	t.Run("vm commit in reversed payload order", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid", "vm", "vm1", "hash", "", 4)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 4, SpecGeneration: 3,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 4, vm,
+			[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+			[]DiskRecord{{DiskName: "root", HostName: "h1", Path: "/vm1.img"}},
+			[]NICRecord{{ID: "nic1", NetworkName: "net1"}},
+			[]PCIIntentRecord{{DeviceID: "pci1", HostName: "h1", SelectorKind: "vendor", SelectorPayload: "1234"}},
+		); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for left, right := 0, len(payload.Tables)-1; left < right; left, right = left+1, right-1 {
+			payload.Tables[left], payload.Tables[right] = payload.Tables[right], payload.Tables[left]
+		}
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "vm1"); len(rows) != 1 {
+				t.Errorf("valid anti-entropy repair did not converge %s: %v", table, rows)
+			}
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("valid repaired operation state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+
+	t.Run("container commit", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid-ct", "container", "ct1", "hash", "", 5)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "alpine", Project: "p1",
+			OwnerEpoch: 5, SpecGeneration: 2,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct,
+			[]ContainerInterfaceRecord{{NetworkName: "net1"}}); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM container_interfaces WHERE host_name = ? AND ct_name = ?`,
+			"h1", "ct1"); len(rows) != 1 {
+			t.Fatalf("valid container interface repair did not converge: %v", rows)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("valid container state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-valid-rollback", "vm", "vm1", "hash", "", 6)
+		if applied, err := source.BeginVMCreateOperation(ctx, op,
+			VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 6}); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackVMCreateOperation(ctx, "vm1", op.ID, 6, "cleanup"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, 6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepFailed || faulted {
+			t.Fatalf("valid rollback state=%q faulted=%v steps=%v", state, faulted, stepNames(steps))
+		}
+	})
+}
+
+func TestCreateOperationAntiEntropyRejectsStepsFromConflictingImmutableHeader(t *testing.T) {
+	ctx := context.Background()
+	localReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+	}).Encode()
+	otherReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 9, TargetHost: "h1", TargetCPU: 9,
+	}).Encode()
+
+	tests := []struct {
+		name   string
+		mutate func(*OperationRecord)
+	}{
+		{"method", func(op *OperationRecord) { op.Method = "CreateVM-v2" }},
+		{"principal", func(op *OperationRecord) { op.Principal = "bob" }},
+		{"request hash", func(op *OperationRecord) { op.RequestHash = "other-hash" }},
+		{"idempotency key", func(op *OperationRecord) { op.IdempotencyKey = "other-key" }},
+		{"reservation", func(op *OperationRecord) { op.ReservationJSON = otherReservation }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			local := testClient(t)
+			source := testClient(t)
+			op := createOp("op-conflicting-header", "vm", "vm1", "hash", localReservation, 1)
+			vm := VMRecord{
+				Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+				OwnerEpoch: 1, SpecGeneration: 1,
+			}
+			if applied, err := local.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+				t.Fatalf("local begin: applied=%v err=%v", applied, err)
+			}
+			incoming := op
+			tc.mutate(&incoming)
+			if applied, err := source.BeginVMCreateOperation(ctx, incoming, vm); err != nil || !applied {
+				t.Fatalf("source begin: applied=%v err=%v", applied, err)
+			}
+			for _, step := range []string{OpStepCompleted, OpStepRollbackCompleted, OpStepFailed} {
+				if err := AppendOperationStep(ctx, source, OperationStepRecord{
+					OperationID: incoming.ID, OwnerEpoch: 1, StepName: step,
+				}); err != nil {
+					t.Fatalf("append %s: %v", step, err)
+				}
+			}
+
+			if err := local.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+			steps, err := ListOperationSteps(ctx, local, op.ID, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, step := range steps {
+				switch step.StepName {
+				case OpStepCompleted, OpStepRollbackCompleted, OpStepFailed:
+					t.Errorf("terminal step %q from conflicting header was admitted", step.StepName)
+				}
+			}
+			if cpu, _, err := HostReserved(ctx, local, "h1"); err != nil || cpu != 2 {
+				t.Fatalf("local reservation after conflicting repair: cpu=%d err=%v", cpu, err)
+			}
+		})
+	}
+}
+
+func TestCreateOperationWALBindsCompleteImmutableHeader(t *testing.T) {
+	ctx := context.Background()
+	reservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+	}).Encode()
+	otherReservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 9, TargetHost: "h1", TargetCPU: 9,
+	}).Encode()
+	op := createOp("op-wal-immutable-header", "vm", "vm1", "request-hash", reservation, 7)
+	op.DesiredRef = "desired/vm1"
+	vm := VMRecord{
+		Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+		OwnerEpoch: 7, SpecGeneration: 3,
+	}
+	source := testClient(t)
+	if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+		t.Fatalf("source begin: applied=%v err=%v", applied, err)
+	}
+	beginEntry := latestMutationEntry(t, source, "immutable-header-source", 1)
+	if applied, err := source.CommitVMCreateOperation(ctx, op.ID, op.VMOwnerEpoch, vm,
+		[]InterfaceRecord{{NetworkName: "net1", MAC: "52:54:00:00:00:01"}},
+		nil, nil, nil); err != nil || !applied {
+		t.Fatalf("source commit: applied=%v err=%v", applied, err)
+	}
+	commitEntry := latestMutationEntry(t, source, "immutable-header-source", 2)
+
+	tests := []struct {
+		name        string
+		column      string
+		incoming    interface{}
+		mutateLocal func(*OperationRecord)
+	}{
+		{"id", "id", "other-op", nil},
+		{"method", "method", "CreateVM-v2", func(got *OperationRecord) { got.Method = "CreateVM-v2" }},
+		{"principal", "principal", "bob", func(got *OperationRecord) { got.Principal = "bob" }},
+		{"project", "project", "p2", func(got *OperationRecord) { got.Project = "p2" }},
+		{"resource kind", "resource_kind", "container", func(got *OperationRecord) { got.ResourceKind = "container" }},
+		{"resource id", "resource_id", "vm2", func(got *OperationRecord) { got.ResourceID = "vm2" }},
+		{"operation kind", "operation_kind", "resize", func(got *OperationRecord) { got.OperationKind = "resize" }},
+		{"request hash", "request_hash", "other-hash", func(got *OperationRecord) { got.RequestHash = "other-hash" }},
+		{"idempotency key", "idempotency_key", "other-key", func(got *OperationRecord) { got.IdempotencyKey = "other-key" }},
+		{"reservation", "reservation_json", otherReservation, func(got *OperationRecord) { got.ReservationJSON = otherReservation }},
+		{"desired ref", "desired_ref", "desired/vm2", func(got *OperationRecord) { got.DesiredRef = "desired/vm2" }},
+		{"owner epoch", "vm_owner_epoch", int64(8), func(got *OperationRecord) { got.VMOwnerEpoch++ }},
+	}
+	for _, tc := range tests {
+		t.Run("incoming "+tc.name, func(t *testing.T) {
+			var stmts []Statement
+			if err := json.Unmarshal([]byte(beginEntry.Stmts), &stmts); err != nil {
+				t.Fatal(err)
+			}
+			changed := false
+			for i := range stmts {
+				sh, _, err := parseResolved(stmts[i].SQL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sh.Table != "operations" {
+					continue
+				}
+				for columnIndex, column := range sh.InsertCols {
+					if column == tc.column && sh.InsertVals[columnIndex].isParam() {
+						stmts[i].Params[sh.InsertVals[columnIndex].ParamIndex] = tc.incoming
+						changed = true
+					}
+				}
+			}
+			if !changed {
+				t.Fatalf("operation insert did not bind %q", tc.column)
+			}
+			encoded, err := json.Marshal(stmts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tampered := &pb.MutationEntry{
+				Seq: beginEntry.Seq, Hlc: beginEntry.Hlc, Origin: beginEntry.Origin,
+				Stmts: string(encoded),
+			}
+			receiver := testClient(t)
+			replicator := NewReplicator(receiver, "", RelayConfig{})
+			for _, entry := range []*pb.MutationEntry{tampered, commitEntry} {
+				if _, err := replicator.ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err == nil {
+					t.Errorf("WAL seq=%d accepted a differing incoming %s", entry.Seq, tc.name)
+				}
+			}
+			if got, err := GetVM(ctx, receiver, vm.Name); err != nil || got != nil {
+				t.Fatalf("tampered incoming header created VM: got=%+v err=%v", got, err)
+			}
+		})
+
+		if tc.mutateLocal == nil {
+			continue
+		}
+		t.Run("conflicting "+tc.name, func(t *testing.T) {
+			receiver := testClient(t)
+			conflicting := op
+			tc.mutateLocal(&conflicting)
+			if err := InsertOperation(ctx, receiver, conflicting); err != nil {
+				t.Fatalf("insert conflicting local header: %v", err)
+			}
+			beforeCPU, beforeMem, err := HostReserved(ctx, receiver, vm.HostName)
+			if err != nil {
+				t.Fatalf("reservation before conflicting WAL: %v", err)
+			}
+			replicator := NewReplicator(receiver, "", RelayConfig{})
+			for _, entry := range []*pb.MutationEntry{beginEntry, commitEntry} {
+				if _, err := replicator.ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err == nil {
+					t.Errorf("WAL seq=%d accepted a conflicting %s header", entry.Seq, tc.name)
+				}
+			}
+			if got, err := GetVM(ctx, receiver, vm.Name); err != nil || got != nil {
+				t.Fatalf("conflicting WAL created VM: got=%+v err=%v", got, err)
+			}
+			if cpu, mem, err := HostReserved(ctx, receiver, vm.HostName); err != nil || cpu != beforeCPU || mem != beforeMem {
+				t.Fatalf("conflicting WAL changed reservations: before=(%d,%d) after=(%d,%d) err=%v",
+					beforeCPU, beforeMem, cpu, mem, err)
+			}
+			got, err := GetOperation(ctx, receiver, op.ID)
+			if err != nil || got == nil || !sameOperationClaim(*got, conflicting) {
+				t.Fatalf("local immutable header changed: got=%+v err=%v", got, err)
+			}
+		})
+	}
+
+	t.Run("exact header converges and replays idempotently", func(t *testing.T) {
+		receiver := testClient(t)
+		if err := InsertOperation(ctx, receiver, op); err != nil {
+			t.Fatalf("insert exact local header: %v", err)
+		}
+		for replay := 0; replay < 2; replay++ {
+			for _, entry := range []*pb.MutationEntry{beginEntry, commitEntry} {
+				if _, err := NewReplicator(receiver, "", RelayConfig{}).
+					ApplyRemoteMutations(ctx, []*pb.MutationEntry{entry}); err != nil {
+					t.Fatalf("replay %d WAL seq=%d: %v", replay, entry.Seq, err)
+				}
+			}
+		}
+		got, err := GetVM(ctx, receiver, vm.Name)
+		if err != nil || got == nil || got.State != "running" || got.ActiveOperationID != "" {
+			t.Fatalf("exact immutable header did not converge: got=%+v err=%v", got, err)
+		}
+		if rows, err := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces
+			 WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			vm.Name, "net1"); err != nil || len(rows) != 1 {
+			t.Fatalf("exact immutable header hardware did not converge: rows=%v err=%v", rows, err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, op.ID, op.VMOwnerEpoch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state, faulted := ReduceOperationState(OpWorkloadCreate, stepNames(steps)); state != OpStepCompleted || faulted {
+			t.Fatalf("exact immutable header state=%q faulted=%v steps=%v",
+				state, faulted, stepNames(steps))
+		}
+	})
+}
+
+func TestRetainedAndCurrentContainerRekeyDeletesCannotCrossRecreate(t *testing.T) {
+	ctx := context.Background()
+	const delayed = "8000000000000-0000-delayed"
+
+	t.Run("retained strict tombstone", func(t *testing.T) {
+		receiver := testClient(t)
+		op := createOp("op-retained-strict-recreate", "container", "ct1", "new", "", 2)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("receiver begin: applied=%v err=%v", applied, err)
+		}
+		raw, err := json.Marshal([]Statement{{
+			SQL: `UPDATE containers SET deleted_at = ?, updated_at = ?
+			 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{delayed, delayed, "h1", "ct1"},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyMutationEntry(t, receiver, &pb.MutationEntry{
+			Seq: 1, Hlc: delayed, Origin: "retained-strict-delete", Stmts: string(raw),
+		})
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 {
+			t.Fatalf("retained strict tombstone crossed recreated authority: %+v", got)
+		}
+	})
+
+	t.Run("current rekey batch", func(t *testing.T) {
+		source := testClient(t)
+		oldOp := createOp("op-current-rekey-old", "container", "ct1", "old", "", 1)
+		oldCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "old", Project: "p1",
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, oldOp, oldCT); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitContainerCreateOperation(ctx, oldOp.ID, 1, oldCT, nil); err != nil || !applied {
+			t.Fatalf("source commit: applied=%v err=%v", applied, err)
+		}
+		observed, err := GetContainer(ctx, source, "h1", "ct1")
+		if err != nil || observed == nil {
+			t.Fatalf("source container: got=%+v err=%v", observed, err)
+		}
+		if applied, err := RekeyContainerOwnerGuarded(ctx, source, *observed, "h2"); err != nil || !applied {
+			t.Fatalf("source rekey: applied=%v err=%v", applied, err)
+		}
+		rekeyEntry := latestMutationEntry(t, source, "current-rekey-source", 1)
+
+		receiver := testClient(t)
+		newOp := createOp("op-current-rekey-new", "container", "ct1", "new", "", 2)
+		newCT := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(ctx, newOp, newCT); err != nil || !applied {
+			t.Fatalf("receiver begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.CommitContainerCreateOperation(ctx, newOp.ID, 2, newCT, nil); err != nil || !applied {
+			t.Fatalf("receiver commit: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, receiver, rekeyEntry)
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.Image != "new" {
+			t.Fatalf("delayed current rekey crossed recreated authority: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+			t.Fatalf("declined delayed rekey manufactured target: %+v", got)
+		}
+
+		targetRecreated := testClient(t)
+		sourceReplicaOp := createOp("op-current-rekey-source-replica", "container", "ct1", "old", "", 1)
+		if applied, err := targetRecreated.BeginContainerCreateOperation(
+			ctx, sourceReplicaOp, oldCT,
+		); err != nil || !applied {
+			t.Fatalf("receiver source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := targetRecreated.CommitContainerCreateOperation(
+			ctx, sourceReplicaOp.ID, 1, oldCT, nil,
+		); err != nil || !applied {
+			t.Fatalf("receiver source commit: applied=%v err=%v", applied, err)
+		}
+		targetOp := createOp("op-current-rekey-target-new", "container", "ct1", "target-new", "", 2)
+		targetCT := ContainerRecord{
+			HostName: "h2", Name: "ct1", Image: "target-new", Project: "p1",
+			OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := targetRecreated.BeginContainerCreateOperation(
+			ctx, targetOp, targetCT,
+		); err != nil || !applied {
+			t.Fatalf("receiver target begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := targetRecreated.CommitContainerCreateOperation(
+			ctx, targetOp.ID, 2, targetCT, nil,
+		); err != nil || !applied {
+			t.Fatalf("receiver target commit: applied=%v err=%v", applied, err)
+		}
+		applyMutationEntry(t, targetRecreated, rekeyEntry)
+		if got, _ := GetContainer(ctx, targetRecreated, "h2", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 || got.Image != "target-new" {
+			t.Fatalf("delayed rekey clobbered recreated target authority: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, targetRecreated, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 1 || got.SpecGeneration != 1 {
+			t.Fatalf("declined target-conflicting rekey tombstoned source: %+v", got)
+		}
+
+		var delayedStmts []Statement
+		if err := json.Unmarshal([]byte(rekeyEntry.Stmts), &delayedStmts); err != nil {
+			t.Fatal(err)
+		}
+		for i := range delayedStmts {
+			shape, _, err := parseResolved(delayedStmts[i].SQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shape.UpdatedAtParamIdx < 0 ||
+				shape.UpdatedAtParamIdx >= len(delayedStmts[i].Params) {
+				t.Fatalf("rekey statement %d has no updated_at binding", i)
+			}
+			delayedStmts[i].Params[shape.UpdatedAtParamIdx] = delayed
+		}
+		delayedRaw, err := json.Marshal(delayedStmts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delayedRekey := &pb.MutationEntry{
+			Seq: 1, Hlc: delayed, Origin: "delayed-current-rekey",
+			Stmts: string(delayedRaw),
+		}
+		seedSourceReplica := func(t *testing.T, receiver *Client) {
+			t.Helper()
+			op := createOp("op-current-rekey-source-"+t.Name(),
+				"container", "ct1", "old", "", 1)
+			if applied, err := receiver.BeginContainerCreateOperation(
+				ctx, op, oldCT,
+			); err != nil || !applied {
+				t.Fatalf("source replica begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitContainerCreateOperation(
+				ctx, op.ID, 1, oldCT, nil,
+			); err != nil || !applied {
+				t.Fatalf("source replica commit: applied=%v err=%v", applied, err)
+			}
+		}
+		rowSnapshot := func(t *testing.T, receiver *Client, host string) string {
+			t.Helper()
+			rows, err := receiver.Query(ctx,
+				`SELECT * FROM containers WHERE host_name = ? AND name = ?`,
+				host, "ct1")
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("container snapshot %s: rows=%v err=%v", host, rows, err)
+			}
+			raw, err := json.Marshal(rows[0].Values)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(raw)
+		}
+
+		t.Run("tombstoned target authority declines atomically", func(t *testing.T) {
+			cases := []struct {
+				name       string
+				ownerEpoch int64
+				generation int64
+			}{
+				{name: "newer axes", ownerEpoch: 2, generation: 2},
+				{name: "owner axis only", ownerEpoch: 2, generation: 1},
+				{name: "generation axis only", ownerEpoch: 1, generation: 2},
+				{name: "equal axes different identity", ownerEpoch: 1, generation: 1},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					receiver := testClient(t)
+					seedSourceReplica(t, receiver)
+					targetOp := createOp("op-current-rekey-tombstone-"+t.Name(),
+						"container", "ct1", "target-new", "", tc.ownerEpoch)
+					target := ContainerRecord{
+						HostName: "h2", Name: "ct1", Image: "target-new", Project: "p1",
+						OwnerEpoch: tc.ownerEpoch, SpecGeneration: tc.generation,
+					}
+					if applied, err := receiver.BeginContainerCreateOperation(
+						ctx, targetOp, target,
+					); err != nil || !applied {
+						t.Fatalf("target begin: applied=%v err=%v", applied, err)
+					}
+					if applied, err := receiver.CommitContainerCreateOperation(
+						ctx, targetOp.ID, tc.ownerEpoch, target, nil,
+					); err != nil || !applied {
+						t.Fatalf("target commit: applied=%v err=%v", applied, err)
+					}
+					if err := DeleteContainer(ctx, receiver, "h2", "ct1"); err != nil {
+						t.Fatal(err)
+					}
+					sourceBefore := rowSnapshot(t, receiver, "h1")
+					targetBefore := rowSnapshot(t, receiver, "h2")
+					applyMutationEntry(t, receiver, delayedRekey)
+					if sourceAfter := rowSnapshot(t, receiver, "h1"); sourceAfter != sourceBefore {
+						t.Fatalf("declined rekey changed source:\nbefore=%s\nafter=%s",
+							sourceBefore, sourceAfter)
+					}
+					if targetAfter := rowSnapshot(t, receiver, "h2"); targetAfter != targetBefore {
+						t.Fatalf("declined rekey changed tombstoned target:\nbefore=%s\nafter=%s",
+							targetBefore, targetAfter)
+					}
+				})
+			}
+		})
+
+		t.Run("unsafe source declines atomically", func(t *testing.T) {
+			cases := []struct {
+				name    string
+				state   string
+				detail  string
+				token   string
+				deleted bool
+			}{
+				{name: "tombstoned", state: "running", deleted: true},
+				{name: "pending", state: "pending", detail: ContainerRelocateRecreateDetail},
+				{name: "migrating", state: "migrating"},
+				{name: "relocating", state: "relocating", detail: RelocateRestoreDetail("h2", "tok")},
+				{name: "relocation detail", state: "running", detail: RelocateRestoreDetail("h2", "tok")},
+				{name: "relocation token", state: "running", token: "tok"},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					receiver := testClient(t)
+					seedSourceReplica(t, receiver)
+					deletedAt := interface{}(nil)
+					if tc.deleted {
+						deletedAt = "2026-07-28T15:00:00Z"
+					}
+					if _, err := receiver.db.Exec(
+						`UPDATE containers
+						 SET state = ?, state_detail = ?, relocate_token = ?, deleted_at = ?
+						 WHERE host_name = ? AND name = ?`,
+						tc.state, tc.detail, tc.token, deletedAt, "h1", "ct1",
+					); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := receiver.db.Exec(
+						`INSERT INTO container_interfaces
+						 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+						 VALUES ('h1', 'ct1', 'sentinel', 0, '52:54:00:00:00:01', 'sentinel')`,
+					); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := receiver.db.Exec(
+						`INSERT INTO ip_allocations
+						 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+						 VALUES ('sentinel', '10.0.0.10', '52:54:00:00:00:01',
+						         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+					); err != nil {
+						t.Fatal(err)
+					}
+					sourceBefore := rowSnapshot(t, receiver, "h1")
+					footprintBefore := containerOwnershipFootprintSnapshot(t, receiver, "ct1")
+					applyMutationEntry(t, receiver, delayedRekey)
+					if sourceAfter := rowSnapshot(t, receiver, "h1"); sourceAfter != sourceBefore {
+						t.Fatalf("declined rekey changed unsafe source:\nbefore=%s\nafter=%s",
+							sourceBefore, sourceAfter)
+					}
+					if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+						t.Fatalf("declined rekey manufactured target: %+v", got)
+					}
+					if footprintAfter := containerOwnershipFootprintSnapshot(
+						t, receiver, "ct1",
+					); footprintAfter != footprintBefore {
+						t.Fatalf("declined rekey changed interface/lease footprint:\nbefore=%s\nafter=%s",
+							footprintBefore, footprintAfter)
+					}
+				})
+			}
+		})
+
+		t.Run("exact live result permits idempotent completion", func(t *testing.T) {
+			receiver := testClient(t)
+			seedSourceReplica(t, receiver)
+			source, err := GetContainer(ctx, receiver, "h1", "ct1")
+			if err != nil || source == nil {
+				t.Fatalf("source before exact replay: got=%+v err=%v", source, err)
+			}
+			exactTarget := *source
+			exactTarget.HostName = "h2"
+			exactTarget.State = "running"
+			exactTarget.StateDetail = ContainerRuntimeRekeyDetail
+			exactOp := createOp("op-current-rekey-exact-target",
+				"container", "ct1", "old", "", 1)
+			if applied, err := receiver.BeginContainerCreateOperation(
+				ctx, exactOp, exactTarget,
+			); err != nil || !applied {
+				t.Fatalf("exact target begin: applied=%v err=%v", applied, err)
+			}
+			if applied, err := receiver.CommitContainerCreateOperation(
+				ctx, exactOp.ID, 1, exactTarget, nil,
+			); err != nil || !applied {
+				t.Fatalf("exact target commit: applied=%v err=%v", applied, err)
+			}
+			applyMutationEntry(t, receiver, delayedRekey)
+			if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+				t.Fatalf("exact target completion left source live: %+v", got)
+			}
+			if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got == nil ||
+				got.OwnerEpoch != 1 || got.SpecGeneration != 1 ||
+				got.Image != "old" || got.State != "running" ||
+				got.StateDetail != ContainerRuntimeRekeyDetail {
+				t.Fatalf("exact target did not complete safely: %+v", got)
+			}
+		})
+	})
+}
+
+func TestRetainedV130ContainerRekeyEnvelopeProtectsTargetAuthority(t *testing.T) {
+	ctx := context.Background()
+	const (
+		high        = "9000000000000-0000-retained-rekey"
+		ifaceRFC0   = "2026-07-28T12:00:03.000000001Z"
+		ifaceRFC1   = "2026-07-28T12:00:03.000000002Z"
+		ifaceHLC1   = "9000000000002-0000-retained-iface-1"
+		parentWall  = "2026-07-28T12:00:00Z"
+		cleanupWall = "2026-07-28T12:00:01Z"
+		leaseWall   = "2026-07-28T12:00:02Z"
+	)
+	createSpec := EncodeCreateSpec(ContainerCreateSpec{
+		Networks: []ContainerNetwork{
+			{
+				Name: "eth0", NetworkName: "net1", IP: "10.0.0.10",
+				MAC: "52:54:00:00:00:01", SecurityGroups: []string{"web"},
+			},
+			{
+				Name: "eth1", NetworkName: "net2",
+				MAC: "52:54:00:00:00:02",
+			},
+		},
+	})
+
+	seedLegacySource := func(t *testing.T, c *Client) ContainerRecord {
+		t.Helper()
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Image: "legacy",
+			Project: "p1", CreateSpec: createSpec,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := GetContainer(ctx, c, "h1", "ct1")
+		if err != nil || got == nil {
+			t.Fatalf("legacy source: got=%+v err=%v", got, err)
+		}
+		return *got
+	}
+	retainedBatch := func(createdAt, interfaceClock0, interfaceClock1 string) []Statement {
+		return []Statement{
+			{
+				SQL: legacyContainerStrictDeleteSQL,
+				Params: []interface{}{
+					parentWall, high, "h1", "ct1",
+				},
+			},
+			{
+				SQL: legacyContainerRekeySQL,
+				Params: []interface{}{
+					"h2", "ct1", "legacy", 0, 0, "", "",
+					ContainerRuntimeRekeyDetail, "p1", 0, "", createSpec, "",
+					createdAt, high,
+				},
+			},
+			{
+				SQL: containerRekeyInterfaceCleanupSQL,
+				Params: []interface{}{
+					cleanupWall, high, "h1", "ct1",
+				},
+			},
+			{
+				SQL: containerCreateInterfaceSQL,
+				Params: []interface{}{
+					"h2", "ct1", "net1", 0, "52:54:00:00:00:01", "10.0.0.10",
+					ContainerVethName("ct1", 0), `["web"]`, interfaceClock0,
+				},
+			},
+			{
+				SQL: containerCreateInterfaceSQL,
+				Params: []interface{}{
+					"h2", "ct1", "net2", 1, "52:54:00:00:00:02", "",
+					ContainerVethName("ct1", 1), "", interfaceClock1,
+				},
+			},
+			{
+				SQL: containerRekeyLeaseSQL,
+				Params: []interface{}{
+					"h2", leaseWall, high, "h1", "ct1",
+				},
+			},
+		}
+	}
+	entry := func(t *testing.T, origin string, stmts []Statement) *pb.MutationEntry {
+		t.Helper()
+		raw, err := json.Marshal(stmts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &pb.MutationEntry{
+			Seq: 1, Hlc: high, Origin: origin, Stmts: string(raw),
+		}
+	}
+
+	t.Run("modern target declines whole retained batch", func(t *testing.T) {
+		receiver := testClient(t)
+		source := seedLegacySource(t, receiver)
+		targetOp := createOp("op-retained-v130-modern-target", "container", "ct1", "modern", "", 2)
+		target := ContainerRecord{
+			HostName: "h2", Name: "ct1", State: "running", Image: "modern",
+			Project: "p1", OwnerEpoch: 2, SpecGeneration: 2,
+		}
+		if applied, err := receiver.BeginContainerCreateOperation(
+			ctx, targetOp, target,
+		); err != nil || !applied {
+			t.Fatalf("modern target begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := receiver.CommitContainerCreateOperation(
+			ctx, targetOp.ID, 2, target, nil,
+		); err != nil || !applied {
+			t.Fatalf("modern target commit: applied=%v err=%v", applied, err)
+		}
+		targetBefore, err := GetContainer(ctx, receiver, "h2", "ct1")
+		if err != nil || targetBefore == nil {
+			t.Fatalf("modern target before replay: got=%+v err=%v", targetBefore, err)
+		}
+
+		applyMutationEntry(t, receiver,
+			entry(t, "retained-v130-modern-target",
+				retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1)))
+		if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil ||
+			got.OwnerEpoch != 0 || got.SpecGeneration != 0 || got.Image != "legacy" ||
+			got.State != source.State || got.UpdatedAt != source.UpdatedAt {
+			t.Fatalf("declined retained rekey changed legacy source: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got == nil ||
+			got.OwnerEpoch != 2 || got.SpecGeneration != 2 || got.Image != "modern" ||
+			got.State != targetBefore.State || got.UpdatedAt != targetBefore.UpdatedAt {
+			t.Fatalf("retained rekey clobbered modern target: %+v", got)
+		}
+	})
+
+	t.Run("safe legacy apply and idempotent replay", func(t *testing.T) {
+		cases := map[string][2]string{
+			"legacy rfc3339 clocks":        {ifaceRFC0, ifaceRFC1},
+			"mixed rfc3339 and hlc clocks": {ifaceRFC0, ifaceHLC1},
+		}
+		for name, clocks := range cases {
+			t.Run(name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				stmts := retainedBatch(source.CreatedAt, clocks[0], clocks[1])
+				applyMutationEntry(t, receiver, entry(t, "retained-v130-safe-"+name, stmts))
+				if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got != nil {
+					t.Fatalf("safe retained rekey left source live: %+v", got)
+				}
+				assertTarget := func() {
+					t.Helper()
+					got, err := GetContainer(ctx, receiver, "h2", "ct1")
+					if err != nil || got == nil || got.OwnerEpoch != 0 ||
+						got.SpecGeneration != 0 || got.Image != "legacy" ||
+						got.State != "running" || got.StateDetail != ContainerRuntimeRekeyDetail {
+						t.Fatalf("safe retained target: got=%+v err=%v", got, err)
+					}
+					ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
+					if err != nil || len(ifaces) != 2 ||
+						ifaces[0].NetworkName != "net1" || ifaces[0].IP != "10.0.0.10" ||
+						ifaces[0].VethDevice != ContainerVethName("ct1", 0) ||
+						len(ifaces[0].SecurityGroups) != 1 || ifaces[0].SecurityGroups[0] != "web" ||
+						ifaces[1].NetworkName != "net2" ||
+						ifaces[1].VethDevice != ContainerVethName("ct1", 1) {
+						t.Fatalf("safe retained interfaces: got=%+v err=%v", ifaces, err)
+					}
+				}
+				assertTarget()
+				applyMutationEntry(t, receiver, entry(t, "retained-v130-replay-"+name, stmts))
+				assertTarget()
+			})
+		}
+	})
+
+	t.Run("unsafe legacy source declines whole envelope", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			state   string
+			detail  string
+			token   string
+			deleted bool
+		}{
+			{name: "tombstoned", state: "running", deleted: true},
+			{name: "pending", state: "pending", detail: ContainerRelocateRecreateDetail},
+			{name: "migrating", state: "migrating"},
+			{name: "relocating", state: "relocating", detail: RelocateRestoreDetail("h2", "tok")},
+			{name: "relocation detail", state: "running", detail: RelocateRestoreDetail("h2", "tok")},
+			{name: "relocation token", state: "running", token: "tok"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				deletedAt := interface{}(nil)
+				if tc.deleted {
+					deletedAt = "2026-07-28T15:00:00Z"
+				}
+				if _, err := receiver.db.Exec(
+					`UPDATE containers
+					 SET state = ?, state_detail = ?, relocate_token = ?, deleted_at = ?
+					 WHERE host_name = ? AND name = ?`,
+					tc.state, tc.detail, tc.token, deletedAt, "h1", "ct1",
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := receiver.db.Exec(
+					`INSERT INTO container_interfaces
+					 (host_name, ct_name, network_name, ordinal, mac, updated_at)
+					 VALUES ('h1', 'ct1', 'sentinel', 9, '52:54:00:00:00:09', 'sentinel')`,
+				); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := receiver.db.Exec(
+					`INSERT INTO ip_allocations
+					 (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+					 VALUES ('sentinel', '10.0.0.99', '52:54:00:00:00:09',
+					         'ct1', 'ct', 'h1', 'sentinel', 'sentinel')`,
+				); err != nil {
+					t.Fatal(err)
+				}
+				stmts := retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1)
+				stmts[1].Params[12] = tc.token
+				before, err := receiver.Query(ctx,
+					`SELECT * FROM containers WHERE name = ? ORDER BY host_name`, "ct1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeJSON, err := json.Marshal(before)
+				if err != nil {
+					t.Fatal(err)
+				}
+				footprintBefore := containerOwnershipFootprintSnapshot(t, receiver, "ct1")
+				applyMutationEntry(t, receiver,
+					entry(t, "retained-v130-unsafe-"+tc.name, stmts))
+				after, err := receiver.Query(ctx,
+					`SELECT * FROM containers WHERE name = ? ORDER BY host_name`, "ct1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				afterJSON, err := json.Marshal(after)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(afterJSON) != string(beforeJSON) {
+					t.Fatalf("declined retained rekey changed container rows:\nbefore=%s\nafter=%s",
+						beforeJSON, afterJSON)
+				}
+				ifaces, err := GetContainerInterfaces(ctx, receiver, "h2", "ct1")
+				if err != nil || len(ifaces) != 0 {
+					t.Fatalf("declined retained rekey changed target interfaces: got=%+v err=%v",
+						ifaces, err)
+				}
+				if footprintAfter := containerOwnershipFootprintSnapshot(
+					t, receiver, "ct1",
+				); footprintAfter != footprintBefore {
+					t.Fatalf("declined retained rekey changed interface/lease footprint:\nbefore=%s\nafter=%s",
+						footprintBefore, footprintAfter)
+				}
+			})
+		}
+	})
+
+	t.Run("malformed registered envelopes are rejected", func(t *testing.T) {
+		cases := map[string]func([]Statement) []Statement{
+			"reordered roles": func(stmts []Statement) []Statement {
+				stmts[1], stmts[2] = stmts[2], stmts[1]
+				return stmts
+			},
+			"target name misbound": func(stmts []Statement) []Statement {
+				stmts[1].Params[1] = "other"
+				return stmts
+			},
+			"source cleanup misbound": func(stmts []Statement) []Statement {
+				stmts[2].Params[2] = "other"
+				return stmts
+			},
+			"target interface misbound": func(stmts []Statement) []Statement {
+				stmts[3].Params[0] = "other"
+				return stmts
+			},
+			"target interface content misbound": func(stmts []Statement) []Statement {
+				stmts[3].Params[2] = "other"
+				return stmts
+			},
+			"lease target misbound": func(stmts []Statement) []Statement {
+				stmts[len(stmts)-1].Params[0] = "other"
+				return stmts
+			},
+			"parent wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[0].Params[0] = "not-rfc3339"
+				return stmts
+			},
+			"target wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[1].Params[13] = "not-rfc3339"
+				return stmts
+			},
+			"cleanup wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[2].Params[0] = "not-rfc3339"
+				return stmts
+			},
+			"lease wall timestamp malformed": func(stmts []Statement) []Statement {
+				stmts[len(stmts)-1].Params[1] = "not-rfc3339"
+				return stmts
+			},
+			"interface clock malformed": func(stmts []Statement) []Statement {
+				stmts[3].Params[8] = "not-an-hlc"
+				return stmts
+			},
+			"interface clock empty": func(stmts []Statement) []Statement {
+				stmts[3].Params[8] = ""
+				return stmts
+			},
+			"extra registered role": func(stmts []Statement) []Statement {
+				return append(stmts, stmts[len(stmts)-1])
+			},
+		}
+		for name, mutate := range cases {
+			t.Run(name, func(t *testing.T) {
+				receiver := testClient(t)
+				source := seedLegacySource(t, receiver)
+				stmts := mutate(retainedBatch(source.CreatedAt, ifaceRFC0, ifaceRFC1))
+				if _, err := NewReplicator(receiver, "", RelayConfig{}).
+					ApplyRemoteMutations(ctx, []*pb.MutationEntry{
+						entry(t, "retained-v130-malformed-"+name, stmts),
+					}); err == nil {
+					t.Fatal("malformed retained rekey applied")
+				}
+				if got, _ := GetContainer(ctx, receiver, "h1", "ct1"); got == nil {
+					t.Fatal("malformed retained rekey changed source")
+				}
+				if got, _ := GetContainer(ctx, receiver, "h2", "ct1"); got != nil {
+					t.Fatalf("malformed retained rekey manufactured target: %+v", got)
+				}
+			})
+		}
+	})
+}
+
+func TestAntiEntropyEqualAuthorityTombstoneRequiresExactIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("vm", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-vm-identity", "vm", "vm1", "hash", "", 4)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, Project: "p1",
+			OwnerEpoch: 4, SpecGeneration: 6,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackVMCreateOperation(ctx, vm.Name, op.ID, 4, "failed"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+
+		conflict := testClient(t)
+		if applied, err := conflict.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("conflict begin: applied=%v err=%v", applied, err)
+		}
+		if _, err := conflict.db.Exec(`UPDATE vms SET spec = ? WHERE name = ?`, `{"cpu":9}`, vm.Name); err != nil {
+			t.Fatal(err)
+		}
+		if err := InsertInterface(ctx, conflict, InterfaceRecord{VMName: vm.Name, NetworkName: "keep"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conflict.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, conflict, vm.Name); got == nil || got.Spec != `{"cpu":9}` {
+			t.Fatalf("conflicting same-axis VM tombstone applied: %+v", got)
+		}
+		if rows, _ := conflict.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			vm.Name, "keep"); len(rows) != 1 {
+			t.Fatalf("conflicting VM tombstone swept children: %v", rows)
+		}
+		if conflict.UnresolvedTieCount() == 0 {
+			t.Fatal("conflicting same-axis VM identity was not surfaced")
+		}
+
+		exact := testClient(t)
+		if applied, err := exact.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("exact begin: applied=%v err=%v", applied, err)
+		}
+		if err := InsertInterface(ctx, exact, InterfaceRecord{VMName: vm.Name, NetworkName: "sweep"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := exact.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetVM(ctx, exact, vm.Name); got != nil {
+			t.Fatalf("exact same-axis VM tombstone did not converge: %+v", got)
+		}
+		if rows, _ := exact.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NULL`, vm.Name); len(rows) != 0 {
+			t.Fatalf("exact VM tombstone did not sweep children: %v", rows)
+		}
+	})
+
+	t.Run("container", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-ae-ct-identity", "container", "ct1", "hash", "", 4)
+		ct := ContainerRecord{
+			HostName: "h1", Name: "ct1", Image: "debian", Project: "p1",
+			OwnerEpoch: 4, SpecGeneration: 6,
+		}
+		if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("source begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 4, "failed"); err != nil || !applied {
+			t.Fatalf("source rollback: applied=%v err=%v", applied, err)
+		}
+
+		conflict := testClient(t)
+		if applied, err := conflict.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("conflict begin: applied=%v err=%v", applied, err)
+		}
+		if _, err := conflict.db.Exec(
+			`UPDATE containers SET image = ? WHERE host_name = ? AND name = ?`,
+			"alpine", "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		if err := UpsertContainerInterface(ctx, conflict, ContainerInterfaceRecord{
+			HostName: "h1", CtName: "ct1", NetworkName: "keep",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := conflict.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, conflict, "h1", "ct1"); got == nil || got.Image != "alpine" {
+			t.Fatalf("conflicting same-axis container tombstone applied: %+v", got)
+		}
+		if rows, _ := conflict.Query(ctx,
+			`SELECT 1 FROM container_interfaces
+			 WHERE host_name = ? AND ct_name = ? AND network_name = ? AND deleted_at IS NULL`,
+			"h1", "ct1", "keep"); len(rows) != 1 {
+			t.Fatalf("conflicting container tombstone swept children: %v", rows)
+		}
+		if conflict.UnresolvedTieCount() == 0 {
+			t.Fatal("conflicting same-axis container identity was not surfaced")
+		}
+
+		exact := testClient(t)
+		if applied, err := exact.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+			t.Fatalf("exact begin: applied=%v err=%v", applied, err)
+		}
+		if err := UpsertContainerInterface(ctx, exact, ContainerInterfaceRecord{
+			HostName: "h1", CtName: "ct1", NetworkName: "sweep",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := exact.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := GetContainer(ctx, exact, "h1", "ct1"); got != nil {
+			t.Fatalf("exact same-axis container tombstone did not converge: %+v", got)
+		}
+		if rows, _ := exact.Query(ctx,
+			`SELECT 1 FROM container_interfaces
+			 WHERE host_name = ? AND ct_name = ? AND deleted_at IS NULL`, "h1", "ct1"); len(rows) != 0 {
+			t.Fatalf("exact container tombstone did not sweep children: %v", rows)
+		}
+	})
+}
+
+// TestOrdinaryWorkloadWriterWireShapes pins which shapes the ordinary (non-
+// operation) workload writers put on the wire: INSERT stays on the v43
+// pre-authority shape for rolling upgrades, DELETE carries authority because a
+// terminal fact must not ship on a shape a receiver can silently ignore.
+func TestOrdinaryWorkloadWriterWireShapes(t *testing.T) {
+	ctx := context.Background()
+	decodeLatest := func(t *testing.T, c *Client) []Statement {
+		t.Helper()
+		entry := latestMutationEntry(t, c, "ordinary-writer", 1)
+		var stmts []Statement
+		if err := json.Unmarshal([]byte(entry.Stmts), &stmts); err != nil {
+			t.Fatal(err)
+		}
+		return stmts
+	}
+	assertUnguarded := func(t *testing.T, stmts []Statement) {
+		t.Helper()
+		for _, stmt := range stmts {
+			if stmt.Guard != nil {
+				t.Fatalf("ordinary writer emitted v44 guard: %+v", stmt.Guard)
+			}
+		}
+	}
+
+	t.Run("VM insert and delete", func(t *testing.T) {
+		c := testClient(t)
+		if err := InsertVM(ctx, c, VMRecord{
+			Name: "vm1", HostName: "h1", State: "running", Project: "p1",
+			OwnerEpoch: 9, SpecGeneration: 11, ActiveOperationID: "must-not-emit",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		insert := decodeLatest(t, c)
+		assertUnguarded(t, insert)
+		found := false
+		for _, stmt := range insert {
+			sh, _, err := parseResolved(stmt.SQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sh.Table == "vms" && sh.Kind == KindInsert {
+				found = true
+				for _, forbidden := range []string{"vm_owner_epoch", "spec_generation", "active_operation_id"} {
+					if indexOf(sh.InsertCols, forbidden) >= 0 {
+						t.Errorf("ordinary VM insert emitted v44 column %s", forbidden)
+					}
+				}
+			}
+		}
+		if !found {
+			t.Fatal("ordinary VM insert entry has no VM parent")
+		}
+		// DELETE is the deliberate exception (2026-08-02): it emits the
+		// AUTHORITY-BEARING tombstone. The pre-authority shape is admitted by a
+		// receiver only while its own row has zero authority, so once epochs
+		// exist it is silently dropped and the workload survives on every peer.
+		// A terminal fact cannot ship on a shape that can be silently ignored.
+		// Insert stays on the v43 shape — only deletion changed.
+		if err := DeleteVM(ctx, c, "vm1"); err != nil {
+			t.Fatal(err)
+		}
+		deleted := decodeLatest(t, c)
+		parent, _, err := parseResolved(deleted[len(deleted)-1].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stmtFingerprint(parent) != mustStatementFingerprint(vmDeleteSQL) {
+			t.Fatalf("ordinary VM delete must emit the authority-bearing parent, got: %s",
+				deleted[len(deleted)-1].SQL)
+		}
+		if deleted[len(deleted)-1].Guard == nil {
+			t.Fatal("the authority-bearing VM delete must travel with its guard")
+		}
+	})
+
+	t.Run("container insert and delete", func(t *testing.T) {
+		c := testClient(t)
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Project: "p1",
+			OwnerEpoch: 9, SpecGeneration: 11, ActiveOperationID: "must-not-emit",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		insert := decodeLatest(t, c)
+		assertUnguarded(t, insert)
+		sh, _, err := parseResolved(insert[0].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"owner_epoch", "spec_generation", "active_operation_id"} {
+			if indexOf(sh.InsertCols, forbidden) >= 0 {
+				t.Errorf("ordinary container insert emitted v44 column %s", forbidden)
+			}
+		}
+		// See the VM case: deletion deliberately moved to the authority-bearing
+		// shape; insert did not.
+		if err := DeleteContainer(ctx, c, "h1", "ct1"); err != nil {
+			t.Fatal(err)
+		}
+		deleted := decodeLatest(t, c)
+		parent, _, err := parseResolved(deleted[len(deleted)-1].SQL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stmtFingerprint(parent) != mustStatementFingerprint(containerDeleteSQL) {
+			t.Fatalf("ordinary container delete must emit the authority-bearing parent, got: %s",
+				deleted[len(deleted)-1].SQL)
+		}
+		if deleted[len(deleted)-1].Guard == nil {
+			t.Fatal("the authority-bearing container delete must travel with its guard")
+		}
+	})
+}
+
+func TestGuardedSemanticWorkloadClockNeverRegresses(t *testing.T) {
+	ctx := context.Background()
+	const (
+		middle = "7000000000000-0000-stale"
+		future = "9000000000000-0000-receiver"
+	)
+	for _, kind := range []string{"vm", "container"} {
+		for _, action := range []string{"commit", "rollback", "delete"} {
+			t.Run(kind+" "+action, func(t *testing.T) {
+				source := testClient(t)
+				receiver := testClient(t)
+				stale := testClient(t)
+				op := createOp("op-clock-"+kind+"-"+action, kind, kind+"1", "hash", "", 5)
+				var initial []*pb.MutationEntry
+				var terminal *pb.MutationEntry
+				switch kind {
+				case "vm":
+					vm := VMRecord{
+						Name: "vm1", HostName: "h1", Spec: `{"cpu":2}`, Project: "p1",
+						OwnerEpoch: 5, SpecGeneration: 7,
+					}
+					if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+						t.Fatalf("begin: applied=%v err=%v", applied, err)
+					}
+					initial = append(initial, latestMutationEntry(t, source, "clock-source", 1))
+					if action == "delete" {
+						if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 5, vm, nil, nil, nil, nil); err != nil || !applied {
+							t.Fatalf("prepare running: applied=%v err=%v", applied, err)
+						}
+						initial = append(initial, latestMutationEntry(t, source, "clock-source", 2))
+					}
+					for _, c := range []*Client{receiver, stale} {
+						for _, entry := range initial {
+							applyMutationEntry(t, c, entry)
+						}
+					}
+					switch action {
+					case "commit":
+						if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 5, vm, nil, nil, nil, nil); err != nil || !applied {
+							t.Fatalf("commit: applied=%v err=%v", applied, err)
+						}
+					case "rollback":
+						if applied, err := source.RollbackVMCreateOperation(ctx, vm.Name, op.ID, 5, "failed"); err != nil || !applied {
+							t.Fatalf("rollback: applied=%v err=%v", applied, err)
+						}
+					case "delete":
+						if outcome, err := deleteVMGuarded(ctx, source, vm.Name); err != nil || outcome != deleteApplied {
+							t.Fatalf("delete: outcome=%v err=%v", outcome, err)
+						}
+					}
+					terminal = latestMutationEntry(t, source, "clock-terminal", 3)
+					if _, err := receiver.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`, future, vm.Name); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := stale.db.Exec(`UPDATE vms SET updated_at = ? WHERE name = ?`, middle, vm.Name); err != nil {
+						t.Fatal(err)
+					}
+				case "container":
+					ct := ContainerRecord{
+						HostName: "h1", Name: "container1", Image: "debian", Project: "p1",
+						OwnerEpoch: 5, SpecGeneration: 7,
+					}
+					op.ResourceID = ct.Name
+					if applied, err := source.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+						t.Fatalf("begin: applied=%v err=%v", applied, err)
+					}
+					initial = append(initial, latestMutationEntry(t, source, "clock-source", 1))
+					if action == "delete" {
+						if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct, nil); err != nil || !applied {
+							t.Fatalf("prepare running: applied=%v err=%v", applied, err)
+						}
+						initial = append(initial, latestMutationEntry(t, source, "clock-source", 2))
+					}
+					for _, c := range []*Client{receiver, stale} {
+						for _, entry := range initial {
+							applyMutationEntry(t, c, entry)
+						}
+					}
+					switch action {
+					case "commit":
+						if applied, err := source.CommitContainerCreateOperation(ctx, op.ID, 5, ct, nil); err != nil || !applied {
+							t.Fatalf("commit: applied=%v err=%v", applied, err)
+						}
+					case "rollback":
+						if applied, err := source.RollbackContainerCreateOperation(ctx, "h1", ct.Name, op.ID, 5, "failed"); err != nil || !applied {
+							t.Fatalf("rollback: applied=%v err=%v", applied, err)
+						}
+					case "delete":
+						if outcome, err := deleteContainerGuarded(ctx, source, "h1", ct.Name); err != nil || outcome != deleteApplied {
+							t.Fatalf("delete: outcome=%v err=%v", outcome, err)
+						}
+					}
+					terminal = latestMutationEntry(t, source, "clock-terminal", 3)
+					if _, err := receiver.db.Exec(
+						`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+						future, "h1", ct.Name); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := stale.db.Exec(
+						`UPDATE containers SET updated_at = ? WHERE host_name = ? AND name = ?`,
+						middle, "h1", ct.Name); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				applyMutationEntry(t, receiver, terminal)
+				table, where, args := "vms", "name = ?", []interface{}{"vm1"}
+				if kind == "container" {
+					table, where, args = "containers", "host_name = ? AND name = ?",
+						[]interface{}{"h1", "container1"}
+				}
+				rows, err := receiver.Query(ctx,
+					`SELECT state, updated_at, COALESCE(deleted_at, '') AS deleted_at FROM `+table+` WHERE `+where,
+					args...)
+				if err != nil || len(rows) != 1 || rows[0].String("updated_at") != future {
+					t.Fatalf("semantic %s clock regressed: rows=%v err=%v", action, rows, err)
+				}
+				if err := receiver.MergeStateBytesLWW(stale.DumpStateBytes()); err != nil {
+					t.Fatal(err)
+				}
+				rows, err = receiver.Query(ctx,
+					`SELECT state, updated_at, COALESCE(deleted_at, '') AS deleted_at FROM `+table+` WHERE `+where,
+					args...)
+				if err != nil || len(rows) != 1 || rows[0].String("updated_at") != future {
+					t.Fatalf("delayed live replay defeated semantic %s: rows=%v err=%v", action, rows, err)
+				}
+				if action == "commit" {
+					if rows[0].String("state") != "running" || rows[0].String("deleted_at") != "" {
+						t.Fatalf("delayed live replay regressed commit: %v", rows)
+					}
+				} else if rows[0].String("deleted_at") == "" {
+					t.Fatalf("delayed live replay resurrected %s: %v", action, rows)
+				}
+			})
+		}
+	}
+}
+
+func TestWorkloadAuthorityAntiEntropyCompatibility(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ordinary hardware still converges", func(t *testing.T) {
+		source := testClient(t)
+		if err := InsertVM(ctx, source, VMRecord{
+			Name: "legacy-vm", HostName: "h1", Project: "p1", State: "running",
+		}, []InterfaceRecord{{VMName: "legacy-vm", NetworkName: "net1"}}, []DiskRecord{{
+			VMName: "legacy-vm", DiskName: "root", HostName: "h1", Path: "/legacy.img",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range []string{"vm_interfaces", "vm_disks"} {
+			if rows, _ := receiver.Query(ctx, `SELECT 1 FROM `+table+` WHERE vm_name = ?`, "legacy-vm"); len(rows) != 1 {
+				t.Errorf("ordinary anti-entropy repair did not converge %s: %v", table, rows)
+			}
+		}
+	})
+
+	t.Run("non-create journal still converges", func(t *testing.T) {
+		source := testClient(t)
+		insertOp(t, source, "op-update", "hash", "2026-06-03T18:40:00Z", "")
+		if err := AppendOperationStep(ctx, source, OperationStepRecord{
+			OperationID: "op-update", OwnerEpoch: 1, StepName: OpStepPlanned,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		receiver := testClient(t)
+		if err := receiver.MergeStateBytesLWW(source.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+		steps, err := ListOperationSteps(ctx, receiver, "op-update", 1)
+		if err != nil || len(steps) != 1 {
+			t.Fatalf("non-create journal repair steps=%v err=%v", steps, err)
+		}
+	})
+
+	t.Run("child without source authority fails closed", func(t *testing.T) {
+		source := testClient(t)
+		if err := InsertVM(ctx, source, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "running",
+		}, []InterfaceRecord{{VMName: "vm1", NetworkName: "net1"}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		filtered := payload.Tables[:0]
+		for _, table := range payload.Tables {
+			if table.Name != "vms" {
+				filtered = append(filtered, table)
+			}
+		}
+		payload.Tables = filtered
+
+		receiver := testClient(t)
+		if err := InsertVM(ctx, receiver, VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", State: "running",
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+			t.Fatalf("authority-less child payload merged: %v", rows)
+		}
+	})
+
+	t.Run("provisional parent cannot authorize commit hardware", func(t *testing.T) {
+		source := testClient(t)
+		op := createOp("op-split-snapshot", "vm", "vm1", "hash", "", 1)
+		vm := VMRecord{
+			Name: "vm1", HostName: "h1", Project: "p1", Spec: `{"cpu":2}`,
+			OwnerEpoch: 1, SpecGeneration: 1,
+		}
+		if applied, err := source.BeginVMCreateOperation(ctx, op, vm); err != nil || !applied {
+			t.Fatalf("begin: applied=%v err=%v", applied, err)
+		}
+		if applied, err := source.CommitVMCreateOperation(ctx, op.ID, 1, vm,
+			[]InterfaceRecord{{NetworkName: "net1"}}, nil, nil, nil); err != nil || !applied {
+			t.Fatalf("commit: applied=%v err=%v", applied, err)
+		}
+		payload, err := decompressPayload(source.DumpStateBytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for tableIdx := range payload.Tables {
+			table := &payload.Tables[tableIdx]
+			if table.Name != "vms" {
+				continue
+			}
+			stateIdx := indexOf(table.Columns, "state")
+			activeIdx := indexOf(table.Columns, "active_operation_id")
+			for rowIdx := range table.Rows {
+				table.Rows[rowIdx][stateIdx] = "creating"
+				table.Rows[rowIdx][activeIdx] = op.ID
+			}
+		}
+		receiver := testClient(t)
+		if err := receiver.mergeStatePayloadLWW(payload); err != nil {
+			t.Fatal(err)
+		}
+		if rows, _ := receiver.Query(ctx,
+			`SELECT 1 FROM vm_interfaces WHERE vm_name = ?`, "vm1"); len(rows) != 0 {
+			t.Fatalf("provisional parent authorized commit hardware: %v", rows)
+		}
+	})
+}
+
+func assertNoOperationSteps(t *testing.T, c *Client, opID string) {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT step_name FROM operation_steps WHERE operation_id = ? AND deleted_at IS NULL`, opID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("stale anti-entropy steps merged: %v", rows)
+	}
+}
+
+func TestBeginContainerCreateOperationRollsBackAndPreservesLiveRow(t *testing.T) {
+	ctx := context.Background()
+	t.Run("statement failure", func(t *testing.T) {
+		c := testClient(t)
+		if _, err := c.db.Exec(`CREATE TRIGGER fail_ct_begin BEFORE INSERT ON containers
+			BEGIN SELECT RAISE(ABORT, 'injected container insert failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+		op := createOp("op-ct-begin-fail", "container", "ct1", "hash", "", 1)
+		applied, err := c.BeginContainerCreateOperation(ctx, op,
+			ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1})
+		if err == nil || applied {
+			t.Fatalf("begin container: applied=%v err=%v", applied, err)
+		}
+		if got, _ := GetOperation(ctx, c, op.ID); got != nil {
+			t.Fatalf("operation survived rollback: %+v", got)
+		}
+		if got, _ := GetContainer(ctx, c, "h1", "ct1"); got != nil {
+			t.Fatalf("container survived rollback: %+v", got)
+		}
+	})
+	t.Run("live row", func(t *testing.T) {
+		c := testClient(t)
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "h1", Name: "ct1", State: "running", Image: "existing",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		op := createOp("op-ct-live", "container", "ct1", "hash", "", 1)
+		applied, err := c.BeginContainerCreateOperation(ctx, op,
+			ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 1})
+		if err != nil || applied {
+			t.Fatalf("begin over live container: applied=%v err=%v", applied, err)
+		}
+		got, _ := GetContainer(ctx, c, "h1", "ct1")
+		if got == nil || got.State != "running" || got.Image != "existing" {
+			t.Fatalf("live container overwritten: %+v", got)
+		}
+	})
+}
+
+func TestContainerCreateOperationStatementFailureIsAtomicAndRollbackTombstones(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	op := createOp("op-ct-fail", "container", "ct1", "hash", "", 2)
+	ct := ContainerRecord{HostName: "h1", Name: "ct1", Project: "p1", OwnerEpoch: 2}
+	if applied, err := c.BeginContainerCreateOperation(ctx, op, ct); err != nil || !applied {
+		t.Fatalf("begin: applied=%v err=%v", applied, err)
+	}
+	if _, err := c.db.Exec(`CREATE TRIGGER fail_ct_hardware BEFORE INSERT ON container_interfaces
+		BEGIN SELECT RAISE(ABORT, 'injected interface failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := c.CommitContainerCreateOperation(ctx, op.ID, 2, ct,
+		[]ContainerInterfaceRecord{{NetworkName: "net1"}}); err == nil || applied {
+		t.Fatalf("commit with injected failure: applied=%v err=%v", applied, err)
+	}
+	got, _ := GetContainer(ctx, c, "h1", "ct1")
+	if got == nil || got.State != "creating" || got.ActiveOperationID != op.ID {
+		t.Fatalf("container changed after failed commit: %+v", got)
+	}
+	if _, err := c.db.Exec(`DROP TRIGGER fail_ct_hardware`); err != nil {
+		t.Fatal(err)
+	}
+	if applied, err := c.RollbackContainerCreateOperation(ctx, "h1", "ct1", op.ID, 2, "cleanup"); err != nil || !applied {
+		t.Fatalf("container rollback: applied=%v err=%v", applied, err)
+	}
+	if got, _ := GetContainer(ctx, c, "h1", "ct1"); got != nil {
+		t.Fatalf("rolled-back container remains live: %+v", got)
+	}
+}
+
+func TestReservationAggregationValidatesCurrentAuthority(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if applied, err := ClaimInitialProjectAuthority(ctx, c, "p1", "authority-1"); err != nil || !applied {
+		t.Fatalf("claim authority: applied=%v err=%v", applied, err)
+	}
+	current, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 2, TargetHost: "h1", TargetCPU: 2,
+	}).Encode()
+	op1 := createOp("op-current", "vm", "vm1", "hash1", current, 1)
+	op1.ReservationFacts = &ReservationFacts{Project: "p1", AuthorityEpoch: 1, AuthorityHost: "authority-1"}
+	if applied, err := c.BeginVMCreateOperation(ctx, op1,
+		VMRecord{Name: "vm1", HostName: "h1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+		t.Fatalf("begin current reservation: applied=%v err=%v", applied, err)
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 2 {
+		t.Fatalf("current reservation cpu=%d err=%v", cpu, err)
+	}
+	if _, applied, err := TakeoverProjectAuthority(ctx, c, "p1", "authority-2", "planned", "", 1); err != nil || !applied {
+		t.Fatalf("takeover: applied=%v err=%v", applied, err)
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 0 {
+		t.Fatalf("stale reservation cpu=%d err=%v", cpu, err)
+	}
+	current2, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 3, TargetHost: "h1", TargetCPU: 3,
+	}).Encode()
+	op2 := createOp("op-current-2", "vm", "vm2", "hash2", current2, 1)
+	op2.ReservationFacts = &ReservationFacts{Project: "p1", AuthorityEpoch: 2, AuthorityHost: "authority-2"}
+	if applied, err := c.BeginVMCreateOperation(ctx, op2,
+		VMRecord{Name: "vm2", HostName: "h1", Project: "p1", OwnerEpoch: 1}); err != nil || !applied {
+		t.Fatalf("begin current2 reservation: applied=%v err=%v", applied, err)
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 3 {
+		t.Fatalf("current epoch reservation cpu=%d err=%v", cpu, err)
+	}
+	if _, err := c.db.Exec(`UPDATE operation_steps SET facts = '{'
+		WHERE operation_id = ? AND step_name = ?`, op2.ID, OpStepReserved); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := HostReserved(ctx, c, "h1"); err == nil || !strings.Contains(err.Error(), "malformed authority facts") {
+		t.Fatalf("malformed current facts error = %v", err)
+	}
+}
+
+func TestReservationAggregationWithoutAuthorityPreservesLegacyClaims(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	reservation, _ := (ReservationVector{
+		Project: "p1", ProjectCPU: 1, TargetHost: "h1", TargetCPU: 1,
+	}).Encode()
+	op := createOp("op-legacy", "vm", "vm1", "hash", reservation, 0)
+	if applied, err := c.BeginVMCreateOperation(ctx, op,
+		VMRecord{Name: "vm1", HostName: "h1", Project: "p1"}); err != nil || !applied {
+		t.Fatalf("begin legacy reservation: applied=%v err=%v", applied, err)
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 1 {
+		t.Fatalf("legacy reservation cpu=%d err=%v", cpu, err)
+	}
+	if cpu, _, err := ProjectReserved(ctx, c, "p1"); err != nil || cpu != 1 {
+		t.Fatalf("legacy project reservation cpu=%d err=%v", cpu, err)
+	}
+	if err := AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: op.ID, OwnerEpoch: 1, StepName: OpStepCompleted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cpu, _, err := HostReserved(ctx, c, "h1"); err != nil || cpu != 1 {
+		t.Fatalf("stale-owner terminal released reservation: cpu=%d err=%v", cpu, err)
+	}
+}
+
+func stepNames(steps []OperationStepRecord) []string {
+	out := make([]string, len(steps))
+	for i := range steps {
+		out[i] = steps[i].StepName
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertNoCreateTerminalSteps(t *testing.T, c *Client, opID string, ownerEpoch int64) {
+	t.Helper()
+	steps, err := ListOperationSteps(context.Background(), c, opID, ownerEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		switch step.StepName {
+		case OpStepPrepared, OpStepRuntimeStarted, OpStepObserved, OpStepCompleted,
+			OpStepRollbackCompleted, OpStepFailed:
+			t.Fatalf("unexpected create terminal/progress step after refused mutation: %s", step.StepName)
+		}
+	}
+}
+
+func latestMutationEntry(t *testing.T, c *Client, origin string, seq int64) *pb.MutationEntry {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT hlc, stmts FROM mutation_log ORDER BY seq DESC LIMIT 1`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("latest mutation: rows=%v err=%v", rows, err)
+	}
+	return &pb.MutationEntry{
+		Seq: seq, Hlc: rows[0].String("hlc"), Origin: origin, Stmts: rows[0].String("stmts"),
+	}
+}
+
+func applyMutationEntry(t *testing.T, c *Client, entry *pb.MutationEntry) {
+	t.Helper()
+	if _, err := NewReplicator(c, "", RelayConfig{}).ApplyRemoteMutations(
+		context.Background(), []*pb.MutationEntry{entry}); err != nil {
+		t.Fatalf("apply mutation seq=%d: %v", entry.Seq, err)
+	}
+}
+
+func containerOwnershipFootprintSnapshot(t *testing.T, c *Client, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	ifaces, err := c.Query(ctx,
+		`SELECT * FROM container_interfaces
+		 WHERE ct_name = ? ORDER BY host_name, ordinal`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leases, err := c.Query(ctx,
+		`SELECT * FROM ip_allocations
+		 WHERE owner_kind = 'ct' AND vm_name = ? ORDER BY network, ip`, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(struct {
+		Interfaces []Row
+		Leases     []Row
+	}{Interfaces: ifaces, Leases: leases})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}

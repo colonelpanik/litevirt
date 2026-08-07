@@ -1,0 +1,349 @@
+package grpcapi
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/placement"
+)
+
+// seedOwnershipCondition plants an ACTIVE ownership condition, the input the
+// admission gate reads.
+func seedOwnershipCondition(t *testing.T, s *Server, code, subjectKind, subject string, hosts ...string) {
+	t.Helper()
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: code, SubjectKind: subjectKind, SubjectID: subject,
+		Lifecycle: corrosion.ConditionObserved, Severity: corrosion.SeverityWarning,
+		Hosts: hosts, FirstSeen: "2026-08-04T10:00:00Z", LastSeen: "2026-08-04T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("seed condition: %v", err)
+	}
+}
+
+// TestHostSafety_OwnershipConditionBlocksInvolvedHost: an active dual-run
+// blocks capacity-growing admission to EVERY involved host — even while still
+// OBSERVED, before the second scan confirms it. Growing into a possibly-
+// corrupting host is not a risk admission gets to take.
+func TestHostSafety_OwnershipConditionBlocksInvolvedHost(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	seedOwnershipCondition(t, s, "vm_dual_run", "vm", "web-1", "test-host", "other-host")
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("admission to an involved host: got %v, want FailedPrecondition", err)
+	}
+
+	// An UNINVOLVED host still admits — the condition scopes to its hosts.
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+		Name: "clean-host", Address: "10.0.0.7", State: "active", CPUTotal: 16, MemTotal: 8192,
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	s2 := testServer(t)
+	_ = s2 // placeholder: admission is host-scoped on s; reuse s with the clean host
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "clean-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if err != nil {
+		t.Fatalf("admission to an uninvolved host refused: %v", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestHostSafety_AffectedWorkloadBlockedEverywhere: a runtime-changing action
+// on the workload NAMED by the condition refuses on any host.
+func TestHostSafety_AffectedWorkloadBlockedEverywhere(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	seedOwnershipCondition(t, s, "runtime_owner_mismatch", "vm", "drifted", "elsewhere-1", "elsewhere-2")
+
+	_, err := s.admitGrowWithReservation(context.Background(), "UpdateVM", "test-host", "proj",
+		corrosion.WorkloadVM, "drifted", 1, 512, 2, 1024)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("grow of a disputed workload: got %v, want FailedPrecondition", err)
+	}
+}
+
+// TestHostSafety_DisputedWorkloadBlockedOnUninvolvedHost: the HOST-ONLY
+// admissions (start, migrate, restore) carry the workload's identity, so a
+// disputed workload refuses even on a host the dispute does not involve.
+// Without the identity the gate can only match on host involvement, and
+// starting or migrating the workload onto a clean third host would quietly
+// add another holder to a disk the cluster already knows is contested.
+func TestHostSafety_DisputedWorkloadBlockedOnUninvolvedHost(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	seedOwnershipCondition(t, s, "vm_dual_run", "vm", "split", "h1", "h2")
+	seedOwnershipCondition(t, s, "ct_dual_run", "container", "webct", "h1", "h2")
+
+	// test-host is uninvolved in either condition; identity alone must refuse.
+	_, err := s.admitHostWithReservation(context.Background(), "MigrateVM", "test-host", "proj",
+		"vm:split", 2, 2048, intentVMResident)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("migrating a disputed VM onto an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+	_, err = s.admitHostWithReservation(context.Background(), "StartContainer", "test-host", "proj",
+		"ct:webct", 0, 512, intentResourceGrow)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("starting a disputed container on an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+	// The overcommit draw carries identity too — bypassing the numeric check
+	// must not also bypass the dispute.
+	_, err = s.reserveWithoutCheck(context.Background(), "StartVM", "test-host", "proj",
+		"vm:split", 2, 2048)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("overcommit start of a disputed VM on an uninvolved host: got %v, want FailedPrecondition", err)
+	}
+
+	// An UNRELATED workload on the same clean host still admits — the refusal
+	// above is the identity, not the host.
+	lease, err := s.admitHostWithReservation(context.Background(), "StartVM", "test-host", "proj",
+		"vm:unrelated", 1, 512, intentVMResident)
+	if err != nil {
+		t.Fatalf("unrelated workload refused on a clean host: %v", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestHostSafety_OvercommitCannotBypass: --allow-overcommit bypasses numeric
+// headroom only. The overcommit draw path consults the same gate.
+func TestHostSafety_OvercommitCannotBypass(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	seedOwnershipCondition(t, s, "ct_dual_run", "container", "web", "test-host")
+
+	_, err := s.reserveWithoutCheck(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:dense", 64, 65536)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("overcommit reserve on an involved host: got %v, want FailedPrecondition — "+
+			"--allow-overcommit bypasses the numeric check only", err)
+	}
+}
+
+// TestHostSafety_IncompleteInventoryBlocksNewWorkloads: a host that cannot
+// account for its own runtime refuses NEW workloads, but a grow of an existing
+// one (no new residency) still admits.
+func TestHostSafety_IncompleteInventoryBlocksNewWorkloads(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	s.virt = &recordingVirt{listErr: fmt.Errorf("libvirt down")}
+	s.invalidateInventoryCache()
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("new workload on a blind host: got %v, want FailedPrecondition", err)
+	}
+
+	// A grow of an existing workload is not new residency — quota/host checks
+	// still run, safety inventory does not block it.
+	lease, err := s.admitGrowWithReservation(context.Background(), "UpdateVM", "test-host", "proj",
+		corrosion.WorkloadVM, "existing", 1, 512, 2, 1024)
+	if err != nil {
+		t.Fatalf("grow on a blind host refused: %v — incomplete inventory blocks NEW residency only", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestVIPSafety_DualRunFreezesLBChange_NotPlacement: a VIP dual-holder blocks
+// the VIP's LB reconfiguration but must not block unrelated VM placement.
+func TestVIPSafety_DualRunFreezesLBChange_NotPlacement(t *testing.T) {
+	s := testServer(t)
+	admissionHost(t, s)
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vip_dual_run", SubjectKind: "vip", SubjectID: "10.0.0.100",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
+		Hosts:     []string{"test-host", "other-host"},
+		FirstSeen: "2026-08-04T10:00:00Z", LastSeen: "2026-08-04T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("seed VIP condition: %v", err)
+	}
+
+	if err := s.checkVIPSafety(context.Background(), "10.0.0.100"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("VIP change under a dual-holder: got %v, want FailedPrecondition", err)
+	}
+	if err := s.checkVIPSafety(context.Background(), "10.0.0.200"); err != nil {
+		t.Fatalf("unrelated VIP refused: %v", err)
+	}
+	// Unrelated VM placement on an involved host is NOT blocked by a VIP condition.
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:unrelated", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if err != nil {
+		t.Fatalf("VM placement blocked by a VIP condition: %v — VIP dual-run freezes VIP moves only", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency: unboundedness is per
+// the dimension that matters. A runtime-only container with a CPU limit but NO
+// memory cap is memory-unlimited — the old cpu==0 && mem==0 classification
+// called it bounded, charged it 0 MiB, and let a pinned create through beside
+// consumption that capacity accounting cannot bound. A FINITE rogue (both
+// limits set) is attributable and must NOT trip this gate (its charging is the
+// effective-capacity model's job, not the uncapped gate's).
+func TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s)
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"memless"},
+		states: map[string]string{"memless": "running"},
+		limits: map[string][2]int{"memless": {2, 0}}, // CPU-limited, memory-unlimited
+	})
+	s.invalidateInventoryCache()
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("new workload beside a memory-unlimited rogue: got %v, want FailedPrecondition — "+
+			"a memory cap of 0 is unbounded in the one dimension host capacity reserves", err)
+	}
+
+	// A finite rogue does not trip the UNCAPPED gate. (Sized small enough that
+	// its runtime-only CHARGE — which final admission now subtracts from
+	// headroom — leaves room for the control admission below.)
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite"},
+		states: map[string]string{"finite": "running"},
+		limits: map[string][2]int{"finite": {2, 256}},
+	})
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if err != nil {
+		t.Fatalf("finite rogue tripped the uncapped gate: %v — bounded consumption is attributable", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestAdmission_FiniteRogueConsumesHeadroom: a BOUNDED runtime-only workload
+// passes the uncapped gate (it is attributable), but its consumption must still
+// come out of the headroom final admission computes. The DB-derived free figure
+// knows nothing about it, so before the subtraction the authoritative host
+// could observe a rogue eating most of its memory — placement correctly
+// avoiding the host — while a pinned create was still admitted against full
+// database headroom.
+func TestAdmission_FiniteRogueConsumesHeadroom(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s) // allocatable 1536 MiB
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite-rogue"},
+		states: map[string]string{"finite-rogue": "running"},
+		limits: map[string][2]int{"finite-rogue": {2, 1024}},
+	})
+	s.invalidateInventoryCache()
+
+	// 512 MiB guest (+overhead) fits 1536 MiB of DB headroom easily — but not
+	// the 512 MiB left once the rogue's 1024 are charged.
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:squeezed", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("pinned create beside a finite 1024 MiB rogue on a 1536 MiB host: got %v, "+
+			"want ResourceExhausted — runtime-only load must come out of admission headroom", err)
+	}
+
+	// Account the rogue in the DB (at its real size): no longer runtime-only,
+	// so no extra charge — but its DB row itself now consumes, so the same
+	// admission still refuses. Shrink the rogue instead to prove the charge
+	// followed the accounting.
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"finite-rogue"},
+		states: map[string]string{"finite-rogue": "running"},
+		limits: map[string][2]int{"finite-rogue": {2, 256}},
+	})
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:squeezed", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if err != nil {
+		t.Fatalf("create beside a small finite rogue refused: %v — the charge must scale with the rogue, not blanket-refuse", err)
+	}
+	lease.release(context.Background())
+}
+
+// TestPlacement_RefusesUnknownCapacity: an incomplete or stale capacity
+// observation disqualifies the host as a placement target; a missing one does
+// not (bootstrap), and extra runtime-only usage counts against headroom.
+func TestPlacement_RefusesUnknownCapacity(t *testing.T) {
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	hosts := []corrosion.HostRecord{
+		{Name: "h-fresh", State: "active", CPUTotal: 16, MemTotal: 16384},
+		{Name: "h-stale", State: "active", CPUTotal: 16, MemTotal: 16384},
+		{Name: "h-incomplete", State: "active", CPUTotal: 16, MemTotal: 16384},
+		{Name: "h-virgin", State: "active", CPUTotal: 16, MemTotal: 16384},
+	}
+	snap := placement.BuildSnapshotFrom(hosts, nil)
+	snap.AddCapacityObservations([]corrosion.HostCapacityObservation{
+		{HostName: "h-fresh", Complete: true, ExtraCPU: 2, ExtraMemMiB: 2048,
+			SampledAt: now.Add(-time.Minute).Format(time.RFC3339)},
+		{HostName: "h-stale", Complete: true,
+			SampledAt: now.Add(-time.Hour).Format(time.RFC3339)},
+		{HostName: "h-incomplete", Complete: false, Detail: "uncapped rogue",
+			SampledAt: now.Add(-time.Minute).Format(time.RFC3339)},
+	}, now)
+
+	if !snap.CapacityUnknown["h-stale"] {
+		t.Error("a stale observation must mark the host unknown")
+	}
+	if !snap.CapacityUnknown["h-incomplete"] {
+		t.Error("an incomplete observation must mark the host unknown")
+	}
+	if snap.CapacityUnknown["h-fresh"] || snap.CapacityUnknown["h-virgin"] {
+		t.Error("fresh and never-sampled hosts must remain eligible")
+	}
+	if snap.CPUUsed["h-fresh"] != 2 || snap.MemUsed["h-fresh"] != 2048 {
+		t.Errorf("runtime-only extra not counted: cpu=%d mem=%d, want 2/2048",
+			snap.CPUUsed["h-fresh"], snap.MemUsed["h-fresh"])
+	}
+}
+
+// TestHostSafety_UncappedRogueBlocksNewResidency: an uncapped RUNTIME-ONLY
+// container makes the host's consumption unattributable, so a pinned create
+// must refuse exactly like the placement filter does — while a DB-known
+// uncapped container (deliberately unlimited, accounted) does not block.
+func TestHostSafety_UncappedRogueBlocksNewResidency(t *testing.T) {
+	origCap := lxcCapable
+	lxcCapable = func() bool { return true }
+	defer func() { lxcCapable = origCap }()
+
+	s := testServer(t)
+	admissionHost(t, s)
+	s.SetContainerRuntime(&fakeCT{
+		names:  []string{"rogue"},
+		states: map[string]string{"rogue": "running"},
+	})
+	s.invalidateInventoryCache()
+
+	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("new workload beside an uncapped rogue: got %v, want FailedPrecondition", err)
+	}
+
+	// Account the container in the DB: no longer a rogue, admission opens.
+	if err := corrosion.UpsertContainer(context.Background(), s.db, corrosion.ContainerRecord{
+		HostName: "test-host", Name: "rogue", State: "running",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	s.invalidateInventoryCache()
+	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
+	if err != nil {
+		t.Fatalf("DB-accounted uncapped container still blocks: %v", err)
+	}
+	lease.release(context.Background())
+}

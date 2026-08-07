@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -303,8 +304,16 @@ func TestNFSDriver_Prepare_SafeMountDirName(t *testing.T) {
 		source:    "192.168.1.10:/data/vms",
 		mountBase: tmp,
 		opts:      map[string]string{},
+		run: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			if name == "mountpoint" {
+				return nil, errors.New("not mounted")
+			}
+			return nil, nil
+		},
 	}
-	_ = d.Prepare(context.Background()) // will fail without NFS but mountDir set
+	if err := d.Prepare(context.Background()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 
 	// The mount dir name should have slashes and colons replaced with underscores.
 	safe := strings.NewReplacer("/", "_", ":", "_").Replace("192.168.1.10:/data/vms")
@@ -322,9 +331,16 @@ func TestNFSDriver_Prepare_CustomOptions(t *testing.T) {
 		source:    "10.0.0.5:/share",
 		mountBase: tmp,
 		opts:      map[string]string{"options": "vers=4.2,hard,timeo=600"},
+		run: func(_ context.Context, name string, _ ...string) ([]byte, error) {
+			if name == "mountpoint" {
+				return nil, errors.New("not mounted")
+			}
+			return nil, nil
+		},
 	}
-	// Prepare will fail (no NFS), but should create dir and set mountDir.
-	_ = d.Prepare(context.Background())
+	if err := d.Prepare(context.Background()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
 	if d.mountDir == "" {
 		t.Error("mountDir should be set after Prepare")
 	}

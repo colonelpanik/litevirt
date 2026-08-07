@@ -74,8 +74,7 @@ func TestRelocate_RestorePreferred(t *testing.T) {
 	fr := &fakeRestorer{db: db, outcome: corrosion.RestoreLanded}
 	c.Restorer = fr
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	if fr.calls != 1 {
 		t.Fatalf("restorer called %d times, want 1", fr.calls)
@@ -94,8 +93,7 @@ func TestRelocate_FallbackToImageRecreateOnRestoreError(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreFailedBeforeRow, err: errors.New("no manifest")}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	// Image-recreate: source soft-deleted, fresh target row pending+relocate-recreate.
 	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
@@ -113,8 +111,7 @@ func TestRelocate_SkipWhenNeitherRestoreNorImage(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreFailedBeforeRow, err: errors.New("no manifest")}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	// Restore failed + non-re-pullable → skip; the row is LEFT VISIBLE for operator
 	// recovery (not tombstoned), with a terminal relocate-skipped detail.
@@ -130,7 +127,7 @@ func TestRelocate_SkipWhenNeitherRestoreNorImage(t *testing.T) {
 	}
 
 	// A second pass must NOT re-process the skipped row (no loop).
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 	row2, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
 	if row2 == nil || row2.StateDetail != corrosion.ContainerRelocateSkippedDetail {
 		t.Fatalf("skipped row should be untouched on a second pass, got %+v", row2)
@@ -146,8 +143,7 @@ func TestRelocate_RestoreRowExistsDespiteError(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreLanded, err: errors.New("restored but start failed")}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
 		t.Fatal("source must be tombstoned: the target signaled the restore landed despite the error")
@@ -165,8 +161,7 @@ func TestRelocate_SchemaIncompatibleSurvivorImageRecreates(t *testing.T) {
 	fr := &fakeRestorer{db: db}
 	c.Restorer = fr
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	if fr.calls != 0 {
 		t.Fatalf("restore must NOT run against a schema-behind survivor; calls=%d", fr.calls)
@@ -197,8 +192,7 @@ func TestRelocate_ResumeRestoredThenCrashBeforeTombstone(t *testing.T) {
 		t.Fatalf("seed target: %v", err)
 	}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	if fr.calls != 0 {
 		t.Fatalf("must NOT re-restore when the target row already exists; calls=%d", fr.calls)
@@ -220,8 +214,7 @@ func TestRelocate_ResumeFreshMarkerSkips(t *testing.T) {
 		t.Fatalf("mark: %v", err)
 	}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	if fr.calls != 0 {
 		t.Fatalf("a fresh in-flight marker must be skipped (no duplicate restore); calls=%d", fr.calls)
@@ -245,8 +238,7 @@ func TestRelocate_ResumeStaleMarkerFallsBack(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond) // ensure now-updated_at > timeout
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	// Stale + no target row → image-recreate fallback.
 	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow != nil {
@@ -267,8 +259,7 @@ func TestRelocate_UnknownLeavesMarkerForResolve(t *testing.T) {
 	c := newTestCoordinator("coord", db)
 	c.Restorer = &fakeRestorer{db: db, outcome: corrosion.RestoreUnknown, err: errors.New("stream broke")}
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	row, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
 	tgt, _, restoring := corrosion.RelocateRestoreMarker(rowState(row), rowDetail(row))
@@ -356,8 +347,7 @@ func TestRelocate_CollisionTargetPreservesBoth(t *testing.T) {
 	}
 	c := newTestCoordinator("coord", db) // no Restorer → image-recreate path
 
-	idx := 0
-	c.relocateContainers(ctx, src, cands, &idx)
+	c.relocateContainers(ctx, src, cands)
 
 	// Source preserved (not lost), and the unrelated surv/ct1 untouched (not clobbered).
 	if srcRow, _ := corrosion.GetContainer(ctx, db, "src", "ct1"); srcRow == nil {

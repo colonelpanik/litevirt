@@ -39,6 +39,10 @@ type CTFake struct {
 	state map[string]string
 	// ips is what IPContainer reports, keyed by name.
 	ips map[string]string
+	// limits is what ContainerLimits reports, keyed by name — recorded at
+	// create from the request's CPU/memory so the runtime-inventory collector
+	// sees the same limits the caller configured. Absent = uncapped (0,0).
+	limits map[string][2]int
 
 	// Call counters/records. Read them with the accessors, never directly —
 	// the handlers write these from other goroutines.
@@ -191,7 +195,24 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
+	if f.limits == nil {
+		f.limits = map[string][2]int{}
+	}
+	f.limits[opts.Name] = [2]int{opts.CPULimit, opts.MemoryMiB}
 	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
+}
+
+// ContainerLimits reports the limits recorded at create; a container seeded
+// outside CreateContainer (a bare Seed) is uncapped, matching a runtime-only
+// rogue with no configured limits.
+func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.state[name]; !ok {
+		return 0, 0, fmt.Errorf("container %q does not exist", name)
+	}
+	l := f.limits[name]
+	return l[0], l[1], nil
 }
 
 func (f *CTFake) StartContainer(_ context.Context, name string) error {

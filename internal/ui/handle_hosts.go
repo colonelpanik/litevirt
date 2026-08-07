@@ -70,6 +70,7 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 	vms, _ := s.grpc.ListVMs(ctx, &pb.ListVMsRequest{HostName: name})
 	devices, _ := s.grpc.ListHostDevices(ctx, &pb.ListHostDevicesRequest{Name: name})
 	allNets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	hostNetIntents, _ := s.grpc.ListHostNetworks(ctx, &pb.ListHostNetworksRequest{HostName: name})
 
 	// Filter networks to those used by VMs on this host.
 	usedNets := map[string]bool{}
@@ -107,6 +108,7 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 	data["VMs"] = vms.GetVms()
 	data["Devices"] = devices.GetDevices()
 	data["Networks"] = hostNets
+	data["HostNetworks"] = hostNetIntents.GetNetworks()
 	data["CPUPct"] = cpuPct
 	data["MemPct"] = memPct
 	data["DiskActualUsed"] = diskActualUsed
@@ -208,14 +210,14 @@ func (s *Server) handleHostLabelsUpdate(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleHostHealthMatrix(w http.ResponseWriter, r *http.Request) {
-	matrix, err := s.grpc.GetHostHealth(s.uiBearerCtx(r), &emptypb.Empty{})
+	health, err := s.grpc.GetClusterHealth(s.uiBearerCtx(r), &pb.GetClusterHealthRequest{})
 	if err != nil {
 		sendToast(w, "Health check failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(matrix.Entries)
+	_ = json.NewEncoder(w).Encode(health.GetConnectivity())
 }
 
 func (s *Server) handleConfigureHost(w http.ResponseWriter, r *http.Request) {

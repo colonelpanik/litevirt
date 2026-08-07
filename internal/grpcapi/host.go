@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,8 +33,8 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 
 	// Single query for all VM counts instead of per-host N+1.
 	vmCounts, _ := corrosion.CountVMsByHost(ctx, s.db)
-	// Aggregate CPU/memory allocated to running VMs per host.
-	resUsage, _ := corrosion.SumVMResourcesByHost(ctx, s.db)
+	// Aggregate CPU/memory allocated per host, containers included.
+	resUsage := s.hostUsageWithContainers(ctx)
 
 	resp := &pb.ListHostsResponse{}
 	for _, h := range hosts {
@@ -53,6 +54,7 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			Version:      h.Version,
 			StoragePools: pools,
 			Region:       h.Region,
+			CertSerial:   h.CertSerial,
 			CreatedAt:    parseTimestamp(h.CreatedAt),
 			UpdatedAt:    parseTimestamp(h.UpdatedAt),
 		}
@@ -97,34 +99,10 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 		IpmiAddress:   h.IPMIAddress,
 		WatchdogDev:   h.WatchdogDev,
 		Region:        h.Region,
+		CertSerial:    h.CertSerial,
 		CreatedAt:     parseTimestamp(h.CreatedAt),
 		UpdatedAt:     parseTimestamp(h.UpdatedAt),
 	}, nil
-}
-
-func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostHealthMatrix, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(ctx,
-		`SELECT observer, target, status, consecutive_failures, last_seen
-		 FROM host_health`)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query health: %v", err)
-	}
-
-	resp := &pb.HostHealthMatrix{}
-	for _, r := range rows {
-		resp.Entries = append(resp.Entries, &pb.HostHealthEntry{
-			Observer:            r.String("observer"),
-			Target:              r.String("target"),
-			Status:              r.String("status"),
-			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            parseTimestamp(r.String("last_seen")),
-		})
-	}
-
-	return resp, nil
 }
 
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
@@ -141,6 +119,13 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
 		Capabilities: s.advertisedCapabilities(),
+		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
+		// HLC value would compare against its own wall clock as nonsense skew.
+		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
+		// Self-report of degradation: see PingResponse.wal_quarantined. A peer
+		// records our isolation on the strength of this, because we cannot
+		// record it ourselves.
+		WalQuarantined: s.walQuarantinedNow(),
 	}, nil
 }
 
@@ -149,20 +134,30 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // the health checker (SetPeerPinger) so cluster-wide activation is computed from
 // live reachability, never from stale replicated rows. An unreachable peer
 // returns an error so the caller can fail closed.
-func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, error) {
+// It also returns the peer's WALL clock so the health checker can detect NTP
+// drift without a second RPC. A peer that predates the field reports the zero
+// time, which the caller must read as "unknown", never as skew. Self returns the
+// zero time too: a node cannot be skewed against itself.
+func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
-		return s.advertisedCapabilities(), nil
+		return s.advertisedCapabilities(), time.Time{}, nil
 	}
 	c, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer closeConn()
 	resp, err := c.Ping(ctx, &pb.PingRequest{})
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return resp.GetCapabilities(), nil
+	peerWall := time.Time{}
+	if s := resp.GetWallClock(); s != "" {
+		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {
+			peerWall = parsed
+		}
+	}
+	return resp.GetCapabilities(), peerWall, nil
 }
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
@@ -442,6 +437,25 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
+	// Destination admission for a RUNNING VM, before anything irreversible: a
+	// drain is an OPERATOR-initiated move and lands the same full-sized VM on
+	// the target an explicit migrate would — placement.Select is a read-only
+	// filter over replicated data, not an admission. The decision belongs to
+	// the DESTINATION daemon (fresh local inventory, ownership conditions,
+	// serialized reserve-then-verify), exactly like MigrateVM; the lease is
+	// held across the move and released when this VM's drain step returns. A
+	// STOPPED VM's reassign moves only the row — it consumes nothing on the
+	// target until StartVM admits it there — so it takes no lease.
+	if fresh.State == "running" {
+		migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
+			"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
+		if aerr != nil {
+			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+				Error: "target admission refused: " + aerr.Error()}
+		}
+		defer migLease.release(ctx)
+	}
+
 	if fresh.State == "running" && !hasLocalOnly {
 		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
 		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE
@@ -451,7 +465,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 				"vm", vm.Name, "error", err)
 			// Fall through to cold migration.
 		} else {
-			if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
+			// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
+			if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
 				slog.Error("drain: post-migration ownership write failed", "vm", vm.Name, "to", target.Name, "error", err)
 				s.noteStateWriteFail(corrosion.OpVMHost, err)
 				progress.Status = "error"
@@ -492,7 +507,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// Reassign VM to target host. Target daemon will pick it up and start it.
 	// Ownership was confirmed above (fresh.HostName == s.hostName), so this never
 	// yanks a VM running elsewhere.
-	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
+	// Phase 4: cold drain move is an ownership transition (fresh-read CAS + increment).
+	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
 		progress.Status = "error"
 		progress.Error = err.Error()
 		return progress
@@ -829,6 +845,32 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	slog.Warn("host removed from cluster", "host", req.Name, "cert_serial", h.CertSerial)
 	s.publish("host.removed", req.Name, "cert_serial="+h.CertSerial)
 
+	return &emptypb.Empty{}, nil
+}
+
+// AdmitHost records the CA-authorized identity produced by `lv host add`.
+// Running it on an existing member breaks the tombstone/authentication deadlock
+// when a removed machine is deliberately re-added with a fresh certificate.
+func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
+		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
+	}
+	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+		Name:       req.Name,
+		Address:    req.Address,
+		SSHUser:    "root",
+		SSHPort:    22,
+		GRPCPort:   7443,
+		State:      "active",
+		CertSerial: req.CertSerial,
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
+	}
+	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
 	return &emptypb.Empty{}, nil
 }
 

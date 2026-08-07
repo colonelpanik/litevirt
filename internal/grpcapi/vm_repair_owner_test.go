@@ -64,6 +64,12 @@ func TestRepairVMOwner(t *testing.T) {
 	if vm == nil || vm.HostName != "host-a" || vm.State != "running" || vm.StateDetail != "" {
 		t.Fatalf("owner must be re-stamped to host-a/running with cleared detail, got %+v", vm)
 	}
+	// Phase 4: repair is an ownership transition and must advance the owner
+	// epoch — the lab-confirmed gap where repair-owner re-stamped ownership
+	// without a generation bump, leaving stale-writer CAS protection inert.
+	if vm.OwnerEpoch != 1 {
+		t.Fatalf("repair must bump the owner epoch, got %d want 1", vm.OwnerEpoch)
+	}
 	// Audited as the caller.
 	if got := auditActor(t, s, "vm.repair-owner", "ok"); got != "admin" {
 		t.Fatalf("audit actor = %q, want admin", got)

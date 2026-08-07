@@ -54,6 +54,22 @@ lv ct create alpine-1 --distro alpine --release 3.21
 lv ct start alpine-1
 ```
 
+### Naming a container on a specific host
+
+Container names are unique **per host**, not cluster-wide, so the same name may
+legitimately exist on two hosts. `lv ct start|stop|rm <name>` without `--host`
+resolves the owner by name, which works whenever the name is unique. When it is
+not, the command is refused and lists the candidates rather than picking one:
+
+```
+$ lv ct rm web
+Error: container "web" exists on 2 hosts (node-a, node-b); pass --host to name the one you mean
+
+$ lv ct rm web --host node-b
+```
+
+`--host` is always exact, so it is the unambiguous form in scripts.
+
 ## Private registry credentials
 
 Pulling a private image (a private Docker Hub repo, `ghcr.io`, a self-hosted

@@ -2,6 +2,8 @@ package corrosion
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -104,6 +106,33 @@ func TestInitSchema_FreshDB(t *testing.T) {
 	}
 	if v := storedVersion(t, c); v != CurrentSchemaVersion {
 		t.Errorf("schema_state.version=%d, want %d", v, CurrentSchemaVersion)
+	}
+}
+
+func TestInitSchema_RebuildsTheEarlierV47ClusterCRLShape(t *testing.T) {
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	if err := c.execLocal(ctx, `CREATE TABLE cluster_crl (
+		id TEXT PRIMARY KEY,
+		crl_pem TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`); err != nil {
+		t.Fatalf("create earlier v47 shape: %v", err)
+	}
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	got, err := primaryKeyColumns(ctx, c.db, "cluster_crl")
+	if err != nil {
+		t.Fatalf("read rebuilt primary key: %v", err)
+	}
+	if !slices.Equal(got, []string{"id", "crl_pem"}) {
+		t.Fatalf("cluster_crl primary key = %v, want [id crl_pem]", got)
 	}
 }
 
@@ -257,4 +286,124 @@ func TestInitSchema_AllowsForwardDB(t *testing.T) {
 	if e := c.EffectiveDBSchema(); e != forward {
 		t.Errorf("EffectiveDBSchema = %d, want forward %d (max of derived, stored)", e, forward)
 	}
+}
+
+// buildV42DB shapes a DB exactly as upstream schema v42 left it: every table
+// from a version ≤42, WITHOUT the columns v43+ ALTERs added and WITHOUT the
+// v45+ tables, stamped schema_state.version=42. This is the upgrade-horizon
+// fixture the v50 release must migrate: a cluster coming straight from the
+// last pre-consolidation upstream schema.
+func buildV42DB(t *testing.T, c *Client) {
+	t.Helper()
+	ctx := context.Background()
+	for _, ddl := range schemaDDL {
+		// Strip line comments: SQLite stores the CREATE text verbatim, and
+		// ALTER TABLE … DROP COLUMN re-parses it — a trailing “-- …” comment
+		// makes that re-parse fail with “incomplete input”. The fixture needs
+		// droppable tables, so it executes comment-free DDL.
+		if err := c.execLocal(ctx, stripLineComments(ddl)); err != nil {
+			t.Fatalf("v42 DDL: %v", err)
+		}
+	}
+	// Remove everything newer than v42, so healing has real work to do.
+	post42Tables := map[string]bool{}
+	for _, ct := range createTableUnits {
+		if ct.version > 42 {
+			post42Tables[ct.table] = true
+		}
+	}
+	for table := range post42Tables {
+		if err := c.execLocal(ctx, `DROP TABLE `+table); err != nil {
+			t.Fatalf("drop post-v42 table %s: %v", table, err)
+		}
+	}
+	for i, sql := range schemaMigrations {
+		if alterVersions[i] <= 42 {
+			continue
+		}
+		table, col := parseAddColumn(sql)
+		// Skip columns on tables that no longer exist in the fixture.
+		if post42Tables[table] {
+			continue
+		}
+		if err := c.execLocal(ctx, `ALTER TABLE `+table+` DROP COLUMN `+col); err != nil {
+			t.Fatalf("drop post-v42 column %s.%s: %v", table, col, err)
+		}
+	}
+	if err := c.execLocal(ctx,
+		`INSERT OR REPLACE INTO schema_state (id, version, updated_at) VALUES (1, 42, datetime('now'))`); err != nil {
+		t.Fatalf("stamp v42: %v", err)
+	}
+}
+
+// TestInitSchema_MigratesV42ToV50 is the release upgrade path in one test: a DB
+// at the last pre-consolidation upstream schema must come out of InitSchema at
+// v50 with every intervening table and column present and the whole ledger
+// recorded — and with pre-existing data intact.
+func TestInitSchema_MigratesV42ToV50(t *testing.T) {
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	ctx := context.Background()
+	buildV42DB(t, c)
+
+	// Pre-existing v42-era data that must survive the migration untouched.
+	if err := c.execLocal(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES ('h1', '10.0.0.1', 'root', '', 'active', datetime('now'), datetime('now'))`); err != nil {
+		t.Fatalf("seed host: %v", err)
+	}
+
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema v42→v50: %v", err)
+	}
+
+	if v := storedVersion(t, c); v != 50 {
+		t.Fatalf("stored version after migration = %d, want 50", v)
+	}
+	// Every post-42 table healed, including the three v50 health tables.
+	for _, table := range []string{
+		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
+		"cluster_crl", "host_networks",
+		"health_conditions", "health_evaluator_status", "host_capacity_observations",
+	} {
+		if ok, _ := tableExists(ctx, c, table); !ok {
+			t.Errorf("table %s missing after v42→v50 migration", table)
+		}
+	}
+	// Every post-42 column healed (spot-check one per version class).
+	for _, tc := range []struct{ table, col string }{
+		{"hosts", "capacity_policy_hash"},   // v44
+		{"audit_log", "seq"},                // v45
+		{"hosts", "isolation_epoch"},        // v49
+		{"containers", "owner_epoch"},       // v44
+	} {
+		if ok, _ := columnExists(ctx, c.db, tc.table, tc.col); !ok {
+			t.Errorf("column %s.%s missing after migration", tc.table, tc.col)
+		}
+	}
+	if n := appliedCount(t, c); n != len(schemaMigrationLedger) {
+		t.Errorf("applied_migrations rows=%d, want the full ledger %d", n, len(schemaMigrationLedger))
+	}
+	// The v42 data is still there.
+	rows, err := c.Query(ctx, `SELECT name FROM hosts WHERE name = 'h1'`)
+	if err != nil || len(rows) != 1 {
+		t.Errorf("pre-migration host row lost: err=%v rows=%d", err, len(rows))
+	}
+	// And the healed DB is fully usable at v50: a health condition round-trips.
+	if err := UpsertHealthCondition(ctx, c, seedCondition("post-migration")); err != nil {
+		t.Errorf("health write on migrated DB: %v", err)
+	}
+}
+
+// stripLineComments removes “-- …” line comments from a SQL statement.
+func stripLineComments(sql string) string {
+	var out []string
+	for _, line := range strings.Split(sql, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }

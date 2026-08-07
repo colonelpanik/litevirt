@@ -545,12 +545,13 @@ func TestHostUpgradeFlags(t *testing.T) {
 func TestRunFlags(t *testing.T) {
 	cmd := newRunCmd()
 	checkFlags(t, cmd, map[string]string{
-		"name":   "",
-		"cpu":    "2",
-		"memory": "4096",
-		"image":  "",
-		"disk":   "20G",
-		"host":   "",
+		"name":    "",
+		"cpu":     "2",
+		"memory":  "4096",
+		"image":   "",
+		"disk":    "20G",
+		"host":    "",
+		"project": "",
 	})
 }
 

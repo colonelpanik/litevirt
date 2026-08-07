@@ -40,6 +40,21 @@ func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCr
 	return ifaces, specNets
 }
 
+// managedNICCount is how many of a create-spec's NICs become container_interfaces
+// rows — the ONLY NICs a project's NIC quota counts. A legacy raw-bridge
+// attachment carries no managed state and no row, so charging it would refuse
+// creates for something that contributes nothing. Mirrors the rule in
+// corrosion.BuildContainerInterfacesFromSpec and cloneContainerNICs.
+func managedNICCount(spec corrosion.ContainerCreateSpec) int {
+	n := 0
+	for _, net := range spec.Networks {
+		if net.NetworkName != "" {
+			n++
+		}
+	}
+	return n
+}
+
 // containerVethName is the deterministic host veth name for a container NIC.
 // Defined in corrosion (shared with the health/relocate path); kept as a local
 // alias for readability here.

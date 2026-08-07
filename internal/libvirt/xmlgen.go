@@ -1062,3 +1062,71 @@ func DiskSourceByTarget(domXML, targetDev string) (diskType string, src diskSour
 	}
 	return "", diskSource{}, false
 }
+
+// CurrentVCPUFromXML returns the domain's CURRENT vcpu count — the "current"
+// attribute when hotplug leaves it below the ceiling, else the element value.
+// 0 when unparseable.
+func CurrentVCPUFromXML(domXML string) int {
+	type vcpu struct {
+		Current int `xml:"current,attr"`
+		Value   int `xml:",chardata"`
+	}
+	var d struct {
+		VCPU vcpu `xml:"vcpu"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return 0
+	}
+	if d.VCPU.Current > 0 {
+		return d.VCPU.Current
+	}
+	return d.VCPU.Value
+}
+
+// CurrentMemoryMiBFromXML returns the domain's current memory in MiB, preferring
+// currentMemory (the balloon target) over the boot-time memory element. 0 when
+// unparseable. Units are normalized (libvirt defaults to KiB).
+func CurrentMemoryMiBFromXML(domXML string) int {
+	type mem struct {
+		Unit  string `xml:"unit,attr"`
+		Value int64  `xml:",chardata"`
+	}
+	var d struct {
+		Current mem `xml:"currentMemory"`
+		Boot    mem `xml:"memory"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return 0
+	}
+	pick := d.Current
+	if pick.Value == 0 {
+		pick = d.Boot
+	}
+	if pick.Value == 0 {
+		return 0
+	}
+	unit := pick.Unit
+	if unit == "" {
+		unit = "KiB"
+	}
+	var bytes int64
+	switch unit {
+	case "b", "bytes":
+		bytes = pick.Value
+	case "KB":
+		bytes = pick.Value * 1000
+	case "KiB", "k":
+		bytes = pick.Value * 1024
+	case "MB":
+		bytes = pick.Value * 1000 * 1000
+	case "MiB", "M", "m":
+		bytes = pick.Value * 1024 * 1024
+	case "GB":
+		bytes = pick.Value * 1000 * 1000 * 1000
+	case "GiB", "G", "g":
+		bytes = pick.Value * 1024 * 1024 * 1024
+	default:
+		bytes = pick.Value * 1024 // treat unknown as KiB, libvirt's default
+	}
+	return int(bytes / (1024 * 1024))
+}

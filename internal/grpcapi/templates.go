@@ -100,7 +100,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// report as its usage — admitting a different number than the row we go on to
 	// write would leave the accounting permanently off by the difference.
 	lease, aerr := s.admitWithReservation(
-		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib), intentVMResident)
+		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target,
+		int(srcSpec.Cpu), int(srcSpec.MemoryMib), vmSpecQuotaAmount(&srcSpec), intentVMResident)
 	if aerr != nil {
 		return nil, aerr
 	}

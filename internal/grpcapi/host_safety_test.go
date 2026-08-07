@@ -36,7 +36,7 @@ func TestHostSafety_OwnershipConditionBlocksInvolvedHost(t *testing.T) {
 	seedOwnershipCondition(t, s, "vm_dual_run", "vm", "web-1", "test-host", "other-host")
 
 	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("admission to an involved host: got %v, want FailedPrecondition", err)
 	}
@@ -50,7 +50,7 @@ func TestHostSafety_OwnershipConditionBlocksInvolvedHost(t *testing.T) {
 	s2 := testServer(t)
 	_ = s2 // placeholder: admission is host-scoped on s; reuse s with the clean host
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "clean-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if err != nil {
 		t.Fatalf("admission to an uninvolved host refused: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestHostSafety_IncompleteInventoryBlocksNewWorkloads(t *testing.T) {
 	s.invalidateInventoryCache()
 
 	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("new workload on a blind host: got %v, want FailedPrecondition", err)
 	}
@@ -160,7 +160,7 @@ func TestVIPSafety_DualRunFreezesLBChange_NotPlacement(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vip_dual_run", SubjectKind: "vip", SubjectID: "10.0.0.100",
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"test-host", "other-host"},
+		Hosts:     []string{"test-host", "other-host"},
 		FirstSeen: "2026-08-04T10:00:00Z", LastSeen: "2026-08-04T10:00:00Z",
 	}); err != nil {
 		t.Fatalf("seed VIP condition: %v", err)
@@ -174,7 +174,7 @@ func TestVIPSafety_DualRunFreezesLBChange_NotPlacement(t *testing.T) {
 	}
 	// Unrelated VM placement on an involved host is NOT blocked by a VIP condition.
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:unrelated", 1, 512, intentVMResident)
+		"vm:unrelated", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if err != nil {
 		t.Fatalf("VM placement blocked by a VIP condition: %v — VIP dual-run freezes VIP moves only", err)
 	}
@@ -203,7 +203,7 @@ func TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency(t *testing.T) {
 	s.invalidateInventoryCache()
 
 	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("new workload beside a memory-unlimited rogue: got %v, want FailedPrecondition — "+
 			"a memory cap of 0 is unbounded in the one dimension host capacity reserves", err)
@@ -219,7 +219,7 @@ func TestHostSafety_MemoryUnlimitedRogueBlocksNewResidency(t *testing.T) {
 	})
 	s.invalidateInventoryCache()
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if err != nil {
 		t.Fatalf("finite rogue tripped the uncapped gate: %v — bounded consumption is attributable", err)
 	}
@@ -250,7 +250,7 @@ func TestAdmission_FiniteRogueConsumesHeadroom(t *testing.T) {
 	// 512 MiB guest (+overhead) fits 1536 MiB of DB headroom easily — but not
 	// the 512 MiB left once the rogue's 1024 are charged.
 	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:squeezed", 1, 512, intentVMResident)
+		"vm:squeezed", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("pinned create beside a finite 1024 MiB rogue on a 1536 MiB host: got %v, "+
 			"want ResourceExhausted — runtime-only load must come out of admission headroom", err)
@@ -267,7 +267,7 @@ func TestAdmission_FiniteRogueConsumesHeadroom(t *testing.T) {
 	})
 	s.invalidateInventoryCache()
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:squeezed", 1, 512, intentVMResident)
+		"vm:squeezed", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if err != nil {
 		t.Fatalf("create beside a small finite rogue refused: %v — the charge must scale with the rogue, not blanket-refuse", err)
 	}
@@ -328,7 +328,7 @@ func TestHostSafety_UncappedRogueBlocksNewResidency(t *testing.T) {
 	s.invalidateInventoryCache()
 
 	_, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("new workload beside an uncapped rogue: got %v, want FailedPrecondition", err)
 	}
@@ -341,7 +341,7 @@ func TestHostSafety_UncappedRogueBlocksNewResidency(t *testing.T) {
 	}
 	s.invalidateInventoryCache()
 	lease, err := s.admitWithReservation(context.Background(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if err != nil {
 		t.Fatalf("DB-accounted uncapped container still blocks: %v", err)
 	}

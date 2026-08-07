@@ -263,10 +263,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// SERIALIZED admission like any other create — the earlier tenancy
 			// fail-fast cannot see in-flight reservations, so relying on it here
 			// let concurrent overcommit creates all observe the same headroom.
+			createQuota := vmSpecQuotaAmount(spec)
 			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
-				corrosion.WorkloadVM, spec.Name,
-				corrosion.QuotaAmount{VCPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib)},
-				corrosion.QuotaAmount{VCPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib)}, intentVMResident)
+				corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
 			if qerr != nil {
 				return nil, qerr
 			}
@@ -320,7 +319,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name,
+			int(spec.Cpu), int(spec.MemoryMib), vmSpecQuotaAmount(spec), intentVMResident)
 		if aerr != nil {
 			return nil, aerr
 		}

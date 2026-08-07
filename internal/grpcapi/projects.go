@@ -196,6 +196,22 @@ func sumDiskGiB(disks []*pb.DiskSpec) int {
 	return total
 }
 
+// vmSpecQuotaAmount is what a VM spec will charge its project once persisted, in
+// every dimension the quota bounds. One derivation for the unserialized
+// fail-fast AND the authoritative reservation, so a create cannot be checked
+// against one number and reserve another.
+func vmSpecQuotaAmount(spec *pb.VMSpec) corrosion.QuotaAmount {
+	if spec == nil {
+		return corrosion.QuotaAmount{}
+	}
+	return corrosion.QuotaAmount{
+		VCPU:    int(spec.Cpu),
+		MemMiB:  int(spec.MemoryMib),
+		DiskGiB: sumDiskGiB(spec.Disks),
+		NIC:     len(spec.Network),
+	}
+}
+
 // parseDiskGiB extracts a GiB count from strings like "30G", "1T",
 // "512M". Bare integers are interpreted as GiB. Returns 0 on parse
 // failure so the caller can apply a conservative default.

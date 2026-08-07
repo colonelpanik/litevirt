@@ -161,7 +161,7 @@ func TestCreateContainer_BoundedResidency_NoQEMUOverhead(t *testing.T) {
 
 	// The SAME size as a VM does not fit: the domain's overhead tips it over.
 	_, err := s.admitWithReservation(adminCtx(), "CreateVM", "test-host", "proj",
-		"vm:snug-vm", 1, 1536, intentVMResident)
+		"vm:snug-vm", 1, 1536, corrosion.QuotaAmount{VCPU: 1, MemMiB: 1536}, intentVMResident)
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("a 1536 MiB VM on a host the container filled: got %v, want ResourceExhausted", err)
 	}
@@ -182,7 +182,7 @@ func TestAdmission_UnreadableAuthorityFailsClosed(t *testing.T) {
 	}
 
 	_, err := s.admitWithReservation(adminCtx(), "CreateVM", "test-host", "proj",
-		"vm:new-vm", 1, 512, intentVMResident)
+		"vm:new-vm", 1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512}, intentVMResident)
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("admission with an unreadable authority table: got %v, want Unavailable — "+
 			"an unreadable ledger is not a license to admit", err)

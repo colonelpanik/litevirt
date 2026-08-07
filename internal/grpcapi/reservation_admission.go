@@ -256,11 +256,16 @@ func (l *reservationLease) release(ctx context.Context) {
 // A zero/negative delta consumes nothing and takes the cheap path — no operation
 // row, no lease — but only AFTER host safety has passed: residency is a safety
 // decision even when nothing numeric is requested (see admissionIntent).
+// quota is the PROJECT-quota charge in all four bounded dimensions; cpuDelta and
+// memDelta remain the HOST figures (a host has no disk or NIC dimension). They
+// are separate parameters because they are genuinely different numbers: host
+// memory carries the per-domain qemu overhead, and a create charges its project
+// for disks and NICs the host never accounts for.
 func (s *Server) admitWithReservation(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, quota corrosion.QuotaAmount, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, true, intent)
+		subjectForCreate(resourceID, host, quota), cpuDelta, memDelta, quota, true, intent)
 }
 
 // admitGrowWithReservation is admitWithReservation for a GROW of an existing
@@ -275,7 +280,8 @@ func (s *Server) admitGrowWithReservation(
 		tag = "ct"
 	}
 	subject := quotaSubject{Kind: kind, Host: host, Name: name, Want: corrosion.QuotaAmount{VCPU: wantCPU, MemMiB: wantMem}}
-	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, intentResourceGrow)
+	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, tag+":"+name, subject,
+		cpuDelta, memDelta, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, true, intentResourceGrow)
 }
 
 // admitWithReservationID is admitWithReservation with an explicit operation ID.
@@ -286,8 +292,9 @@ func (s *Server) admitGrowWithReservation(
 func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
+	quota := corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}
 	return s.admitReserved(ctx, callerPrincipal(ctx), opID, method, host, project, resourceID,
-		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, true, intent)
+		subjectForCreate(resourceID, host, quota), cpuDelta, memDelta, quota, true, intent)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -305,7 +312,8 @@ func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, false, intent)
+		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}),
+		cpuDelta, memDelta, corrosion.QuotaAmount{}, false, intent)
 }
 
 // reserveWithoutCheck publishes a HOST reservation without verifying it fits —
@@ -377,7 +385,7 @@ func callerPrincipal(ctx context.Context) string {
 }
 
 func (s *Server) admitReserved(
-	ctx context.Context, principal, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota bool, intent admissionIntent,
+	ctx context.Context, principal, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, quota corrosion.QuotaAmount, withQuota bool, intent admissionIntent,
 ) (*reservationLease, error) {
 	// Host safety BEFORE the zero-delta fast path AND before any reservation: an
 	// active ownership condition on this host or workload, or an incomplete
@@ -389,7 +397,10 @@ func (s *Server) admitReserved(
 		intent.newResidency || cpuDelta > 0 || memDelta > 0); err != nil {
 		return nil, err
 	}
-	if cpuDelta <= 0 && memDelta <= 0 {
+	// A create that asks for no cpu/memory can still charge its project for disks
+	// or NICs, so the no-op path has to consider the quota amount too — returning
+	// early on the host figures alone would let those dimensions land unreserved.
+	if cpuDelta <= 0 && memDelta <= 0 && (!withQuota || quota.IsZero()) {
 		return &reservationLease{}, nil
 	}
 
@@ -418,7 +429,8 @@ func (s *Server) admitReserved(
 		// reserves host capacity alone: its allocation is already in project usage,
 		// so publishing a project reservation too would make concurrent starts
 		// appear to double-consume a quota neither of them is growing.
-		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.ProjectCPU, rv.ProjectMemMiB = quota.VCPU, quota.MemMiB
+		rv.ProjectDiskGiB, rv.ProjectNIC = quota.DiskGiB, quota.NIC
 		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
 		rv.WantCPU, rv.WantMemMiB = subject.Want.VCPU, subject.Want.MemMiB
 		rv.WantDiskGiB, rv.WantNIC = subject.Want.DiskGiB, subject.Want.NIC
@@ -462,7 +474,7 @@ func (s *Server) admitReserved(
 	}
 	if withQuota {
 		if !delegated {
-			if err := s.checkProjectQuotaBefore(ctx, project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
+			if err := s.checkProjectQuotaBefore(ctx, project, quota, op.ID); err != nil {
 				lease.release(ctx)
 				return nil, err
 			}
@@ -470,7 +482,7 @@ func (s *Server) admitReserved(
 		}
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
-		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, quota)
 		if qerr != nil {
 			lease.release(ctx)
 			return nil, qerr

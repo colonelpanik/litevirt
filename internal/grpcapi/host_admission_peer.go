@@ -50,7 +50,7 @@ func (s *Server) ReserveHostCapacity(ctx context.Context, req *pb.ReserveHostCap
 	intent := admissionIntent{newResidency: req.NewResidency, vmOverhead: req.VmOverhead}
 	lease, err := s.admitReserved(ctx, reservedPrincipal(req.Principal), "", req.Method, s.hostName, req.Project, req.ResourceId,
 		subjectForCreate(req.ResourceId, s.hostName, corrosion.QuotaAmount{VCPU: int(req.CpuDelta), MemMiB: int(req.MemMibDelta)}),
-		int(req.CpuDelta), int(req.MemMibDelta), false, intent)
+		int(req.CpuDelta), int(req.MemMibDelta), corrosion.QuotaAmount{}, false, intent)
 	if err != nil {
 		return nil, err
 	}

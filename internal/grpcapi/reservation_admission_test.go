@@ -7,7 +7,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // The tie-break, pinned DETERMINISTICALLY rather than by racing two goroutines.
@@ -65,7 +67,7 @@ func TestAdmitWithReservation_YieldsToAnEarlierClaimant(t *testing.T) {
 	// "0000…" sorts before any minted id.
 	plantReservation(t, s, "00000000-earlier", "test-host", "_default", 1, 1024)
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, intentResourceGrow)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, corrosion.QuotaAmount{VCPU: 1, MemMiB: 1024}, intentResourceGrow)
 	if status.Code(err) != codes.ResourceExhausted {
 		if lease != nil {
 			lease.release(ctx)
@@ -85,7 +87,7 @@ func TestAdmitWithReservation_IgnoresALaterClaimant(t *testing.T) {
 	// "zzzz…" sorts after any minted id.
 	plantReservation(t, s, "zzzzzzzz-later", "test-host", "_default", 1, 1024)
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, intentResourceGrow)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, corrosion.QuotaAmount{VCPU: 1, MemMiB: 1024}, intentResourceGrow)
 	if err != nil {
 		t.Fatalf("admission against a LATER claimant was refused: %v — later racers yield, or both sides deadlock and nobody is admitted", err)
 	}
@@ -110,7 +112,7 @@ func TestAdmitWithReservation_ReleaseFreesTheCapacity(t *testing.T) {
 		t.Fatalf("HostReserved: %v", err)
 	}
 
-	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, intentResourceGrow)
+	lease, err := s.admitWithReservation(ctx, "CreateVM", "test-host", "_default", "vm:probe", 1, 1024, corrosion.QuotaAmount{VCPU: 1, MemMiB: 1024}, intentResourceGrow)
 	if err != nil {
 		t.Fatalf("admission: %v", err)
 	}
@@ -235,7 +237,7 @@ func TestAdmitWithReservation_ACreateRecordsItsOwnSizeAsTheTarget(t *testing.T) 
 	admissionHost(t, s)
 
 	lease, err := s.admitWithReservation(context.Background(), "CreateContainer", "test-host", "proj",
-		"ct:web", 2, 1024, intentResourceGrow)
+		"ct:web", 2, 1024, corrosion.QuotaAmount{VCPU: 2, MemMiB: 1024}, intentResourceGrow)
 	if err != nil {
 		t.Fatalf("admitWithReservation: %v", err)
 	}
@@ -299,5 +301,71 @@ func TestReservationLease_FenceZeroValueAllows(t *testing.T) {
 	s := testServer(t)
 	if err := (&reservationLease{s: s, quotaProject: "proj"}).allowCommit(ctx); err != nil {
 		t.Errorf("epoch-0 lease fence refused: %v — no epoch-bearing authority backed this grant", err)
+	}
+}
+
+// TestCreateVM_DiskAndNICQuotaReserved: a create's disk and NIC charge goes
+// through the SAME serialized reservation as cpu/mem. They used to be covered
+// only by the unserialized tenancy fail-fast, which reads committed usage and
+// cannot see a concurrent request's claim — so two creates each fitting the
+// remaining disk (or NIC) budget both passed and both committed over the limit.
+// The --allow-overcommit path bypasses HOST capacity, never a tenancy limit, so
+// it must reserve the same four dimensions.
+func TestCreateVM_DiskAndNICQuotaReserved(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		overcommit bool
+	}{{"normal", false}, {"allow-overcommit", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServerR2(t)
+			s.virt = libvirtfake.New()
+			ctx := adminCtx()
+			if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: "/acme"}); err != nil {
+				t.Fatalf("InsertProject: %v", err)
+			}
+			// Disk and NIC are the only bounded dimensions.
+			if err := corrosion.UpsertProjectQuota(ctx, s.db, corrosion.ProjectQuotaRecord{
+				ProjectName: "/acme", DiskGiBLimit: 10, NICLimit: 4,
+			}); err != nil {
+				t.Fatalf("UpsertProjectQuota: %v", err)
+			}
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+				Name: "test-host", Address: "10.0.0.1", State: "active", CPUTotal: 16, MemTotal: 32768,
+			}); err != nil {
+				t.Fatalf("InsertHost: %v", err)
+			}
+			// An earlier claimant holds 6 of the 10 GiB — committed usage is still
+			// zero, so the unserialized glance sees the whole budget free.
+			plantQuotaReservation(t, s, "00000000-earlier", "/acme", corrosion.QuotaAmount{DiskGiB: 6})
+
+			_, err := s.CreateVM(ctx, &pb.CreateVMRequest{
+				AllowOvercommit: tc.overcommit,
+				Spec: &pb.VMSpec{
+					Name: "disk-hog", Project: "/acme", Cpu: 1, MemoryMib: 512,
+					Disks:   []*pb.DiskSpec{{Name: "root", Size: "6G"}},
+					Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio"}},
+				},
+			})
+			if status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("create of a 6 GiB disk with 6 of a 10 GiB quota already reserved: got %v, "+
+					"want ResourceExhausted — disk must ride the reservation, not a glance", err)
+			}
+			if rec, _ := corrosion.GetVM(ctx, s.db, "disk-hog"); rec != nil {
+				t.Fatalf("refused create still persisted a row: %+v", rec)
+			}
+
+			// NICs are the other dimension the reservation used to omit.
+			plantQuotaReservation(t, s, "00000000-nics", "/acme", corrosion.QuotaAmount{NIC: 4})
+			_, err = s.CreateVM(ctx, &pb.CreateVMRequest{
+				AllowOvercommit: tc.overcommit,
+				Spec: &pb.VMSpec{
+					Name: "nic-hog", Project: "/acme", Cpu: 1, MemoryMib: 512,
+					Network: []*pb.NetworkAttachment{{Name: "lan", Model: "virtio"}},
+				},
+			})
+			if status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("create of a 1-NIC VM with the whole 4-NIC quota reserved: got %v, want ResourceExhausted", err)
+			}
+		})
 	}
 }

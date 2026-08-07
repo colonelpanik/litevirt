@@ -1012,6 +1012,16 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 // resolveContainerHost finds the host that owns a container. When hostHint is
 // set it's trusted (and the row fetched directly); otherwise the cluster is
 // scanned by name. Returns the host plus the record.
+//
+// A name-only scan can match MORE THAN ONE container: the primary key is
+// (host_name, name), so the same name on two hosts is two distinct, legitimate
+// containers, not a duplicate to be deduplicated. Returning the first match
+// picked one of them by list order — a delete then destroyed a container the
+// operator never named, and start/stop acted on the wrong one, with nothing in
+// the response distinguishing that from the intended container. So an ambiguous
+// name is refused with the candidates named; --host is exact and always
+// resolves. Fail-closed here covers every caller (delete/start/stop, backup,
+// snapshot, migrate, template) at once, since they all resolve through this.
 func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string) (string, *corrosion.ContainerRecord, error) {
 	if hostHint != "" {
 		rec, err := corrosion.GetContainer(ctx, s.db, hostHint, name)
@@ -1027,10 +1037,25 @@ func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string
 	if err != nil {
 		return "", nil, status.Errorf(codes.Internal, "list containers: %v", err)
 	}
+	var match *corrosion.ContainerRecord
+	var hosts []string
 	for i := range cts {
 		if cts[i].Name == name {
-			return cts[i].HostName, &cts[i], nil
+			if match == nil {
+				match = &cts[i]
+			}
+			hosts = append(hosts, cts[i].HostName)
 		}
 	}
-	return "", nil, status.Errorf(codes.NotFound, "container %q not found in cluster", name)
+	switch {
+	case len(hosts) == 0:
+		return "", nil, status.Errorf(codes.NotFound, "container %q not found in cluster", name)
+	case len(hosts) > 1:
+		// ListContainers orders by (host_name, name), so the candidate list is
+		// already deterministic and stable across nodes.
+		return "", nil, status.Errorf(codes.FailedPrecondition,
+			"container %q exists on %d hosts (%s); pass --host to name the one you mean",
+			name, len(hosts), strings.Join(hosts, ", "))
+	}
+	return match.HostName, match, nil
 }

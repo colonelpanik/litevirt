@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -141,5 +142,85 @@ func TestStartStopContainer_HostlessResolvesTheOwner(t *testing.T) {
 	}
 	if _, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "no-such-ct"}); status.Code(err) != codes.NotFound {
 		t.Fatalf("host-less stop of a nonexistent container: got %v, want NotFound", err)
+	}
+}
+
+// TestResolveContainerHost_AmbiguousNameRefuses: containers are keyed
+// (host_name, name), so the SAME name on two hosts is two distinct, legitimate
+// containers. Resolving a host-less name to the first row that matched picked
+// one of them by list order — so `lv ct rm <name>` could destroy a container
+// the operator never named, and start/stop could act on the wrong one. An
+// ambiguous name is now a FailedPrecondition naming the candidates; --host
+// remains exact and unambiguous.
+func TestResolveContainerHost_AmbiguousNameRefuses(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	fake := &fakeCTDeletePeer{}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return fake, func() {}, nil
+	}
+	// One twin is LOCAL: without the ambiguity check a host-less delete that
+	// resolved to this node would destroy it outright, not merely forward wrong.
+	for _, host := range []string{"host-a", s.hostName} {
+		if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+			HostName: host, Name: "twin", State: "stopped", Project: "proj",
+		}); err != nil {
+			t.Fatalf("UpsertContainer on %s: %v", host, err)
+		}
+	}
+
+	if _, _, err := s.resolveContainerHost(ctx, "", "twin"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("resolve of an ambiguous name: got %v, want FailedPrecondition", err)
+	} else if !strings.Contains(err.Error(), "host-a") || !strings.Contains(err.Error(), s.hostName) ||
+		!strings.Contains(err.Error(), "--host") {
+		t.Fatalf("ambiguity error %q must name both candidate hosts and point at --host", err)
+	}
+
+	for _, tc := range []struct {
+		op   string
+		call func() error
+	}{
+		{"delete", func() error {
+			_, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "twin"})
+			return err
+		}},
+		{"start", func() error {
+			_, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "twin"})
+			return err
+		}},
+		{"stop", func() error {
+			_, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "twin"})
+			return err
+		}},
+	} {
+		if err := tc.call(); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("host-less %s of an ambiguous name: got %v, want FailedPrecondition", tc.op, err)
+		}
+	}
+
+	// Nothing may have been acted on: no forward, and BOTH rows still live.
+	fake.mu.Lock()
+	nCalls := len(fake.calls) + len(fake.startCalls) + len(fake.stopCalls)
+	fake.mu.Unlock()
+	if nCalls != 0 {
+		t.Fatalf("ambiguous host-less ops forwarded %d times, want 0", nCalls)
+	}
+	for _, host := range []string{"host-a", s.hostName} {
+		rec, err := corrosion.GetContainer(ctx, s.db, host, "twin")
+		if err != nil || rec == nil {
+			t.Fatalf("container twin on %s: rec=%v err=%v — an ambiguous op destroyed a row", host, rec, err)
+		}
+	}
+
+	// --host stays exact: it names one of the two, so it is never ambiguous.
+	if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "twin", HostName: "host-a"}); err != nil {
+		t.Fatalf("explicit-host delete of a duplicated name: %v", err)
+	}
+	fake.mu.Lock()
+	nDeletes := len(fake.calls)
+	fake.mu.Unlock()
+	if nDeletes != 1 {
+		t.Fatalf("explicit-host delete forwarded %d times, want 1", nDeletes)
 	}
 }

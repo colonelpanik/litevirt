@@ -643,7 +643,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// target identity. The lease is held until persistence completes
 			// and carries the authority commit fence checked before the insert.
 			qLease, qerr := s.admitQuotaWithReservation(ctx, "PromoteReplica", s.hostName, vm.Project,
-				corrosion.WorkloadVM, targetName, int(spec.Cpu), int(spec.MemoryMib), int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+				corrosion.WorkloadVM, targetName,
+				corrosion.QuotaAmount{VCPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib)},
+				corrosion.QuotaAmount{VCPU: int(spec.Cpu), MemMiB: int(spec.MemoryMib)}, intentVMResident)
 			if qerr != nil {
 				return qerr
 			}

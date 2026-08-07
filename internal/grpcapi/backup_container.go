@@ -750,7 +750,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		}
 		if !relocation && (spec.CPULimit > 0 || spec.MemMiB > 0) {
 			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
-				corrosion.WorkloadContainer, req.Name, spec.CPULimit, spec.MemMiB, spec.CPULimit, spec.MemMiB, intentContainerResident)
+				corrosion.WorkloadContainer, req.Name,
+				corrosion.QuotaAmount{VCPU: spec.CPULimit, MemMiB: spec.MemMiB},
+				corrosion.QuotaAmount{VCPU: spec.CPULimit, MemMiB: spec.MemMiB}, intentContainerResident)
 			if aerr != nil {
 				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 				return aerr

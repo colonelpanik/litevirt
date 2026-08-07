@@ -24408,8 +24408,17 @@ type ReserveProjectCapacityRequest struct {
 	// already visible at its old size, so the holder retires the released lease
 	// only once the workload CONTRIBUTES this much — presence alone would free
 	// the lease instantly while usage still counted the smaller spec.
-	WantCpu       int32 `protobuf:"varint,9,opt,name=want_cpu,json=wantCpu,proto3" json:"want_cpu,omitempty"`
-	WantMemMib    int32 `protobuf:"varint,10,opt,name=want_mem_mib,json=wantMemMib,proto3" json:"want_mem_mib,omitempty"`
+	WantCpu    int32 `protobuf:"varint,9,opt,name=want_cpu,json=wantCpu,proto3" json:"want_cpu,omitempty"`
+	WantMemMib int32 `protobuf:"varint,10,opt,name=want_mem_mib,json=wantMemMib,proto3" json:"want_mem_mib,omitempty"`
+	// The other two dimensions a project quota bounds, reserved on the SAME
+	// lease. Checking them with an unserialized read just before the insert left
+	// them enforceable one request at a time: concurrent creates each saw a view
+	// without the other's claim, both fit the remaining budget, and both
+	// committed over the limit.
+	DiskGibDelta  int32 `protobuf:"varint,11,opt,name=disk_gib_delta,json=diskGibDelta,proto3" json:"disk_gib_delta,omitempty"`
+	NicDelta      int32 `protobuf:"varint,12,opt,name=nic_delta,json=nicDelta,proto3" json:"nic_delta,omitempty"`
+	WantDiskGib   int32 `protobuf:"varint,13,opt,name=want_disk_gib,json=wantDiskGib,proto3" json:"want_disk_gib,omitempty"`
+	WantNic       int32 `protobuf:"varint,14,opt,name=want_nic,json=wantNic,proto3" json:"want_nic,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24510,6 +24519,34 @@ func (x *ReserveProjectCapacityRequest) GetWantCpu() int32 {
 func (x *ReserveProjectCapacityRequest) GetWantMemMib() int32 {
 	if x != nil {
 		return x.WantMemMib
+	}
+	return 0
+}
+
+func (x *ReserveProjectCapacityRequest) GetDiskGibDelta() int32 {
+	if x != nil {
+		return x.DiskGibDelta
+	}
+	return 0
+}
+
+func (x *ReserveProjectCapacityRequest) GetNicDelta() int32 {
+	if x != nil {
+		return x.NicDelta
+	}
+	return 0
+}
+
+func (x *ReserveProjectCapacityRequest) GetWantDiskGib() int32 {
+	if x != nil {
+		return x.WantDiskGib
+	}
+	return 0
+}
+
+func (x *ReserveProjectCapacityRequest) GetWantNic() int32 {
+	if x != nil {
+		return x.WantNic
 	}
 	return 0
 }
@@ -26738,7 +26775,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fpublic_ips_used\x18\a \x01(\x05R\rpublicIpsUsed\x12&\n" +
 	"\x0fbackup_gib_used\x18\b \x01(\x05R\rbackupGibUsed\";\n" +
 	"\x16GetProjectUsageRequest\x12!\n" +
-	"\fproject_name\x18\x01 \x01(\tR\vprojectName\"\xdc\x02\n" +
+	"\fproject_name\x18\x01 \x01(\tR\vprojectName\"\xde\x03\n" +
 	"\x1dReserveProjectCapacityRequest\x12\x18\n" +
 	"\aproject\x18\x01 \x01(\tR\aproject\x12\x16\n" +
 	"\x06method\x18\x02 \x01(\tR\x06method\x12\x1b\n" +
@@ -26752,7 +26789,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bwant_cpu\x18\t \x01(\x05R\awantCpu\x12 \n" +
 	"\fwant_mem_mib\x18\n" +
 	" \x01(\x05R\n" +
-	"wantMemMib\"d\n" +
+	"wantMemMib\x12$\n" +
+	"\x0edisk_gib_delta\x18\v \x01(\x05R\fdiskGibDelta\x12\x1b\n" +
+	"\tnic_delta\x18\f \x01(\x05R\bnicDelta\x12\"\n" +
+	"\rwant_disk_gib\x18\r \x01(\x05R\vwantDiskGib\x12\x19\n" +
+	"\bwant_nic\x18\x0e \x01(\x05R\awantNic\"d\n" +
 	"\x1eReserveProjectCapacityResponse\x12\x19\n" +
 	"\blease_id\x18\x01 \x01(\tR\aleaseId\x12'\n" +
 	"\x0fauthority_epoch\x18\x02 \x01(\x03R\x0eauthorityEpoch\"T\n" +

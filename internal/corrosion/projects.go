@@ -372,6 +372,38 @@ type QuotaCheck struct {
 	NIC     int
 }
 
+// QuotaAmount is an amount of project quota in EVERY dimension a project quota
+// bounds. It is the shape the serialized admission path passes around: a
+// requested delta, a summed reservation total, and one workload's contribution
+// are all the same four numbers, so admission compares like with like.
+//
+// Carrying all four together is the point. Reserving only cpu/mem while
+// checking disk/NIC with an unserialized read left those two dimensions
+// enforceable one request at a time: two concurrent creates each read a view
+// containing neither, both fit, and both committed.
+type QuotaAmount struct {
+	VCPU    int
+	MemMiB  int
+	DiskGiB int
+	NIC     int
+}
+
+// IsZero reports whether the amount asks for nothing in any dimension — the
+// admission fast path (nothing to reserve, nothing to check).
+func (a QuotaAmount) IsZero() bool {
+	return a.VCPU <= 0 && a.MemMiB <= 0 && a.DiskGiB <= 0 && a.NIC <= 0
+}
+
+// Add returns the dimension-wise sum.
+func (a QuotaAmount) Add(b QuotaAmount) QuotaAmount {
+	return QuotaAmount{
+		VCPU:    a.VCPU + b.VCPU,
+		MemMiB:  a.MemMiB + b.MemMiB,
+		DiskGiB: a.DiskGiB + b.DiskGiB,
+		NIC:     a.NIC + b.NIC,
+	}
+}
+
 // CheckProjectQuota returns nil if the proposed allocation would fit
 // under the project's quotas, or a descriptive error otherwise.
 // Empty/missing quota row means unbounded — admission passes.
@@ -439,9 +471,11 @@ const (
 //
 // The accounting mirrors SumProjectUsage exactly, so "contributes at least what it
 // was admitted for" is comparable against the same numbers the quota check uses: VMs
-// count their spec cpu/memory_mib, containers their declared limits, and a
-// soft-deleted row counts as absent.
-func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, host, workload string) (cpu, memMiB int, found bool, err error) {
+// count their spec cpu/memory_mib plus their disk and interface rows, containers
+// their declared limits plus their interface rows (containers contribute no disk
+// quota), and a soft-deleted row — of the workload or of an individual disk/NIC —
+// counts as absent.
+func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, host, workload string) (QuotaAmount, bool, error) {
 	project = projectOrDefault(project)
 	switch kind {
 	case WorkloadContainer:
@@ -452,23 +486,55 @@ func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, ho
 			 WHERE name = ? AND host_name = ? AND project = ? AND deleted_at IS NULL`,
 			workload, host, project)
 		if err != nil {
-			return 0, 0, false, err
+			return QuotaAmount{}, false, err
 		}
 		if len(rows) == 0 {
-			return 0, 0, false, nil
+			return QuotaAmount{}, false, nil
 		}
-		return rows[0].Int("cpu"), rows[0].Int("mem"), true, nil
+		amt := QuotaAmount{VCPU: rows[0].Int("cpu"), MemMiB: rows[0].Int("mem")}
+		nicRows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM container_interfaces
+			 WHERE ct_name = ? AND host_name = ? AND deleted_at IS NULL`, workload, host)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(nicRows) > 0 {
+			amt.NIC = nicRows[0].Int("n")
+		}
+		return amt, true, nil
 	default: // WorkloadVM
 		rows, err := c.Query(ctx,
 			`SELECT COALESCE(json_extract(spec,'$.cpu'),0)        AS cpu,
 			        COALESCE(json_extract(spec,'$.memory_mib'),0) AS mem
 			 FROM vms WHERE name = ? AND project = ? AND deleted_at IS NULL`, workload, project)
 		if err != nil {
-			return 0, 0, false, err
+			return QuotaAmount{}, false, err
 		}
 		if len(rows) == 0 {
-			return 0, 0, false, nil
+			return QuotaAmount{}, false, nil
 		}
-		return rows[0].Int("cpu"), rows[0].Int("mem"), true, nil
+		amt := QuotaAmount{VCPU: rows[0].Int("cpu"), MemMiB: rows[0].Int("mem")}
+		diskRows, err := c.Query(ctx,
+			`SELECT COALESCE(SUM(size_bytes),0) AS bytes FROM vm_disks
+			 WHERE vm_name = ? AND deleted_at IS NULL`, workload)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(diskRows) > 0 {
+			// Truncating division, exactly as SumProjectUsage totals disk usage —
+			// a contribution measured differently from the usage it is compared
+			// against would retire a charge the quota check still counts.
+			amt.DiskGiB = int(diskRows[0].Int64("bytes") / (1 << 30))
+		}
+		nicRows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM vm_interfaces
+			 WHERE vm_name = ? AND deleted_at IS NULL`, workload)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(nicRows) > 0 {
+			amt.NIC = nicRows[0].Int("n")
+		}
+		return amt, true, nil
 	}
 }

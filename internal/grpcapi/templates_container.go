@@ -152,7 +152,9 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	}
 	if src.CPULimit > 0 || src.MemMiB > 0 {
 		lease, aerr := s.admitQuotaWithReservation(ctx, "CloneContainer", s.hostName, project,
-			corrosion.WorkloadContainer, req.Target, src.CPULimit, src.MemMiB, src.CPULimit, src.MemMiB, intentContainerResident)
+			corrosion.WorkloadContainer, req.Target,
+			corrosion.QuotaAmount{VCPU: src.CPULimit, MemMiB: src.MemMiB},
+			corrosion.QuotaAmount{VCPU: src.CPULimit, MemMiB: src.MemMiB}, intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}

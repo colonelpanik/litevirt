@@ -94,6 +94,14 @@ Usage is computed at admission time (cheap join against `vms` +
 external tool that mutates the cluster outside the RPC surface stays
 visible immediately.
 
+Admission does not decide on committed usage alone. A request first publishes a
+**reservation** for what it is about to consume, then re-checks the limit
+counting every reservation that was claimed before it — so two requests racing
+for the last of a budget cannot both read a view without the other and both
+commit. All four bounded dimensions (vCPU, memory, disk GiB, NICs) travel on
+that one reservation, and it is held until the workload's row is durably
+recorded.
+
 ## Project = RBAC scope
 
 The project name is also the RBAC path under `/projects/`. To grant

@@ -22,10 +22,20 @@ type ReservationVector struct {
 	Project       string `json:"project,omitempty"`
 	ProjectCPU    int    `json:"project_cpu,omitempty"`
 	ProjectMemMiB int    `json:"project_mem_mib,omitempty"`
-	TargetHost    string `json:"target_host,omitempty"`
-	TargetCPU     int    `json:"target_cpu,omitempty"`
-	TargetMemMiB  int    `json:"target_mem_mib,omitempty"`
-	SourceHost    string `json:"source_host,omitempty"`
+
+	// The other two dimensions a project quota bounds. They are reserved on the
+	// SAME lease as cpu/mem rather than checked by a read the moment before the
+	// insert: an unserialized glance cannot see a concurrent request's in-flight
+	// claim, so two creates that each fit the remaining disk (or NIC) budget both
+	// passed and both committed. Host capacity has no disk/NIC dimension — these
+	// are tenancy limits only, so they appear on the project half alone.
+	ProjectDiskGiB int `json:"project_disk_gib,omitempty"`
+	ProjectNIC     int `json:"project_nic,omitempty"`
+
+	TargetHost   string `json:"target_host,omitempty"`
+	TargetCPU    int    `json:"target_cpu,omitempty"`
+	TargetMemMiB int    `json:"target_mem_mib,omitempty"`
+	SourceHost   string `json:"source_host,omitempty"`
 
 	// Workload identity plus the ABSOLUTE size the admission is growing it to.
 	//
@@ -44,6 +54,20 @@ type ReservationVector struct {
 	WorkloadHost string `json:"workload_host,omitempty"` // disambiguates containers
 	WantCPU      int    `json:"want_cpu,omitempty"`
 	WantMemMiB   int    `json:"want_mem_mib,omitempty"`
+	WantDiskGiB  int    `json:"want_disk_gib,omitempty"`
+	WantNIC      int    `json:"want_nic,omitempty"`
+}
+
+// ProjectAmount is the project-quota half of the vector as a QuotaAmount.
+func (r ReservationVector) ProjectAmount() QuotaAmount {
+	return QuotaAmount{VCPU: r.ProjectCPU, MemMiB: r.ProjectMemMiB, DiskGiB: r.ProjectDiskGiB, NIC: r.ProjectNIC}
+}
+
+// ReservesProjectQuota reports whether the vector claims any project quota at
+// all — the predicate the project sums use to skip rows that reserve only host
+// capacity.
+func (r ReservationVector) ReservesProjectQuota() bool {
+	return r.ProjectCPU != 0 || r.ProjectMemMiB != 0 || r.ProjectDiskGiB != 0 || r.ProjectNIC != 0
 }
 
 // ReservationFacts is persisted on the reserved operation step. It is kept
@@ -65,10 +89,14 @@ func (r ReservationVector) Validate() error {
 	}{
 		{field: "project_cpu", value: r.ProjectCPU},
 		{field: "project_mem_mib", value: r.ProjectMemMiB},
+		{field: "project_disk_gib", value: r.ProjectDiskGiB},
+		{field: "project_nic", value: r.ProjectNIC},
 		{field: "target_cpu", value: r.TargetCPU},
 		{field: "target_mem_mib", value: r.TargetMemMiB},
 		{field: "want_cpu", value: r.WantCPU},
 		{field: "want_mem_mib", value: r.WantMemMiB},
+		{field: "want_disk_gib", value: r.WantDiskGiB},
+		{field: "want_nic", value: r.WantNIC},
 	}
 	for _, value := range values {
 		if value.value < 0 {
@@ -327,9 +355,23 @@ func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, r
 // at zero, so "subtract everything then add ours back" silently over-credits once
 // the host is oversubscribed — a bug this shape had until a test caught it.
 func ReservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem, projCPU, projMem int, err error) {
+	hostCPU, hostMem, proj, err := reservedBefore(ctx, c, host, project, opID)
+	return hostCPU, hostMem, proj.VCPU, proj.MemMiB, err
+}
+
+// ProjectReservedBefore is ReservedBefore's project half in ALL FOUR quota
+// dimensions. The serialized quota check uses this one: reserving disk and NIC
+// but summing only cpu/mem would leave those dimensions claimed and never
+// counted, which is the same unenforced limit as not reserving them at all.
+func ProjectReservedBefore(ctx context.Context, c *Client, project, opID string) (QuotaAmount, error) {
+	_, _, proj, err := reservedBefore(ctx, c, "", project, opID)
+	return proj, err
+}
+
+func reservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem int, proj QuotaAmount, err error) {
 	rvs, err := nonterminalReservationsByID(ctx, c)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, QuotaAmount{}, err
 	}
 	for id, rv := range rvs {
 		if id >= opID {
@@ -340,11 +382,10 @@ func ReservedBefore(ctx context.Context, c *Client, host, project, opID string) 
 			hostMem += rv.TargetMemMiB
 		}
 		if project != "" && rv.Project == project {
-			projCPU += rv.ProjectCPU
-			projMem += rv.ProjectMemMiB
+			proj = proj.Add(rv.ProjectAmount())
 		}
 	}
-	return hostCPU, hostMem, projCPU, projMem, nil
+	return hostCPU, hostMem, proj, nil
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations

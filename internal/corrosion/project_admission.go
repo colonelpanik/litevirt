@@ -52,23 +52,35 @@ type stampedStep struct {
 //     decided fact this node cannot see yet.
 //
 // grace ≤ 0 disables the settle term, leaving pure earlier-claimant counting.
+//
+// ProjectReservedSettling is the cpu/mem projection kept for callers that admit
+// only those two dimensions; ProjectReservedSettlingAmount returns all four and
+// is what the serialized quota check uses.
 func ProjectReservedSettling(ctx context.Context, c *Client, project, opID string, grace time.Duration, now time.Time) (cpu, memMiB int, err error) {
+	amt, err := ProjectReservedSettlingAmount(ctx, c, project, opID, grace, now)
+	return amt.VCPU, amt.MemMiB, err
+}
+
+// ProjectReservedSettlingAmount is ProjectReservedSettling in ALL FOUR quota
+// dimensions.
+func ProjectReservedSettlingAmount(ctx context.Context, c *Client, project, opID string, grace time.Duration, now time.Time) (QuotaAmount, error) {
+	var total QuotaAmount
 	project = projectOrDefault(project)
 
 	orows, err := c.Query(ctx,
 		`SELECT id, operation_kind, resource_kind, resource_id, reservation_json FROM operations
 		  WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
-		return 0, 0, err
+		return QuotaAmount{}, err
 	}
 	if len(orows) == 0 {
-		return 0, 0, nil
+		return QuotaAmount{}, nil
 	}
 
 	srows, err := c.Query(ctx,
 		`SELECT operation_id, step_name, created_at FROM operation_steps WHERE deleted_at IS NULL`)
 	if err != nil {
-		return 0, 0, err
+		return QuotaAmount{}, err
 	}
 	stepsByOp := make(map[string][]stampedStep, len(orows))
 	for _, r := range srows {
@@ -81,9 +93,9 @@ func ProjectReservedSettling(ctx context.Context, c *Client, project, opID strin
 		id := r.String("id")
 		rv, derr := DecodeReservation(r.String("reservation_json"))
 		if derr != nil {
-			return 0, 0, derr
+			return QuotaAmount{}, derr
 		}
-		if projectOrDefault(rv.Project) != project || (rv.ProjectCPU == 0 && rv.ProjectMemMiB == 0) {
+		if projectOrDefault(rv.Project) != project || !rv.ReservesProjectQuota() {
 			continue
 		}
 		if id == opID {
@@ -99,8 +111,7 @@ func ProjectReservedSettling(ctx context.Context, c *Client, project, opID strin
 
 		if !IsOperationTerminal(state) {
 			if id < opID { // an earlier claimant; later ones yield to us
-				cpu += rv.ProjectCPU
-				memMiB += rv.ProjectMemMiB
+				total = total.Add(rv.ProjectAmount())
 			}
 			continue
 		}
@@ -119,14 +130,13 @@ func ProjectReservedSettling(ctx context.Context, c *Client, project, opID strin
 		// counts it and counting the lease too would charge the project twice.
 		settled, verr := admittedResourceSettled(ctx, c, rv, r.String("resource_id"))
 		if verr != nil {
-			return 0, 0, verr
+			return QuotaAmount{}, verr
 		}
 		if !settled {
-			cpu += rv.ProjectCPU
-			memMiB += rv.ProjectMemMiB
+			total = total.Add(rv.ProjectAmount())
 		}
 	}
-	return cpu, memMiB, nil
+	return total, nil
 }
 
 // admittedResourceSettled reports whether the workload a lease admitted has become
@@ -143,20 +153,29 @@ func ProjectReservedSettling(ctx context.Context, c *Client, project, opID strin
 // retire the other's charge (the monotone-target property the identity-keyed
 // ledger fix pinned).
 //
+// All four quota dimensions participate, not just cpu/mem: a workload's row can
+// replicate ahead of its vm_disks / vm_interfaces rows, and settling on cpu/mem
+// alone would retire the disk and NIC charge while committed usage still counts
+// neither — under-admitting nothing, over-admitting exactly those two dimensions.
+// When a disk want was rounded UP to whole GiB and the committed bytes truncate
+// down, the comparison simply does not settle and the lease is held for the rest
+// of the grace: conservative in the safe direction.
+//
 // A lease that recorded no workload identity falls back to the presence of the
 // resource named by resource_id — the pre-identity behavior, correct for creates.
 func admittedResourceSettled(ctx context.Context, c *Client, rv ReservationVector, resourceID string) (bool, error) {
 	if rv.Workload == "" {
 		return resourceVisible(ctx, c, resourceID)
 	}
-	cpu, mem, found, err := WorkloadQuotaContribution(ctx, c, rv.Project, rv.WorkloadKind, rv.WorkloadHost, rv.Workload)
+	got, found, err := WorkloadQuotaContribution(ctx, c, rv.Project, rv.WorkloadKind, rv.WorkloadHost, rv.Workload)
 	if err != nil {
 		return false, err
 	}
 	if !found {
 		return false, nil
 	}
-	return cpu >= rv.WantCPU && mem >= rv.WantMemMiB, nil
+	return got.VCPU >= rv.WantCPU && got.MemMiB >= rv.WantMemMiB &&
+		got.DiskGiB >= rv.WantDiskGiB && got.NIC >= rv.WantNIC, nil
 }
 
 // resourceVisible reports whether the resource a lease admitted ("vm:<name>" or

@@ -53,14 +53,14 @@ var (
 // the admission carries no retire-by-observation hint and settles on presence of
 // its resource_id (correct for host-only reservations).
 type quotaSubject struct {
-	Kind, Host, Name    string
-	WantCPU, WantMemMiB int
+	Kind, Host, Name string
+	Want             corrosion.QuotaAmount
 }
 
 // subjectForCreate derives the subject from a create's "vm:<name>" / "ct:<name>"
 // resource id. A create's absolute size IS its delta: the workload does not exist
 // yet, so what it will contribute equals what is being admitted.
-func subjectForCreate(resourceID, host string, cpuDelta, memDelta int) quotaSubject {
+func subjectForCreate(resourceID, host string, delta corrosion.QuotaAmount) quotaSubject {
 	kindTag, name, ok := strings.Cut(resourceID, ":")
 	if !ok || name == "" {
 		return quotaSubject{}
@@ -69,7 +69,7 @@ func subjectForCreate(resourceID, host string, cpuDelta, memDelta int) quotaSubj
 	if kindTag == "ct" {
 		kind = corrosion.WorkloadContainer
 	}
-	return quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: cpuDelta, WantMemMiB: memDelta}
+	return quotaSubject{Kind: kind, Host: host, Name: name, Want: delta}
 }
 
 // Reserve-then-verify admission (F2).
@@ -260,7 +260,7 @@ func (s *Server) admitWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
+		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, true, intent)
 }
 
 // admitGrowWithReservation is admitWithReservation for a GROW of an existing
@@ -274,7 +274,7 @@ func (s *Server) admitGrowWithReservation(
 	if kind == corrosion.WorkloadContainer {
 		tag = "ct"
 	}
-	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, Want: corrosion.QuotaAmount{VCPU: wantCPU, MemMiB: wantMem}}
 	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, intentResourceGrow)
 }
 
@@ -287,7 +287,7 @@ func (s *Server) admitWithReservationID(
 	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, callerPrincipal(ctx), opID, method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, intent)
+		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, true, intent)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -305,7 +305,7 @@ func (s *Server) admitHostWithReservation(
 	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, intent admissionIntent,
 ) (*reservationLease, error) {
 	return s.admitReserved(ctx, callerPrincipal(ctx), "", method, host, project, resourceID,
-		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, false, intent)
+		subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}), cpuDelta, memDelta, false, intent)
 }
 
 // reserveWithoutCheck publishes a HOST reservation without verifying it fits —
@@ -330,7 +330,7 @@ func (s *Server) reserveWithoutCheck(
 	// overcommit path exactly as it binds everything else, and binds it BEFORE
 	// the zero-delta fast path: residency is a safety decision even when the
 	// numeric delta is zero.
-	sub := subjectForCreate(resourceID, host, cpuDelta, memDelta)
+	sub := subjectForCreate(resourceID, host, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
 	if err := s.checkHostSafety(ctx, host, sub.Kind, sub.Name, true, true); err != nil {
 		return nil, err
 	}
@@ -420,7 +420,8 @@ func (s *Server) admitReserved(
 		// appear to double-consume a quota neither of them is growing.
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
 		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
-		rv.WantCPU, rv.WantMemMiB = subject.WantCPU, subject.WantMemMiB
+		rv.WantCPU, rv.WantMemMiB = subject.Want.VCPU, subject.Want.MemMiB
+		rv.WantDiskGiB, rv.WantNIC = subject.Want.DiskGiB, subject.Want.NIC
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -461,7 +462,7 @@ func (s *Server) admitReserved(
 	}
 	if withQuota {
 		if !delegated {
-			if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+			if err := s.checkProjectQuotaBefore(ctx, project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
 				lease.release(ctx)
 				return nil, err
 			}
@@ -469,7 +470,7 @@ func (s *Server) admitReserved(
 		}
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
-		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
 		if qerr != nil {
 			lease.release(ctx)
 			return nil, qerr
@@ -506,7 +507,7 @@ func (s *Server) checkHostCapacityBefore(ctx context.Context, host string, cpuDe
 
 // checkProjectQuotaBefore is checkProjectQuota counting only reservations from
 // operations sorting before opID.
-func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cpuDelta, memDelta int, opID string) error {
+func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, delta corrosion.QuotaAmount, opID string) error {
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {
 		return status.Errorf(codes.Internal, "get project quota: %v", err)
@@ -518,19 +519,38 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project usage: %v", err)
 	}
-	_, _, rCPU, rMem, err := corrosion.ReservedBefore(ctx, s.db, "", project, opID)
+	r, err := corrosion.ProjectReservedBefore(ctx, s.db, project, opID)
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project reservations: %v", err)
 	}
-	if q.VCPULimit > 0 && u.VCPUUsed+rCPU+cpuDelta > q.VCPULimit {
-		return status.Errorf(codes.ResourceExhausted,
-			"project %q vCPU quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.VCPUUsed, rCPU, cpuDelta, q.VCPULimit)
-	}
-	if q.MemMiBLimit > 0 && u.MemMiBUsed+rMem+memDelta > q.MemMiBLimit {
-		return status.Errorf(codes.ResourceExhausted,
-			"project %q memory quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.MemMiBUsed, rMem, memDelta, q.MemMiBLimit)
+	return quotaVerdict(project, q, corrosion.QuotaAmount{
+		VCPU: u.VCPUUsed, MemMiB: u.MemMiBUsed, DiskGiB: u.DiskGiBUsed, NIC: u.NICUsed,
+	}, r, delta)
+}
+
+// quotaVerdict is the one comparison both serialized quota checks make:
+// committed usage + the reservations this admission must yield to + what it is
+// asking for, against the limit, in EVERY dimension the quota bounds.
+//
+// Sharing it is the point. Disk and NIC were previously enforced by a separate
+// unserialized read that could not see an in-flight claim, so the four
+// dimensions were decided under two different rules and only two of them were
+// race-free. A zero limit is unbounded, exactly as CheckProjectQuota reads it.
+func quotaVerdict(project string, q *corrosion.ProjectQuotaRecord, used, reserved, delta corrosion.QuotaAmount) error {
+	for _, d := range []struct {
+		name                    string
+		limit, used, res, delta int
+	}{
+		{"vCPU", q.VCPULimit, used.VCPU, reserved.VCPU, delta.VCPU},
+		{"memory", q.MemMiBLimit, used.MemMiB, reserved.MemMiB, delta.MemMiB},
+		{"disk GiB", q.DiskGiBLimit, used.DiskGiB, reserved.DiskGiB, delta.DiskGiB},
+		{"NIC", q.NICLimit, used.NIC, reserved.NIC, delta.NIC},
+	} {
+		if d.limit > 0 && d.used+d.res+d.delta > d.limit {
+			return status.Errorf(codes.ResourceExhausted,
+				"project %q %s quota exceeded (used %d + reserved %d + new %d > limit %d)",
+				project, d.name, d.used, d.res, d.delta, d.limit)
+		}
 	}
 	return nil
 }
@@ -549,21 +569,29 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 //   - a grow of an already-STOPPED VM: its spec counts toward SumProjectUsage but
 //     it contributes nothing to host usage until StartVM admits the full size.
 //
+// delta is what the admission ASKS FOR and want is the ABSOLUTE size the
+// workload will contribute once committed (equal for a create, larger than the
+// delta for a grow). Both carry all four quota dimensions: disk and NIC are
+// tenancy limits with no host analogue, and reserving them here is what makes
+// them race-free — an unserialized read of committed usage cannot see a
+// concurrent request's claim, so two creates each fitting the remaining disk (or
+// NIC) budget both passed and both committed.
+//
 // The returned lease carries the commit fence like any other quota grant.
 func (s *Server) admitQuotaWithReservation(
-	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int, intent admissionIntent,
+	ctx context.Context, method, host, project, kind, name string, delta, want corrosion.QuotaAmount, intent admissionIntent,
 ) (*reservationLease, error) {
 	// Safety before the zero-delta fast path, same as admitReserved. The quota
 	// figures never carry vmOverhead — it is a host-side cost — so only the
 	// residency half of the intent is consulted here.
 	if err := s.checkHostSafety(ctx, host, kind, name, intent.newResidency,
-		intent.newResidency || cpuDelta > 0 || memDelta > 0); err != nil {
+		intent.newResidency || !delta.IsZero()); err != nil {
 		return nil, err
 	}
-	if cpuDelta <= 0 && memDelta <= 0 {
+	if delta.IsZero() {
 		return &reservationLease{}, nil
 	}
-	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, Want: want}
 	tag := "vm"
 	if kind == corrosion.WorkloadContainer {
 		tag = "ct"
@@ -572,7 +600,7 @@ func (s *Server) admitQuotaWithReservation(
 
 	if s.projectAuthorityActive(ctx) {
 		lease := &reservationLease{s: s}
-		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, delta)
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -584,9 +612,11 @@ func (s *Server) admitQuotaWithReservation(
 	// Pre-delegation: a local reservation carrying quota figures only, verified
 	// reserve-then-verify like every other admission.
 	rv := corrosion.ReservationVector{
-		Project: project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
+		Project: project, ProjectCPU: delta.VCPU, ProjectMemMiB: delta.MemMiB,
+		ProjectDiskGiB: delta.DiskGiB, ProjectNIC: delta.NIC,
 		Workload: name, WorkloadKind: kind, WorkloadHost: host,
-		WantCPU: wantCPU, WantMemMiB: wantMem,
+		WantCPU: want.VCPU, WantMemMiB: want.MemMiB,
+		WantDiskGiB: want.DiskGiB, WantNIC: want.NIC,
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -610,7 +640,7 @@ func (s *Server) admitQuotaWithReservation(
 		lease.release(ctx)
 		return nil, err
 	}
-	if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+	if err := s.checkProjectQuotaBefore(ctx, project, delta, op.ID); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}

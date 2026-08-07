@@ -286,7 +286,7 @@ func (s *Server) admitResizeReservation(
 	// the holder's usage still counted the smaller spec.
 	subject := quotaSubject{
 		Kind: corrosion.WorkloadVM, Host: vm.HostName, Name: vm.Name,
-		WantCPU: wantCPU, WantMemMiB: wantMem,
+		Want: corrosion.QuotaAmount{VCPU: wantCPU, MemMiB: wantMem},
 	}
 	rv := corrosion.ReservationVector{
 		Project:    vm.Project,
@@ -295,7 +295,7 @@ func (s *Server) admitResizeReservation(
 	if !delegated {
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
 		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
-		rv.WantCPU, rv.WantMemMiB = subject.WantCPU, subject.WantMemMiB
+		rv.WantCPU, rv.WantMemMiB = subject.Want.VCPU, subject.Want.MemMiB
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -327,14 +327,14 @@ func (s *Server) admitResizeReservation(
 	}
 
 	if !delegated {
-		if err := s.checkProjectQuotaBefore(ctx, vm.Project, cpuDelta, memDelta, op.ID); err != nil {
+		if err := s.checkProjectQuotaBefore(ctx, vm.Project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
 			lease.release(ctx)
 			return nil, err
 		}
 		return lease, nil
 	}
 
-	holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, cpuDelta, memDelta)
+	holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
 	if qerr != nil {
 		lease.release(ctx)
 		return nil, qerr

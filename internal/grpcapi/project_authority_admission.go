@@ -98,8 +98,15 @@ func (s *Server) ReserveProjectCapacity(ctx context.Context, req *pb.ReserveProj
 	// Rebuild the subject from the wire: identity (kind:name from resource_id,
 	// host) plus the absolute want. The HOLDER's op row is the one the settle rule
 	// reads, so the retire-by-observation hint must survive the delegation hop.
-	subject := subjectForCreate(req.ResourceId, req.WorkloadHost, int(req.WantCpu), int(req.WantMemMib))
-	lease, err := s.admitProjectLocal(ctx, req.Method, req.Project, req.Principal, req.ResourceId, subject, int(req.CpuDelta), int(req.MemMibDelta))
+	subject := subjectForCreate(req.ResourceId, req.WorkloadHost, corrosion.QuotaAmount{
+		VCPU: int(req.WantCpu), MemMiB: int(req.WantMemMib),
+		DiskGiB: int(req.WantDiskGib), NIC: int(req.WantNic),
+	})
+	delta := corrosion.QuotaAmount{
+		VCPU: int(req.CpuDelta), MemMiB: int(req.MemMibDelta),
+		DiskGiB: int(req.DiskGibDelta), NIC: int(req.NicDelta),
+	}
+	lease, err := s.admitProjectLocal(ctx, req.Method, req.Project, req.Principal, req.ResourceId, subject, delta)
 	if err != nil {
 		return nil, err
 	}
@@ -161,14 +168,16 @@ func (s *Server) ReleaseProjectCapacity(ctx context.Context, req *pb.ReleaseProj
 //
 // principal is the ORIGINATING end user, carried across the delegation so the
 // journal records who asked rather than which daemon relayed it.
-func (s *Server) admitProjectLocal(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, cpuDelta, memDelta int) (string, error) {
-	if cpuDelta <= 0 && memDelta <= 0 {
+func (s *Server) admitProjectLocal(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount) (string, error) {
+	if delta.IsZero() {
 		return "", nil
 	}
 	rv := corrosion.ReservationVector{
-		Project: project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
+		Project: project, ProjectCPU: delta.VCPU, ProjectMemMiB: delta.MemMiB,
+		ProjectDiskGiB: delta.DiskGiB, ProjectNIC: delta.NIC,
 		Workload: subject.Name, WorkloadKind: subject.Kind, WorkloadHost: subject.Host,
-		WantCPU: subject.WantCPU, WantMemMiB: subject.WantMemMiB,
+		WantCPU: subject.Want.VCPU, WantMemMiB: subject.Want.MemMiB,
+		WantDiskGiB: subject.Want.DiskGiB, WantNIC: subject.Want.NIC,
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -191,7 +200,7 @@ func (s *Server) admitProjectLocal(ctx context.Context, method, project, princip
 		s.releaseLocalLease(ctx, op.ID)
 		return "", err
 	}
-	if err := s.checkProjectQuotaSettling(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+	if err := s.checkProjectQuotaSettling(ctx, project, delta, op.ID); err != nil {
 		s.releaseLocalLease(ctx, op.ID)
 		return "", err
 	}
@@ -201,7 +210,7 @@ func (s *Server) admitProjectLocal(ctx context.Context, method, project, princip
 // checkProjectQuotaSettling is the quota check the AUTHORITY HOLDER makes: committed
 // usage, plus earlier in-flight claimants, plus winners whose committed row has not
 // reached this node yet (see projectAdmissionSettleGrace).
-func (s *Server) checkProjectQuotaSettling(ctx context.Context, project string, cpuDelta, memDelta int, opID string) error {
+func (s *Server) checkProjectQuotaSettling(ctx context.Context, project string, delta corrosion.QuotaAmount, opID string) error {
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {
 		return status.Errorf(codes.Internal, "get project quota: %v", err)
@@ -213,21 +222,13 @@ func (s *Server) checkProjectQuotaSettling(ctx context.Context, project string, 
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project usage: %v", err)
 	}
-	rCPU, rMem, err := corrosion.ProjectReservedSettling(ctx, s.db, project, opID, projectAdmissionSettleGrace, time.Now())
+	r, err := corrosion.ProjectReservedSettlingAmount(ctx, s.db, project, opID, projectAdmissionSettleGrace, time.Now())
 	if err != nil {
 		return status.Errorf(codes.Internal, "sum project reservations: %v", err)
 	}
-	if q.VCPULimit > 0 && u.VCPUUsed+rCPU+cpuDelta > q.VCPULimit {
-		return status.Errorf(codes.ResourceExhausted,
-			"project %q vCPU quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.VCPUUsed, rCPU, cpuDelta, q.VCPULimit)
-	}
-	if q.MemMiBLimit > 0 && u.MemMiBUsed+rMem+memDelta > q.MemMiBLimit {
-		return status.Errorf(codes.ResourceExhausted,
-			"project %q memory quota exceeded (used %d + reserved %d + new %d > limit %d)",
-			project, u.MemMiBUsed, rMem, memDelta, q.MemMiBLimit)
-	}
-	return nil
+	return quotaVerdict(project, q, corrosion.QuotaAmount{
+		VCPU: u.VCPUUsed, MemMiB: u.MemMiBUsed, DiskGiB: u.DiskGiBUsed, NIC: u.NICUsed,
+	}, r, delta)
 }
 
 // releaseLocalLease marks a local capacity lease terminal, freeing it.
@@ -246,8 +247,8 @@ func (s *Server) releaseLocalLease(ctx context.Context, id string) {
 // the authority holder when delegation is active and this node is not the holder.
 // It returns the holder it decided on and the lease held there ("" for a local or
 // no-op decision).
-func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int) (holder, leaseID string, epoch int64, err error) {
-	if cpuDelta <= 0 && memDelta <= 0 {
+func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount) (holder, leaseID string, epoch int64, err error) {
+	if delta.IsZero() {
 		return "", "", 0, nil
 	}
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
@@ -284,7 +285,7 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 		auth = corrosion.ProjectAuthority{Holder: candidate, Epoch: 1}
 	}
 	if auth.Holder == s.hostName {
-		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta)
+		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, delta)
 		return s.hostName, id, auth.Epoch, derr
 	}
 
@@ -299,14 +300,18 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 	resp, rerr := client.ReserveProjectCapacity(ctx, &pb.ReserveProjectCapacityRequest{
 		Project:        project,
 		Method:         method,
-		CpuDelta:       int32(cpuDelta),
-		MemMibDelta:    int32(memDelta),
+		CpuDelta:       int32(delta.VCPU),
+		MemMibDelta:    int32(delta.MemMiB),
+		DiskGibDelta:   int32(delta.DiskGiB),
+		NicDelta:       int32(delta.NIC),
 		AuthorityEpoch: auth.Epoch,
 		Principal:      principal,
 		ResourceId:     resourceID,
 		WorkloadHost:   subject.Host,
-		WantCpu:        int32(subject.WantCPU),
-		WantMemMib:     int32(subject.WantMemMiB),
+		WantCpu:        int32(subject.Want.VCPU),
+		WantMemMib:     int32(subject.Want.MemMiB),
+		WantDiskGib:    int32(subject.Want.DiskGiB),
+		WantNic:        int32(subject.Want.NIC),
 	})
 	if rerr != nil {
 		// A FailedPrecondition means authority moved between our read and the call.
@@ -314,7 +319,7 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 		// a spurious refusal to the user, but retrying indefinitely would turn a
 		// flapping authority into a hang.
 		if status.Code(rerr) == codes.FailedPrecondition {
-			return s.retryProjectQuotaOnce(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta, auth.Epoch)
+			return s.retryProjectQuotaOnce(ctx, method, project, principal, resourceID, subject, delta, auth.Epoch)
 		}
 		return "", "", 0, rerr
 	}
@@ -326,14 +331,14 @@ func (s *Server) admitProjectQuota(ctx context.Context, method, project, resourc
 // retryProjectQuotaOnce re-reads the authority and makes exactly one more attempt,
 // used when the first attempt raced a handoff. prevEpoch guards against retrying
 // into the same stale answer.
-func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, cpuDelta, memDelta int, prevEpoch int64) (holder, leaseID string, epoch int64, err error) {
+func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, principal, resourceID string, subject quotaSubject, delta corrosion.QuotaAmount, prevEpoch int64) (holder, leaseID string, epoch int64, err error) {
 	cur, ok, cerr := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if cerr != nil || !ok || cur.Epoch == prevEpoch {
 		return "", "", 0, status.Errorf(codes.Unavailable,
 			"project %q admission authority moved while admitting; retry", project)
 	}
 	if cur.Holder == s.hostName {
-		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, cpuDelta, memDelta)
+		id, derr := s.admitProjectLocal(ctx, method, project, principal, resourceID, subject, delta)
 		return s.hostName, id, cur.Epoch, derr
 	}
 	client, conn, derr := s.peerClient(ctx, cur.Holder)
@@ -345,14 +350,18 @@ func (s *Server) retryProjectQuotaOnce(ctx context.Context, method, project, pri
 	resp, rerr := client.ReserveProjectCapacity(ctx, &pb.ReserveProjectCapacityRequest{
 		Project:        project,
 		Method:         method,
-		CpuDelta:       int32(cpuDelta),
-		MemMibDelta:    int32(memDelta),
+		CpuDelta:       int32(delta.VCPU),
+		MemMibDelta:    int32(delta.MemMiB),
+		DiskGibDelta:   int32(delta.DiskGiB),
+		NicDelta:       int32(delta.NIC),
 		AuthorityEpoch: cur.Epoch,
 		Principal:      principal,
 		ResourceId:     resourceID,
 		WorkloadHost:   subject.Host,
-		WantCpu:        int32(subject.WantCPU),
-		WantMemMib:     int32(subject.WantMemMiB),
+		WantCpu:        int32(subject.Want.VCPU),
+		WantMemMib:     int32(subject.Want.MemMiB),
+		WantDiskGib:    int32(subject.Want.DiskGiB),
+		WantNic:        int32(subject.Want.NIC),
 	})
 	if rerr != nil {
 		return "", "", 0, rerr

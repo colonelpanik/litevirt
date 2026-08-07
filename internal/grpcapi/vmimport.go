@@ -161,12 +161,20 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
-	// Reserve-then-verify admission for cpu/mem, with residency safety and the
-	// commit fence — the same contract every other path that lands a VM
-	// carries. admitImport above stays as the read-only fail-fast (and the only
-	// check covering disk/NIC quota), but a glance cannot see in-flight
-	// reservations, holds nothing across the commit below, and never consulted
-	// host capacity or host safety at all.
+	// Reserve-then-verify admission across ALL FOUR quota dimensions, with
+	// residency safety and the commit fence — the same contract every other path
+	// that lands a VM carries. admitImport above stays as the cheap pre-convert
+	// fail-fast, but a glance cannot see in-flight reservations, holds nothing
+	// across the commit below, and never consulted host capacity or host safety
+	// at all.
+	//
+	// Disk and NIC are reserved here rather than left to that glance. Leaving
+	// them there made those two limits enforceable one request at a time: two
+	// imports (or an import racing a create) each read a view without the
+	// other's claim, each fit the remaining disk or NIC budget, and both
+	// committed — over the limit, with neither request having done anything
+	// wrong. The converted sizes are authoritative by this point, so the
+	// reservation charges what the row will actually contribute.
 	//
 	// Quota is charged for stopped AND started imports alike — the row written
 	// below counts toward project usage the moment it lands. HOST capacity and
@@ -176,8 +184,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if first.Start {
 		importIntent = intentVMResident
 	}
+	// A create's absolute contribution IS its delta — the VM does not exist yet.
+	importAmount := importQuotaAmount(fv)
 	importQuotaLease, qerr := s.admitQuotaWithReservation(ctx, "ImportVM", s.hostName, project,
-		corrosion.WorkloadVM, name, fv.CPUs, fv.MemoryMiB, fv.CPUs, fv.MemoryMiB, importIntent)
+		corrosion.WorkloadVM, name, importAmount, importAmount, importIntent)
 	if qerr != nil {
 		cleanupDisks()
 		return qerr
@@ -566,14 +576,24 @@ func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM,
 	return nil
 }
 
-func (s *Server) admitImport(ctx context.Context, project string, fv *vmimport.ForeignVM) error {
+// importQuotaAmount is what an import will charge the project, in every
+// dimension the quota bounds. One derivation feeds BOTH the cheap pre-convert
+// fail-fast and the serialized reservation, so the two can never disagree about
+// what the import costs. Disk sizes round UP per disk: a partial GiB still
+// occupies one.
+func importQuotaAmount(fv *vmimport.ForeignVM) corrosion.QuotaAmount {
 	diskGiB := 0
 	for _, d := range fv.Disks {
 		if !d.IsCDROM {
 			diskGiB += int((d.CapacityBytes + (1 << 30) - 1) >> 30)
 		}
 	}
-	qreq := tenancy.QuotaRequest{VCPU: fv.CPUs, MemMiB: fv.MemoryMiB, DiskGiB: diskGiB, NIC: len(fv.NICs)}
+	return corrosion.QuotaAmount{VCPU: fv.CPUs, MemMiB: fv.MemoryMiB, DiskGiB: diskGiB, NIC: len(fv.NICs)}
+}
+
+func (s *Server) admitImport(ctx context.Context, project string, fv *vmimport.ForeignVM) error {
+	amt := importQuotaAmount(fv)
+	qreq := tenancy.QuotaRequest{VCPU: amt.VCPU, MemMiB: amt.MemMiB, DiskGiB: amt.DiskGiB, NIC: amt.NIC}
 	if s.tenancy != nil {
 		if err := s.tenancy.Admit(ctx, project, qreq); err != nil {
 			return status.Errorf(codes.ResourceExhausted, "%v", err)

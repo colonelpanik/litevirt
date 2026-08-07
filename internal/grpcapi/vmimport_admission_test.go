@@ -74,7 +74,8 @@ func stubQemuImg(t *testing.T) {
 
 // importSmallVM runs a full ImportVM of a one-disk Proxmox conf whose disk is
 // mapped to a tiny local raw file, and returns the terminal error.
-func importSmallVM(t *testing.T, s *Server, name, project string, memMiB int, start bool) error {
+// extraConf lines are appended to the generated .conf (e.g. a net0 interface).
+func importSmallVM(t *testing.T, s *Server, name, project string, memMiB int, start bool, extraConf ...string) error {
 	t.Helper()
 	stubQemuImg(t)
 	raw := t.TempDir() + "/disk0.raw"
@@ -82,6 +83,9 @@ func importSmallVM(t *testing.T, s *Server, name, project string, memMiB int, st
 		t.Fatalf("write staged disk: %v", err)
 	}
 	conf := fmt.Sprintf("name: %s\ncores: 1\nmemory: %d\nscsi0: local-lvm:%s-disk-0,size=1G\n", name, memMiB, name)
+	for _, line := range extraConf {
+		conf += line + "\n"
+	}
 	st := &fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{{
 		Name: name, SourceFormat: "proxmox", Project: project, Start: start,
 		Chunk: []byte(conf), DiskMap: map[string]string{"scsi0": raw},
@@ -168,6 +172,108 @@ func TestImportVM_QuotaReserved_NotJustChecked(t *testing.T) {
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("import of 1024 MiB with 512 already reserved of a 1024 quota: got %v, "+
 			"want ResourceExhausted — the estimate must be a reservation, not a glance", err)
+	}
+}
+
+// plantQuotaReservation plants a nonterminal PROJECT-quota reservation holding
+// an arbitrary QuotaAmount — the in-flight claimant a racing admission must
+// yield to. Unlike plantReservation it charges no host capacity, so a test can
+// isolate a single quota dimension.
+func plantQuotaReservation(t *testing.T, s *Server, id, project string, amt corrosion.QuotaAmount) {
+	t.Helper()
+	rv := corrosion.ReservationVector{
+		Project: project, ProjectCPU: amt.VCPU, ProjectMemMiB: amt.MemMiB,
+		ProjectDiskGiB: amt.DiskGiB, ProjectNIC: amt.NIC,
+	}
+	enc, err := rv.Encode()
+	if err != nil {
+		t.Fatalf("encode reservation: %v", err)
+	}
+	if err := corrosion.InsertOperation(context.Background(), s.db, corrosion.OperationRecord{
+		ID: id, Method: "CreateVM", Project: project, ResourceKind: "capacity",
+		OperationKind: string(corrosion.OpResourceUpdateRunning), ReservationJSON: enc,
+	}); err != nil {
+		t.Fatalf("plant reservation %s: %v", id, err)
+	}
+}
+
+// quotaProject seeds a project with the given limits (0 = unbounded), so a test
+// can bind exactly one quota dimension.
+func quotaProject(t *testing.T, s *Server, name string, q corrosion.ProjectQuotaRecord) {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertProject(ctx, s.db, corrosion.ProjectRecord{Name: name}); err != nil {
+		t.Fatalf("InsertProject: %v", err)
+	}
+	q.ProjectName = name
+	if err := corrosion.UpsertProjectQuota(ctx, s.db, q); err != nil {
+		t.Fatalf("UpsertProjectQuota: %v", err)
+	}
+}
+
+// TestImportVM_DiskQuotaReserved_NotJustChecked: the DISK dimension goes through
+// the same serialized reservation as cpu/mem. It used to be covered only by the
+// read-only pre-convert estimate, which cannot see an in-flight claim — so two
+// concurrent imports each saw the full remaining disk budget, each fit, and both
+// committed over the project's limit.
+func TestImportVM_DiskQuotaReserved_NotJustChecked(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	s.virt = libvirtfake.New()
+	// Disk is the only bounded dimension, so nothing else can explain a refusal.
+	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{DiskGiBLimit: 2})
+
+	// An earlier in-flight claimant holds 2 of the 2 GiB. Committed usage is
+	// still zero, so the unserialized estimate sees the whole budget free.
+	plantQuotaReservation(t, s, "00000000-earlier", "acme", corrosion.QuotaAmount{DiskGiB: 2})
+
+	err := importSmallVM(t, s, "imp-disk", "acme", 512, false)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("import of a 1 GiB disk with 2 of a 2 GiB disk quota already reserved: got %v, "+
+			"want ResourceExhausted — disk must participate in the reservation, not a glance", err)
+	}
+	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-disk"); rec != nil {
+		t.Fatalf("refused import still persisted a row: %+v", rec)
+	}
+}
+
+// TestImportVM_NICQuotaReserved_NotJustChecked is the disk test's sibling for
+// the other dimension the reservation used to omit.
+func TestImportVM_NICQuotaReserved_NotJustChecked(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	s.virt = libvirtfake.New()
+	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{NICLimit: 1})
+	plantQuotaReservation(t, s, "00000000-earlier", "acme", corrosion.QuotaAmount{NIC: 1})
+
+	err := importSmallVM(t, s, "imp-nic", "acme", 512, false,
+		"net0: virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0")
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("import of a 1-NIC VM with the whole 1-NIC quota already reserved: got %v, "+
+			"want ResourceExhausted — NICs must participate in the reservation", err)
+	}
+	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-nic"); rec != nil {
+		t.Fatalf("refused import still persisted a row: %+v", rec)
+	}
+}
+
+// TestImportVM_DiskQuotaAdmitsWhenItFits guards the other direction: the new
+// dimensions must not refuse an import that genuinely fits.
+func TestImportVM_DiskQuotaAdmitsWhenItFits(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	s.virt = libvirtfake.New()
+	quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{DiskGiBLimit: 2, NICLimit: 2})
+
+	if err := importSmallVM(t, s, "imp-fits", "acme", 512, false,
+		"net0: virtio=AA:BB:CC:DD:EE:02,bridge=vmbr0"); err != nil {
+		t.Fatalf("import of a 1 GiB / 1 NIC VM into a 2 GiB / 2 NIC quota: %v", err)
+	}
+	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-fits"); rec == nil {
+		t.Fatal("import that fits its quota did not persist a row")
 	}
 }
 

@@ -150,11 +150,15 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		}
 		defer lease.release(ctx)
 	}
-	if src.CPULimit > 0 || src.MemMiB > 0 {
+	// The clone rebuilds the source's MANAGED NICs (below), and those rows count
+	// toward the project's NIC budget — so the charge includes them, derived from
+	// the same spec the rebuild reads.
+	if cloneQuota := (corrosion.QuotaAmount{
+		VCPU: src.CPULimit, MemMiB: src.MemMiB,
+		NIC: managedNICCount(corrosion.DecodeCreateSpec(src.CreateSpec)),
+	}); !cloneQuota.IsZero() {
 		lease, aerr := s.admitQuotaWithReservation(ctx, "CloneContainer", s.hostName, project,
-			corrosion.WorkloadContainer, req.Target,
-			corrosion.QuotaAmount{VCPU: src.CPULimit, MemMiB: src.MemMiB},
-			corrosion.QuotaAmount{VCPU: src.CPULimit, MemMiB: src.MemMiB}, intentContainerResident)
+			corrosion.WorkloadContainer, req.Target, cloneQuota, cloneQuota, intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}

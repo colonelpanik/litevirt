@@ -748,11 +748,17 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			}
 			defer lease.release(ctx)
 		}
-		if !relocation && (spec.CPULimit > 0 || spec.MemMiB > 0) {
+		// The restore rebuilds the archived spec's MANAGED NICs into
+		// container_interfaces rows, which the project's NIC budget counts — so
+		// the charge includes them, from the same spec the rebuild reads. A
+		// RELOCATION still charges nothing: the workload is moving, not new.
+		restoreQuota := corrosion.QuotaAmount{
+			VCPU: spec.CPULimit, MemMiB: spec.MemMiB,
+			NIC: managedNICCount(corrosion.DecodeCreateSpec(spec.CreateSpec)),
+		}
+		if !relocation && !restoreQuota.IsZero() {
 			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
-				corrosion.WorkloadContainer, req.Name,
-				corrosion.QuotaAmount{VCPU: spec.CPULimit, MemMiB: spec.MemMiB},
-				corrosion.QuotaAmount{VCPU: spec.CPULimit, MemMiB: spec.MemMiB}, intentContainerResident)
+				corrosion.WorkloadContainer, req.Name, restoreQuota, restoreQuota, intentContainerResident)
 			if aerr != nil {
 				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
 				return aerr

@@ -164,27 +164,42 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		defer lease.release(ctx)
 	}
-	if req.Cpu > 0 || req.MemoryMib > 0 {
-		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
-			corrosion.WorkloadContainer, req.Name,
-			corrosion.QuotaAmount{VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib)},
-			corrosion.QuotaAmount{VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib)}, intentContainerResident)
-		if aerr != nil {
-			return nil, aerr
-		}
-		defer lease.release(ctx)
-		ctLease = lease
-	}
 
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
 	// container's leases (s.releaseContainerNICs) to undo partial allocation.
+	//
+	// This runs BEFORE the quota reservation, and the order is load-bearing: only
+	// a MANAGED NIC becomes a container_interfaces row, and only those rows count
+	// toward the project's NIC budget. Charging len(req.Networks) up front would
+	// refuse creates for raw-bridge attachments that contribute nothing, so the
+	// charge waits until the persisted set is known. Residency safety is already
+	// settled by the host admission above, so nothing unsafe has been done by the
+	// time we get here, and a refusal below unwinds the allocation.
 	plan, err := s.resolveContainerNICs(ctx, req.Project, req.Name, req.Networks)
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name) // undo any leases taken before the error
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, err
+	}
+
+	// PROJECT quota — cpu, memory and the NICs about to be persisted. The NIC
+	// charge was missing entirely: SumProjectUsage counts container_interfaces
+	// rows against the project's NIC budget, so a container could walk straight
+	// past the limit without any concurrency at all.
+	if ctQuota := (corrosion.QuotaAmount{
+		VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib), NIC: len(plan.ifaces),
+	}); !ctQuota.IsZero() {
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
+			corrosion.WorkloadContainer, req.Name, ctQuota, ctQuota, intentContainerResident)
+		if aerr != nil {
+			_ = s.releaseContainerNICs(ctx, req.Name)
+			s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		ctLease = lease
 	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,

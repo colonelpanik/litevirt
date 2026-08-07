@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -579,14 +580,22 @@ func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM,
 // importQuotaAmount is what an import will charge the project, in every
 // dimension the quota bounds. One derivation feeds BOTH the cheap pre-convert
 // fail-fast and the serialized reservation, so the two can never disagree about
-// what the import costs. Disk sizes round UP per disk: a partial GiB still
-// occupies one.
+// what the import costs. Disk goes through corrosion.DiskQuotaGiB, the same rule
+// committed usage and the settle contribution use, so the charge is a number the
+// accounting can actually observe as paid.
 func importQuotaAmount(fv *vmimport.ForeignVM) corrosion.QuotaAmount {
 	diskGiB := 0
 	for _, d := range fv.Disks {
-		if !d.IsCDROM {
-			diskGiB += int((d.CapacityBytes + (1 << 30) - 1) >> 30)
+		if d.IsCDROM {
+			continue
 		}
+		// A parsed foreign descriptor is untrusted input; clamp rather than let
+		// an absurd declared size wrap negative and charge nothing.
+		size := d.CapacityBytes
+		if size > math.MaxInt64 {
+			size = math.MaxInt64
+		}
+		diskGiB += corrosion.DiskQuotaGiB(int64(size))
 	}
 	return corrosion.QuotaAmount{VCPU: fv.CPUs, MemMiB: fv.MemoryMiB, DiskGiB: diskGiB, NIC: len(fv.NICs)}
 }

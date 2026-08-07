@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -257,14 +258,13 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 	}
 
 	diskRows, err := c.Query(ctx,
-		`SELECT COALESCE(SUM(vm_disks.size_bytes), 0) AS bytes
+		`SELECT `+quotaDiskGiBSum("vm_disks.size_bytes")+` AS gib
 		 FROM vm_disks
 		 JOIN vms ON vm_disks.vm_name = vms.name
 		 WHERE vms.project = ? AND vms.deleted_at IS NULL AND vm_disks.deleted_at IS NULL`,
 		name)
 	if err == nil && len(diskRows) > 0 {
-		bytes := diskRows[0].Int64("bytes")
-		u.DiskGiBUsed = int(bytes / (1 << 30))
+		u.DiskGiBUsed = diskRows[0].Int("gib")
 	}
 
 	// NIC count + public-IP count from the same interface set. Public-IP
@@ -370,6 +370,39 @@ type QuotaCheck struct {
 	MemMiB  int
 	DiskGiB int
 	NIC     int
+}
+
+// bytesPerGiB is the quota accounting unit for disk.
+const bytesPerGiB = 1 << 30
+
+// DiskQuotaGiB is THE bytes→GiB rule for project disk quota: each disk rounds
+// UP, so a partial GiB occupies a whole one.
+//
+// Every site that measures disk against the quota must use it — admission, the
+// committed-usage sum, and the per-workload contribution the settle rule reads.
+// They diverged once: admission rounded up while usage truncated the summed
+// bytes, so a 512 MiB disk was charged 1 GiB and counted 0. The charge could
+// never be observed as paid, so its lease rode out the whole settle grace and
+// then freed a GiB that committed usage had never picked up — double-counted
+// first, uncounted after.
+func DiskQuotaGiB(sizeBytes int64) int {
+	if sizeBytes <= 0 {
+		return 0
+	}
+	// Divide first, then carry the remainder: adding bytesPerGiB-1 up front
+	// overflows int64 for a size near the maximum.
+	gib := sizeBytes / bytesPerGiB
+	if sizeBytes%bytesPerGiB != 0 {
+		gib++
+	}
+	return int(gib)
+}
+
+// quotaDiskGiBSum is DiskQuotaGiB as a SQL aggregate over col — the round-up
+// applies PER ROW, then sums, so it matches DiskQuotaGiB applied per disk.
+// Rounding after the sum would be a different (and smaller) number.
+func quotaDiskGiBSum(col string) string {
+	return "COALESCE(SUM((" + col + " + " + strconv.Itoa(bytesPerGiB-1) + ") / " + strconv.Itoa(bytesPerGiB) + "), 0)"
 }
 
 // QuotaAmount is an amount of project quota in EVERY dimension a project quota
@@ -515,16 +548,17 @@ func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, ho
 		}
 		amt := QuotaAmount{VCPU: rows[0].Int("cpu"), MemMiB: rows[0].Int("mem")}
 		diskRows, err := c.Query(ctx,
-			`SELECT COALESCE(SUM(size_bytes),0) AS bytes FROM vm_disks
+			`SELECT `+quotaDiskGiBSum("size_bytes")+` AS gib FROM vm_disks
 			 WHERE vm_name = ? AND deleted_at IS NULL`, workload)
 		if err != nil {
 			return QuotaAmount{}, false, err
 		}
 		if len(diskRows) > 0 {
-			// Truncating division, exactly as SumProjectUsage totals disk usage —
-			// a contribution measured differently from the usage it is compared
-			// against would retire a charge the quota check still counts.
-			amt.DiskGiB = int(diskRows[0].Int64("bytes") / (1 << 30))
+			// Measured by the SAME rule as the usage this contribution is compared
+			// against — a contribution counted differently from the charge could
+			// never be observed as paid, so the lease would ride out its whole
+			// grace and then free a charge usage had never picked up.
+			amt.DiskGiB = diskRows[0].Int("gib")
 		}
 		nicRows, err := c.Query(ctx,
 			`SELECT COUNT(*) AS n FROM vm_interfaces

@@ -157,9 +157,8 @@ func ProjectReservedSettlingAmount(ctx context.Context, c *Client, project, opID
 // replicate ahead of its vm_disks / vm_interfaces rows, and settling on cpu/mem
 // alone would retire the disk and NIC charge while committed usage still counts
 // neither — under-admitting nothing, over-admitting exactly those two dimensions.
-// When a disk want was rounded UP to whole GiB and the committed bytes truncate
-// down, the comparison simply does not settle and the lease is held for the rest
-// of the grace: conservative in the safe direction.
+// Disk is measured by corrosion.DiskQuotaGiB on both sides, so a charge made at
+// admission is a number the contribution can actually reach.
 //
 // A lease that recorded no workload identity falls back to the presence of the
 // resource named by resource_id — the pre-identity behavior, correct for creates.

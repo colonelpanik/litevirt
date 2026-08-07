@@ -17,8 +17,10 @@ import (
 // fakeCTDeletePeer records DeleteContainer forwards.
 type fakeCTDeletePeer struct {
 	pb.LiteVirtClient
-	mu    sync.Mutex
-	calls []*pb.DeleteContainerRequest
+	mu         sync.Mutex
+	calls      []*pb.DeleteContainerRequest
+	startCalls []*pb.StartContainerRequest
+	stopCalls  []*pb.StopContainerRequest
 }
 
 func (f *fakeCTDeletePeer) DeleteContainer(_ context.Context, req *pb.DeleteContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -73,5 +75,71 @@ func TestDeleteContainer_HostlessResolvesTheOwner(t *testing.T) {
 	// documented retry-safety exception for failover/relocation re-issues).
 	if _, err := s.DeleteContainer(adminCtx(), &pb.DeleteContainerRequest{Name: "no-such-ct", HostName: s.hostName}); err != nil {
 		t.Fatalf("explicit-host delete of an absent container: %v — retry idempotency must be preserved", err)
+	}
+}
+
+func (f *fakeCTDeletePeer) StartContainer(_ context.Context, req *pb.StartContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCalls = append(f.startCalls, req)
+	return &emptypb.Empty{}, nil
+}
+
+func (f *fakeCTDeletePeer) StopContainer(_ context.Context, req *pb.StopContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, req)
+	return &emptypb.Empty{}, nil
+}
+
+// TestStartStopContainer_HostlessResolvesTheOwner: start and stop get the same
+// owner resolution as delete. They failed LOUDLY without --host from a
+// non-owning node ("not found on host <local>") — an inconvenience rather than
+// delete's silent no-op, but the same wrong shape: the daemon knows exactly
+// where the container lives. A name that exists nowhere is NotFound; the
+// explicit-host form is unchanged.
+func TestStartStopContainer_HostlessResolvesTheOwner(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	fake := &fakeCTDeletePeer{}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return fake, func() {}, nil
+	}
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "other-host", Name: "wanderer", State: "stopped", Project: "proj",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "wanderer"}); err != nil {
+		t.Fatalf("host-less start of a container owned elsewhere: %v", err)
+	}
+	if _, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "wanderer", TimeoutSec: 7}); err != nil {
+		t.Fatalf("host-less stop of a container owned elsewhere: %v", err)
+	}
+	fake.mu.Lock()
+	nStart, nStop := len(fake.startCalls), len(fake.stopCalls)
+	var gotStart *pb.StartContainerRequest
+	var gotStop *pb.StopContainerRequest
+	if nStart > 0 {
+		gotStart = fake.startCalls[0]
+	}
+	if nStop > 0 {
+		gotStop = fake.stopCalls[0]
+	}
+	fake.mu.Unlock()
+	if nStart != 1 || gotStart.HostName != "other-host" || gotStart.Name != "wanderer" {
+		t.Fatalf("start forwarded %d times (last %+v), want one forward to other-host", nStart, gotStart)
+	}
+	if nStop != 1 || gotStop.HostName != "other-host" || gotStop.Name != "wanderer" || gotStop.TimeoutSec != 7 {
+		t.Fatalf("stop forwarded %d times (last %+v), want one forward to other-host with TimeoutSec 7", nStop, gotStop)
+	}
+
+	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "no-such-ct"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("host-less start of a nonexistent container: got %v, want NotFound", err)
+	}
+	if _, err := s.StopContainer(adminCtx(), &pb.StopContainerRequest{Name: "no-such-ct"}); status.Code(err) != codes.NotFound {
+		t.Fatalf("host-less stop of a nonexistent container: got %v, want NotFound", err)
 	}
 }

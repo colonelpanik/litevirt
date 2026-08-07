@@ -255,8 +255,20 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.StartContainer(ctx, req)
+	// Resolve the OWNER when no host was named (same shape as DeleteContainer):
+	// the daemon knows exactly where the container lives, so a host-less start
+	// from a non-owning node forwards there instead of failing "not found on
+	// host <local>". A name that exists nowhere is NotFound.
+	startHost := req.HostName
+	if startHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		startHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, startHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.StartContainer(ctx, &pb.StartContainerRequest{Name: req.Name, HostName: startHost})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -331,8 +343,17 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.StopContainer(ctx, req)
+	// Owner resolution, same as StartContainer/DeleteContainer.
+	stopHost := req.HostName
+	if stopHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		stopHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, stopHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.StopContainer(ctx, &pb.StopContainerRequest{Name: req.Name, HostName: stopHost, TimeoutSec: req.TimeoutSec})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}

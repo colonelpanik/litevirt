@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -19,14 +20,47 @@ import (
 // silently swap out an old compatibility shape for an equal-sized replacement. Update it only
 // with a deliberate, reviewed compatibility change (e.g. a release ages out of the horizon).
 //
-// Updated for v43 (per-host capacity policy): InsertHost AND the fixed-shape
-// ConfigureHost UPDATE each gained four capacity columns, so the tree stopped
-// emitting the prior release's narrower shapes. Both old shapes were ADDED to the
-// historical families (insert_host_v130, configure_host_fixed_v130) rather than
-// dropped — a prior-release peer still emits them, and an upgraded receiver that no
-// longer recognised them would back-pressure valid statements and stall that peer's
-// stream. This digest change is those additions; no existing shape's identity changed.
-const compatibilityDigest = "ca716aa29983ccb82fe3beb7175398319218d48af082ccfc38952bfef02860a1"
+// Updated for v44 (workload lifecycle + scoped notification routing): the
+// containers upsert/re-key and notification-route insert gained additive columns.
+// Their v1.3.0 shapes were ADDED to the historical families rather than dropped,
+// so supported peers and retained WAL continue to apply. No existing historical
+// identity was removed or changed. The immediate schema-v43 InsertHost shape was
+// subsequently added after v44 appended capacity_policy_hash. The authority-
+// fenced workload writers also retain their immediately preceding VM insert and
+// VM/container delete shapes for rolling upgrades and retained WAL, including
+// the strict live-container tombstone emitted by DeleteContainerStrict.
+//
+// Updated again when ClaimInitialProjectAuthority stopped minting the literal
+// epoch 1 (it now binds the epoch so it can mint above a project's retired
+// epochs). The schema-v41 literal shape was ADDED as claim_project_authority_v41,
+// not dropped, so a peer on the older shape still applies. No existing historical
+// identity was removed or changed.
+//
+// Updated again for v45 (audit tamper-evidence). The audit_log INSERT gained
+// key_id/signature/seq, and the hash-chain reseal UPDATE gained a
+// `signature IS NULL OR signature = ”` guard so it can never rewrite a signed
+// row — the guard lives in the SQL because that statement applies verbatim by
+// primary key on every peer, and without it a tampering node's reseal would
+// replicate over everyone else's good copies. Both pre-v45 shapes were ADDED as
+// audit_log_insert_v44 / audit_reseal_v44 rather than dropped. No existing
+// historical identity was removed or changed.
+//
+// Updated once more to move audit_reseal_v44 from DispFullPKUpdateNoClock to
+// DispAuditReseal. The v45 reasoning above was wrong on one point, and it is the
+// point that mattered: the retained pre-v45 reseal has NO signature predicate,
+// and DispFullPKUpdateNoClock applies a statement verbatim by primary key. A
+// node that rewrote its own signed rows could therefore emit the legacy shape
+// and have every peer overwrite its good content_hash — the guard that was added
+// to the v45 shape was bypassable by simply sending the older one. The shape
+// stays accepted, and its identity is otherwise unchanged; DispAuditReseal makes
+// the receiver execute the GUARDED form regardless of which shape arrived, so a
+// legacy sender still works and a signed row is unreachable by any reseal.
+//
+// Updated for the upstream #126 merge: its five durable quota-reservation SQL
+// shapes are receive-only on this integration line and were added as the
+// quota_reservations_upstream_v44 family. No previously accepted historical
+// identity was removed or changed.
+const compatibilityDigest = "23dbf172dc6f828aebf4cd8815412923e6852e685e9f95e2ad336e65eef75c73"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -66,14 +100,27 @@ func TestCompatibilityDigestFrozen(t *testing.T) {
 // upgrade/WAL-retention horizon (a deliberate act). Counts are the raw HistoricalShapes
 // expansion (before dedup against the current ledger).
 var supportedReleaseFamilyManifest = map[string]int{
-	"configure_host_v130":          127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
-	"stack_firewall_teardown_v130": 4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
-	"vm_rename_v130":               3,   // vm_interfaces / vm_disks / ip_allocations
-	"network_rename_v130":          3,   // network_vteps / ip_allocations / vm_interfaces
-	"vm_disks_insert_v130":         1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
-	"insert_host_v130":             1,   // pre-capacity-policy hosts insert (narrower column list)
-	"configure_host_fixed_v130":    1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
-	"pci_release_by_vm_v130":       1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"configure_host_v130":                   127, // 2^7-1 non-empty subsets of the 7 ConfigureHost fields
+	"stack_firewall_teardown_v130":          4,   // ip_sets / cluster_firewall_rules / host_firewall_rules / firewall_defaults
+	"vm_rename_v130":                        3,   // vm_interfaces / vm_disks / ip_allocations
+	"network_rename_v130":                   3,   // network_vteps / ip_allocations / vm_interfaces
+	"vm_disks_insert_v130":                  1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"insert_host_v130":                      1,   // pre-capacity-policy hosts insert (narrower column list)
+	"insert_host_v43":                       1,   // capacity overrides present, before v44 capacity-policy fingerprint
+	"configure_host_fixed_v130":             1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
+	"quota_reservations_upstream_v44":       5,   // upstream #126 durable reservation statements, receive-only on this line
+	"containers_upsert_v130":                1,   // pre-v44 container upsert without lifecycle fencing columns
+	"containers_rekey_v130":                 1,   // pre-v44 container re-key without lifecycle fencing columns
+	"notification_routes_insert_v130":       1,   // pre-v44 route insert without subject/project selectors
+	"insert_vm_pre_authority":               1,   // VM insert before owner/generation columns were carried
+	"delete_vm_pre_authority":               1,   // VM tombstone before authority guard columns
+	"delete_container_pre_authority":        1,   // container tombstone before authority guard columns
+	"delete_container_strict_pre_authority": 1,   // strict live-container tombstone before authority guard columns
+	"pci_release_by_vm_v130":                1,   // pre-branch cluster-wide clear of a VM's PCI ownership by vm_name
+	"claim_project_authority_v41":           1,   // initial authority claim when the epoch was the literal 1
+	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
+	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
+	"complete_vm_start_pre_epoch_v47":       1,   // reschedule completion before the Phase 4 owner-epoch mint
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.
@@ -295,4 +342,70 @@ func TestHistoricalLedgerKeepsFixedConfigureHostShape(t *testing.T) {
 	// so a typo in the registered entry cannot self-certify — the package's
 	// established shape-retention pattern (see release_corpus_test.go).
 	mustResolve(t, "pre-v43 fixed ConfigureHost", oldSQL)
+}
+
+func TestHistoricalLedgerKeepsV43InsertHostShapeAndReceiverFields(t *testing.T) {
+	const oldSQL = `INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
+			cpu_total, mem_total, disk_total, fence_strategy, version, role,
+			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	fp, err := FingerprintSQL(oldSQL)
+	if err != nil {
+		t.Fatalf("fingerprint v43 InsertHost: %v", err)
+	}
+	const wantFingerprint = "stmtshape/v1:d383c54470d1d0692c38cdb7a55624d4ec6828dd7ff533ff5757e824f7fffd11"
+	if fp != wantFingerprint {
+		t.Fatalf("v43 InsertHost fingerprint = %q, want %q", fp, wantFingerprint)
+	}
+	if _, ok := LedgerLookup(fp); !ok {
+		t.Fatalf("v43 InsertHost shape %s is not registered", fp)
+	}
+
+	const oldTS = "1000000000000-0000-n1"
+	const newTS = "3000000000000-0000-n2"
+	c := mustTestClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts
+		 (name, address, ssh_user, cert_serial, capacity_policy_hash, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"h1", "10.0.0.1", "root", "serial", "sha256:receiver-policy",
+		"2020-01-01T00:00:00Z", oldTS); err != nil {
+		t.Fatalf("seed receiver host: %v", err)
+	}
+
+	stmts, err := json.Marshal([]Statement{{
+		SQL: oldSQL,
+		Params: []interface{}{
+			"h1", "10.0.0.2", "admin", 2222, 7444, "active", "serial-2",
+			8, 16384, 1024, "strict", "v43", "worker",
+			1.5, 1.25, 2, 1024,
+			"2020-01-01T00:00:00Z", newTS,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("marshal v43 InsertHost mutation: %v", err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	if _, err := r.ApplyRemoteMutations(ctx, []*pb.MutationEntry{{
+		Seq: 1, Hlc: newTS, Origin: "v43-peer", Stmts: string(stmts),
+	}}); err != nil {
+		t.Fatalf("v43 InsertHost historical shape must apply: %v", err)
+	}
+
+	rows, err := c.Query(ctx,
+		`SELECT address, ssh_user, cpu_overcommit, mem_overcommit,
+		        cpu_reserve, mem_reserve_mib, capacity_policy_hash
+		 FROM hosts WHERE name = ?`, "h1")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read updated receiver host: rows=%d err=%v", len(rows), err)
+	}
+	if rows[0].String("address") != "10.0.0.2" || rows[0].String("ssh_user") != "admin" ||
+		rows[0].Float("cpu_overcommit") != 1.5 || rows[0].Float("mem_overcommit") != 1.25 ||
+		rows[0].Int("cpu_reserve") != 2 || rows[0].Int("mem_reserve_mib") != 1024 ||
+		rows[0].String("capacity_policy_hash") != "sha256:receiver-policy" {
+		t.Fatalf("v43 host apply lost current or receiver-only fields: %#v", rows[0])
+	}
 }

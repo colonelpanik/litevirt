@@ -149,17 +149,18 @@
       </div>
     </div>
 
-    <!-- Active Alerts -->
+    <!-- Active conditions (durable health) -->
     <div class="section">
-      <div class="section-header"><h2>Active Alerts</h2></div>
-      {{range .Alerts}}
-      <div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
-        <span class="badge {{if eq .Level "critical"}}badge-error{{else if eq .Level "warning"}}badge-warning{{else}}badge-info{{end}}" style="font-size:10px">{{.Level}}</span>
-        <span>{{.Message}}</span>
-      </div>
-      {{else}}
-      <p style="padding:12px;color:var(--muted);font-size:13px">No active alerts</p>
-      {{end}}
+      <div class="section-header"><h2>Health Conditions{{if .Overall}} — {{.Overall}}{{end}}</h2></div>
+      {{range .Conditions}}
+  <div style="padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:8px;align-items:center">
+    <span class="badge {{if eq .Severity "critical"}}badge-error{{else if eq .Severity "warning"}}badge-warning{{else}}badge-info{{end}}" style="font-size:10px">{{.Severity}}</span>
+    <span class="badge badge-info" style="font-size:10px">{{.Lifecycle}}</span>
+    <span>{{.Code}}: {{.SubjectKind}}/{{.SubjectId}}</span>
+  </div>
+  {{else}}
+  <p style="padding:12px;color:var(--muted);font-size:13px">No active conditions</p>
+  {{end}}
     </div>
   </div>
 </div>

@@ -2026,11 +2026,11 @@ func TestExecVM_EmptyCommand(t *testing.T) {
 
 // ─── Host health with data ──────────────────────────────────────────────────
 
-func TestGetHostHealth_WithEntries(t *testing.T) {
+func TestGetClusterHealth_ConnectivityEdges(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	// Insert health entries directly via the DB.
+	// Insert connectivity rows directly via the DB (what the checker writes).
 	s.db.Execute(ctx,
 		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 		 VALUES ('node-1', 'node-2', 'healthy', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`)
@@ -2038,12 +2038,12 @@ func TestGetHostHealth_WithEntries(t *testing.T) {
 		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 		 VALUES ('node-1', 'node-3', 'suspect', 3, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')`)
 
-	resp, err := s.GetHostHealth(ctx, &emptypb.Empty{})
+	resp, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
+		t.Fatalf("GetClusterHealth: %v", err)
 	}
-	if len(resp.Entries) != 2 {
-		t.Errorf("expected 2 entries, got %d", len(resp.Entries))
+	if len(resp.GetConnectivity()) != 2 {
+		t.Errorf("expected 2 connectivity edges, got %d", len(resp.GetConnectivity()))
 	}
 }
 
@@ -3929,16 +3929,17 @@ func TestMigrateRestore_MintsRelocationProofUnderEnforcement(t *testing.T) {
 	}
 	// Enforced + gated target → mint succeeds, a relocation proof row is written.
 	s := newS(true)
-	if _, err := s.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err != nil {
+	if _, err := s.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true, 7); err != nil {
 		t.Fatalf("migrate to a gated target under enforcement must succeed (mint proof); got %v", err)
 	}
-	rows, _ := s.db.Query(ctx, `SELECT action, dest_host FROM runtime_action_proofs WHERE target_name = 'ct1'`)
-	if len(rows) != 1 || rows[0].String("action") != corrosion.ActionRelocate || rows[0].String("dest_host") != "tgt" {
+	rows, _ := s.db.Query(ctx, `SELECT action, dest_host, owner_epoch FROM runtime_action_proofs WHERE target_name = 'ct1'`)
+	if len(rows) != 1 || rows[0].String("action") != corrosion.ActionRelocate ||
+		rows[0].String("dest_host") != "tgt" || rows[0].String("owner_epoch") != "7" {
 		t.Fatalf("expected one relocation proof for ct1→tgt; got %d rows", len(rows))
 	}
 	// Enforced + UNGATED target → refused (fail closed), no proofless migrate.
 	s2 := newS(false)
-	if _, err := s2.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true); err == nil {
+	if _, err := s2.migrateRestore(ctx, "tgt", "repo", "ct1", "ts", true, 7); err == nil {
 		t.Fatal("migrate under enforcement to a target that doesn't advertise the gate must be refused")
 	}
 }

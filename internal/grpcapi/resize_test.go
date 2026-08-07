@@ -155,3 +155,42 @@ func TestSetVMMemory_PostLatch_UpdatesDesiredSpec(t *testing.T) {
 		t.Errorf("barrier not cleared: %q", vm.ActiveOperationID)
 	}
 }
+
+// TestResizeVMLive_DelegatedQuotaLeaseReleasedOnSuccess: the coordinated
+// resize's local reservation op IS the workload operation (terminated by
+// CompleteVMOperation), but the DELEGATED project-quota half is a separate
+// capacity-lease row on the authority holder that nothing else terminates. The
+// success path used to return without releasing it, so every delegated resize
+// held project quota as an earlier claimant until the stale-lease sweep aged
+// it out — refusing admissions that genuinely fit for the whole window.
+func TestResizeVMLive_DelegatedQuotaLeaseReleasedOnSuccess(t *testing.T) {
+	s := coordResizeServer(t)
+	s.SetProjectAuthorityEnforce(true)
+	s.SetGate(fakeServerGate{enforcedTok: map[string]bool{
+		capabilities.LiveResizeV1:        true,
+		capabilities.OperationProtocolV1: true,
+		capabilities.ProjectAuthorityV1:  true,
+	}})
+	ctx := adminCtx()
+	// This node holds the project's admission authority, so the delegated
+	// grant is minted locally — the exact shape that leaked.
+	if applied, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, "_default", "test-host"); err != nil || !applied {
+		t.Fatalf("ClaimInitialProjectAuthority: applied=%v err=%v", applied, err)
+	}
+	seedRunningVM(t, s, "dq", &pb.VMSpec{Name: "dq", Cpu: 2, MaxCpu: 8, MemoryMib: 2048, MinMemoryMib: 1024, MaxMemoryMib: 8192}, 2, 2048)
+
+	if err := s.resizeVMLive(ctx, "dq", &pb.VMSpec{Cpu: 4, MemoryMib: 3072}, "k-dq"); err != nil {
+		t.Fatalf("delegated coordinated resize: %v", err)
+	}
+
+	// Every capacity lease must be terminal now: a leaked one keeps counting
+	// against the project in every future admission.
+	_, _, projCPU, projMem, err := corrosion.ReservedBefore(ctx, s.db, "", "_default", "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz")
+	if err != nil {
+		t.Fatalf("ReservedBefore: %v", err)
+	}
+	if projCPU != 0 || projMem != 0 {
+		t.Fatalf("after a successful delegated resize the project still holds %d vCPU/%d MiB in nonterminal reservations, want 0/0 — "+
+			"the holder's quota lease outlived the resize", projCPU, projMem)
+	}
+}

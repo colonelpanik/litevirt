@@ -198,3 +198,12 @@ func parseInterfaceTargets(xmlDesc string) []string {
 	}
 	return devs
 }
+
+// ListRunningDomains is the exported form of listRunningDomains, for callers
+// outside the stats path (the watchdog ownership probe at shutdown).
+func (c *Client) ListRunningDomains() ([]string, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return c.listRunningDomains()
+}

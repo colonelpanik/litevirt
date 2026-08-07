@@ -35,6 +35,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.dualrun.ct` | error | a container is running on more than one host |
 | `ha.dualrun.vip` | error | a VIP is kernel-assigned on more than one host — a dual VIP holder |
 | `ha.owner.mismatch` | error | a VM's DB owner is not its sole runtime holder — the DB and runtime disagree (ownership drift) |
+| `ha.owner.epoch_mismatch` | error | under a latched `owner_epoch_v1`, the DB owner's runtime carries an owner-epoch marker that is missing/corrupt/unreadable or unequal to the row's epoch — the runtime cannot prove it belongs to the current ownership generation |
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
@@ -49,13 +50,17 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 > **The `ha.dualrun.*` / `ha.owner.mismatch` / `ha.lww.unresolved` kinds are alert-only**
 > and always on — the leader-gated dual-run detector never destroys or reconciles; it
 > turns a silent split-brain (the same workload/VIP live on two hosts, or a DB owner that
-> disagrees with the runtime) into a page so an operator can act. A finding pages only
-> after it persists across two consecutive passes (a migration cutover clears within one),
-> and clears on its own when the condition heals. Route `ha.dualrun.*` at `error` (or
+> disagrees with the runtime) into a page so an operator can act. Findings are DURABLE
+> health conditions (schema v50): the first positive scan emits the kind at `warn`
+> (lifecycle *observed*), the second consecutive scan CONFIRMS and pages at the kind's
+> listed severity, and the condition resolves — emitting the kind once at `info` — only
+> after two consecutive clean scans with complete coverage. Conditions survive detector
+> leadership changes and daemon restarts, and the same rows drive admission refusals
+> (`lv health` shows exactly what admission enforces). Route `ha.dualrun.*` at `error` (or
 > `ha.*` broadly). Expect standing `ha.dualrun.coverage` alerts for any host that is
 > genuinely down or network-segmented from the current leader — that is a real coverage
 > gap, deduped to one page; do not mute the kind or a true split-brain on that host goes
-> unseen. A host on an *older binary* (no `ReportRuntime` handler) during a rolling
+> unseen. A host on an *older binary* (no `GetRuntimeInventory` handler) during a rolling
 > upgrade is deliberately **not** paged as a coverage gap — it still appears in the
 > `litevirt_dual_run_probe_failed{host}` gauge, but the transient version skew of an
 > upgrade window does not raise a page. The gauges

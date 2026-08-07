@@ -168,11 +168,75 @@ func (c *ContainerChecker) tryRekey(ctx context.Context, name string, remote cor
 		c.observeRekey(name, "inconclusive")
 	default:
 		// Decision-complete: runs here, exactly one remote owner row, no other
-		// host runs it. Re-key ownership to us (guarded atomic PK change across the
-		// row, its interface rows, and its IPAM leases).
-		applied, err := corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName)
+		// host runs it.
+		//
+		// EXACT-MARKER PROOF, the container twin of the VM rule: this host's own
+		// marker must say its runtime belongs to EXACTLY the epoch being
+		// superseded. Unreadable/corrupt never authorizes; unequal is another
+		// generation's runtime; missing refuses once the epoch regime carries
+		// modern authority (remote.OwnerEpoch > 0 — pre-epoch rows have no
+		// markers to demand).
+		if c.containersRoot != "" {
+			markerEpoch, found, merr := ReadContainerOwnerEpochMarker(c.containersRoot, name)
+			switch {
+			case merr != nil:
+				slog.Warn("ct-rekey: refusing — owner-epoch marker unreadable or corrupt",
+					"container", name, "error", merr)
+				c.observeRekey(name, "marker_unreadable")
+				return
+			case found && markerEpoch != remote.OwnerEpoch:
+				slog.Warn("ct-rekey: refusing — marker epoch does not equal the DB epoch being superseded",
+					"container", name, "marker_epoch", markerEpoch, "db_epoch", remote.OwnerEpoch)
+				c.observeRekey(name, "marker_epoch_mismatch")
+				return
+			case !found && remote.OwnerEpoch > 0:
+				slog.Warn("ct-rekey: refusing — owner-epoch marker missing for an epoched container",
+					"container", name, "db_epoch", remote.OwnerEpoch)
+				c.observeRekey(name, "marker_missing")
+				return
+			}
+		}
+		// An ACTIVE ownership condition freezes automated repair outright.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "container", name); cerr != nil {
+			slog.Warn("ct-rekey: cannot read health conditions; deferring", "container", name, "error", cerr)
+			c.observeRekey(name, "inconclusive")
+			return
+		} else if disputed {
+			slog.Warn("ct-rekey: refusing — active ownership condition", "container", name, "condition", code)
+			c.observeRekey(name, "disputed")
+			return
+		}
+		// Re-key ownership to us (guarded atomic PK change across the row, its
+		// interface rows, and its IPAM leases).
+		var (
+			applied bool
+			err     error
+		)
+		switch {
+		case remote.State == "creating" || remote.State == "provisional" ||
+			remote.ActiveOperationID != "":
+			slog.Info("ct-rekey: source has an active/provisional operation — deferring",
+				"container", name, "db_host", remote.HostName,
+				"state", remote.State, "operation_id", remote.ActiveOperationID)
+			c.observeRekey(name, "inconclusive")
+			return
+		case remote.OwnerEpoch == 0 && remote.SpecGeneration == 0:
+			// Exact v1.3 envelope for rolling compatibility.
+			applied, err = corrosion.RekeyContainerOwner(ctx, c.db, remote, c.hostName)
+		case c.guardedContainerRekeyActive != nil && c.guardedContainerRekeyActive():
+			applied, err = corrosion.RekeyContainerOwnerGuarded(
+				ctx, c.db, remote, c.hostName,
+			)
+		default:
+			slog.Info("ct-rekey: modern authority present before operation protocol latch — deferring",
+				"container", name, "db_host", remote.HostName,
+				"owner_epoch", remote.OwnerEpoch,
+				"spec_generation", remote.SpecGeneration)
+			c.observeRekey(name, "inconclusive")
+			return
+		}
 		if err != nil {
-			slog.Warn("ct-rekey: RekeyContainerOwner failed", "container", name, "error", err)
+			slog.Warn("ct-rekey: ownership mutation failed", "container", name, "error", err)
 			c.observeRekey(name, "error")
 			return
 		}

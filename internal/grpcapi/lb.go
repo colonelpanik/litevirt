@@ -1420,6 +1420,14 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	}
 	r := rows[0]
 
+	// A VIP with an ACTIVE dual-holder condition freezes: reconfiguring the LB
+	// that owns it changes who renders/claims the address, which is exactly the
+	// ownership transition a dual-run makes unsafe. (Unrelated VM placement is
+	// deliberately not blocked by a VIP condition — see checkVIPSafety.)
+	if err := s.checkVIPSafety(ctx, r.String("vip")); err != nil {
+		return nil, err
+	}
+
 	// Merge changes.
 	oldVip := r.String("vip")
 	vip := oldVip
@@ -2105,7 +2113,7 @@ func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.R
 	}
 	return &pb.RuntimeActionProof{
 		Id: p.ID, Action: p.Action, TargetKind: p.TargetKind, TargetName: p.TargetName,
-		DestHost: p.DestHost, Coordinator: p.Coordinator,
+		DestHost: p.DestHost, Coordinator: p.Coordinator, OwnerEpoch: p.OwnerEpoch,
 	}
 }
 

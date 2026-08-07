@@ -37,7 +37,13 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 		data["HostRows"] = buildHostRows(hosts)
 		data["RecentVMs"] = recentVMs
 		data["Events"] = s.recentEvents(ctx, 8)
-		data["Alerts"] = cs.GetAlerts()
+		// The dashboard's alert panel is the ACTIVE health conditions — the
+		// same rows admission refuses on. GetClusterStatus stays a pure
+		// inventory/count API.
+		if health, herr := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
+			data["Overall"] = health.GetOverall()
+			data["Conditions"] = health.GetConditions()
+		}
 	}
 	s.renderPage(w, "cluster.html", data)
 }
@@ -61,7 +67,10 @@ func (s *Server) handleClusterStats(w http.ResponseWriter, r *http.Request) {
 		data["HostRows"] = buildHostRows(hosts)
 		data["RecentVMs"] = recentVMs
 		data["Events"] = s.recentEvents(ctx, 8)
-		data["Alerts"] = cs.GetAlerts()
+		if health, herr := s.grpc.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
+			data["Overall"] = health.GetOverall()
+			data["Conditions"] = health.GetConditions()
+		}
 	}
 	s.renderPartial(w, "cluster.html", "cluster-live", data)
 }

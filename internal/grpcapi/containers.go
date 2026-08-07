@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -52,8 +51,6 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
-	// ctCommitted is flipped at the durable container write; see the release site.
-	ctCommitted := false
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -138,54 +135,71 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// Admission. Two different scopes, deliberately split:
 	//
 	//   HOST capacity — MEMORY only. A container's cpu_limit is CPU *shares* (a
-	//   relative cgroup weight), not a vCPU reservation, so it cannot be added to a
-	//   host's vCPU total; only its memory cap is comparable to a VM's. An UNCAPPED
-	//   container (memory 0) reserves nothing, matching how it is accounted.
+	//   relative cgroup weight), not a vCPU reservation, so it cannot be added to
+	//   a host's vCPU total; only its memory cap is comparable to a VM's. An
+	//   UNCAPPED container (memory 0) reserves nothing, matching how it is
+	//   accounted, and never pays the qemu overhead (newVMOnHost=false).
 	//
 	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts a container's
-	//   cpu_limit against the project's vCPU budget, so admission has to charge it or
-	//   the limit is unenforceable. It previously passed 0 for CPU and ran only when
-	//   memory was non-zero, so concurrent containers could exceed the project vCPU
-	//   limit, and a CPU-limited container with unlimited memory skipped serialized
-	//   admission entirely.
+	//   cpu_limit against the project's vCPU budget, so admission has to charge it
+	//   or the limit is unenforceable. It previously passed 0 for CPU and ran only
+	//   when memory was non-zero, so concurrent containers could exceed the
+	//   project vCPU limit, and a CPU-limited container with unlimited memory
+	//   skipped serialized admission entirely.
 	//
-	// Reserved (not just checked) because this host commits the container below, and
-	// routed through admitProjectQuota so the project's authority serializes it.
-	// Placed after tenancy and before any runtime or IPAM work, so a refusal leaves
-	// no partial state to unwind.
-	ctCommitFact := func() CommitFact {
-		return CommitFact{
-			Committed: ctCommitted, Workload: req.Name,
-			Kind: corrosion.WorkloadContainer, Host: s.hostName,
-			CPU: int(req.Cpu), MemMiB: int(req.MemoryMib),
+	// Reserved (not just checked) because this host commits the container below —
+	// otherwise a concurrent create for a different name sees the same headroom
+	// and both pass. Placed after tenancy and before any runtime or IPAM work, so
+	// a refusal leaves no partial state to unwind.
+	// The host admission is UNCONDITIONAL — a fully uncapped container reserves
+	// nothing but still becomes resident, and residency is a safety decision
+	// (incomplete inventory, active ownership conditions) the container cannot
+	// opt out of by declining limits. The zero-delta case returns an empty lease
+	// after safety passes.
+	var ctLease *reservationLease
+	{
+		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
+		if aerr != nil {
+			return nil, aerr
 		}
-	}
-	if req.MemoryMib > 0 {
-		hostRelease, herr := s.admitHostCapacity(ctx, s.hostName, 0, int(req.MemoryMib))
-		defer hostRelease()
-		if herr != nil {
-			return nil, herr
-		}
-	}
-	var ctAdmission Admission
-	if req.Cpu > 0 || req.MemoryMib > 0 {
-		qAdm, qerr := s.admitProjectQuota(ctx, req.Project, int(req.Cpu), int(req.MemoryMib))
-		ctAdmission = qAdm
-		defer func() { qAdm.Release(ctCommitFact()) }()
-		if qerr != nil {
-			return nil, qerr
-		}
+		defer lease.release(ctx)
 	}
 
 	// Resolve the requested NICs into runtime attachments + managed-interface rows
 	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
 	// (managed network vs legacy raw bridge). On any later failure we release this
 	// container's leases (s.releaseContainerNICs) to undo partial allocation.
+	//
+	// This runs BEFORE the quota reservation, and the order is load-bearing: only
+	// a MANAGED NIC becomes a container_interfaces row, and only those rows count
+	// toward the project's NIC budget. Charging len(req.Networks) up front would
+	// refuse creates for raw-bridge attachments that contribute nothing, so the
+	// charge waits until the persisted set is known. Residency safety is already
+	// settled by the host admission above, so nothing unsafe has been done by the
+	// time we get here, and a refusal below unwinds the allocation.
 	plan, err := s.resolveContainerNICs(ctx, req.Project, req.Name, req.Networks)
 	if err != nil {
 		_ = s.releaseContainerNICs(ctx, req.Name) // undo any leases taken before the error
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, err
+	}
+
+	// PROJECT quota — cpu, memory and the NICs about to be persisted. The NIC
+	// charge was missing entirely: SumProjectUsage counts container_interfaces
+	// rows against the project's NIC budget, so a container could walk straight
+	// past the limit without any concurrency at all.
+	if ctQuota := (corrosion.QuotaAmount{
+		VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib), NIC: len(plan.ifaces),
+	}); !ctQuota.IsZero() {
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
+			corrosion.WorkloadContainer, req.Name, ctQuota, ctQuota, intentContainerResident)
+		if aerr != nil {
+			_ = s.releaseContainerNICs(ctx, req.Name)
+			s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		ctLease = lease
 	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
@@ -206,7 +220,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.specNets,
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
+	// nanosecond precision, and that stamp is the row's INCARNATION identity —
+	// anti-entropy uses it to tell a genuine recreate from a stale pre-delete
+	// copy. Pre-filling a bare-second stamp here (as this site used to) would
+	// make a same-second delete+recreate indistinguishable from the incarnation
+	// the delete killed.
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: info.Name,
 		State: info.State, Image: chooseImage(req.Image, info.Image),
@@ -215,14 +234,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
-		CreatedAt:     now,
 	}
-	// Write the container row + managed interface rows in ONE atomic batch. Fail
-	// closed: the runtime container exists but the DB write failed → delete the
-	// just-created container and release its leases, so no partial tracked state
-	// and no leaked lease.
-	// FENCE before the durable write; see CreateVM.
-	if ferr := ctAdmission.AllowCommit(ctx); ferr != nil {
+	// FENCE before the durable write; see CreateVM. The cleanup mirrors the
+	// failed-write path below: the runtime container exists but must not be
+	// recorded under an authority that no longer covers its admission.
+	if ferr := ctLease.allowCommit(ctx); ferr != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
 			slog.Warn("container create: cleanup after an aborted admission also failed",
@@ -230,6 +246,10 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 		return nil, ferr
 	}
+	// Write the container row + managed interface rows in ONE atomic batch. Fail
+	// closed: the runtime container exists but the DB write failed → delete the
+	// just-created container and release its leases, so no partial tracked state
+	// and no leaked lease.
 	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
 		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
@@ -239,10 +259,6 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
-	// The durable write landed: the container counts against project quota from here
-	// even if this RPC later fails, so the authority keeps its charge until it can
-	// see the row.
-	ctCommitted = true
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
 	return toPbContainer(rec), nil
@@ -256,8 +272,20 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.StartContainer(ctx, req)
+	// Resolve the OWNER when no host was named (same shape as DeleteContainer):
+	// the daemon knows exactly where the container lives, so a host-less start
+	// from a non-owning node forwards there instead of failing "not found on
+	// host <local>". A name that exists nowhere is NotFound.
+	startHost := req.HostName
+	if startHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		startHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, startHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.StartContainer(ctx, &pb.StartContainerRequest{Name: req.Name, HostName: startHost})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -289,16 +317,18 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Host capacity admission — memory only (see CreateContainer). Starting is when
 	// the memory is actually taken: a stopped container is accounted as nothing, so
 	// checking only at create would be sidestepped by creating several that each fit
-	// and starting them all. Skipped when already running (adds nothing) and when
-	// uncapped (nothing to admit).
+	// and starting them all. Skipped when already running (adds nothing). An
+	// UNCAPPED container reserves nothing but is still admitted: the start makes it
+	// resident, and residency is the safety decision — a host with incomplete
+	// inventory or an active ownership condition refuses it even at zero delta.
 	// Reserved, not just checked, so the memory stays accounted for across the
 	// runtime start and the "running" state write below.
-	if rec.State != "running" && rec.MemMiB > 0 {
-		release, err := s.admitHostCapacity(ctx, s.hostName, 0, rec.MemMiB)
-		defer release()
-		if err != nil {
-			return nil, err
+	if rec.State != "running" {
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
+		if aerr != nil {
+			return nil, aerr
 		}
+		defer lease.release(ctx)
 	}
 	if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 		s.audit(ctx, "ct.start", req.Name, "project="+project, "error")
@@ -330,8 +360,17 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.StopContainer(ctx, req)
+	// Owner resolution, same as StartContainer/DeleteContainer.
+	stopHost := req.HostName
+	if stopHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		stopHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, stopHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.StopContainer(ctx, &pb.StopContainerRequest{Name: req.Name, HostName: stopHost, TimeoutSec: req.TimeoutSec})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -363,8 +402,24 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}
-	if forwarded, err := s.forwardSimpleCT(ctx, req.HostName, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
-		return c.DeleteContainer(ctx, req)
+	// Resolve the OWNER when no host was named. Without this a host-less delete
+	// executed "locally" on whichever node the client happened to dial, where
+	// the runtime not-found AND the zero-row tombstone are both idempotent
+	// successes — rc=0, nothing deleted anywhere, an operator typo
+	// indistinguishable from a clean delete. Resolution is scoped to the
+	// name-only form: an EXPLICIT-host delete keeps its full retry idempotency
+	// (failover/relocation re-issue those), and a name that exists nowhere now
+	// surfaces as NotFound instead of a silent ok.
+	targetHost := req.HostName
+	if targetHost == "" {
+		h, _, rerr := s.resolveContainerHost(ctx, "", req.Name)
+		if rerr != nil {
+			return nil, rerr
+		}
+		targetHost = h
+	}
+	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
+		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
 	}); err != nil || forwarded != nil {
 		return forwarded, err
 	}
@@ -390,7 +445,10 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// governs start/stop): retry-safety matters for the failover/relocation paths
 	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
 	// success — but audited distinctly (not a silent "ok") so an operator typo
-	// isn't invisible; only a REAL DB error surfaces as Internal.
+	// isn't invisible. A REAL DB error — or ErrDeleteContended, a row still LIVE
+	// after the guarded CAS retried (its authority kept moving) — surfaces as
+	// Internal: the runtime container is gone by this point, and OK-with-a-live-
+	// row would be exactly the ghost this tombstone is mandatory to prevent.
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
@@ -607,11 +665,11 @@ func (s *Server) forwardSimpleCT(
 	if hostName == "" || hostName == s.hostName {
 		return nil, nil
 	}
-	c, conn, err := s.peerClient(ctx, hostName)
+	c, closer, err := s.dialPeer(ctx, hostName)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "forward: %v", err)
 	}
-	defer conn.Close()
+	defer closer()
 	return dial(c)
 }
 

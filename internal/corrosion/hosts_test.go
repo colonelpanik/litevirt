@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -46,6 +47,88 @@ func TestGetHost_NotFound(t *testing.T) {
 	}
 	if h != nil {
 		t.Errorf("expected nil for missing host, got %+v", h)
+	}
+}
+
+func TestAdmitHost_ReplacesOnlyATombstoneWithANewCertificate(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	old := HostRecord{
+		Name: "node4", Address: "10.0.0.4", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", CertSerial: "aaaa",
+	}
+	if err := InsertHost(ctx, c, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteHost(ctx, c, old.Name); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AdmitHost(ctx, c, old); err == nil || !strings.Contains(err.Error(), "removed certificate") {
+		t.Fatalf("old certificate admission = %v, want refusal", err)
+	}
+	if got, _ := GetHost(ctx, c, old.Name); got != nil {
+		t.Fatal("refused admission cleared the tombstone")
+	}
+
+	fresh := old
+	fresh.CertSerial = "bbbb"
+	if err := AdmitHost(ctx, c, fresh); err != nil {
+		t.Fatalf("fresh certificate admission: %v", err)
+	}
+	got, err := GetHost(ctx, c, fresh.Name)
+	if err != nil || got == nil {
+		t.Fatalf("re-admitted host = %#v, %v", got, err)
+	}
+	if got.CertSerial != fresh.CertSerial {
+		t.Fatalf("certificate serial = %q, want %q", got.CertSerial, fresh.CertSerial)
+	}
+}
+
+func TestAdmitHost_DoesNotReplaceAnActiveIdentity(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	active := HostRecord{
+		Name: "node4", Address: "10.0.0.4", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", CertSerial: "aaaa",
+	}
+	if err := AdmitHost(ctx, c, active); err != nil {
+		t.Fatalf("first admission: %v", err)
+	}
+	if err := AdmitHost(ctx, c, active); err != nil {
+		t.Fatalf("idempotent admission: %v", err)
+	}
+	replacement := active
+	replacement.CertSerial = "bbbb"
+	if err := AdmitHost(ctx, c, replacement); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("replacement admission = %v, want active-host refusal", err)
+	}
+}
+
+func TestRegisterHost_ClearsOnlyItsOldCertificateTombstone(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	old := HostRecord{
+		Name: "node4", Address: "10.0.0.4", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", CertSerial: "aaaa",
+	}
+	if err := InsertHost(ctx, c, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteHost(ctx, c, old.Name); err != nil {
+		t.Fatal(err)
+	}
+	if err := RegisterHost(ctx, c, old); err == nil {
+		t.Fatal("removed certificate registered itself")
+	}
+	fresh := old
+	fresh.CertSerial = "bbbb"
+	if err := RegisterHost(ctx, c, fresh); err != nil {
+		t.Fatalf("fresh certificate registration: %v", err)
+	}
+	got, _ := GetHost(ctx, c, fresh.Name)
+	if got == nil || got.CertSerial != fresh.CertSerial {
+		t.Fatalf("registered host = %#v, want fresh active identity", got)
 	}
 }
 

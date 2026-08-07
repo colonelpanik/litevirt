@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"sort"
 	"strings"
 )
 
@@ -22,6 +24,36 @@ import (
 // attempted without a proof reference for the prior holder's fence.
 var ErrFenceProofRequired = errors.New("corrosion: a fenced project-authority takeover requires a fence_proof_ref")
 
+// DeriveProjectAuthorityHolder picks a project's INITIAL authority holder from the
+// eligible hosts, deterministically.
+//
+// Every node claiming authority for ITSELF looks reasonable and is useless: each node
+// serves its own creates, so each becomes the holder of its own replica, every
+// admission stays local, and delegation never happens. Worse, the claims then collide
+// — one epoch, two holders — and the cluster is back to two deciders while believing
+// it has one. That is not a hypothetical: the lab produced exactly it, with node-1 and
+// node-2 each holding /qa at epoch 1.
+//
+// Choosing by hash of the project name over the SORTED host list makes concurrent
+// claimants mint an IDENTICAL row instead of competing ones, so the race stops
+// mattering: the rows converge because they agree. It also spreads different projects
+// across different hosts rather than piling every project onto one.
+//
+// Membership is itself eventually consistent, so two nodes with different views of the
+// host list can still choose differently. That window is far narrower than claiming for
+// self (which collides every single time) and heals the same way — the losing claim's
+// node sees FailedPrecondition and retries against the winner.
+func DeriveProjectAuthorityHolder(project string, candidates []string) string {
+	eligible := append([]string(nil), candidates...)
+	sort.Strings(eligible)
+	if len(eligible) == 0 {
+		return ""
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(projectOrDefault(project)))
+	return eligible[int(h.Sum32()%uint32(len(eligible)))]
+}
+
 // ProjectAuthority is a project's admission-authority record. The CURRENT authority
 // is the row with the maximum live authority_epoch for the project.
 type ProjectAuthority struct {
@@ -36,17 +68,10 @@ type ProjectAuthority struct {
 // or ok=false when the project has no authority yet.
 func CurrentProjectAuthority(ctx context.Context, c *Client, project string) (ProjectAuthority, bool, error) {
 	project = projectOrDefault(project)
-	// ORDER BY … holder ASC: the tie-break matters. A cluster that ran an older
-	// build may already hold two epoch-1 rows for one project (two nodes minted
-	// concurrently; see ClaimInitialProjectAuthority's warning). The PK
-	// (project, authority_epoch) makes that pair an immutable_conflict that is
-	// kept-local on both sides and never resolved, so the rows persist. Picking
-	// deterministically among equal epochs at least makes every node AGREE on
-	// which one wins, turning permanent divergence into a stable answer.
 	rows, err := c.Query(ctx,
 		`SELECT project, authority_epoch, holder, transfer_kind, fence_proof_ref
 		 FROM project_authority_epochs WHERE project = ? AND deleted_at IS NULL
-		 ORDER BY authority_epoch DESC, holder ASC LIMIT 1`, project)
+		 ORDER BY authority_epoch DESC LIMIT 1`, project)
 	if err != nil {
 		return ProjectAuthority{}, false, err
 	}
@@ -63,46 +88,121 @@ func CurrentProjectAuthority(ctx context.Context, c *Client, project string) (Pr
 	}, true, nil
 }
 
-// ClaimInitialProjectAuthority mints epoch 1 for a project with holder, iff no
-// authority exists yet. Returns applied=false (no error) if another node already
-// established authority (the caller re-reads the current holder).
+// ClaimInitialProjectAuthority mints the project's first authority epoch with
+// holder, iff no LIVE authority exists yet. Returns applied=false (no error) if
+// another node already established authority (the caller re-reads the current
+// holder).
 //
-// DO NOT CALL THIS TO ESTABLISH AN INITIAL AUTHORITY. Use ResolveProjectAuthority.
-//
-// The guard runs inside ExecuteBatchGuarded, which is a LOCAL transaction, so it
-// cannot make this a cluster-wide single writer: on two nodes both guards see
-// COUNT(*) = 0 before either has replicated and both insert epoch 1. The PK is
-// (project, authority_epoch), so those two rows collide with DIFFERENT facts, and
-// project_authority_epochs merges via immutableMergeKeepLocalRow — which
-// deliberately refuses to coin-flip an immutable row and instead keeps both sides
-// locally and flags immutable_conflict, PERMANENTLY. The project then has two
-// holders until an operator repairs it. (immutableFactsEqual compares created_at,
-// per-node wall time, so even two claims naming the same holder conflict — making
-// the holder agree is not sufficient; only one node may write.)
-//
-// A "deterministic candidate" is not enough either: the candidate is computed from
-// the replicated host set, which is delivered ASYNCHRONOUSLY, so two nodes with
-// different views of hosts/states compute different winners and both mint.
-//
-// The initial authority is therefore DERIVED, never written. Only an explicit
-// transfer records a row (TakeoverProjectAuthority), and a transfer has a real
-// single writer: the CAS on expectedPrevEpoch.
+// The epoch is one above the highest this project has EVER held, counting retired
+// (tombstoned) rows, rather than the literal 1. Deleting a project retires its
+// authority but keeps the tombstones — they are the record that it existed — and
+// they still occupy their primary keys, so a claim that reused epoch 1 would be
+// swallowed by INSERT OR IGNORE while the guard, which only looks at live rows,
+// reported success. It also keeps epochs monotonic across a project's whole
+// history, so a holder from before a delete can never validate against what
+// follows it.
 func ClaimInitialProjectAuthority(ctx context.Context, c *Client, project, holder string) (applied bool, err error) {
 	project = projectOrDefault(project)
+	prevMax, err := maxProjectAuthorityEpoch(ctx, c, project)
+	if err != nil {
+		return false, err
+	}
+	epoch := prevMax + 1
 	now, wall := c.NowTS(), nowRFC3339()
+	// The guard re-checks BOTH halves inside the transaction: no live authority
+	// (someone else may have claimed) and the same historical ceiling (someone else
+	// may have retired or minted rows since the read above). Either miss returns
+	// applied=false and the caller re-reads.
 	guard := func(tx *sql.Tx) (bool, error) {
-		var n int
-		qerr := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM project_authority_epochs WHERE project = ? AND deleted_at IS NULL`, project).Scan(&n)
-		return n == 0, qerr
+		var live int
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM project_authority_epochs WHERE project = ? AND deleted_at IS NULL`,
+			project).Scan(&live); qerr != nil {
+			return false, qerr
+		}
+		if live != 0 {
+			return false, nil
+		}
+		var maxEpoch sql.NullInt64
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT MAX(authority_epoch) FROM project_authority_epochs WHERE project = ?`,
+			project).Scan(&maxEpoch); qerr != nil {
+			return false, qerr
+		}
+		return maxEpoch.Int64 == prevMax, nil
 	}
 	stmts := []Statement{{
 		SQL: `INSERT OR IGNORE INTO project_authority_epochs
 		      (project, authority_epoch, holder, transfer_kind, fence_proof_ref, created_at, updated_at, deleted_at)
-		      VALUES (?, 1, ?, 'initial', '', ?, ?, NULL)`,
-		Params: []interface{}{project, holder, wall, now},
+		      VALUES (?, ?, ?, 'initial', '', ?, ?, NULL)`,
+		Params: []interface{}{project, epoch, holder, wall, now},
 	}}
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// maxProjectAuthorityEpoch returns the highest epoch the project has ever held,
+// INCLUDING retired rows, or 0 when it has never held any. Retired rows count
+// because they still own their primary keys.
+func maxProjectAuthorityEpoch(ctx context.Context, c *Client, project string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(MAX(authority_epoch), 0) AS max_epoch
+		 FROM project_authority_epochs WHERE project = ?`, projectOrDefault(project))
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	return rows[0].Int64("max_epoch"), nil
+}
+
+// RetireProjectAuthority tombstones every authority row for a project, so nothing
+// holds authority for a name that no longer exists. Called when a project is
+// deleted: an orphaned live row would otherwise let a later incarnation of the name
+// inherit a holder nobody chose for it — possibly one the cluster had actively
+// disagreed about. The rows themselves are kept, both because the table is
+// append-only and because ClaimInitialProjectAuthority mints above them.
+func RetireProjectAuthority(ctx context.Context, c *Client, project string) error {
+	return c.Execute(ctx,
+		`UPDATE project_authority_epochs SET deleted_at = ?, updated_at = ?
+		 WHERE project = ? AND deleted_at IS NULL`,
+		nowRFC3339(), c.NowTS(), projectOrDefault(project))
+}
+
+// ReconcileOrphanedProjectAuthority retires authority still held by projects that
+// no longer exist, returning how many it retired.
+//
+// Retiring on delete only helps projects deleted from now on. Every project
+// deleted before that landed still holds live authority, and nothing else will
+// ever collect it: the operation reaper only touches terminal operations, and an
+// authority row never becomes terminal on its own. So these rows sit live
+// indefinitely for names that are gone, which is how a lab ended up with five.
+//
+// _default is excluded explicitly. It is treated as always existing even when no
+// row lists it, and retiring its authority would leave every untenanted admission
+// in the cluster with no decider.
+//
+// Idempotent by construction — the scan only matches live authority for a
+// tombstoned project — so the hourly GC that calls it does no work once clean.
+func ReconcileOrphanedProjectAuthority(ctx context.Context, c *Client) (int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT DISTINCT a.project AS project
+		 FROM project_authority_epochs a
+		 JOIN projects p ON p.name = a.project
+		 WHERE a.deleted_at IS NULL AND p.deleted_at IS NOT NULL AND a.project <> ?`,
+		DefaultProject)
+	if err != nil {
+		return 0, err
+	}
+	retired := 0
+	for _, r := range rows {
+		project := r.String("project")
+		if project == "" {
+			continue
+		}
+		if rerr := RetireProjectAuthority(ctx, c, project); rerr != nil {
+			return retired, fmt.Errorf("retire authority for deleted project %q: %w", project, rerr)
+		}
+		retired++
+	}
+	return retired, nil
 }
 
 // TakeoverProjectAuthority mints epoch = expectedPrevEpoch+1 with the new holder.
@@ -130,13 +230,7 @@ func TakeoverProjectAuthority(ctx context.Context, c *Client, project, holder, t
 		if qerr != nil {
 			return false, qerr
 		}
-		// No rows means the project's authority is DERIVED, not recorded (see
-		// ResolveProjectAuthority) — a derived authority is epoch 0, so a first
-		// explicit transfer legitimately expects 0 and mints epoch 1.
-		if !maxEpoch.Valid {
-			return expectedPrevEpoch == 0, nil
-		}
-		return maxEpoch.Int64 == expectedPrevEpoch, nil
+		return maxEpoch.Valid && maxEpoch.Int64 == expectedPrevEpoch, nil
 	}
 	stmts := []Statement{{
 		SQL: `INSERT OR IGNORE INTO project_authority_epochs
@@ -198,48 +292,4 @@ func DeterministicAuthorityCandidate(hosts []HostRecord, project string) (host s
 		return "", false
 	}
 	return best, true
-}
-
-// ResolveProjectAuthority reports who serializes a project's admission.
-//
-// An explicitly RECORDED authority wins: a transfer is a deliberate operator or
-// coordinator act, is CAS-guarded on the previous epoch, and is sticky.
-//
-// With no record — the common case — the authority is DERIVED from the current host
-// set and nothing is written. That is the whole point: a derived authority cannot
-// produce a conflicting row, so the permanent-divergence class above simply does
-// not exist. Epoch 0 marks "derived".
-//
-// The trade this makes, stated plainly: a derived authority is NOT sticky. Two nodes
-// whose replicated host views differ can briefly disagree about the holder, so both
-// may serialize the same project independently — a bounded over-admission window
-// that closes as soon as host state converges, and one the admission RPC actively
-// corrects (it refuses a non-holder and reports the holder it sees). That is
-// strictly better than a permanently divergent pair of epoch-1 rows that needs an
-// operator to repair and silently leaves the project with two holders forever.
-//
-// ok=false means no authority could be resolved at all (no eligible host); the
-// caller must not treat itself as the holder.
-func ResolveProjectAuthority(ctx context.Context, c *Client, project string) (ProjectAuthority, bool, error) {
-	cur, ok, err := CurrentProjectAuthority(ctx, c, project)
-	if err != nil {
-		return ProjectAuthority{}, false, err
-	}
-	if ok {
-		return cur, true, nil
-	}
-	hosts, err := ListHosts(ctx, c)
-	if err != nil {
-		return ProjectAuthority{}, false, err
-	}
-	candidate, hasCandidate := DeterministicAuthorityCandidate(hosts, project)
-	if !hasCandidate {
-		return ProjectAuthority{}, false, nil
-	}
-	return ProjectAuthority{
-		Project:      projectOrDefault(project),
-		Epoch:        0, // derived, not recorded
-		Holder:       candidate,
-		TransferKind: "derived",
-	}, true, nil
 }

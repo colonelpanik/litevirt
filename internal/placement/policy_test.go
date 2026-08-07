@@ -1,6 +1,7 @@
 package placement
 
 import (
+	"time"
 	"context"
 	"fmt"
 	"math"
@@ -59,7 +60,7 @@ func hostUtilizationVariance(snap *ClusterSnapshot) float64 {
 // placement snapshot reflecting the chosen layout.
 func runBatchAndSnapshot(t *testing.T, hosts []corrosion.HostRecord, requests []Request) *ClusterSnapshot {
 	t.Helper()
-	results, err := SelectBatch(hosts, nil, nil, nil, requests)
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, requests)
 	if err != nil {
 		t.Fatalf("SelectBatch: %v", err)
 	}
@@ -142,16 +143,19 @@ func TestPolicy_SpreadStrictRefusesAbovePressureCap(t *testing.T) {
 	// Single host: 4 cores. First request (3 cores) → 75% post-placement
 	// pressure, exceeds 0.5 cap; should fail.
 	hosts := equalCapHosts(1, 4, 16*1024)
-	_, err := SelectBatch(hosts, nil, nil, nil, []Request{
+	results0, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "big", CPUNeeded: 3, MemMiBNeeded: 1024, Policy: PolicySpreadStrict},
 	})
-	if err == nil {
-		t.Fatal("spread-strict: expected rejection when post-placement pressure > 0.5")
+	if err != nil {
+		t.Fatalf("per-VM infeasibility must not fail the batch: %v", err)
+	}
+	if results0["big"].Host != "" {
+		t.Fatalf("spread-strict above the pressure cap must yield an empty Host, got %q", results0["big"].Host)
 	}
 
 	// Same host: 1-core request → 25% post-placement pressure; allowed.
 	hosts = equalCapHosts(1, 4, 16*1024)
-	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "small", CPUNeeded: 1, MemMiBNeeded: 1024, Policy: PolicySpreadStrict},
 	})
 	if err != nil {
@@ -170,7 +174,7 @@ func TestPolicy_MixedBatchPerVMPolicy(t *testing.T) {
 
 	// First, two large bin-pack VMs (should land on the same host).
 	// Then, two balance VMs (should spread).
-	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "batch-1", CPUNeeded: 8, MemMiBNeeded: 16 * 1024, Policy: PolicyBinPack},
 		{VMName: "batch-2", CPUNeeded: 8, MemMiBNeeded: 16 * 1024, Policy: PolicyBinPack},
 		{VMName: "prod-1", CPUNeeded: 4, MemMiBNeeded: 8 * 1024, Policy: PolicyBalance},
@@ -204,10 +208,19 @@ func TestPolicy_BalanceRespectsMaxPerNode(t *testing.T) {
 			MaxPerNode:   1,
 		})
 	}
-	// 4 VMs, max 1 per node, only 3 nodes → last must fail.
-	_, err := SelectBatch(hosts, nil, nil, nil, requests)
-	if err == nil {
-		t.Fatal("expected MaxPerNode rejection at 4th VM")
+	// 4 VMs, max 1 per node, only 3 nodes → the last gets no host.
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, requests)
+	if err != nil {
+		t.Fatalf("per-VM infeasibility must not fail the batch: %v", err)
+	}
+	placed := 0
+	for _, r := range results {
+		if r.Host != "" {
+			placed++
+		}
+	}
+	if placed != 3 {
+		t.Fatalf("placed %d of 4 VMs with MaxPerNode=1 over 3 nodes, want exactly 3", placed)
 	}
 }
 
@@ -223,7 +236,7 @@ func TestPolicy_CostAwarePreferCheapHosts(t *testing.T) {
 			Labels: map[string]string{"cost.hourly": "1.00"}},
 	}
 	// First placement on equal-headroom hosts: cost-aware should pick cheap.
-	results, err := SelectBatch(hosts, nil, nil, nil, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "vm1", CPUNeeded: 1, MemMiBNeeded: 1024, Policy: PolicyCostAware},
 	})
 	if err != nil {
@@ -264,7 +277,7 @@ func TestPolicy_RequireLabelBeatsContradictoryPreference(t *testing.T) {
 			CPUTotal: 16, MemTotal: 64 * 1024,
 			Labels: map[string]string{"zone": "west", "disk": "fast"}},
 	}
-	results, err := SelectBatch(hosts, nil, nil, nil, []Request{{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{{
 		VMName:        "vm1",
 		CPUNeeded:     1,
 		MemMiBNeeded:  1024,

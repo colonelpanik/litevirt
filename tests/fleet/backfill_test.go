@@ -157,6 +157,15 @@ func TestFleet_AuditChainIntactThroughFleet(t *testing.T) {
 	if resp.BrokenAtId != "" {
 		t.Errorf("audit chain broken at %s (checked=%d)", resp.BrokenAtId, resp.RowsChecked)
 	}
+	// Tampered covers what a hash walk alone cannot see: a bad signature, a
+	// sequence gap, a laundered row, a truncated host. Rows written on one node
+	// and verified on another go through the published-certificate path, so a
+	// keyring that never replicated would surface here and nowhere else.
+	if resp.Tampered {
+		t.Errorf("audit chain reports tampering: broken_at=%q bad_sig=%v unknown_key=%v seq_gaps=%v laundered=%v truncated=%v",
+			resp.BrokenAtId, resp.BadSignature, resp.UnknownKeyId,
+			resp.SeqGaps, resp.Laundered, resp.TruncatedHosts)
+	}
 	if resp.RowsChecked < 3 {
 		t.Errorf("expected ≥3 audit rows from 3 CreateUser calls, got %d", resp.RowsChecked)
 	}

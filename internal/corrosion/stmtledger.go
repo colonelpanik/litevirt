@@ -26,6 +26,37 @@ const (
 	DispDeleteRetention     Disposition = "delete_retention"       // hard delete on a registered retention table
 	DispAppendOnly          Disposition = "append_only"            // INSERT OR IGNORE, no LWW
 	DispCustomMerge         Disposition = "custom_merge"           // runtime_action_proofs / operations / …
+	// DispAuditReseal applies an audit_log hash-chain reseal through the
+	// signature-guarded form of the statement, WHATEVER shape arrived.
+	//
+	// The pre-v45 shape has no signature predicate, and it stays on the wire for
+	// the rolling-upgrade horizon. Applied verbatim it is a cluster-wide eraser:
+	// a node that rewrote its own signed rows could emit the old shape and every
+	// peer would overwrite its good content_hash by primary key, with no clock
+	// compare and no way back — reseal refuses to touch signed rows, so nothing
+	// can restore the correct hash afterwards. Rewriting the statement on the
+	// receiver keeps the legacy sender working (legacy rows carry no signature,
+	// so the guard is a no-op for everything it was ever meant to reach) while
+	// making a signed row unreachable by any reseal, local or replicated.
+	DispAuditReseal Disposition = "audit_reseal"
+	// DispCreateBegin applies one of the exact, audited workload-create
+	// resurrection UPSERTs verbatim after workload_create_begin_v1 matches.
+	// Their owner/generation WHERE is the ordering rule; an unrelated receiver
+	// clock must not override that semantic ABA fence.
+	DispCreateBegin Disposition = "create_begin"
+	// DispGuardedTransition applies an exact, authority-guarded workload
+	// terminal transition verbatim. The workload guard is the ordering rule;
+	// unrelated receiver clocks must not split the transition from the
+	// hardware/journal statements earlier in the same transaction.
+	DispGuardedTransition Disposition = "guarded_transition"
+	// DispWorkloadDelete applies an exact authority-fenced parent tombstone
+	// verbatim. The workload owner/generation guard prevents delayed deletes
+	// from crossing a recreate epoch; equal-authority deletes remain valid.
+	DispWorkloadDelete Disposition = "workload_delete"
+	// DispLegacyWorkloadDelete accepts retained pre-authority delete shapes only
+	// for rows whose owner/generation axes are still both zero. The old wire
+	// shape cannot prove authority, so it must never cross into a v44 identity.
+	DispLegacyWorkloadDelete Disposition = "legacy_workload_delete"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

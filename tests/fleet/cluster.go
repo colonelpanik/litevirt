@@ -42,6 +42,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
@@ -82,6 +83,7 @@ type Node struct {
 	Server   *grpcapi.Server
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
 	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
+	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
 	GRPCSrv  *grpc.Server
 	Listener net.Listener
 	// peerConn caches a self-loopback client for scenario assertions
@@ -115,10 +117,10 @@ func New(t *testing.T, opts Options) *Cluster {
 		opts.Nodes = 3
 	}
 
-	// Reset the global audit-chain pointer so a test running after
-	// another in the same process doesn't inherit a tail hash from
-	// a different (now-closed) DB. Cheap, idempotent.
-	corrosion.ResetChainStateForTests()
+	// The audit-chain tail used to be process-global, so this had to reset it
+	// between tests — and, worse, every node in a cluster shared one tail, so
+	// node B's first audit row linked to node A's. The state now hangs off each
+	// Client and is keyed by host_name, which is correct by construction here.
 	c := &Cluster{t: t, tmpRoot: t.TempDir()}
 	c.mintCA()
 
@@ -327,13 +329,17 @@ func (c *Cluster) crossRegisterHosts() {
 	ctx := context.Background()
 	for _, target := range c.Nodes {
 		for _, hostNode := range c.Nodes {
+			serial, err := pki.CertSerial(filepath.Join(hostNode.PKIDir, "host.crt"))
+			if err != nil {
+				c.t.Fatalf("read certificate serial for %s: %v", hostNode.Name, err)
+			}
 			rec := corrosion.HostRecord{
 				Name:          hostNode.Name,
 				Address:       hostNode.Address,
 				GRPCPort:      hostNode.Port,
 				SSHUser:       "root",
 				SSHPort:       22,
-				CertSerial:    "fleet",
+				CertSerial:    serial,
 				State:         "active",
 				FenceStrategy: "best-effort",
 				// Real capacity. Host admission now runs on CREATE as well as resize,
@@ -385,6 +391,18 @@ func (c *Cluster) buildServer(n *Node) {
 	n.CT = NewCTFake(filepath.Join(c.tmpRoot, n.Name, "lxc"))
 	n.Server.SetContainerRuntime(n.CT)
 
+	// Host network apply protocol: a per-node in-memory netplan System plus a
+	// REAL host-local operation journal, so host-network RPCs — forwarding,
+	// journaled apply, rollback, replicated outcomes — run multi-node without
+	// root. The advertise address matches what the cluster harness registers.
+	n.HostNet = NewHostNetFake()
+	if j, err := opjournal.Open(filepath.Join(c.tmpRoot, n.Name, "opjournal")); err != nil {
+		c.t.Fatalf("opjournal for %s: %v", n.Name, err)
+	} else {
+		n.Server.SetOpJournal(j)
+	}
+	n.Server.SetHostNetworkEnv(n.HostNet, "127.0.0.1")
+
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it
 	// discovers peers via memberlist (corrosion.Client.Members()), and the
@@ -430,11 +448,15 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 }
 
-// replicationMethods are the gRPC method names (final path segment) the
-// partition gate drops. It covers BOTH lanes — public and sensitive — and both
-// the digest and the dump/push/ack steps; omitting the sensitive lane would let
-// it converge during a "partition".
-var replicationMethods = map[string]bool{
+// partitionedMethods are the gRPC method names (final path segment) the partition
+// gate drops — the peer-to-peer traffic a severed link would actually take out.
+//
+// Replication covers BOTH lanes, public and sensitive, and both the digest and the
+// dump/push/ack steps; omitting the sensitive lane would let a "partition" converge.
+// Delegated project admission is peer traffic over the same link, so a partition must
+// drop it too — otherwise a scenario that partitions the authority holder would still
+// reach it and prove nothing about the unreachable-holder path.
+var partitionedMethods = map[string]bool{
 	"PushMutations":            true,
 	"AckMutations":             true,
 	"GetStateDigest":           true,
@@ -442,6 +464,8 @@ var replicationMethods = map[string]bool{
 	"StreamStateDump":          true,
 	"GetSensitiveStateDigest":  true,
 	"StreamSensitiveStateDump": true,
+	"ReserveProjectCapacity":   true,
+	"ReleaseProjectCapacity":   true,
 }
 
 // methodName returns the final segment of a gRPC full-method string
@@ -467,10 +491,10 @@ func peerCertCN(ctx context.Context) string {
 	return tlsInfo.State.PeerCertificates[0].Subject.CommonName
 }
 
-// blocked reports whether a replication RPC from the given caller is currently
+// blocked reports whether a peer RPC from the given caller is currently
 // partitioned away from this node.
 func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
-	if !replicationMethods[methodName(fullMethod)] {
+	if !partitionedMethods[methodName(fullMethod)] {
 		return false
 	}
 	caller := peerCertCN(ctx)

@@ -20,231 +20,241 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	LiteVirt_ListHosts_FullMethodName                      = "/litevirt.v1.LiteVirt/ListHosts"
-	LiteVirt_InspectHost_FullMethodName                    = "/litevirt.v1.LiteVirt/InspectHost"
-	LiteVirt_DrainHost_FullMethodName                      = "/litevirt.v1.LiteVirt/DrainHost"
-	LiteVirt_ShutdownHostWorkloads_FullMethodName          = "/litevirt.v1.LiteVirt/ShutdownHostWorkloads"
-	LiteVirt_UndrainHost_FullMethodName                    = "/litevirt.v1.LiteVirt/UndrainHost"
-	LiteVirt_SetHostLabels_FullMethodName                  = "/litevirt.v1.LiteVirt/SetHostLabels"
-	LiteVirt_FenceHost_FullMethodName                      = "/litevirt.v1.LiteVirt/FenceHost"
-	LiteVirt_GetHostHealth_FullMethodName                  = "/litevirt.v1.LiteVirt/GetHostHealth"
-	LiteVirt_RemoveHost_FullMethodName                     = "/litevirt.v1.LiteVirt/RemoveHost"
-	LiteVirt_RescanHost_FullMethodName                     = "/litevirt.v1.LiteVirt/RescanHost"
-	LiteVirt_ListHostDevices_FullMethodName                = "/litevirt.v1.LiteVirt/ListHostDevices"
-	LiteVirt_UpgradeHost_FullMethodName                    = "/litevirt.v1.LiteVirt/UpgradeHost"
-	LiteVirt_PreStageUpgrade_FullMethodName                = "/litevirt.v1.LiteVirt/PreStageUpgrade"
-	LiteVirt_FetchBinary_FullMethodName                    = "/litevirt.v1.LiteVirt/FetchBinary"
-	LiteVirt_UninstallHost_FullMethodName                  = "/litevirt.v1.LiteVirt/UninstallHost"
-	LiteVirt_ConfigureHost_FullMethodName                  = "/litevirt.v1.LiteVirt/ConfigureHost"
-	LiteVirt_CreateVM_FullMethodName                       = "/litevirt.v1.LiteVirt/CreateVM"
-	LiteVirt_ListVMs_FullMethodName                        = "/litevirt.v1.LiteVirt/ListVMs"
-	LiteVirt_InspectVM_FullMethodName                      = "/litevirt.v1.LiteVirt/InspectVM"
-	LiteVirt_ListVMHardware_FullMethodName                 = "/litevirt.v1.LiteVirt/ListVMHardware"
-	LiteVirt_StartVM_FullMethodName                        = "/litevirt.v1.LiteVirt/StartVM"
-	LiteVirt_StopVM_FullMethodName                         = "/litevirt.v1.LiteVirt/StopVM"
-	LiteVirt_RestartVM_FullMethodName                      = "/litevirt.v1.LiteVirt/RestartVM"
-	LiteVirt_DeleteVM_FullMethodName                       = "/litevirt.v1.LiteVirt/DeleteVM"
-	LiteVirt_RepairVMOwner_FullMethodName                  = "/litevirt.v1.LiteVirt/RepairVMOwner"
-	LiteVirt_CheckVMRuntime_FullMethodName                 = "/litevirt.v1.LiteVirt/CheckVMRuntime"
-	LiteVirt_CheckContainerRuntime_FullMethodName          = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
-	LiteVirt_ReportRuntime_FullMethodName                  = "/litevirt.v1.LiteVirt/ReportRuntime"
-	LiteVirt_AdmitProjectQuota_FullMethodName              = "/litevirt.v1.LiteVirt/AdmitProjectQuota"
-	LiteVirt_ReleaseProjectQuotaReservation_FullMethodName = "/litevirt.v1.LiteVirt/ReleaseProjectQuotaReservation"
-	LiteVirt_ListProjectQuotaReservations_FullMethodName   = "/litevirt.v1.LiteVirt/ListProjectQuotaReservations"
-	LiteVirt_CheckVIPParticipant_FullMethodName            = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
-	LiteVirt_RelayCheckVIPParticipant_FullMethodName       = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
-	LiteVirt_CheckLBPresent_FullMethodName                 = "/litevirt.v1.LiteVirt/CheckLBPresent"
-	LiteVirt_CloneVM_FullMethodName                        = "/litevirt.v1.LiteVirt/CloneVM"
-	LiteVirt_ConvertToTemplate_FullMethodName              = "/litevirt.v1.LiteVirt/ConvertToTemplate"
-	LiteVirt_ExecVM_FullMethodName                         = "/litevirt.v1.LiteVirt/ExecVM"
-	LiteVirt_ConsoleVM_FullMethodName                      = "/litevirt.v1.LiteVirt/ConsoleVM"
-	LiteVirt_SetVMIP_FullMethodName                        = "/litevirt.v1.LiteVirt/SetVMIP"
-	LiteVirt_SetBootOrder_FullMethodName                   = "/litevirt.v1.LiteVirt/SetBootOrder"
-	LiteVirt_RebuildVM_FullMethodName                      = "/litevirt.v1.LiteVirt/RebuildVM"
-	LiteVirt_CutoverVM_FullMethodName                      = "/litevirt.v1.LiteVirt/CutoverVM"
-	LiteVirt_UpdateVM_FullMethodName                       = "/litevirt.v1.LiteVirt/UpdateVM"
-	LiteVirt_SetVMMemory_FullMethodName                    = "/litevirt.v1.LiteVirt/SetVMMemory"
-	LiteVirt_SetVMLabels_FullMethodName                    = "/litevirt.v1.LiteVirt/SetVMLabels"
-	LiteVirt_AttachDevice_FullMethodName                   = "/litevirt.v1.LiteVirt/AttachDevice"
-	LiteVirt_DetachDevice_FullMethodName                   = "/litevirt.v1.LiteVirt/DetachDevice"
-	LiteVirt_ResizeDisk_FullMethodName                     = "/litevirt.v1.LiteVirt/ResizeDisk"
-	LiteVirt_ProxyVNC_FullMethodName                       = "/litevirt.v1.LiteVirt/ProxyVNC"
-	LiteVirt_GetVMLogs_FullMethodName                      = "/litevirt.v1.LiteVirt/GetVMLogs"
-	LiteVirt_DeployStack_FullMethodName                    = "/litevirt.v1.LiteVirt/DeployStack"
-	LiteVirt_DeleteStack_FullMethodName                    = "/litevirt.v1.LiteVirt/DeleteStack"
-	LiteVirt_ListStacks_FullMethodName                     = "/litevirt.v1.LiteVirt/ListStacks"
-	LiteVirt_DiffStack_FullMethodName                      = "/litevirt.v1.LiteVirt/DiffStack"
-	LiteVirt_ExportStack_FullMethodName                    = "/litevirt.v1.LiteVirt/ExportStack"
-	LiteVirt_MigrateVM_FullMethodName                      = "/litevirt.v1.LiteVirt/MigrateVM"
-	LiteVirt_MoveVolume_FullMethodName                     = "/litevirt.v1.LiteVirt/MoveVolume"
-	LiteVirt_ReplicateVolume_FullMethodName                = "/litevirt.v1.LiteVirt/ReplicateVolume"
-	LiteVirt_MigrateStackVolumes_FullMethodName            = "/litevirt.v1.LiteVirt/MigrateStackVolumes"
-	LiteVirt_PullImage_FullMethodName                      = "/litevirt.v1.LiteVirt/PullImage"
-	LiteVirt_ListImages_FullMethodName                     = "/litevirt.v1.LiteVirt/ListImages"
-	LiteVirt_DeleteImage_FullMethodName                    = "/litevirt.v1.LiteVirt/DeleteImage"
-	LiteVirt_ImportImage_FullMethodName                    = "/litevirt.v1.LiteVirt/ImportImage"
-	LiteVirt_PushImage_FullMethodName                      = "/litevirt.v1.LiteVirt/PushImage"
-	LiteVirt_BuildImage_FullMethodName                     = "/litevirt.v1.LiteVirt/BuildImage"
-	LiteVirt_BackupVM_FullMethodName                       = "/litevirt.v1.LiteVirt/BackupVM"
-	LiteVirt_RestoreVM_FullMethodName                      = "/litevirt.v1.LiteVirt/RestoreVM"
-	LiteVirt_ImportVM_FullMethodName                       = "/litevirt.v1.LiteVirt/ImportVM"
-	LiteVirt_CreateSnapshot_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateSnapshot"
-	LiteVirt_ListSnapshots_FullMethodName                  = "/litevirt.v1.LiteVirt/ListSnapshots"
-	LiteVirt_RestoreSnapshot_FullMethodName                = "/litevirt.v1.LiteVirt/RestoreSnapshot"
-	LiteVirt_DeleteSnapshot_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteSnapshot"
-	LiteVirt_CreateNetwork_FullMethodName                  = "/litevirt.v1.LiteVirt/CreateNetwork"
-	LiteVirt_GetNetwork_FullMethodName                     = "/litevirt.v1.LiteVirt/GetNetwork"
-	LiteVirt_DeleteNetwork_FullMethodName                  = "/litevirt.v1.LiteVirt/DeleteNetwork"
-	LiteVirt_ListNetworks_FullMethodName                   = "/litevirt.v1.LiteVirt/ListNetworks"
-	LiteVirt_ListLoadBalancers_FullMethodName              = "/litevirt.v1.LiteVirt/ListLoadBalancers"
-	LiteVirt_InspectLoadBalancer_FullMethodName            = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
-	LiteVirt_CreateLoadBalancer_FullMethodName             = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
-	LiteVirt_UpdateLoadBalancer_FullMethodName             = "/litevirt.v1.LiteVirt/UpdateLoadBalancer"
-	LiteVirt_DeleteLoadBalancer_FullMethodName             = "/litevirt.v1.LiteVirt/DeleteLoadBalancer"
-	LiteVirt_LBStats_FullMethodName                        = "/litevirt.v1.LiteVirt/LBStats"
-	LiteVirt_DrainBackend_FullMethodName                   = "/litevirt.v1.LiteVirt/DrainBackend"
-	LiteVirt_DisableBackend_FullMethodName                 = "/litevirt.v1.LiteVirt/DisableBackend"
-	LiteVirt_EnableBackend_FullMethodName                  = "/litevirt.v1.LiteVirt/EnableBackend"
-	LiteVirt_ApplyLB_FullMethodName                        = "/litevirt.v1.LiteVirt/ApplyLB"
-	LiteVirt_RemoveLB_FullMethodName                       = "/litevirt.v1.LiteVirt/RemoveLB"
-	LiteVirt_LBKeepalivedRunning_FullMethodName            = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
-	LiteVirt_Login_FullMethodName                          = "/litevirt.v1.LiteVirt/Login"
-	LiteVirt_ListRealms_FullMethodName                     = "/litevirt.v1.LiteVirt/ListRealms"
-	LiteVirt_Logout_FullMethodName                         = "/litevirt.v1.LiteVirt/Logout"
-	LiteVirt_ListSessions_FullMethodName                   = "/litevirt.v1.LiteVirt/ListSessions"
-	LiteVirt_RevokeSession_FullMethodName                  = "/litevirt.v1.LiteVirt/RevokeSession"
-	LiteVirt_CreateUser_FullMethodName                     = "/litevirt.v1.LiteVirt/CreateUser"
-	LiteVirt_ListUsers_FullMethodName                      = "/litevirt.v1.LiteVirt/ListUsers"
-	LiteVirt_DeleteUser_FullMethodName                     = "/litevirt.v1.LiteVirt/DeleteUser"
-	LiteVirt_CreateToken_FullMethodName                    = "/litevirt.v1.LiteVirt/CreateToken"
-	LiteVirt_RevokeToken_FullMethodName                    = "/litevirt.v1.LiteVirt/RevokeToken"
-	LiteVirt_Whoami_FullMethodName                         = "/litevirt.v1.LiteVirt/Whoami"
-	LiteVirt_ChangePassword_FullMethodName                 = "/litevirt.v1.LiteVirt/ChangePassword"
-	LiteVirt_ListTwoFactors_FullMethodName                 = "/litevirt.v1.LiteVirt/ListTwoFactors"
-	LiteVirt_EnrollTOTP_FullMethodName                     = "/litevirt.v1.LiteVirt/EnrollTOTP"
-	LiteVirt_DisableTwoFactor_FullMethodName               = "/litevirt.v1.LiteVirt/DisableTwoFactor"
-	LiteVirt_GrantRole_FullMethodName                      = "/litevirt.v1.LiteVirt/GrantRole"
-	LiteVirt_RevokeRole_FullMethodName                     = "/litevirt.v1.LiteVirt/RevokeRole"
-	LiteVirt_ListRoleBindings_FullMethodName               = "/litevirt.v1.LiteVirt/ListRoleBindings"
-	LiteVirt_NormalizeRoleBindings_FullMethodName          = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
-	LiteVirt_GetVMOperation_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMOperation"
-	LiteVirt_AbortVMOperation_FullMethodName               = "/litevirt.v1.LiteVirt/AbortVMOperation"
-	LiteVirt_BeginWebAuthnRegistration_FullMethodName      = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
-	LiteVirt_FinishWebAuthnRegistration_FullMethodName     = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
-	LiteVirt_BeginWebAuthnLogin_FullMethodName             = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
-	LiteVirt_FinishWebAuthnLogin_FullMethodName            = "/litevirt.v1.LiteVirt/FinishWebAuthnLogin"
-	LiteVirt_RestoreLive_FullMethodName                    = "/litevirt.v1.LiteVirt/RestoreLive"
-	LiteVirt_BindSecurityGroups_FullMethodName             = "/litevirt.v1.LiteVirt/BindSecurityGroups"
-	LiteVirt_ReloadFirewall_FullMethodName                 = "/litevirt.v1.LiteVirt/ReloadFirewall"
-	LiteVirt_BackupSnapshot_FullMethodName                 = "/litevirt.v1.LiteVirt/BackupSnapshot"
-	LiteVirt_RestoreFromBackup_FullMethodName              = "/litevirt.v1.LiteVirt/RestoreFromBackup"
-	LiteVirt_HasChunks_FullMethodName                      = "/litevirt.v1.LiteVirt/HasChunks"
-	LiteVirt_PushBackup_FullMethodName                     = "/litevirt.v1.LiteVirt/PushBackup"
-	LiteVirt_CreateContainer_FullMethodName                = "/litevirt.v1.LiteVirt/CreateContainer"
-	LiteVirt_StartContainer_FullMethodName                 = "/litevirt.v1.LiteVirt/StartContainer"
-	LiteVirt_StopContainer_FullMethodName                  = "/litevirt.v1.LiteVirt/StopContainer"
-	LiteVirt_DeleteContainer_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteContainer"
-	LiteVirt_ExecContainer_FullMethodName                  = "/litevirt.v1.LiteVirt/ExecContainer"
-	LiteVirt_ListContainers_FullMethodName                 = "/litevirt.v1.LiteVirt/ListContainers"
-	LiteVirt_PullOCIImage_FullMethodName                   = "/litevirt.v1.LiteVirt/PullOCIImage"
-	LiteVirt_BackupContainer_FullMethodName                = "/litevirt.v1.LiteVirt/BackupContainer"
-	LiteVirt_RestoreContainer_FullMethodName               = "/litevirt.v1.LiteVirt/RestoreContainer"
-	LiteVirt_MigrateContainer_FullMethodName               = "/litevirt.v1.LiteVirt/MigrateContainer"
-	LiteVirt_SnapshotContainer_FullMethodName              = "/litevirt.v1.LiteVirt/SnapshotContainer"
-	LiteVirt_ListContainerSnapshots_FullMethodName         = "/litevirt.v1.LiteVirt/ListContainerSnapshots"
-	LiteVirt_RevertContainerSnapshot_FullMethodName        = "/litevirt.v1.LiteVirt/RevertContainerSnapshot"
-	LiteVirt_DeleteContainerSnapshot_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
-	LiteVirt_ConvertContainerToTemplate_FullMethodName     = "/litevirt.v1.LiteVirt/ConvertContainerToTemplate"
-	LiteVirt_CloneContainer_FullMethodName                 = "/litevirt.v1.LiteVirt/CloneContainer"
-	LiteVirt_GetVMStats_FullMethodName                     = "/litevirt.v1.LiteVirt/GetVMStats"
-	LiteVirt_GetHostStats_FullMethodName                   = "/litevirt.v1.LiteVirt/GetHostStats"
-	LiteVirt_GetClusterStatus_FullMethodName               = "/litevirt.v1.LiteVirt/GetClusterStatus"
-	LiteVirt_StreamEvents_FullMethodName                   = "/litevirt.v1.LiteVirt/StreamEvents"
-	LiteVirt_ListAuditLog_FullMethodName                   = "/litevirt.v1.LiteVirt/ListAuditLog"
-	LiteVirt_ListVMEvents_FullMethodName                   = "/litevirt.v1.LiteVirt/ListVMEvents"
-	LiteVirt_ListStoragePools_FullMethodName               = "/litevirt.v1.LiteVirt/ListStoragePools"
-	LiteVirt_CreateStoragePool_FullMethodName              = "/litevirt.v1.LiteVirt/CreateStoragePool"
-	LiteVirt_DeleteStoragePool_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteStoragePool"
-	LiteVirt_GetStoragePool_FullMethodName                 = "/litevirt.v1.LiteVirt/GetStoragePool"
-	LiteVirt_ListStoragePoolContents_FullMethodName        = "/litevirt.v1.LiteVirt/ListStoragePoolContents"
-	LiteVirt_UploadStoragePoolContent_FullMethodName       = "/litevirt.v1.LiteVirt/UploadStoragePoolContent"
-	LiteVirt_CreateResourceMapping_FullMethodName          = "/litevirt.v1.LiteVirt/CreateResourceMapping"
-	LiteVirt_ListResourceMappings_FullMethodName           = "/litevirt.v1.LiteVirt/ListResourceMappings"
-	LiteVirt_DeleteResourceMapping_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteResourceMapping"
-	LiteVirt_AddMappingDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AddMappingDevice"
-	LiteVirt_RemoveMappingDevice_FullMethodName            = "/litevirt.v1.LiteVirt/RemoveMappingDevice"
-	LiteVirt_CreateNotificationTarget_FullMethodName       = "/litevirt.v1.LiteVirt/CreateNotificationTarget"
-	LiteVirt_ListNotificationTargets_FullMethodName        = "/litevirt.v1.LiteVirt/ListNotificationTargets"
-	LiteVirt_DeleteNotificationTarget_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteNotificationTarget"
-	LiteVirt_TestNotificationTarget_FullMethodName         = "/litevirt.v1.LiteVirt/TestNotificationTarget"
-	LiteVirt_CreateNotificationRoute_FullMethodName        = "/litevirt.v1.LiteVirt/CreateNotificationRoute"
-	LiteVirt_ListNotificationRoutes_FullMethodName         = "/litevirt.v1.LiteVirt/ListNotificationRoutes"
-	LiteVirt_DeleteNotificationRoute_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteNotificationRoute"
-	LiteVirt_SetRegistryCredential_FullMethodName          = "/litevirt.v1.LiteVirt/SetRegistryCredential"
-	LiteVirt_ListRegistryCredentials_FullMethodName        = "/litevirt.v1.LiteVirt/ListRegistryCredentials"
-	LiteVirt_DeleteRegistryCredential_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteRegistryCredential"
-	LiteVirt_CreateClusterFirewallRule_FullMethodName      = "/litevirt.v1.LiteVirt/CreateClusterFirewallRule"
-	LiteVirt_ListClusterFirewallRules_FullMethodName       = "/litevirt.v1.LiteVirt/ListClusterFirewallRules"
-	LiteVirt_DeleteClusterFirewallRule_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteClusterFirewallRule"
-	LiteVirt_CreateHostFirewallRule_FullMethodName         = "/litevirt.v1.LiteVirt/CreateHostFirewallRule"
-	LiteVirt_ListHostFirewallRules_FullMethodName          = "/litevirt.v1.LiteVirt/ListHostFirewallRules"
-	LiteVirt_DeleteHostFirewallRule_FullMethodName         = "/litevirt.v1.LiteVirt/DeleteHostFirewallRule"
-	LiteVirt_CreateIpSet_FullMethodName                    = "/litevirt.v1.LiteVirt/CreateIpSet"
-	LiteVirt_ListIpSets_FullMethodName                     = "/litevirt.v1.LiteVirt/ListIpSets"
-	LiteVirt_DeleteIpSet_FullMethodName                    = "/litevirt.v1.LiteVirt/DeleteIpSet"
-	LiteVirt_SetFirewallDefault_FullMethodName             = "/litevirt.v1.LiteVirt/SetFirewallDefault"
-	LiteVirt_ListFirewallDefaults_FullMethodName           = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
-	LiteVirt_DeleteStoragePoolContent_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
-	LiteVirt_PushReplicaIncrement_FullMethodName           = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
-	LiteVirt_Ping_FullMethodName                           = "/litevirt.v1.LiteVirt/Ping"
-	LiteVirt_ProvisionNetwork_FullMethodName               = "/litevirt.v1.LiteVirt/ProvisionNetwork"
-	LiteVirt_SyncVTEP_FullMethodName                       = "/litevirt.v1.LiteVirt/SyncVTEP"
-	LiteVirt_GetVMIPRemote_FullMethodName                  = "/litevirt.v1.LiteVirt/GetVMIPRemote"
-	LiteVirt_RefreshLB_FullMethodName                      = "/litevirt.v1.LiteVirt/RefreshLB"
-	LiteVirt_UpdateFDB_FullMethodName                      = "/litevirt.v1.LiteVirt/UpdateFDB"
-	LiteVirt_EnsureCloudInit_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureCloudInit"
-	LiteVirt_EnsureDisks_FullMethodName                    = "/litevirt.v1.LiteVirt/EnsureDisks"
-	LiteVirt_EnsureFirmwareState_FullMethodName            = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
-	LiteVirt_CleanupMigrationArtifacts_FullMethodName      = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
-	LiteVirt_GetStateDigest_FullMethodName                 = "/litevirt.v1.LiteVirt/GetStateDigest"
-	LiteVirt_GetStateDump_FullMethodName                   = "/litevirt.v1.LiteVirt/GetStateDump"
-	LiteVirt_StreamStateDump_FullMethodName                = "/litevirt.v1.LiteVirt/StreamStateDump"
-	LiteVirt_GetSensitiveStateDigest_FullMethodName        = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
-	LiteVirt_StreamSensitiveStateDump_FullMethodName       = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
-	LiteVirt_TriggerAntiEntropy_FullMethodName             = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
-	LiteVirt_GetClusterStateDigest_FullMethodName          = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
-	LiteVirt_DiagnoseDivergence_FullMethodName             = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
-	LiteVirt_ScanSensitiveDivergence_FullMethodName        = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
-	LiteVirt_PushMutations_FullMethodName                  = "/litevirt.v1.LiteVirt/PushMutations"
-	LiteVirt_AckMutations_FullMethodName                   = "/litevirt.v1.LiteVirt/AckMutations"
-	LiteVirt_ListRebalanceProposals_FullMethodName         = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
-	LiteVirt_RunRebalance_FullMethodName                   = "/litevirt.v1.LiteVirt/RunRebalance"
-	LiteVirt_ApproveRebalanceProposal_FullMethodName       = "/litevirt.v1.LiteVirt/ApproveRebalanceProposal"
-	LiteVirt_RejectRebalanceProposal_FullMethodName        = "/litevirt.v1.LiteVirt/RejectRebalanceProposal"
-	LiteVirt_GetSpiceInfo_FullMethodName                   = "/litevirt.v1.LiteVirt/GetSpiceInfo"
-	LiteVirt_PreflightUpgrade_FullMethodName               = "/litevirt.v1.LiteVirt/PreflightUpgrade"
-	LiteVirt_ListRegions_FullMethodName                    = "/litevirt.v1.LiteVirt/ListRegions"
-	LiteVirt_RegionStatus_FullMethodName                   = "/litevirt.v1.LiteVirt/RegionStatus"
-	LiteVirt_CrossRegionMigrate_FullMethodName             = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
-	LiteVirt_UpsertServiceEndpoint_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
-	LiteVirt_ListServiceEndpoints_FullMethodName           = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
-	LiteVirt_DeleteServiceEndpoint_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
-	LiteVirt_CreateBackupSchedule_FullMethodName           = "/litevirt.v1.LiteVirt/CreateBackupSchedule"
-	LiteVirt_ListBackupSchedules_FullMethodName            = "/litevirt.v1.LiteVirt/ListBackupSchedules"
-	LiteVirt_DeleteBackupSchedule_FullMethodName           = "/litevirt.v1.LiteVirt/DeleteBackupSchedule"
-	LiteVirt_CreateReplicationSchedule_FullMethodName      = "/litevirt.v1.LiteVirt/CreateReplicationSchedule"
-	LiteVirt_ListReplicationSchedules_FullMethodName       = "/litevirt.v1.LiteVirt/ListReplicationSchedules"
-	LiteVirt_DeleteReplicationSchedule_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteReplicationSchedule"
-	LiteVirt_PromoteReplica_FullMethodName                 = "/litevirt.v1.LiteVirt/PromoteReplica"
-	LiteVirt_VerifyAuditChain_FullMethodName               = "/litevirt.v1.LiteVirt/VerifyAuditChain"
-	LiteVirt_ExportAuditChain_FullMethodName               = "/litevirt.v1.LiteVirt/ExportAuditChain"
-	LiteVirt_CreateProject_FullMethodName                  = "/litevirt.v1.LiteVirt/CreateProject"
-	LiteVirt_ListProjects_FullMethodName                   = "/litevirt.v1.LiteVirt/ListProjects"
-	LiteVirt_GetProject_FullMethodName                     = "/litevirt.v1.LiteVirt/GetProject"
-	LiteVirt_DeleteProject_FullMethodName                  = "/litevirt.v1.LiteVirt/DeleteProject"
-	LiteVirt_SetProjectQuota_FullMethodName                = "/litevirt.v1.LiteVirt/SetProjectQuota"
-	LiteVirt_GetProjectQuota_FullMethodName                = "/litevirt.v1.LiteVirt/GetProjectQuota"
-	LiteVirt_GetProjectUsage_FullMethodName                = "/litevirt.v1.LiteVirt/GetProjectUsage"
+	LiteVirt_ListHosts_FullMethodName                  = "/litevirt.v1.LiteVirt/ListHosts"
+	LiteVirt_InspectHost_FullMethodName                = "/litevirt.v1.LiteVirt/InspectHost"
+	LiteVirt_DrainHost_FullMethodName                  = "/litevirt.v1.LiteVirt/DrainHost"
+	LiteVirt_ShutdownHostWorkloads_FullMethodName      = "/litevirt.v1.LiteVirt/ShutdownHostWorkloads"
+	LiteVirt_UndrainHost_FullMethodName                = "/litevirt.v1.LiteVirt/UndrainHost"
+	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
+	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
+	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
+	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
+	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
+	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
+	LiteVirt_UpsertHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
+	LiteVirt_PlanHostNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/PlanHostNetwork"
+	LiteVirt_ApplyHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ApplyHostNetwork"
+	LiteVirt_DeleteHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteHostNetwork"
+	LiteVirt_IsolateHost_FullMethodName                = "/litevirt.v1.LiteVirt/IsolateHost"
+	LiteVirt_ReseedHost_FullMethodName                 = "/litevirt.v1.LiteVirt/ReseedHost"
+	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
+	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
+	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
+	LiteVirt_UpgradeHost_FullMethodName                = "/litevirt.v1.LiteVirt/UpgradeHost"
+	LiteVirt_PreStageUpgrade_FullMethodName            = "/litevirt.v1.LiteVirt/PreStageUpgrade"
+	LiteVirt_FetchBinary_FullMethodName                = "/litevirt.v1.LiteVirt/FetchBinary"
+	LiteVirt_UninstallHost_FullMethodName              = "/litevirt.v1.LiteVirt/UninstallHost"
+	LiteVirt_ConfigureHost_FullMethodName              = "/litevirt.v1.LiteVirt/ConfigureHost"
+	LiteVirt_CreateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CreateVM"
+	LiteVirt_ListVMs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListVMs"
+	LiteVirt_InspectVM_FullMethodName                  = "/litevirt.v1.LiteVirt/InspectVM"
+	LiteVirt_ListVMHardware_FullMethodName             = "/litevirt.v1.LiteVirt/ListVMHardware"
+	LiteVirt_StartVM_FullMethodName                    = "/litevirt.v1.LiteVirt/StartVM"
+	LiteVirt_StopVM_FullMethodName                     = "/litevirt.v1.LiteVirt/StopVM"
+	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
+	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
+	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
+	LiteVirt_GetRuntimeInventory_FullMethodName        = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
+	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
+	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
+	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
+	LiteVirt_CloneVM_FullMethodName                    = "/litevirt.v1.LiteVirt/CloneVM"
+	LiteVirt_ConvertToTemplate_FullMethodName          = "/litevirt.v1.LiteVirt/ConvertToTemplate"
+	LiteVirt_ExecVM_FullMethodName                     = "/litevirt.v1.LiteVirt/ExecVM"
+	LiteVirt_ConsoleVM_FullMethodName                  = "/litevirt.v1.LiteVirt/ConsoleVM"
+	LiteVirt_SetVMIP_FullMethodName                    = "/litevirt.v1.LiteVirt/SetVMIP"
+	LiteVirt_SetBootOrder_FullMethodName               = "/litevirt.v1.LiteVirt/SetBootOrder"
+	LiteVirt_RebuildVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RebuildVM"
+	LiteVirt_CutoverVM_FullMethodName                  = "/litevirt.v1.LiteVirt/CutoverVM"
+	LiteVirt_UpdateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/UpdateVM"
+	LiteVirt_SetVMMemory_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMMemory"
+	LiteVirt_SetVMLabels_FullMethodName                = "/litevirt.v1.LiteVirt/SetVMLabels"
+	LiteVirt_AttachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/AttachDevice"
+	LiteVirt_DetachDevice_FullMethodName               = "/litevirt.v1.LiteVirt/DetachDevice"
+	LiteVirt_ResizeDisk_FullMethodName                 = "/litevirt.v1.LiteVirt/ResizeDisk"
+	LiteVirt_ProxyVNC_FullMethodName                   = "/litevirt.v1.LiteVirt/ProxyVNC"
+	LiteVirt_GetVMLogs_FullMethodName                  = "/litevirt.v1.LiteVirt/GetVMLogs"
+	LiteVirt_DeployStack_FullMethodName                = "/litevirt.v1.LiteVirt/DeployStack"
+	LiteVirt_DeleteStack_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteStack"
+	LiteVirt_ListStacks_FullMethodName                 = "/litevirt.v1.LiteVirt/ListStacks"
+	LiteVirt_DiffStack_FullMethodName                  = "/litevirt.v1.LiteVirt/DiffStack"
+	LiteVirt_ExportStack_FullMethodName                = "/litevirt.v1.LiteVirt/ExportStack"
+	LiteVirt_MigrateVM_FullMethodName                  = "/litevirt.v1.LiteVirt/MigrateVM"
+	LiteVirt_MoveVolume_FullMethodName                 = "/litevirt.v1.LiteVirt/MoveVolume"
+	LiteVirt_ReplicateVolume_FullMethodName            = "/litevirt.v1.LiteVirt/ReplicateVolume"
+	LiteVirt_MigrateStackVolumes_FullMethodName        = "/litevirt.v1.LiteVirt/MigrateStackVolumes"
+	LiteVirt_PullImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PullImage"
+	LiteVirt_ListImages_FullMethodName                 = "/litevirt.v1.LiteVirt/ListImages"
+	LiteVirt_DeleteImage_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteImage"
+	LiteVirt_ImportImage_FullMethodName                = "/litevirt.v1.LiteVirt/ImportImage"
+	LiteVirt_PushImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PushImage"
+	LiteVirt_BuildImage_FullMethodName                 = "/litevirt.v1.LiteVirt/BuildImage"
+	LiteVirt_BackupVM_FullMethodName                   = "/litevirt.v1.LiteVirt/BackupVM"
+	LiteVirt_RestoreVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestoreVM"
+	LiteVirt_ImportVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ImportVM"
+	LiteVirt_CreateSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/CreateSnapshot"
+	LiteVirt_ListSnapshots_FullMethodName              = "/litevirt.v1.LiteVirt/ListSnapshots"
+	LiteVirt_RestoreSnapshot_FullMethodName            = "/litevirt.v1.LiteVirt/RestoreSnapshot"
+	LiteVirt_DeleteSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/DeleteSnapshot"
+	LiteVirt_CreateNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/CreateNetwork"
+	LiteVirt_GetNetwork_FullMethodName                 = "/litevirt.v1.LiteVirt/GetNetwork"
+	LiteVirt_DeleteNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteNetwork"
+	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
+	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
+	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
+	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
+	LiteVirt_UpdateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/UpdateLoadBalancer"
+	LiteVirt_DeleteLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/DeleteLoadBalancer"
+	LiteVirt_LBStats_FullMethodName                    = "/litevirt.v1.LiteVirt/LBStats"
+	LiteVirt_DrainBackend_FullMethodName               = "/litevirt.v1.LiteVirt/DrainBackend"
+	LiteVirt_DisableBackend_FullMethodName             = "/litevirt.v1.LiteVirt/DisableBackend"
+	LiteVirt_EnableBackend_FullMethodName              = "/litevirt.v1.LiteVirt/EnableBackend"
+	LiteVirt_ApplyLB_FullMethodName                    = "/litevirt.v1.LiteVirt/ApplyLB"
+	LiteVirt_RemoveLB_FullMethodName                   = "/litevirt.v1.LiteVirt/RemoveLB"
+	LiteVirt_LBKeepalivedRunning_FullMethodName        = "/litevirt.v1.LiteVirt/LBKeepalivedRunning"
+	LiteVirt_Login_FullMethodName                      = "/litevirt.v1.LiteVirt/Login"
+	LiteVirt_ListRealms_FullMethodName                 = "/litevirt.v1.LiteVirt/ListRealms"
+	LiteVirt_Logout_FullMethodName                     = "/litevirt.v1.LiteVirt/Logout"
+	LiteVirt_ListSessions_FullMethodName               = "/litevirt.v1.LiteVirt/ListSessions"
+	LiteVirt_RevokeSession_FullMethodName              = "/litevirt.v1.LiteVirt/RevokeSession"
+	LiteVirt_CreateUser_FullMethodName                 = "/litevirt.v1.LiteVirt/CreateUser"
+	LiteVirt_ListUsers_FullMethodName                  = "/litevirt.v1.LiteVirt/ListUsers"
+	LiteVirt_DeleteUser_FullMethodName                 = "/litevirt.v1.LiteVirt/DeleteUser"
+	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
+	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
+	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
+	LiteVirt_ChangePassword_FullMethodName             = "/litevirt.v1.LiteVirt/ChangePassword"
+	LiteVirt_ListTwoFactors_FullMethodName             = "/litevirt.v1.LiteVirt/ListTwoFactors"
+	LiteVirt_EnrollTOTP_FullMethodName                 = "/litevirt.v1.LiteVirt/EnrollTOTP"
+	LiteVirt_DisableTwoFactor_FullMethodName           = "/litevirt.v1.LiteVirt/DisableTwoFactor"
+	LiteVirt_GrantRole_FullMethodName                  = "/litevirt.v1.LiteVirt/GrantRole"
+	LiteVirt_RevokeRole_FullMethodName                 = "/litevirt.v1.LiteVirt/RevokeRole"
+	LiteVirt_ListRoleBindings_FullMethodName           = "/litevirt.v1.LiteVirt/ListRoleBindings"
+	LiteVirt_NormalizeRoleBindings_FullMethodName      = "/litevirt.v1.LiteVirt/NormalizeRoleBindings"
+	LiteVirt_GetVMOperation_FullMethodName             = "/litevirt.v1.LiteVirt/GetVMOperation"
+	LiteVirt_AbortVMOperation_FullMethodName           = "/litevirt.v1.LiteVirt/AbortVMOperation"
+	LiteVirt_BeginWebAuthnRegistration_FullMethodName  = "/litevirt.v1.LiteVirt/BeginWebAuthnRegistration"
+	LiteVirt_FinishWebAuthnRegistration_FullMethodName = "/litevirt.v1.LiteVirt/FinishWebAuthnRegistration"
+	LiteVirt_BeginWebAuthnLogin_FullMethodName         = "/litevirt.v1.LiteVirt/BeginWebAuthnLogin"
+	LiteVirt_FinishWebAuthnLogin_FullMethodName        = "/litevirt.v1.LiteVirt/FinishWebAuthnLogin"
+	LiteVirt_RestoreLive_FullMethodName                = "/litevirt.v1.LiteVirt/RestoreLive"
+	LiteVirt_BindSecurityGroups_FullMethodName         = "/litevirt.v1.LiteVirt/BindSecurityGroups"
+	LiteVirt_ReloadFirewall_FullMethodName             = "/litevirt.v1.LiteVirt/ReloadFirewall"
+	LiteVirt_BackupSnapshot_FullMethodName             = "/litevirt.v1.LiteVirt/BackupSnapshot"
+	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
+	LiteVirt_HasChunks_FullMethodName                  = "/litevirt.v1.LiteVirt/HasChunks"
+	LiteVirt_PushBackup_FullMethodName                 = "/litevirt.v1.LiteVirt/PushBackup"
+	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
+	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
+	LiteVirt_StopContainer_FullMethodName              = "/litevirt.v1.LiteVirt/StopContainer"
+	LiteVirt_DeleteContainer_FullMethodName            = "/litevirt.v1.LiteVirt/DeleteContainer"
+	LiteVirt_ExecContainer_FullMethodName              = "/litevirt.v1.LiteVirt/ExecContainer"
+	LiteVirt_ListContainers_FullMethodName             = "/litevirt.v1.LiteVirt/ListContainers"
+	LiteVirt_PullOCIImage_FullMethodName               = "/litevirt.v1.LiteVirt/PullOCIImage"
+	LiteVirt_BackupContainer_FullMethodName            = "/litevirt.v1.LiteVirt/BackupContainer"
+	LiteVirt_RestoreContainer_FullMethodName           = "/litevirt.v1.LiteVirt/RestoreContainer"
+	LiteVirt_MigrateContainer_FullMethodName           = "/litevirt.v1.LiteVirt/MigrateContainer"
+	LiteVirt_SnapshotContainer_FullMethodName          = "/litevirt.v1.LiteVirt/SnapshotContainer"
+	LiteVirt_ListContainerSnapshots_FullMethodName     = "/litevirt.v1.LiteVirt/ListContainerSnapshots"
+	LiteVirt_RevertContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/RevertContainerSnapshot"
+	LiteVirt_DeleteContainerSnapshot_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteContainerSnapshot"
+	LiteVirt_ConvertContainerToTemplate_FullMethodName = "/litevirt.v1.LiteVirt/ConvertContainerToTemplate"
+	LiteVirt_CloneContainer_FullMethodName             = "/litevirt.v1.LiteVirt/CloneContainer"
+	LiteVirt_GetVMStats_FullMethodName                 = "/litevirt.v1.LiteVirt/GetVMStats"
+	LiteVirt_GetHostStats_FullMethodName               = "/litevirt.v1.LiteVirt/GetHostStats"
+	LiteVirt_GetClusterStatus_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterStatus"
+	LiteVirt_StreamEvents_FullMethodName               = "/litevirt.v1.LiteVirt/StreamEvents"
+	LiteVirt_ListAuditLog_FullMethodName               = "/litevirt.v1.LiteVirt/ListAuditLog"
+	LiteVirt_ListVMEvents_FullMethodName               = "/litevirt.v1.LiteVirt/ListVMEvents"
+	LiteVirt_ListStoragePools_FullMethodName           = "/litevirt.v1.LiteVirt/ListStoragePools"
+	LiteVirt_CreateStoragePool_FullMethodName          = "/litevirt.v1.LiteVirt/CreateStoragePool"
+	LiteVirt_DeleteStoragePool_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteStoragePool"
+	LiteVirt_GetStoragePool_FullMethodName             = "/litevirt.v1.LiteVirt/GetStoragePool"
+	LiteVirt_ListStoragePoolContents_FullMethodName    = "/litevirt.v1.LiteVirt/ListStoragePoolContents"
+	LiteVirt_UploadStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/UploadStoragePoolContent"
+	LiteVirt_CreateResourceMapping_FullMethodName      = "/litevirt.v1.LiteVirt/CreateResourceMapping"
+	LiteVirt_ListResourceMappings_FullMethodName       = "/litevirt.v1.LiteVirt/ListResourceMappings"
+	LiteVirt_DeleteResourceMapping_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteResourceMapping"
+	LiteVirt_AddMappingDevice_FullMethodName           = "/litevirt.v1.LiteVirt/AddMappingDevice"
+	LiteVirt_RemoveMappingDevice_FullMethodName        = "/litevirt.v1.LiteVirt/RemoveMappingDevice"
+	LiteVirt_CreateNotificationTarget_FullMethodName   = "/litevirt.v1.LiteVirt/CreateNotificationTarget"
+	LiteVirt_ListNotificationTargets_FullMethodName    = "/litevirt.v1.LiteVirt/ListNotificationTargets"
+	LiteVirt_DeleteNotificationTarget_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteNotificationTarget"
+	LiteVirt_TestNotificationTarget_FullMethodName     = "/litevirt.v1.LiteVirt/TestNotificationTarget"
+	LiteVirt_CreateNotificationRoute_FullMethodName    = "/litevirt.v1.LiteVirt/CreateNotificationRoute"
+	LiteVirt_ListNotificationRoutes_FullMethodName     = "/litevirt.v1.LiteVirt/ListNotificationRoutes"
+	LiteVirt_DeleteNotificationRoute_FullMethodName    = "/litevirt.v1.LiteVirt/DeleteNotificationRoute"
+	LiteVirt_SetRegistryCredential_FullMethodName      = "/litevirt.v1.LiteVirt/SetRegistryCredential"
+	LiteVirt_ListRegistryCredentials_FullMethodName    = "/litevirt.v1.LiteVirt/ListRegistryCredentials"
+	LiteVirt_DeleteRegistryCredential_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteRegistryCredential"
+	LiteVirt_CreateClusterFirewallRule_FullMethodName  = "/litevirt.v1.LiteVirt/CreateClusterFirewallRule"
+	LiteVirt_ListClusterFirewallRules_FullMethodName   = "/litevirt.v1.LiteVirt/ListClusterFirewallRules"
+	LiteVirt_DeleteClusterFirewallRule_FullMethodName  = "/litevirt.v1.LiteVirt/DeleteClusterFirewallRule"
+	LiteVirt_CreateHostFirewallRule_FullMethodName     = "/litevirt.v1.LiteVirt/CreateHostFirewallRule"
+	LiteVirt_ListHostFirewallRules_FullMethodName      = "/litevirt.v1.LiteVirt/ListHostFirewallRules"
+	LiteVirt_DeleteHostFirewallRule_FullMethodName     = "/litevirt.v1.LiteVirt/DeleteHostFirewallRule"
+	LiteVirt_CreateIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/CreateIpSet"
+	LiteVirt_ListIpSets_FullMethodName                 = "/litevirt.v1.LiteVirt/ListIpSets"
+	LiteVirt_DeleteIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteIpSet"
+	LiteVirt_SetFirewallDefault_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallDefault"
+	LiteVirt_ListFirewallDefaults_FullMethodName       = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
+	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
+	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
+	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
+	LiteVirt_ProvisionNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ProvisionNetwork"
+	LiteVirt_SyncVTEP_FullMethodName                   = "/litevirt.v1.LiteVirt/SyncVTEP"
+	LiteVirt_GetVMIPRemote_FullMethodName              = "/litevirt.v1.LiteVirt/GetVMIPRemote"
+	LiteVirt_RefreshLB_FullMethodName                  = "/litevirt.v1.LiteVirt/RefreshLB"
+	LiteVirt_UpdateFDB_FullMethodName                  = "/litevirt.v1.LiteVirt/UpdateFDB"
+	LiteVirt_EnsureCloudInit_FullMethodName            = "/litevirt.v1.LiteVirt/EnsureCloudInit"
+	LiteVirt_EnsureDisks_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureDisks"
+	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
+	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
+	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
+	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
+	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
+	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
+	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
+	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
+	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
+	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
+	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
+	LiteVirt_AckMutations_FullMethodName               = "/litevirt.v1.LiteVirt/AckMutations"
+	LiteVirt_ListRebalanceProposals_FullMethodName     = "/litevirt.v1.LiteVirt/ListRebalanceProposals"
+	LiteVirt_RunRebalance_FullMethodName               = "/litevirt.v1.LiteVirt/RunRebalance"
+	LiteVirt_ApproveRebalanceProposal_FullMethodName   = "/litevirt.v1.LiteVirt/ApproveRebalanceProposal"
+	LiteVirt_RejectRebalanceProposal_FullMethodName    = "/litevirt.v1.LiteVirt/RejectRebalanceProposal"
+	LiteVirt_GetSpiceInfo_FullMethodName               = "/litevirt.v1.LiteVirt/GetSpiceInfo"
+	LiteVirt_PreflightUpgrade_FullMethodName           = "/litevirt.v1.LiteVirt/PreflightUpgrade"
+	LiteVirt_ListRegions_FullMethodName                = "/litevirt.v1.LiteVirt/ListRegions"
+	LiteVirt_RegionStatus_FullMethodName               = "/litevirt.v1.LiteVirt/RegionStatus"
+	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
+	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
+	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
+	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
+	LiteVirt_CreateBackupSchedule_FullMethodName       = "/litevirt.v1.LiteVirt/CreateBackupSchedule"
+	LiteVirt_ListBackupSchedules_FullMethodName        = "/litevirt.v1.LiteVirt/ListBackupSchedules"
+	LiteVirt_DeleteBackupSchedule_FullMethodName       = "/litevirt.v1.LiteVirt/DeleteBackupSchedule"
+	LiteVirt_CreateReplicationSchedule_FullMethodName  = "/litevirt.v1.LiteVirt/CreateReplicationSchedule"
+	LiteVirt_ListReplicationSchedules_FullMethodName   = "/litevirt.v1.LiteVirt/ListReplicationSchedules"
+	LiteVirt_DeleteReplicationSchedule_FullMethodName  = "/litevirt.v1.LiteVirt/DeleteReplicationSchedule"
+	LiteVirt_PromoteReplica_FullMethodName             = "/litevirt.v1.LiteVirt/PromoteReplica"
+	LiteVirt_VerifyAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyAuditChain"
+	LiteVirt_ExportAuditChain_FullMethodName           = "/litevirt.v1.LiteVirt/ExportAuditChain"
+	LiteVirt_RetireAuditKey_FullMethodName             = "/litevirt.v1.LiteVirt/RetireAuditKey"
+	LiteVirt_CreateProject_FullMethodName              = "/litevirt.v1.LiteVirt/CreateProject"
+	LiteVirt_ListProjects_FullMethodName               = "/litevirt.v1.LiteVirt/ListProjects"
+	LiteVirt_GetProject_FullMethodName                 = "/litevirt.v1.LiteVirt/GetProject"
+	LiteVirt_DeleteProject_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteProject"
+	LiteVirt_SetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/SetProjectQuota"
+	LiteVirt_GetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectQuota"
+	LiteVirt_GetProjectUsage_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectUsage"
+	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
+	LiteVirt_ReserveProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
+	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
+	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
+	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -259,8 +269,32 @@ type LiteVirtClient interface {
 	UndrainHost(ctx context.Context, in *UndrainHostRequest, opts ...grpc.CallOption) (*Host, error)
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
-	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
+	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error)
+	PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+	// host; reseed is forwarded to the isolated host, which pulls a full state
+	// dump from a healthy peer and clears its epoch only on verified convergence.
+	IsolateHost(ctx context.Context, in *IsolateHostRequest, opts ...grpc.CallOption) (*HostIsolationStatus, error)
+	ReseedHost(ctx context.Context, in *ReseedHostRequest, opts ...grpc.CallOption) (*ReseedHostResponse, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error)
 	RescanHost(ctx context.Context, in *RescanHostRequest, opts ...grpc.CallOption) (*RescanHostResponse, error)
 	ListHostDevices(ctx context.Context, in *ListHostDevicesRequest, opts ...grpc.CallOption) (*ListHostDevicesResponse, error)
 	UpgradeHost(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error)
@@ -286,13 +320,7 @@ type LiteVirtClient interface {
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
-	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
-	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
-	ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error)
-	// Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
-	AdmitProjectQuota(ctx context.Context, in *AdmitProjectQuotaRequest, opts ...grpc.CallOption) (*AdmitProjectQuotaResponse, error)
-	ReleaseProjectQuotaReservation(ctx context.Context, in *ReleaseProjectQuotaReservationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	ListProjectQuotaReservations(ctx context.Context, in *ListProjectQuotaReservationsRequest, opts ...grpc.CallOption) (*ListProjectQuotaReservationsResponse, error)
+	GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -559,15 +587,31 @@ type LiteVirtClient interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error)
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.
 	VerifyAuditChain(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(ctx context.Context, in *ExportAuditChainRequest, opts ...grpc.CallOption) (*ExportAuditChainResponse, error)
+	RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -580,6 +624,34 @@ type LiteVirtClient interface {
 	SetProjectQuota(ctx context.Context, in *SetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectQuota(ctx context.Context, in *GetProjectQuotaRequest, opts ...grpc.CallOption) (*ProjectQuota, error)
 	GetProjectUsage(ctx context.Context, in *GetProjectUsageRequest, opts ...grpc.CallOption) (*ProjectUsage, error)
+	// Internal owner-side endpoint appended for wire-order stability.
+	ExecuteCreateVM(ctx context.Context, in *ExecuteCreateVMRequest, opts ...grpc.CallOption) (*VM, error)
+	// ── project admission authority (F2 second half / D1) ──
+	// PEER-ONLY. Reserve-then-verify makes two concurrent admissions agree only
+	// once both reservations are VISIBLE to both deciders; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. These route the PROJECT-QUOTA half of an admission to the
+	// project's authority holder, so every quota decision for one project is made
+	// by ONE node against a view that already contains its own grants.
+	//
+	// Host capacity is NOT delegated: it is already serialized by the target host's
+	// owner, which is the only node that reserves against it.
+	ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error)
+	ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -678,10 +750,10 @@ func (c *liteVirtClient) FenceHost(ctx context.Context, in *FenceHostRequest, op
 	return out, nil
 }
 
-func (c *liteVirtClient) GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error) {
+func (c *liteVirtClient) GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(HostHealthMatrix)
-	err := c.cc.Invoke(ctx, LiteVirt_GetHostHealth_FullMethodName, in, out, cOpts...)
+	out := new(ClusterHealth)
+	err := c.cc.Invoke(ctx, LiteVirt_GetClusterHealth_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -692,6 +764,96 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RemoveHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHostNetworksResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListHostNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostNetwork)
+	err := c.cc.Invoke(ctx, LiteVirt_UpsertHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanHostNetworkResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PlanHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ApplyHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) IsolateHost(ctx context.Context, in *IsolateHostRequest, opts ...grpc.CallOption) (*HostIsolationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostIsolationStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_IsolateHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReseedHost(ctx context.Context, in *ReseedHostRequest, opts ...grpc.CallOption) (*ReseedHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReseedHostResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReseedHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishCRLResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PublishCRL_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -873,60 +1035,10 @@ func (c *liteVirtClient) RepairVMOwner(ctx context.Context, in *RepairVMOwnerReq
 	return out, nil
 }
 
-func (c *liteVirtClient) CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error) {
+func (c *liteVirtClient) GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CheckVMRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_CheckVMRuntime_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CheckContainerRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_ReportRuntime_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) AdmitProjectQuota(ctx context.Context, in *AdmitProjectQuotaRequest, opts ...grpc.CallOption) (*AdmitProjectQuotaResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AdmitProjectQuotaResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_AdmitProjectQuota_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) ReleaseProjectQuotaReservation(ctx context.Context, in *ReleaseProjectQuotaReservationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
-	err := c.cc.Invoke(ctx, LiteVirt_ReleaseProjectQuotaReservation_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) ListProjectQuotaReservations(ctx context.Context, in *ListProjectQuotaReservationsRequest, opts ...grpc.CallOption) (*ListProjectQuotaReservationsResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListProjectQuotaReservationsResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_ListProjectQuotaReservations_FullMethodName, in, out, cOpts...)
+	out := new(RuntimeInventory)
+	err := c.cc.Invoke(ctx, LiteVirt_GetRuntimeInventory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3016,6 +3128,16 @@ func (c *liteVirtClient) ExportAuditChain(ctx context.Context, in *ExportAuditCh
 	return out, nil
 }
 
+func (c *liteVirtClient) RetireAuditKey(ctx context.Context, in *RetireAuditKeyRequest, opts ...grpc.CallOption) (*RetireAuditKeyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetireAuditKeyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RetireAuditKey_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*Project, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Project)
@@ -3086,6 +3208,56 @@ func (c *liteVirtClient) GetProjectUsage(ctx context.Context, in *GetProjectUsag
 	return out, nil
 }
 
+func (c *liteVirtClient) ExecuteCreateVM(ctx context.Context, in *ExecuteCreateVMRequest, opts ...grpc.CallOption) (*VM, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VM)
+	err := c.cc.Invoke(ctx, LiteVirt_ExecuteCreateVM_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReserveProjectCapacityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReserveProjectCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseProjectCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReserveHostCapacityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReserveHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3098,8 +3270,32 @@ type LiteVirtServer interface {
 	UndrainHost(context.Context, *UndrainHostRequest) (*Host, error)
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
-	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
+	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
+	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error)
+	PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error)
+	DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error)
+	// Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+	// host; reseed is forwarded to the isolated host, which pulls a full state
+	// dump from a healthy peer and clears its epoch only on verified convergence.
+	IsolateHost(context.Context, *IsolateHostRequest) (*HostIsolationStatus, error)
+	ReseedHost(context.Context, *ReseedHostRequest) (*ReseedHostResponse, error)
+	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
+	// replication then carries to every node. `lv host rm` calls it after revoking
+	// the removed host's certificate — revocation needs the CA private key, which
+	// lives with the operator, so the CRL is minted there and published here.
+	//
+	// The daemon verifies it against the cluster CA before storing it. That check
+	// is not a formality: the list is what decides whether a certificate still
+	// opens a peer connection, and an unverified one would let a caller un-revoke
+	// themselves by publishing a CRL that simply omits their serial.
+	PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error)
 	RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error)
 	ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error)
 	UpgradeHost(grpc.ClientStreamingServer[UpgradeHostRequest, UpgradeHostResponse]) error
@@ -3125,13 +3321,7 @@ type LiteVirtServer interface {
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
-	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
-	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
-	ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error)
-	// Peer-only (mTLS, CN == sender). See AdmitProjectQuotaRequest.
-	AdmitProjectQuota(context.Context, *AdmitProjectQuotaRequest) (*AdmitProjectQuotaResponse, error)
-	ReleaseProjectQuotaReservation(context.Context, *ReleaseProjectQuotaReservationRequest) (*emptypb.Empty, error)
-	ListProjectQuotaReservations(context.Context, *ListProjectQuotaReservationsRequest) (*ListProjectQuotaReservationsResponse, error)
+	GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3398,15 +3588,31 @@ type LiteVirtServer interface {
 	// it, then localizes via blockpull. Disaster recovery after host loss.
 	PromoteReplica(*PromoteReplicaRequest, grpc.ServerStreamingServer[PromoteReplicaProgress]) error
 	// ── tamper-evident audit log ──
-	// VerifyAuditChain walks every audit_log row from the oldest
-	// forward and confirms each content_hash matches the
-	// SHA-256(prev_hash || canonical(row)) recomputation. Returns
-	// the first ID that fails (or "" for a clean run).
+	// VerifyAuditChain walks each host's audit sub-chain (a row's
+	// prev_hash links to the previous row from the SAME host, because
+	// N daemons appending concurrently can never form one linear
+	// chain) and confirms each content_hash matches the
+	// SHA-256(prev_hash || canonical(row)) recomputation.
+	//
+	// It also checks what a hash alone cannot: the ECDSA signature
+	// over each row, its host sequence number, and the signed chain
+	// heads. A hash break is corruption or a crude edit; a bad
+	// signature is an edit by someone without the host's key and
+	// survives a reseal; a seq gap is a deleted run of rows; a
+	// truncated host is a tail that was cut off entirely.
+	//
+	// It does not stop at the first problem — one id says nothing
+	// about whether the rest of the log was rewritten too — so every
+	// finding is reported and `tampered` summarises whether any of
+	// them is evidence of interference. Unsigned rows are NOT: every
+	// cluster upgrading to signing has a log full of them.
+	//
 	// ExportAuditChain emits a JSON blob containing the rows in a
 	// time-range — suitable for WORM offload to S3 Object Lock /
 	// an immutable tape vault.
 	VerifyAuditChain(context.Context, *emptypb.Empty) (*VerifyAuditChainResponse, error)
 	ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error)
+	RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error)
 	// ── tenancy ──
 	// Projects are hierarchical buckets for VMs / volumes / etc.
 	// Quotas gate VM admission against (vcpu, mem, disk, nics).
@@ -3419,6 +3625,34 @@ type LiteVirtServer interface {
 	SetProjectQuota(context.Context, *SetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectQuota(context.Context, *GetProjectQuotaRequest) (*ProjectQuota, error)
 	GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error)
+	// Internal owner-side endpoint appended for wire-order stability.
+	ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error)
+	// ── project admission authority (F2 second half / D1) ──
+	// PEER-ONLY. Reserve-then-verify makes two concurrent admissions agree only
+	// once both reservations are VISIBLE to both deciders; corrosion is eventually
+	// consistent, so two nodes that have not yet exchanged operation rows can still
+	// both admit. These route the PROJECT-QUOTA half of an admission to the
+	// project's authority holder, so every quota decision for one project is made
+	// by ONE node against a view that already contains its own grants.
+	//
+	// Host capacity is NOT delegated: it is already serialized by the target host's
+	// owner, which is the only node that reserves against it.
+	ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error)
+	ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -3450,11 +3684,38 @@ func (UnimplementedLiteVirtServer) SetHostLabels(context.Context, *SetHostLabels
 func (UnimplementedLiteVirtServer) FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method FenceHost not implemented")
 }
-func (UnimplementedLiteVirtServer) GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetHostHealth not implemented")
+func (UnimplementedLiteVirtServer) GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetClusterHealth not implemented")
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
+}
+func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHostNetworks not implemented")
+}
+func (UnimplementedLiteVirtServer) UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpsertHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) IsolateHost(context.Context, *IsolateHostRequest) (*HostIsolationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method IsolateHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ReseedHost(context.Context, *ReseedHostRequest) (*ReseedHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReseedHost not implemented")
+}
+func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
 }
 func (UnimplementedLiteVirtServer) RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RescanHost not implemented")
@@ -3504,23 +3765,8 @@ func (UnimplementedLiteVirtServer) DeleteVM(context.Context, *DeleteVMRequest) (
 func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RepairVMOwner not implemented")
 }
-func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CheckVMRuntime not implemented")
-}
-func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
-}
-func (UnimplementedLiteVirtServer) ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReportRuntime not implemented")
-}
-func (UnimplementedLiteVirtServer) AdmitProjectQuota(context.Context, *AdmitProjectQuotaRequest) (*AdmitProjectQuotaResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method AdmitProjectQuota not implemented")
-}
-func (UnimplementedLiteVirtServer) ReleaseProjectQuotaReservation(context.Context, *ReleaseProjectQuotaReservationRequest) (*emptypb.Empty, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectQuotaReservation not implemented")
-}
-func (UnimplementedLiteVirtServer) ListProjectQuotaReservations(context.Context, *ListProjectQuotaReservationsRequest) (*ListProjectQuotaReservationsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListProjectQuotaReservations not implemented")
+func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRuntimeInventory not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -4083,6 +4329,9 @@ func (UnimplementedLiteVirtServer) VerifyAuditChain(context.Context, *emptypb.Em
 func (UnimplementedLiteVirtServer) ExportAuditChain(context.Context, *ExportAuditChainRequest) (*ExportAuditChainResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExportAuditChain not implemented")
 }
+func (UnimplementedLiteVirtServer) RetireAuditKey(context.Context, *RetireAuditKeyRequest) (*RetireAuditKeyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetireAuditKey not implemented")
+}
 func (UnimplementedLiteVirtServer) CreateProject(context.Context, *CreateProjectRequest) (*Project, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateProject not implemented")
 }
@@ -4103,6 +4352,21 @@ func (UnimplementedLiteVirtServer) GetProjectQuota(context.Context, *GetProjectQ
 }
 func (UnimplementedLiteVirtServer) GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetProjectUsage not implemented")
+}
+func (UnimplementedLiteVirtServer) ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecuteCreateVM not implemented")
+}
+func (UnimplementedLiteVirtServer) ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReserveProjectCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReserveHostCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostCapacity not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -4237,20 +4501,20 @@ func _LiteVirt_FenceHost_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _LiteVirt_GetHostHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
+func _LiteVirt_GetClusterHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetClusterHealthRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(LiteVirtServer).GetHostHealth(ctx, in)
+		return srv.(LiteVirtServer).GetClusterHealth(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: LiteVirt_GetHostHealth_FullMethodName,
+		FullMethod: LiteVirt_GetClusterHealth_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).GetHostHealth(ctx, req.(*emptypb.Empty))
+		return srv.(LiteVirtServer).GetClusterHealth(ctx, req.(*GetClusterHealthRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -4269,6 +4533,168 @@ func _LiteVirt_RemoveHost_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RemoveHost(ctx, req.(*RemoveHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AdmitHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AdmitHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AdmitHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AdmitHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AdmitHost(ctx, req.(*AdmitHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListHostNetworks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHostNetworksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListHostNetworks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, req.(*ListHostNetworksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_UpsertHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpsertHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_UpsertHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, req.(*UpsertHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PlanHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PlanHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, req.(*PlanHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ApplyHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ApplyHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, req.(*ApplyHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, req.(*DeleteHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_IsolateHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IsolateHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).IsolateHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_IsolateHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).IsolateHost(ctx, req.(*IsolateHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReseedHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReseedHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReseedHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReseedHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReseedHost(ctx, req.(*ReseedHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PublishCRL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishCRLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PublishCRL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PublishCRL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PublishCRL(ctx, req.(*PublishCRLRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -4532,110 +4958,20 @@ func _LiteVirt_RepairVMOwner_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _LiteVirt_CheckVMRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CheckVMRuntimeRequest)
+func _LiteVirt_GetRuntimeInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRuntimeInventoryRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(LiteVirtServer).CheckVMRuntime(ctx, in)
+		return srv.(LiteVirtServer).GetRuntimeInventory(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: LiteVirt_CheckVMRuntime_FullMethodName,
+		FullMethod: LiteVirt_GetRuntimeInventory_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).CheckVMRuntime(ctx, req.(*CheckVMRuntimeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CheckContainerRuntimeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_CheckContainerRuntime_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_ReportRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportRuntimeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).ReportRuntime(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_ReportRuntime_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).ReportRuntime(ctx, req.(*ReportRuntimeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_AdmitProjectQuota_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AdmitProjectQuotaRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).AdmitProjectQuota(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_AdmitProjectQuota_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).AdmitProjectQuota(ctx, req.(*AdmitProjectQuotaRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_ReleaseProjectQuotaReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReleaseProjectQuotaReservationRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).ReleaseProjectQuotaReservation(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_ReleaseProjectQuotaReservation_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).ReleaseProjectQuotaReservation(ctx, req.(*ReleaseProjectQuotaReservationRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_ListProjectQuotaReservations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListProjectQuotaReservationsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).ListProjectQuotaReservations(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_ListProjectQuotaReservations_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).ListProjectQuotaReservations(ctx, req.(*ListProjectQuotaReservationsRequest))
+		return srv.(LiteVirtServer).GetRuntimeInventory(ctx, req.(*GetRuntimeInventoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7771,6 +8107,24 @@ func _LiteVirt_ExportAuditChain_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_RetireAuditKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetireAuditKeyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RetireAuditKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RetireAuditKey(ctx, req.(*RetireAuditKeyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CreateProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateProjectRequest)
 	if err := dec(in); err != nil {
@@ -7897,6 +8251,96 @@ func _LiteVirt_GetProjectUsage_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ExecuteCreateVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecuteCreateVMRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ExecuteCreateVM(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ExecuteCreateVM_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ExecuteCreateVM(ctx, req.(*ExecuteCreateVMRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReserveProjectCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReserveProjectCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReserveProjectCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReserveProjectCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReserveProjectCapacity(ctx, req.(*ReserveProjectCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseProjectCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseProjectCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseProjectCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseProjectCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseProjectCapacity(ctx, req.(*ReleaseProjectCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReserveHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReserveHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReserveHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, req.(*ReserveHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, req.(*ReleaseHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -7925,12 +8369,48 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_FenceHost_Handler,
 		},
 		{
-			MethodName: "GetHostHealth",
-			Handler:    _LiteVirt_GetHostHealth_Handler,
+			MethodName: "GetClusterHealth",
+			Handler:    _LiteVirt_GetClusterHealth_Handler,
 		},
 		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
+		},
+		{
+			MethodName: "AdmitHost",
+			Handler:    _LiteVirt_AdmitHost_Handler,
+		},
+		{
+			MethodName: "ListHostNetworks",
+			Handler:    _LiteVirt_ListHostNetworks_Handler,
+		},
+		{
+			MethodName: "UpsertHostNetwork",
+			Handler:    _LiteVirt_UpsertHostNetwork_Handler,
+		},
+		{
+			MethodName: "PlanHostNetwork",
+			Handler:    _LiteVirt_PlanHostNetwork_Handler,
+		},
+		{
+			MethodName: "ApplyHostNetwork",
+			Handler:    _LiteVirt_ApplyHostNetwork_Handler,
+		},
+		{
+			MethodName: "DeleteHostNetwork",
+			Handler:    _LiteVirt_DeleteHostNetwork_Handler,
+		},
+		{
+			MethodName: "IsolateHost",
+			Handler:    _LiteVirt_IsolateHost_Handler,
+		},
+		{
+			MethodName: "ReseedHost",
+			Handler:    _LiteVirt_ReseedHost_Handler,
+		},
+		{
+			MethodName: "PublishCRL",
+			Handler:    _LiteVirt_PublishCRL_Handler,
 		},
 		{
 			MethodName: "RescanHost",
@@ -7985,28 +8465,8 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_RepairVMOwner_Handler,
 		},
 		{
-			MethodName: "CheckVMRuntime",
-			Handler:    _LiteVirt_CheckVMRuntime_Handler,
-		},
-		{
-			MethodName: "CheckContainerRuntime",
-			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
-		},
-		{
-			MethodName: "ReportRuntime",
-			Handler:    _LiteVirt_ReportRuntime_Handler,
-		},
-		{
-			MethodName: "AdmitProjectQuota",
-			Handler:    _LiteVirt_AdmitProjectQuota_Handler,
-		},
-		{
-			MethodName: "ReleaseProjectQuotaReservation",
-			Handler:    _LiteVirt_ReleaseProjectQuotaReservation_Handler,
-		},
-		{
-			MethodName: "ListProjectQuotaReservations",
-			Handler:    _LiteVirt_ListProjectQuotaReservations_Handler,
+			MethodName: "GetRuntimeInventory",
+			Handler:    _LiteVirt_GetRuntimeInventory_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",
@@ -8641,6 +9101,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_ExportAuditChain_Handler,
 		},
 		{
+			MethodName: "RetireAuditKey",
+			Handler:    _LiteVirt_RetireAuditKey_Handler,
+		},
+		{
 			MethodName: "CreateProject",
 			Handler:    _LiteVirt_CreateProject_Handler,
 		},
@@ -8667,6 +9131,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetProjectUsage",
 			Handler:    _LiteVirt_GetProjectUsage_Handler,
+		},
+		{
+			MethodName: "ExecuteCreateVM",
+			Handler:    _LiteVirt_ExecuteCreateVM_Handler,
+		},
+		{
+			MethodName: "ReserveProjectCapacity",
+			Handler:    _LiteVirt_ReserveProjectCapacity_Handler,
+		},
+		{
+			MethodName: "ReleaseProjectCapacity",
+			Handler:    _LiteVirt_ReleaseProjectCapacity_Handler,
+		},
+		{
+			MethodName: "ReserveHostCapacity",
+			Handler:    _LiteVirt_ReserveHostCapacity_Handler,
+		},
+		{
+			MethodName: "ReleaseHostCapacity",
+			Handler:    _LiteVirt_ReleaseHostCapacity_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

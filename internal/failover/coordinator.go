@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -270,6 +271,10 @@ func (c *Coordinator) now() time.Time {
 	return time.Now()
 }
 
+func ownerEpochString(epoch int64) string {
+	return strconv.FormatInt(epoch, 10)
+}
+
 // Start runs the coordinator loop. Blocks until ctx is cancelled.
 func (c *Coordinator) Start(ctx context.Context) {
 	ticker := time.NewTicker(pollInterval)
@@ -483,9 +488,9 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 		if err != nil || src == nil {
 			continue
 		}
-		// candidates/fallbackIdx are only consulted if the marker carries no target
+		// candidates are only consulted if the marker carries no target
 		// (it always does), so an empty candidate set is fine here.
-		c.resumeRestoreRelocation(ctx, src, ct, target, token, nil, new(int))
+		c.resumeRestoreRelocation(ctx, src, ct, target, token, nil)
 	}
 }
 
@@ -988,7 +993,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	}
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
-	fallbackIdx := 0
+	type failoverPlan struct {
+		vm             corrosion.VMRecord
+		targetName     string
+		needsPlacement bool
+	}
+	plans := make([]failoverPlan, 0, len(vms))
+	placementReqs := make([]placement.Request, 0, len(vms))
+
 	for _, vm := range vms {
 		// A Secure-Boot/vTPM VM's firmware state (UEFI NVRAM + swtpm) is host-local,
 		// so it died with the fenced host — neither a reschedule (would boot a fresh
@@ -1003,6 +1015,31 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				Target: vm.Name, Detail: "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with " + h.Name + ")", Result: "skipped",
 			})
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
+			continue
+		}
+
+		// Automated recovery must never act on a workload whose OWNERSHIP is in
+		// dispute. The fenced host is only ONE of the condition's holders: the
+		// other side may still be live and unfenced, and rescheduling (or
+		// promoting) this VM onto a third host manufactures exactly the
+		// dual-writer the condition was raised to prevent. The owner-assert and
+		// self-heal paths already refuse on this; failover is the remaining
+		// automated writer. Fail closed on a read error — a coordinator that
+		// cannot see the conditions must not assume there are none.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "vm", vm.Name); cerr != nil {
+			slog.Warn("failover: cannot read health conditions; deferring VM recovery (fail closed)",
+				"vm", vm.Name, "error", cerr)
+			c.mVM(ActionReschedule, ResultError, ErrDBError)
+			continue
+		} else if disputed {
+			slog.Warn("failover: refusing VM recovery — active ownership condition; resolve the dispute first",
+				"vm", vm.Name, "condition", code)
+			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
+			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
+			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+				Target: vm.Name, Detail: "active ownership condition " + code + " — automated recovery refused", Result: "refused",
+			})
 			continue
 		}
 
@@ -1091,27 +1128,101 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			}
 		}
 
-		// Use placement engine to find the best host (respects CPU, memory,
-		// anti-affinity, labels, device requirements).
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
-			selected, err := placement.Select(ctx, c.db, req)
-			if err != nil {
-				// Fallback to round-robin if placement fails (degraded mode).
-				slog.Warn("failover: placement failed, using round-robin fallback",
-					"vm", vm.Name, "error", err)
-				c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-				targetName = candidates[fallbackIdx%len(candidates)].Name
-				fallbackIdx++
-			} else {
-				targetName = selected
-			}
+			placementReqs = append(placementReqs, req)
+			plans = append(plans, failoverPlan{vm: vm, needsPlacement: true})
+			continue
 		}
 
+		plans = append(plans, failoverPlan{vm: vm, targetName: targetName, needsPlacement: false})
+	}
+
+	placements := map[string]placement.BatchResult{}
+	if len(placementReqs) > 0 {
+		allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
+		if err != nil {
+			slog.Error("failover: list VMs for batch placement", "host", h.Name, "error", err)
+			c.mAttempt(PhaseFence, ResultError, ErrDBError)
+			return
+		}
+		ctMem, err := corrosion.SumContainerMemoryByHost(ctx, c.db)
+		if err != nil {
+			ctMem = nil
+		}
+		// Effective-capacity observations, best-effort: absent, the batch
+		// degrades to DB-only arithmetic; present, runtime-only usage counts
+		// against headroom and an incomplete/stale host is excluded.
+		observations, oerr := corrosion.ListHostCapacityObservations(ctx, c.db)
+		if oerr != nil {
+			observations = nil
+		}
+		// There is deliberately NO fallback on a batch error. The old code
+		// round-robined the fenced host's VMs across whatever candidates were
+		// healthy — blind to capacity, labels, affinity, spread, max-per-node,
+		// and incomplete-inventory exclusions — and the target reconciler
+		// re-checks none of those before starting, so an infeasible placement
+		// simply landed. Refusing leaves the rows on the fenced host, loudly,
+		// and the operator (or the next placement input change) recovers them;
+		// hard constraints that no surviving host satisfies must strand the
+		// workload, not relocate it somewhere it was never allowed to run.
+		if selected, err := placement.SelectBatch(candidates, allVMs, nil, ctMem,
+			observations, c.now(), placementReqs); err != nil {
+			slog.Error("failover: batch placement failed — affected VMs are left for operator recovery, NOT round-robined",
+				"host", h.Name, "error", err)
+			for i := range plans {
+				if plans[i].needsPlacement {
+					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
+					_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+						ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+						Target: plans[i].vm.Name, Detail: "batch placement failed after fencing " + h.Name + ": " + err.Error(), Result: "error",
+					})
+				}
+			}
+			plans = plans[:0]
+		} else {
+			placements = selected
+		}
+	}
+
+	for _, p := range plans {
+		vm := p.vm
+		if p.needsPlacement {
+			result, ok := placements[vm.Name]
+			if !ok || result.Host == "" {
+				// No eligible host under the VM's hard constraints. Same
+				// reasoning as the batch-error path above: skip loudly.
+				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
+					"vm", vm.Name, "from", h.Name)
+				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
+				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+					Target: vm.Name, Detail: "no eligible host satisfies its placement constraints after fencing " + h.Name, Result: "skipped",
+				})
+				continue
+			}
+			p.targetName = result.Host
+			p.needsPlacement = false
+		}
+
+		targetName := p.targetName
+
 		slog.Info("failover: rescheduling VM",
-			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", policy)
+			"vm", vm.Name, "from", vm.HostName, "to", targetName, "policy", vmFailurePolicy(vm))
 
 		if c.gateEnforced(ctx) {
+			// ListVMs deliberately omits operation-control columns, including
+			// vm_owner_epoch. Re-read the full authoritative row at the decision
+			// boundary so the proof binds the real ownership generation; the
+			// transactional writer checks the same epoch again to close the race.
+			freshVM, ferr := corrosion.GetVM(ctx, c.db, vm.Name)
+			if ferr != nil || freshVM == nil || freshVM.HostName != h.Name {
+				slog.Warn("failover: VM ownership changed before proof mint; deferring",
+					"vm", vm.Name, "expected_host", h.Name, "error", ferr)
+				c.mVM(ActionReschedule, ResultError, ErrDBError)
+				continue
+			}
+			vm = *freshVM
 			// Enforcement active: re-check DecisionGate (quorum + coordinator-eligible;
 			// the lease is already held in this failover path) as close to the write as
 			// possible, then write a durable proof linked to the pending transition so
@@ -1139,6 +1250,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
+				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1172,15 +1284,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// container reconciler does the actual recreate. Stateful / non-re-pullable
 	// containers are skipped and loudly audited (their data can't be recovered
 	// without a backup — the backup-restore tier is a follow-up).
-	c.relocateContainers(ctx, h, candidates, &fallbackIdx)
+	c.relocateContainers(ctx, h, candidates)
 }
 
 // relocateContainers re-homes the fenced host's relocatable containers onto
 // healthy hosts. For each, it prefers a faithful restore-from-backup (tier-2),
 // falls back to image-recreate (tier-1), else skips — and re-derives the outcome
 // of any in-flight restore-relocation (crash recovery). Shares the round-robin
-// fallbackIdx with the VM loop so placement-failure fallbacks stay spread.
-func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
+func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostRecord, candidates []corrosion.HostRecord) {
 	// Split-brain gate (Phase 1, decide site): once enforced, re-check DecisionGate
 	// (quorum + coordinator-eligible; lease already held in the failover path)
 	// before relocating any container off the fenced host — an isolated minority
@@ -1208,20 +1319,35 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 		if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
 			continue
 		}
+		// Same ownership-dispute refusal as the VM loop: the other holder of the
+		// dispute may be live on an unfenced host, and recreating this container
+		// elsewhere adds a writer. Fail closed on a read error.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, c.db, "container", ct.Name); cerr != nil {
+			slog.Warn("failover: cannot read health conditions; deferring container relocation (fail closed)",
+				"container", ct.Name, "error", cerr)
+			c.mCt(ActionRelocate, ResultError, ErrDBError)
+			continue
+		} else if disputed {
+			slog.Warn("failover: refusing container relocation — active ownership condition; resolve the dispute first",
+				"container", ct.Name, "condition", code)
+			c.noteGateRefused(corrosion.ActionRelocate, health.ReasonOwnershipDispute)
+			c.mCt(ActionRelocate, ResultRefused, ErrOwnershipDispute)
+			continue
+		}
 		// Crash recovery: a prior tick already began a restore-relocation (marker on
 		// the source row, carrying the target + attempt token). Re-derive.
 		if target, token, restoring := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); restoring {
-			c.resumeRestoreRelocation(ctx, h, ct, target, token, candidates, fallbackIdx)
+			c.resumeRestoreRelocation(ctx, h, ct, target, token, candidates)
 			continue
 		}
-		c.startRelocation(ctx, h, ct, candidates, fallbackIdx)
+		c.startRelocation(ctx, h, ct, candidates)
 	}
 }
 
 // startRelocation relocates one not-yet-marked container: restore-from-backup if
 // possible, else image-recreate, else skip.
-func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) {
-	target := c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) {
+	target := c.pickContainerTarget(ctx, ct, candidates)
 	if target == "" {
 		slog.Warn("failover: no target for container relocation", "container", ct.Name)
 		return
@@ -1251,6 +1377,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 				LeaseHolder: c.hostName, RelocationToken: token,
+				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1296,7 +1423,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 
 // resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
 // (typically after a coordinator restart mid-restore).
-func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target, token string, candidates []corrosion.HostRecord, fallbackIdx *int) {
+func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target, token string, candidates []corrosion.HostRecord) {
 	// Restore already landed? (crashed after the target row was created but before
 	// the source was tombstoned). Require PROVENANCE: the (target,name) row must
 	// carry OUR attempt token (the target stamps relocate_token from the marker's
@@ -1317,7 +1444,7 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 	slog.Warn("failover: stale relocate-restore marker — falling back to image-recreate",
 		"container", ct.Name, "target", target)
 	if target == "" {
-		target = c.pickContainerTarget(ctx, ct, candidates, fallbackIdx)
+		target = c.pickContainerTarget(ctx, ct, candidates)
 	}
 	c.imageRecreateOrSkip(ctx, h, ct, target)
 }
@@ -1327,7 +1454,19 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 // (logical, idempotent) handoff — the source host is fenced and won't write again.
 func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
 	if err := corrosion.DeleteContainer(ctx, c.db, h.Name, ct.Name); err != nil {
-		slog.Warn("failover: tombstone source row after restore", "container", ct.Name, "error", err)
+		// The restore itself landed, but the handoff is INCOMPLETE: the dead
+		// host's source row is still live next to the target's — a duplicate
+		// the scheduler and quota both count. Recording success here would
+		// declare the relocation clean while that duplicate exists. Report a
+		// partial result instead and DON'T mark the host relocated: the next
+		// sweep re-enters this path (the marker and token-matched target row
+		// are still in place) and retries the tombstone until it lands.
+		slog.Warn("failover: source row tombstone failed after restore — will retry next sweep",
+			"container", ct.Name, "from", h.Name, "to", target, "error", err)
+		c.mCt(ActionRelocate, ResultPartial, ErrDBError)
+		c.auditRelocate(ctx, "ct.relocate.restored", ct.Name,
+			"restored to "+target+" but the source row on "+h.Name+" is still live (tombstone failed; retrying)", "error")
+		return
 	}
 	c.fenceRelocated[h.Name] = true
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
@@ -1390,6 +1529,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 			LeaseHolder: c.hostName, RelocationToken: relocToken,
+			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)
@@ -1416,22 +1556,31 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 // LIVE container of the same name (names aren't cluster-unique), so relocation
 // never collides with / clobbers an unrelated container. Returns "" if no
 // collision-free target exists.
-func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord, fallbackIdx *int) string {
-	if target, err := placement.Select(ctx, c.db, placement.Request{
+func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) string {
+	// The single-VM Select path carries the full capacity model (observations,
+	// reserves, incomplete-host exclusion). There is deliberately NO
+	// round-robin fallback on its failure: the old one walked the raw healthy
+	// candidate list — blind to capacity and to incomplete-inventory exclusions
+	// — so a container that genuinely fit nowhere was relocated somewhere it
+	// did not fit. "" tells the caller to skip loudly and leave the row for
+	// operator recovery instead.
+	target, err := placement.Select(ctx, c.db, placement.Request{
 		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
 		Capacity: c.capacity,
-	}); err == nil && !c.targetHasLiveContainer(ctx, target, ct.Name) {
-		return target
+	})
+	if err != nil {
+		slog.Warn("failover: container placement failed — left for operator recovery, NOT round-robined",
+			"container", ct.Name, "error", err)
+		return ""
 	}
-	// Placement failed or its pick collides — round-robin a collision-free candidate.
-	for i := 0; i < len(candidates); i++ {
-		cand := candidates[*fallbackIdx%len(candidates)].Name
-		*fallbackIdx++
-		if !c.targetHasLiveContainer(ctx, cand, ct.Name) {
-			return cand
-		}
+	if c.targetHasLiveContainer(ctx, target, ct.Name) {
+		// The chosen host already runs an unrelated container of this name
+		// (names are per-host). Rare; skip rather than blind-pick elsewhere.
+		slog.Warn("failover: container relocation target holds a same-name container — left for operator recovery",
+			"container", ct.Name, "target", target)
+		return ""
 	}
-	return ""
+	return target
 }
 
 // targetHasLiveContainer reports whether host already runs a live (non-deleted)

@@ -24,6 +24,9 @@ func testServer(t *testing.T) *Server {
 		pkiDir:   "/etc/litevirt/pki",
 		db:       db,
 		events:   events.NewBus(),
+		bridgeEnsure: func(string) error {
+			return nil
+		},
 	}
 }
 

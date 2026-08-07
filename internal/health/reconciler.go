@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,7 +47,7 @@ type Reconciler struct {
 
 	// checkPeerRuntime asks a peer for its LOCAL libvirt view of a VM
 	// (absent/defined_stopped/running/unknown) — injected by the daemon (it wires
-	// the gRPC CheckVMRuntime client). nil disables runtime owner-assert (e.g. in
+	// the gRPC runtime-inventory client). nil disables runtime owner-assert (e.g. in
 	// tests that don't exercise it). See SetPeerRuntimeChecker.
 	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
 	// onOwnerAssert observes each owner-assert decision (result ∈ asserted /
@@ -59,6 +60,10 @@ type Reconciler struct {
 	// in-flight ownership move isn't reclaimed before its marker lands.
 	ownerMu            sync.Mutex
 	ownershipFirstSeen map[string]time.Time
+
+	// ownerEpochBackfill enables the Phase 4 per-sweep backfill
+	// (enforcement.owner_epoch).
+	ownerEpochBackfill bool
 
 	// gate is the split-brain safety gate (Phase 1). When a pending VM carries a
 	// proof marker (vms.pending_action_id), the reconciler enforces ExecutionGate
@@ -136,6 +141,10 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
+// (enforcement.owner_epoch; the daemon wires it).
+func (r *Reconciler) SetOwnerEpochBackfill(on bool) { r.ownerEpochBackfill = on }
 
 // SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
 // ownership-transfer fence gate (enforcement.shared_storage_fence).
@@ -366,6 +375,15 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context) {
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
+	if r.ownerEpochBackfill {
+		// Phase 4 backfill: graduate every workload this host owns out of the
+		// pre-epoch 0. Idempotent by predicate; the convergence pass below then
+		// writes the runtime markers for whatever just graduated. Readiness
+		// (advertising owner_epoch_v1) keys off no owned row remaining at 0.
+		if err := corrosion.BackfillOwnerEpochs(ctx, r.db, r.hostName); err != nil {
+			slog.Warn("reconciler: owner-epoch backfill pass failed (will retry)", "error", err)
+		}
+	}
 	vms, err := corrosion.ListVMs(ctx, r.db, "", r.hostName)
 	if err != nil {
 		slog.Error("reconciler: list VMs", "error", err)
@@ -396,6 +414,35 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// After daemon restart or libvirt reconnect, verify VMs that
 			// corrosion says are "running" are actually alive in libvirt (#43/#53).
 			if !r.virt.DomainExists(vm.Name) {
+				// Phase 4 enforcement (the dual-run killer): this self-heal
+				// restart is decided purely from THIS NODE'S replica, and a
+				// just-rejoined node's replica is exactly the untrustworthy
+				// input — on 2026-08-01 a rejoined host restarted a VM that had
+				// already been rescheduled away, running a second live copy.
+				// The runtime marker is the host's own attestation of which
+				// generation its runtime belongs to; when the DB knows a NEWER
+				// one, this host's runtime is superseded and must not be
+				// resurrected from local state. Absent marker = pre-epoch, and
+				// the gate below still applies.
+				if r.ownerEpochEnforced(ctx) && r.runtimeSuperseded(ctx, vm.Name) {
+					slog.Warn("reconciler: refusing self-heal restart — this host's runtime belongs to a superseded ownership generation",
+						"vm", vm.Name)
+					r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
+					break
+				}
+				// Automated recovery must never act on a workload whose OWNERSHIP
+				// is in dispute: restarting one side of a dual-run is exactly how
+				// a transient condition becomes a corrupted disk. The condition is
+				// durable state, so this refusal holds across restarts and leader
+				// changes; recovery resumes when the evaluator proves resolution.
+				if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+					slog.Warn("reconciler: cannot read health conditions; deferring self-heal restart", "vm", vm.Name, "error", cerr)
+					break
+				} else if disputed {
+					slog.Warn("reconciler: refusing self-heal restart — active ownership condition",
+						"vm", vm.Name, "condition", code)
+					break
+				}
 				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
 					"vm", vm.Name)
 				r.startPendingVM(ctx, vm)
@@ -414,6 +461,15 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// stop. classifyStop decides whether the VM is genuinely down.
 			st, err := r.virt.DomainStateReason(vm.Name)
 			if err != nil || st.State == "running" {
+				if err == nil && st.State == "running" {
+					// Phase 4 convergence: with the domain CONFIRMED running
+					// here, repair a missing/stale owner-epoch marker toward
+					// the DB row — the crash window between a completion mint
+					// and its write-through, and pre-marker domains. ListVMs
+					// omits the epoch, so read the full row; pre-epoch rows
+					// (epoch 0) are the backfill's to graduate, never stamped.
+					r.convergeOwnerEpochMarker(ctx, vm.Name)
+				}
 				break
 			}
 			if vm.StateDetail == operatorStopDetail {
@@ -425,7 +481,19 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			}
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)
-			if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail); err != nil {
+			// Phase 4: carry the generation this decision was made against, so
+			// the statement cannot stomp a peer whose row has moved on. A
+			// rejoined host's stale sync was doing exactly that on every rejoin
+			// (observed live 2026-08-01) — it now lands locally and stops there.
+			// Pre-epoch rows (0) and un-latched clusters keep the plain write.
+			syncErr := error(nil)
+			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); r.ownerEpochEnforced(ctx) &&
+				gerr == nil && fresh != nil && fresh.OwnerEpoch > 0 {
+				syncErr = corrosion.UpdateVMStateAtEpoch(ctx, r.db, vm.Name, newState, detail, fresh.OwnerEpoch)
+			} else {
+				syncErr = corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
+			}
+			if err := syncErr; err != nil {
 				slog.Error("reconciler: out-of-band stop sync write failed", "vm", vm.Name, "error", err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}
@@ -700,6 +768,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 	}
 
+	// Ownership-dispute gate, EXECUTE side. The coordinator refuses to plan
+	// recovery for a disputed workload, but this reconciler is the node that
+	// actually starts things — and it also serves pending rows minted before
+	// the condition was raised, and local starts (onboot autostart, domain-died
+	// recovery) that never passed through the coordinator at all. Starting any
+	// of them while ownership is contested adds a holder. Fail closed on a read
+	// error; the row stays pending and the next tick retries.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+		slog.Warn("reconciler: cannot read health conditions; deferring start (fail closed)",
+			"vm", vm.Name, "error", cerr)
+		return
+	} else if disputed {
+		slog.Warn("reconciler: refusing automated start — active ownership condition",
+			"vm", vm.Name, "condition", code)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonOwnershipDispute)
+		return
+	}
+
 	// Post-activation, a coordinator OWNERSHIP TRANSFER writes state=pending AND a
 	// proof marker (pending_action_id) atomically. A PENDING row with NO marker under
 	// enforcement is therefore stale / pre-activation / hand-mutated — refuse it
@@ -746,6 +832,17 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			slog.Warn("reconciler: pending proof does not match this VM/host, refusing start",
 				"vm", vm.Name, "proof", proofID, "proof_target", pr.TargetName, "proof_dest", pr.DestHost)
 			r.noteGateRefused(corrosion.ActionReschedule, ReasonProofConflict)
+			return
+		}
+		// Bind the proof to the exact ownership generation the coordinator
+		// observed. A proof left prepared across owner A→B→A must not authorize a
+		// start after the row's owner epoch advances (ABA). Empty is the pre-epoch
+		// form and remains inert until owner_epoch_v1 enforcement is activated.
+		if pr.OwnerEpoch != "" && pr.OwnerEpoch != strconv.FormatInt(fresh.OwnerEpoch, 10) {
+			slog.Warn("reconciler: pending proof owner epoch is stale, refusing start",
+				"vm", vm.Name, "proof", proofID, "proof_epoch", pr.OwnerEpoch,
+				"current_epoch", fresh.OwnerEpoch)
+			r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
 			return
 		}
 		proofFenceEpoch = pr.FenceEpoch
@@ -1065,6 +1162,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		if err := corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
+		} else {
+			// Phase 4 write-through: the completion just minted the next
+			// ownership generation; mirror it into the domain metadata so the
+			// RUNTIME carries the generation a rejoined stale replica can be
+			// checked against. Best-effort — the VM is already running, and the
+			// convergence pass repairs a missed write; failing the start over a
+			// marker would be strictly worse than a temporarily absent marker.
+			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
+				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
+					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
+						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
+				}
+				// The durable twin, which survives the domain being undefined.
+				if merr := WriteVMOwnerEpochMarker(r.dataDir, vm.Name, fresh.OwnerEpoch); merr != nil {
+					slog.Warn("reconciler: owner-epoch file marker write failed (convergence will repair)",
+						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
+				}
+			}
 		}
 	} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover"); err != nil {
 		slog.Error("reconciler: post-failover running-state write failed", "vm", vm.Name, "error", err)
@@ -1181,4 +1296,64 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 		vmName, r.hostName); err != nil {
 		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
 	}
+}
+
+// convergeOwnerEpochMarker repairs the domain's owner-epoch metadata toward
+// the DB row for a VM confirmed running on this host. Absent or stale →
+// stamped with the row's generation; corrupt (Get errors) → overwritten the
+// same way, because a marker that can't be read protects nothing. A row still
+// at epoch 0 is pre-epoch: the sweep never stamps it — deciding when a
+// workload graduates into the marker regime is the backfill's job, and a
+// sweep-stamped zero would be indistinguishable from a real generation.
+func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) {
+	row, err := corrosion.GetVM(ctx, r.db, name)
+	if err != nil || row == nil || row.OwnerEpoch == 0 {
+		return
+	}
+	// Each marker converges INDEPENDENTLY. A single early-return keyed on the
+	// metadata copy meant that once metadata matched, the durable file was never
+	// created — so the check that reads the file stayed blind (lab, 2026-08-02).
+	if cur, ok, gerr := r.virt.GetDomainOwnerEpoch(name); gerr != nil || !ok || cur != row.OwnerEpoch {
+		if serr := r.virt.SetDomainOwnerEpoch(name, row.OwnerEpoch, true); serr != nil {
+			slog.Warn("reconciler: owner-epoch marker convergence failed (will retry next sweep)",
+				"vm", name, "epoch", row.OwnerEpoch, "error", serr)
+		}
+	}
+	if cur, ok, ferr := ReadVMOwnerEpochMarker(r.dataDir, name); ferr != nil || !ok || cur != row.OwnerEpoch {
+		if werr := WriteVMOwnerEpochMarker(r.dataDir, name, row.OwnerEpoch); werr != nil {
+			slog.Warn("reconciler: owner-epoch file marker convergence failed (will retry next sweep)",
+				"vm", name, "epoch", row.OwnerEpoch, "error", werr)
+		}
+	}
+}
+
+// ownerEpochEnforced reports whether owner_epoch_v1 enforcement is live here
+// (latched fleet-wide; partition fails closed via the gate's own semantics).
+func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
+	return r.gate != nil && r.gate.Enforced(ctx, capabilities.OwnerEpochV1)
+}
+
+// runtimeSuperseded reports whether this host's runtime marker for a workload
+// names an ownership generation the DB has already moved past. An absent or
+// unreadable marker is NOT superseded: pre-epoch workloads and hosts whose
+// marker is missing must keep their existing self-heal behavior (the backfill
+// and convergence passes are what graduate them), and failing closed on an
+// unreadable marker would strand a legitimately-owned VM.
+func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
+	// Prefer the HOST-LOCAL marker: this check runs when libvirt has no domain,
+	// and undefining a domain destroys its metadata, so a metadata-only read is
+	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
+	// the domain metadata for a VM whose file marker has not been written yet.
+	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
+	if err != nil || !ok {
+		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
+	}
+	if err != nil || !ok {
+		return false
+	}
+	row, gerr := corrosion.GetVM(ctx, r.db, name)
+	if gerr != nil || row == nil {
+		return false
+	}
+	return row.OwnerEpoch > marker
 }

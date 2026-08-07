@@ -155,6 +155,9 @@ func nonAdditiveViolations(base, head schemaFacts) []string {
 			out = append(out, fmt.Sprintf("table %q was removed", name))
 			continue
 		}
+		if allowedUnreleasedV47CRLReshape(base.version, head.version, name, bt, ht) {
+			continue
+		}
 		for col, btype := range bt.cols {
 			htype, ok := ht.cols[col]
 			if !ok {
@@ -179,6 +182,31 @@ func nonAdditiveViolations(base, head schemaFacts) []string {
 		}
 	}
 	return out
+}
+
+// allowedUnreleasedV47CRLReshape is a one-time exception for correcting the
+// unreleased v47 cluster_crl key. It is intentionally exact: once the composite
+// key is in the base revision, any later structural change is checked normally.
+func allowedUnreleasedV47CRLReshape(baseVersion, headVersion int, name string, base, head tableModel) bool {
+	if baseVersion != 47 || headVersion != 47 || name != "cluster_crl" {
+		return false
+	}
+	if strings.Join(base.pk, ",") != "id" || strings.Join(head.pk, ",") != "crl_pem,id" {
+		return false
+	}
+	return mapsEqual(base.cols, head.cols)
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // nonAdditiveAlter returns a reason string if an ALTER is non-additive, else "".

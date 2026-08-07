@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -57,8 +58,11 @@ type HostRecord struct {
 	MemOvercommit float64 // memory oversubscription multiplier (0 = inherit)
 	CPUReserve    *int    // vCPUs held back for the host itself (nil = inherit)
 	MemReserveMiB *int    // MiB held back for the host itself (nil = inherit)
-	CreatedAt     string
-	UpdatedAt     string
+	// CapacityPolicyHash is the stable fingerprint of the admission policy this
+	// host advertises. Empty means unknown/legacy.
+	CapacityPolicyHash string
+	CreatedAt          string
+	UpdatedAt          string
 }
 
 // optInt reads an optional INTEGER override column. The stored sentinel for
@@ -98,13 +102,69 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 		`INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
 			cpu_total, mem_total, disk_total, fence_strategy, version, role,
 			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			capacity_policy_hash,
 			created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
 		h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role,
 		h.CPUOvercommit, h.MemOvercommit, optIntValue(h.CPUReserve), optIntValue(h.MemReserveMiB),
+		h.CapacityPolicyHash,
 		now, c.NowTS(),
 	)
+}
+
+// AdmitHost creates a host row or replaces a tombstone after an operator has
+// issued a different certificate for the same name. A daemon cannot use its old
+// certificate to resurrect itself: the old serial is retained in the tombstone
+// and an equal serial is refused.
+func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
+	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
+		return fmt.Errorf("host admission requires name, address, and certificate serial")
+	}
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return InsertHost(ctx, c, h)
+	}
+	if rows[0].String("deleted_at") == "" {
+		if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			return nil
+		}
+		return fmt.Errorf("host %q is already active", h.Name)
+	}
+	if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+		return fmt.Errorf("host %q cannot be re-admitted with its removed certificate", h.Name)
+	}
+	return c.Execute(ctx,
+		`UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
+			state = ?, cert_serial = ?, deleted_at = NULL, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NOT NULL AND lower(cert_serial) <> lower(?)`,
+		h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, c.NowTS(),
+		h.Name, h.CertSerial)
+}
+
+// RegisterHost is the daemon startup form of host admission. Ordinary restarts
+// are idempotent. A re-added machine may clear its local tombstone only when the
+// certificate actually installed on disk has a different serial; peers still
+// require the operator's AdmitHost mutation and the matching certificate.
+func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
+	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return InsertHost(ctx, c, h)
+	}
+	if rows[0].String("deleted_at") == "" {
+		if rows[0].String("cert_serial") == "" ||
+			strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+			return nil
+		}
+		return fmt.Errorf("active host %q has a different certificate serial", h.Name)
+	}
+	return AdmitHost(ctx, c, h)
 }
 
 // ListHosts returns all active hosts.
@@ -115,6 +175,7 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
 			labels, version, schema_version, role, region,
 			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			capacity_policy_hash,
 			created_at, updated_at
 		 FROM hosts WHERE deleted_at IS NULL`)
 	if err != nil {
@@ -136,6 +197,7 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
 			labels, version, schema_version, role, region,
 			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
+			capacity_policy_hash,
 			created_at, updated_at
 		 FROM hosts WHERE name = ? AND deleted_at IS NULL`, name)
 	if err != nil {
@@ -150,32 +212,33 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 
 func scanHost(r Row) HostRecord {
 	return HostRecord{
-		Name:          r.String("name"),
-		Address:       r.String("address"),
-		SSHUser:       r.String("ssh_user"),
-		SSHPort:       r.Int("ssh_port"),
-		GRPCPort:      r.Int("grpc_port"),
-		State:         r.String("state"),
-		CertSerial:    r.String("cert_serial"),
-		CPUTotal:      r.Int("cpu_total"),
-		MemTotal:      r.Int("mem_total"),
-		DiskTotal:     r.Int("disk_total"),
-		FenceStrategy: r.String("fence_strategy"),
-		IPMIAddress:   r.String("ipmi_address"),
-		IPMIUser:      r.String("ipmi_user"),
-		IPMIPass:      r.String("ipmi_pass"),
-		WatchdogDev:   r.String("watchdog_dev"),
-		Labels:        decodeLabels(r.String("labels")),
-		Version:       r.String("version"),
-		SchemaVersion: r.Int("schema_version"),
-		Role:          roleOrDefault(r.String("role")),
-		Region:        regionOrDefault(r.String("region")),
-		CPUOvercommit: r.Float("cpu_overcommit"),
-		MemOvercommit: r.Float("mem_overcommit"),
-		CPUReserve:    optInt(r, "cpu_reserve"),
-		MemReserveMiB: optInt(r, "mem_reserve_mib"),
-		CreatedAt:     r.String("created_at"),
-		UpdatedAt:     r.String("updated_at"),
+		Name:               r.String("name"),
+		Address:            r.String("address"),
+		SSHUser:            r.String("ssh_user"),
+		SSHPort:            r.Int("ssh_port"),
+		GRPCPort:           r.Int("grpc_port"),
+		State:              r.String("state"),
+		CertSerial:         r.String("cert_serial"),
+		CPUTotal:           r.Int("cpu_total"),
+		MemTotal:           r.Int("mem_total"),
+		DiskTotal:          r.Int("disk_total"),
+		FenceStrategy:      r.String("fence_strategy"),
+		IPMIAddress:        r.String("ipmi_address"),
+		IPMIUser:           r.String("ipmi_user"),
+		IPMIPass:           r.String("ipmi_pass"),
+		WatchdogDev:        r.String("watchdog_dev"),
+		Labels:             decodeLabels(r.String("labels")),
+		Version:            r.String("version"),
+		SchemaVersion:      r.Int("schema_version"),
+		Role:               roleOrDefault(r.String("role")),
+		Region:             regionOrDefault(r.String("region")),
+		CPUOvercommit:      r.Float("cpu_overcommit"),
+		MemOvercommit:      r.Float("mem_overcommit"),
+		CPUReserve:         optInt(r, "cpu_reserve"),
+		MemReserveMiB:      optInt(r, "mem_reserve_mib"),
+		CapacityPolicyHash: r.String("capacity_policy_hash"),
+		CreatedAt:          r.String("created_at"),
+		UpdatedAt:          r.String("updated_at"),
 	}
 }
 
@@ -321,20 +384,4 @@ func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, 
 		 WHERE name = ?`,
 		cpu, mem, disk, c.NowTS(), name,
 	)
-}
-
-// HostVotes reports whether a host counts as a live voting member.
-//
-// It MIRRORS the quorum denominator used by failover.countLiveHosts and
-// health.votingEligible: everything except offline/maintenance/fenced, witnesses
-// INCLUDED. Keeping one predicate matters — the quota reservation barrier previously
-// counted only "active" hosts while the quorum that elects an authority admitted other
-// voting states, so "a quorum holds the row" said nothing about who could become the
-// authority. The populations must be the same set or the intersection argument is empty.
-func HostVotes(h HostRecord) bool {
-	switch h.State {
-	case "offline", "maintenance", "fenced":
-		return false
-	}
-	return true
 }

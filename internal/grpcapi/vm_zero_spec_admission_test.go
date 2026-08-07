@@ -7,7 +7,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -43,14 +42,18 @@ func TestCreateVM_ZeroSpecIsAdmittedAtItsDefaultSize(t *testing.T) {
 			"want ResourceExhausted — a zero spec must be admitted at what it will actually cost", err)
 	}
 
-	// The spec is normalized in place, so admission demonstrably saw the real
-	// numbers rather than 0/0. This is the precise assertion: it holds regardless
-	// of which admission layer (placement or capacity) does the refusing.
-	if req.Spec.Cpu != compose.DefaultVMCPU || req.Spec.MemoryMib != compose.DefaultVMMemoryMiB {
-		t.Errorf("spec after CreateVM = %d vCPU/%d MiB, want %d/%d — normalization must happen "+
-			"before admission, and in place so the forwarded copy carries it too",
-			req.Spec.Cpu, req.Spec.MemoryMib, compose.DefaultVMCPU, compose.DefaultVMMemoryMiB)
-	}
+	// The refusal above IS the assertion that admission saw the real numbers: a
+	// spec still carrying 0/0 costs nothing, fits anywhere, and would have been
+	// ADMITTED on this deliberately-too-small host. It holds regardless of which
+	// admission layer (placement or capacity) does the refusing.
+	//
+	// Deliberately NOT asserted on the caller's req: createVM clones the whole
+	// request before touching it, so the caller's object is never mutated — that
+	// clone is what stops a caller steering the server-owned UUID. Normalization
+	// is applied to the clone that actually gets forwarded (vm.go), which is the
+	// copy the owning host re-admits from. Asserting in-place mutation here would
+	// pin an implementation detail the design specifically rejects, not the safety
+	// property.
 
 	// No partial state from a refused create.
 	if rec, gerr := corrosion.GetVM(ctx, s.db, "zero"); gerr == nil && rec != nil {

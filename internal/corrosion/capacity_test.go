@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"maps"
 	"testing"
 )
 
@@ -117,6 +118,108 @@ func TestCapacityPolicy_ZeroValueDoesNotStarveEveryHost(t *testing.T) {
 	}
 }
 
+func TestCapacityPolicyFingerprintNormalizesDefaults(t *testing.T) {
+	zero, err := CapacityPolicyFingerprint(CapacityPolicy{}, nil)
+	if err != nil {
+		t.Fatalf("zero fingerprint: %v", err)
+	}
+	defaults, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), map[string]HostCapacityOverride{})
+	if err != nil {
+		t.Fatalf("default fingerprint: %v", err)
+	}
+	if zero != defaults {
+		t.Fatalf("zero policy fingerprint %q != normalized defaults %q", zero, defaults)
+	}
+}
+
+func TestCapacityPolicyFingerprintIncludesEveryCapacityField(t *testing.T) {
+	base := DefaultCapacityPolicy()
+	baseFingerprint, err := CapacityPolicyFingerprint(base, nil)
+	if err != nil {
+		t.Fatalf("base fingerprint: %v", err)
+	}
+	variants := []CapacityPolicy{
+		func() CapacityPolicy { p := base; p.CPUOvercommit++; return p }(),
+		func() CapacityPolicy { p := base; p.MemOvercommit++; return p }(),
+		func() CapacityPolicy { p := base; p.CPUReserve++; return p }(),
+		func() CapacityPolicy { p := base; p.MemReserveMiB++; return p }(),
+		func() CapacityPolicy { p := base; p.MemReservePct++; return p }(),
+		func() CapacityPolicy { p := base; p.VMMemOverheadMiB++; return p }(),
+	}
+	for i, variant := range variants {
+		got, err := CapacityPolicyFingerprint(variant, nil)
+		if err != nil {
+			t.Fatalf("variant %d: %v", i, err)
+		}
+		if got == baseFingerprint {
+			t.Errorf("capacity field variant %d did not change fingerprint", i)
+		}
+	}
+}
+
+func TestCapacityPolicyFingerprintCanonicalizesHostOverrides(t *testing.T) {
+	cpuZero, memZero := 0, 0
+	overridesA := map[string]HostCapacityOverride{
+		"node-b": {CPUOvercommit: 2, MemOvercommit: 1.25},
+		"node-a": {CPUReserve: &cpuZero, MemReserveMiB: &memZero},
+	}
+	overridesB := map[string]HostCapacityOverride{}
+	overridesB["node-a"] = overridesA["node-a"]
+	overridesB["node-b"] = overridesA["node-b"]
+
+	a, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), overridesA)
+	if err != nil {
+		t.Fatalf("fingerprint A: %v", err)
+	}
+	b, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), overridesB)
+	if err != nil {
+		t.Fatalf("fingerprint B: %v", err)
+	}
+	if a != b {
+		t.Fatalf("map insertion order changed fingerprint: %q != %q", a, b)
+	}
+
+	changed := maps.Clone(overridesA)
+	changed["node-b"] = HostCapacityOverride{CPUOvercommit: 3, MemOvercommit: 1.25}
+	c, err := CapacityPolicyFingerprint(DefaultCapacityPolicy(), changed)
+	if err != nil {
+		t.Fatalf("changed fingerprint: %v", err)
+	}
+	if c == a {
+		t.Fatal("host override change did not change fingerprint")
+	}
+}
+
+func TestHostCapacityOverridesPreserveExplicitZeroAndIgnoreUnrelatedFields(t *testing.T) {
+	zero := 0
+	hosts := []HostRecord{
+		{
+			Name: "node-b", Labels: map[string]string{"zone": "west"},
+			CPUOvercommit: 2,
+		},
+		{
+			Name: "node-a", Address: "10.0.0.1",
+			CPUReserve: &zero, MemReserveMiB: &zero,
+		},
+	}
+	got := HostCapacityOverrides(hosts)
+	if got["node-a"].CPUReserve == nil || *got["node-a"].CPUReserve != 0 {
+		t.Fatalf("explicit zero CPU reserve lost: %+v", got["node-a"])
+	}
+	if got["node-a"].MemReserveMiB == nil || *got["node-a"].MemReserveMiB != 0 {
+		t.Fatalf("explicit zero memory reserve lost: %+v", got["node-a"])
+	}
+
+	changedUnrelated := append([]HostRecord(nil), hosts...)
+	changedUnrelated[0].Labels = map[string]string{"zone": "east"}
+	changedUnrelated[1].Address = "10.0.0.99"
+	a, _ := CapacityPolicyFingerprint(DefaultCapacityPolicy(), got)
+	b, _ := CapacityPolicyFingerprint(DefaultCapacityPolicy(), HostCapacityOverrides(changedUnrelated))
+	if a != b {
+		t.Fatal("non-capacity host fields changed capacity-policy fingerprint")
+	}
+}
+
 // TestHostFreeCapacity_CountsRunningContainers is the hole this closes: host
 // usage came from the vms table alone, so a host packed with containers reported
 // 100% of its memory free and VMs were admitted on top of memory already held.
@@ -172,5 +275,78 @@ func TestSumContainerMemoryByHost_OnlyRunningAndCapped(t *testing.T) {
 	}
 	if got["h1"] != 512 {
 		t.Errorf("h1 container memory = %d, want 512 (running+capped only; stopped holds nothing, uncapped is unknowable)", got["h1"])
+	}
+}
+
+// TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU pins a DELIBERATE
+// exclusion that had no guard.
+//
+// A container's cpu_limit is CPU *shares* — a relative cgroup weight — not a vCPU
+// reservation. A container with the conventional 1024 shares is not 1024 vCPUs,
+// so folding it into a host's vCPU total would be meaningless arithmetic that
+// instantly makes every host look full. The decision was documented and tested
+// nowhere: adding cpu_limit to the sum would have broken nothing.
+func TestHostFreeCapacity_ContainerCPUIsNotCountedAsVCPU(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := InsertHost(ctx, db, HostRecord{Name: "h1", CPUTotal: 8, MemTotal: 8192, State: "HOST_ACTIVE"}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	baselineCPU, _, ok, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("HostFreeCapacity: ok=%v err=%v", ok, err)
+	}
+
+	// A running container with a large CPU-shares value and no memory cap.
+	if err := UpsertContainer(ctx, db, ContainerRecord{
+		HostName: "h1", Name: "sharesy", State: "running", CPULimit: 1024, MemMiB: 0,
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+
+	afterCPU, _, _, err := HostFreeCapacity(ctx, db, "h1")
+	if err != nil {
+		t.Fatalf("HostFreeCapacity: %v", err)
+	}
+	if afterCPU != baselineCPU {
+		t.Errorf("free vCPU went %d -> %d after a container with cpu_limit=1024 — shares are a cgroup weight, not a vCPU reservation, and counting them makes every host look full",
+			baselineCPU, afterCPU)
+	}
+}
+
+// TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull is the safety property for the
+// disk dimension: a pool with no capacity sample must NOT read as full.
+//
+// Pool usage is statfs-sampled by the daemon. A pool never sampled — or a driver
+// reporting nothing — has total 0, and treating that as "no space" would refuse
+// every disk on every un-sampled cluster. Unknown means skip the check, not deny.
+func TestPoolFreeBytes_UnsampledPoolIsUnknownNotFull(t *testing.T) {
+	if _, ok := PoolFreeBytes(0, 0, DefaultCapacityPolicy()); ok {
+		t.Error("an unsampled pool (total 0) reported a known free figure — callers would treat it as full and refuse every disk")
+	}
+	free, ok := PoolFreeBytes(100<<30, 50<<30, DefaultCapacityPolicy())
+	if !ok {
+		t.Fatal("a sampled pool should report a known free figure")
+	}
+	// 100 GiB total, 50 used, 5% reserve = 5 GiB → 45 GiB free.
+	if want := int64(45) << 30; free != want {
+		t.Errorf("free = %d, want %d (total - used - 5%% reserve)", free, want)
+	}
+}
+
+// TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull: charging a declared disk
+// at 1:1 against ACTUAL free space would refuse ordinary practice, since a
+// declared 100 GiB qcow2 may occupy 2 GiB.
+func TestDiskNeedBytes_ThinProvisioningIsNotChargedInFull(t *testing.T) {
+	declared := int64(100) << 30
+	need := DiskNeedBytes(declared, DefaultCapacityPolicy())
+	if need >= declared {
+		t.Errorf("a %d GiB declared disk is charged %d GiB — thin provisioning means the declared size is not what it takes",
+			declared>>30, need>>30)
+	}
+	// Default ratio 3.0.
+	if want := declared / 3; need != want {
+		t.Errorf("need = %d, want %d (declared / 3.0)", need, want)
 	}
 }

@@ -17,7 +17,12 @@ var testDBCounter atomic.Int64
 func NewTestClient() (*Client, error) {
 	// Each test client gets a unique in-memory DB
 	id := testDBCounter.Add(1)
-	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared", id)
+	// busy_timeout matches the production DSN (client.go): shared-cache
+	// in-memory DBs serve every fleet node from one pool, and under full-suite
+	// load a concurrent read can otherwise hit SQLITE_BUSY instantly — which
+	// the fail-closed admission paths correctly refuse on, turning raw lock
+	// contention into spurious test-only refusals.
+	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", id)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -46,7 +51,7 @@ func NewTestClient() (*Client, error) {
 //
 // Test-only. The returned client is not started (no replicator, no gossip).
 func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", dsnSuffix)
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=busy_timeout(5000)", dsnSuffix)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

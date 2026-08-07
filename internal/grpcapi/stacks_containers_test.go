@@ -52,8 +52,12 @@ func TestContainerAudit(t *testing.T) {
 		t.Error("ct.create audit detail should record project=acme")
 	}
 	// Hash-chain intact.
-	if _, _, err := corrosion.VerifyAuditChain(ctx, s.db); err != nil {
-		t.Errorf("audit chain broken: %v", err)
+	res, err := corrosion.VerifyAuditChain(ctx, s.db)
+	if err != nil {
+		t.Errorf("verify audit chain: %v", err)
+	}
+	if res.Tampered() {
+		t.Errorf("audit chain reports tampering: %+v", res)
 	}
 }
 

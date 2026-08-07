@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -292,4 +294,98 @@ func auditCount(t *testing.T, db *corrosion.Client, action string) int {
 		return 0
 	}
 	return rows[0].Int("n")
+}
+
+// asserterWithAbsentPeers is ownerAssertFixture with unanimously-absent peers
+// and the debounce already elapsed — the state in which ONLY the exact-marker
+// evidence decides.
+func asserterWithAbsentPeers(t *testing.T) (*Reconciler, *corrosion.Client, *time.Time, map[string]string) {
+	t.Helper()
+	r, db, _, clock, results := ownerAssertFixture(t)
+	r.SetPeerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+	r.assertRuntimeOwnership(context.Background())
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	return r, db, clock, results
+}
+
+// TestOwnerAssert_ExactMarkerReclaims: with a VALID marker exactly equal to the
+// DB epoch being superseded, the sole-holder re-key proceeds.
+func TestOwnerAssert_ExactMarkerReclaims(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, results := asserterWithAbsentPeers(t)
+	// The fixture VM is pre-epoch (OwnerEpoch 0); write the matching marker.
+	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 0); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-a" {
+		t.Fatalf("exact-marker sole-holder re-key must proceed, owner = %s", ownerOf(t, db, "vm1"))
+	}
+	if results["vm1"] != "asserted" {
+		t.Fatalf("result = %q, want asserted", results["vm1"])
+	}
+}
+
+// TestOwnerAssert_UnequalMarkerRefuses: a marker from another generation —
+// older or newer than the DB epoch — refuses the re-key. This runtime cannot
+// prove the decision was made against its own generation.
+func TestOwnerAssert_UnequalMarkerRefuses(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, results := asserterWithAbsentPeers(t)
+	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 7); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("an unequal marker must refuse the re-key")
+	}
+	if results["vm1"] != "marker_epoch_mismatch" {
+		t.Fatalf("result = %q, want marker_epoch_mismatch", results["vm1"])
+	}
+}
+
+// TestOwnerAssert_CorruptMarkerRefuses: garbage evidence NEVER authorizes —
+// corrupt is not epoch 0.
+func TestOwnerAssert_CorruptMarkerRefuses(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, results := asserterWithAbsentPeers(t)
+	if err := os.MkdirAll(filepath.Join(r.dataDir, "vms", "vm1"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(r.dataDir, "vms", "vm1", "owner_epoch"), []byte("garbage\n"), 0o600); err != nil {
+		t.Fatalf("write corrupt marker: %v", err)
+	}
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("a corrupt marker must refuse the re-key")
+	}
+	if results["vm1"] != "marker_unreadable" {
+		t.Fatalf("result = %q, want marker_unreadable", results["vm1"])
+	}
+}
+
+// TestOwnerAssert_ActiveConditionRefuses: an active ownership condition on the
+// workload freezes automated repair regardless of the runtime evidence —
+// repairing under a dispute is how the dispute becomes damage.
+func TestOwnerAssert_ActiveConditionRefuses(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, results := asserterWithAbsentPeers(t)
+	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 0); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
+		Lifecycle: corrosion.ConditionObserved, Severity: corrosion.SeverityWarning,
+		Hosts: []string{"node-a", "node-b"},
+		FirstSeen: "2026-01-01T00:00:00Z", LastSeen: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("seed condition: %v", err)
+	}
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-b" {
+		t.Fatal("an active ownership condition must freeze the re-key")
+	}
+	if results["vm1"] != "disputed" {
+		t.Fatalf("result = %q, want disputed", results["vm1"])
+	}
 }

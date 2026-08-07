@@ -663,15 +663,15 @@ func TestR3_GetHostHealth_WithEntries(t *testing.T) {
 		t.Fatalf("insert health 2: %v", err)
 	}
 
-	resp, err := s.GetHostHealth(ctx, &emptypb.Empty{})
+	resp, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
+		t.Fatalf("GetClusterHealth: %v", err)
 	}
-	if len(resp.Entries) != 2 {
-		t.Fatalf("got %d entries, want 2", len(resp.Entries))
+	if len(resp.GetConnectivity()) != 2 {
+		t.Fatalf("got %d edges, want 2", len(resp.GetConnectivity()))
 	}
 	found := false
-	for _, e := range resp.Entries {
+	for _, e := range resp.GetConnectivity() {
 		if e.Observer == "host-b" && e.Target == "host-a" {
 			found = true
 			if e.Status != "suspect" {

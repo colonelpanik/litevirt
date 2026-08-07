@@ -126,11 +126,44 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	unlock := s.lockVM("ct/" + req.Target)
 	defer unlock()
 
-	// Quota: the clone draws down the project's vCPU/Mem budget (like CreateContainer).
+	// Quota fail-fast: the clone draws down the project's vCPU/Mem budget (like
+	// CreateContainer). The real decision is the serialized admission below —
+	// this read-only glance cannot see in-flight reservations and was the ONLY
+	// gate this path had (nothing at all with tenancy unwired).
 	if s.tenancy != nil {
 		if err := s.tenancy.Admit(ctx, project, tenancy.QuotaRequest{VCPU: src.CPULimit, MemMiB: src.MemMiB}); err != nil {
 			return nil, status.Errorf(codes.ResourceExhausted, "%v", err)
 		}
+	}
+
+	// Admission, mirroring CreateContainer exactly: the host half is
+	// UNCONDITIONAL — a zero-limit clone still becomes resident here, and
+	// residency (incomplete inventory, active ownership conditions) is a safety
+	// decision the clone cannot opt out of by inheriting no limits. The quota
+	// half is serialized reserve-then-verify and carries the commit fence.
+	var cloneQuotaLease *reservationLease
+	{
+		lease, aerr := s.admitHostWithReservation(ctx, "CloneContainer", s.hostName, project,
+			"ct:"+req.Target, 0, src.MemMiB, intentContainerResident)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+	}
+	// The clone rebuilds the source's MANAGED NICs (below), and those rows count
+	// toward the project's NIC budget — so the charge includes them, derived from
+	// the same spec the rebuild reads.
+	if cloneQuota := (corrosion.QuotaAmount{
+		VCPU: src.CPULimit, MemMiB: src.MemMiB,
+		NIC: managedNICCount(corrosion.DecodeCreateSpec(src.CreateSpec)),
+	}); !cloneQuota.IsZero() {
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CloneContainer", s.hostName, project,
+			corrosion.WorkloadContainer, req.Target, cloneQuota, cloneQuota, intentContainerResident)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+		cloneQuotaLease = lease
 	}
 
 	if err := s.containerRuntime.CloneContainer(ctx, req.Source, req.Target); err != nil {
@@ -155,6 +188,16 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		CreateSpec: corrosion.EncodeCreateSpec(cloneSpec), CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
+	// The quota-authority commit fence, immediately before the durable write.
+	// A refusal deletes the just-cloned runtime container, same as a persist
+	// failure below: nothing was persisted, nothing is left untracked.
+	if err := cloneQuotaLease.allowCommit(ctx); err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after fence refusal also failed", "name", req.Target, "error", delErr)
+		}
+		return nil, err
+	}
+
 	// Atomic: the container row + the clone's interface rows in one batch (no IPAM
 	// lease — clone NICs are dynamic). Fail closed: if persistence fails, delete the
 	// just-cloned runtime container so we don't strand an untracked clone (same rule

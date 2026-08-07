@@ -94,6 +94,38 @@
 </div>
 {{end}}
 
+<div class="section" style="margin-bottom:16px">
+  <div class="section-header">
+    <h2>Host Network Configuration ({{len .HostNetworks}})</h2>
+    <div style="flex:1"></div>
+    <div class="actions">
+      <button class="btn" hx-get="/ui/hosts/{{.Host.Name}}/network-modal" hx-target="body" hx-swap="beforeend">Add interface</button>
+      <button class="btn btn-primary" hx-get="/ui/hosts/{{.Host.Name}}/network-plan-modal" hx-target="body" hx-swap="beforeend">Plan &amp; Apply</button>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Interface</th><th>Kind</th><th>Detail</th><th>State</th><th>Gen</th><th>Error</th><th></th></tr></thead>
+    <tbody>
+    {{range .HostNetworks}}
+    <tr>
+      <td><strong>{{.Name}}</strong></td>
+      <td><span class="badge badge-blue">{{.Kind}}</span></td>
+      <td style="font-family:monospace;font-size:12px">{{if eq .Kind "vlan"}}{{.VlanLink}}.{{.VlanId}}{{else if .Members}}{{join .Members ", "}}{{else}}<span style="color:var(--muted)">—</span>{{end}}</td>
+      <td>{{if eq .State "applied"}}<span class="badge badge-green">applied</span>{{else if eq .State "rolled_back"}}<span class="badge badge-red">rolled back</span>{{else}}<span class="badge badge-yellow">{{.State}}</span>{{end}}</td>
+      <td>{{.Generation}}</td>
+      <td style="font-size:12px;color:var(--muted)">{{if .LastError}}{{truncate .LastError 60}}{{else}}—{{end}}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="btn btn-sm" hx-get="/ui/hosts/{{$.Host.Name}}/network-modal?iface={{.Name}}" hx-target="body" hx-swap="beforeend">Edit</button>
+        <button class="btn btn-sm" hx-delete="/ui/hosts/{{$.Host.Name}}/network/{{.Name}}"
+                hx-confirm="Remove the intent for {{.Name}}? The interface goes away on the next apply.">Remove</button>
+      </td>
+    </tr>
+    {{else}}<tr><td colspan="7" class="empty">No managed interfaces — Add one, then Plan &amp; Apply. Wiring changes apply behind an automatic-rollback confirm.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+
 {{if .Host.Labels}}
 <div class="section" style="margin-bottom:16px">
   <div class="section-header"><h2>Labels</h2></div>

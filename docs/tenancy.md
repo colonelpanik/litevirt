@@ -40,7 +40,7 @@ Each project can carry quota rows. Six dimensions are enforced today:
 |---|---|---|
 | `vcpu` | virtual CPUs | sum of vCPU across active VMs **+ containers** |
 | `memory_mib` | MiB | sum of memory across active VMs **+ containers** |
-| `disk_gib` | GiB | sum of all attached disks across active VMs |
+| `disk_gib` | GiB | sum of all attached disks across active VMs, **each rounded up** to a whole GiB |
 | `nic` | count | sum of network interfaces across active VMs |
 | `public_ips` | count | NICs whose address parses as non-private per `net.ParseIP.IsPrivate()` |
 | `backup_gib` | GiB | sum of `TotalSize` across manifests for the project's VMs **+ containers** |
@@ -93,6 +93,19 @@ Usage is computed at admission time (cheap join against `vms` +
 `vm_disks` + the `vm_backups` size index). It is not cached, so an
 external tool that mutates the cluster outside the RPC surface stays
 visible immediately.
+
+Admission does not decide on committed usage alone. A request first publishes a
+**reservation** for what it is about to consume, then re-checks the limit
+counting every reservation that was claimed before it — so two requests racing
+for the last of a budget cannot both read a view without the other and both
+commit. All four bounded dimensions (vCPU, memory, disk GiB, NICs) travel on
+that one reservation, and it is held until the workload's row is durably
+recorded.
+
+A partial GiB occupies a whole one, and the same rounding applies wherever disk
+is measured — what a request is charged, what usage reports, and what the
+accounting expects a workload to contribute. So a 512 MiB disk costs 1 GiB of
+budget and is reported as 1 GiB used.
 
 ## Project = RBAC scope
 

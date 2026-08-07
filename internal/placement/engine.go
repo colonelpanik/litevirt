@@ -4,8 +4,10 @@ package placement
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -86,6 +88,9 @@ type DeviceRequest struct {
 	Type     string // gpu | network | nvme | infiniband
 	Count    int
 	Vendor   string // optional vendor filter
+	Model    string // optional device model/name filter
+	Mapping  string // optional cluster-wide resource mapping
+	Address  string // optional exact PCI address
 	Clique   string // prefer specific NVLink/xGMI clique
 	SameNUMA bool   // require all devices on same NUMA node
 	// Sriov marks an SR-IOV VF request. Placement only gates host eligibility on an
@@ -95,6 +100,36 @@ type DeviceRequest struct {
 	// Parent optionally restricts the SR-IOV request to a specific PF BDF.
 	Parent string
 }
+
+// InfrastructureError marks a placement failure caused by inability to read
+// authoritative cluster state. Callers must not report these as ordinary
+// ineligibility/resource exhaustion.
+type InfrastructureError struct {
+	err error
+}
+
+func (e *InfrastructureError) Error() string { return e.err.Error() }
+func (e *InfrastructureError) Unwrap() error { return e.err }
+
+func infrastructureError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &InfrastructureError{err: err}
+}
+
+// IsInfrastructureError reports whether err means placement could not read
+// authoritative backend state.
+func IsInfrastructureError(err error) bool {
+	var target *InfrastructureError
+	return errors.As(err, &target)
+}
+
+// ErrNoEligibleHost marks a per-VM infeasibility: no host satisfies the VM's
+// hard constraints. SelectBatch converts it into an empty-Host result for that
+// VM instead of failing the whole batch; the single-VM Select surfaces it as
+// the error it always was.
+var ErrNoEligibleHost = errors.New("no eligible host")
 
 // hostCandidate is an evaluated host during selection.
 type hostCandidate struct {
@@ -124,39 +159,14 @@ const strictSpreadPressureCap = 0.5
 // LOW pressure (spread); bin-pack prefers HIGH pressure (concentrate).
 // cost-aware divides the final score by the host's `cost.hourly` label.
 func Select(ctx context.Context, db *corrosion.Client, req Request) (string, error) {
-	// Pinned to a specific host — just validate it exists and is active.
-	if req.PinHost != "" {
-		h, err := corrosion.GetHost(ctx, db, req.PinHost)
-		if err != nil || h == nil {
-			return "", fmt.Errorf("pinned host %q not found", req.PinHost)
-		}
-		if h.State != "active" {
-			return "", fmt.Errorf("pinned host %q is not active (state: %s)", req.PinHost, h.State)
-		}
-		if h.IsWitness() {
-			return "", fmt.Errorf("pinned host %q is a witness; witnesses do not host workloads", req.PinHost)
-		}
-		return req.PinHost, nil
-	}
-
-	snap, err := BuildSnapshot(ctx, db)
+	snap, err := snapshotForRequest(ctx, db, &req)
 	if err != nil {
 		return "", err
 	}
-
-	// Optional device pool load (only when a device is requested).
-	if len(req.Devices) > 0 {
-		snap.Devices = make(map[string][]corrosion.PCIDeviceRecord)
-		for _, h := range snap.HostsBy {
-			devs, err := corrosion.GetAvailableDevicesWithTopology(ctx, db, h.Name, "")
-			if err == nil {
-				snap.Devices[h.Name] = devs
-			}
+	if req.PinHost != "" {
+		if err := restrictToPinnedHost(snap, req.PinHost); err != nil {
+			return "", err
 		}
-	}
-
-	if req.MaxPerNode > 0 {
-		snap.SeedReplicasForBase(req.VMBaseName)
 	}
 
 	candidates, err := scoreCandidates(snap, &req, false)
@@ -165,6 +175,86 @@ func Select(ctx context.Context, db *corrosion.Client, req Request) (string, err
 	}
 
 	return pickBest(candidates), nil
+}
+
+// ValidatePinned checks one already-resolved host through the same snapshot and
+// hard-filter pipeline as Select. It does not perform cluster-wide scoring.
+func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host string) error {
+	if host == "" {
+		return fmt.Errorf("resolved host is required")
+	}
+	req.PinHost = host
+	snap, err := snapshotForRequest(ctx, db, &req)
+	if err != nil {
+		return err
+	}
+	if err := restrictToPinnedHost(snap, host); err != nil {
+		return err
+	}
+	_, err = scoreCandidates(snap, &req, false)
+	return err
+}
+
+func snapshotForRequest(ctx context.Context, db *corrosion.Client, req *Request) (*ClusterSnapshot, error) {
+	snap, err := BuildSnapshot(ctx, db)
+	if err != nil {
+		return nil, infrastructureError(err)
+	}
+	if len(req.Devices) > 0 {
+		snap.Devices = make(map[string][]corrosion.PCIDeviceRecord)
+		for _, host := range snap.HostsBy {
+			// Load the complete inventory, not only unassigned rows: exact and
+			// mapping selectors must see an assigned IOMMU sibling and reject the
+			// host before execution.
+			devices, loadErr := corrosion.ListPCIDevices(ctx, db, host.Name, "")
+			if loadErr != nil {
+				return nil, infrastructureError(fmt.Errorf("list PCI devices on %s: %w", host.Name, loadErr))
+			}
+			snap.Devices[host.Name] = devices
+		}
+
+		snap.MappingDevices = make(map[string]map[string][]string)
+		for _, device := range req.Devices {
+			if device.Mapping == "" {
+				continue
+			}
+			if _, loaded := snap.MappingDevices[device.Mapping]; loaded {
+				continue
+			}
+			mapping, loadErr := corrosion.GetResourceMapping(ctx, db, device.Mapping)
+			if loadErr != nil {
+				return nil, infrastructureError(fmt.Errorf("get resource mapping %q: %w", device.Mapping, loadErr))
+			}
+			byHost := make(map[string][]string)
+			if mapping != nil {
+				for _, mapped := range mapping.Devices {
+					byHost[mapped.HostName] = append(byHost[mapped.HostName], mapped.Address)
+				}
+			}
+			snap.MappingDevices[device.Mapping] = byHost
+		}
+	}
+	if req.MaxPerNode > 0 {
+		snap.SeedReplicasForBase(req.VMBaseName)
+	}
+	return snap, nil
+}
+
+func restrictToPinnedHost(snap *ClusterSnapshot, host string) error {
+	record, ok := snap.Hosts[host]
+	if !ok {
+		return fmt.Errorf("pinned host %q not found", host)
+	}
+	if record.State != "active" {
+		return fmt.Errorf("pinned host %q is not active (state: %s)", host, record.State)
+	}
+	if record.IsWitness() {
+		return fmt.Errorf("pinned host %q is a witness; witnesses do not host workloads", host)
+	}
+	// A pin restricts the candidate set; it does not bypass eligibility. The
+	// singleton still traverses the exact hard-filter pipeline.
+	snap.HostsBy = []corrosion.HostRecord{record}
+	return nil
 }
 
 // scoreCandidates runs hard filters + soft scoring against snapshot.
@@ -197,6 +287,12 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			continue
 		}
 		if h.IsWitness() {
+			continue
+		}
+		// Hard: the host's effective-capacity observation is neither incomplete
+		// nor stale. A host that cannot account for its own runtime consumption
+		// must be treated as unknown, never as headroom.
+		if snap.CapacityUnknown[h.Name] {
 			continue
 		}
 
@@ -246,7 +342,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		var deviceBonus int
 		if len(req.Devices) > 0 {
 			pool := snap.Devices[h.Name]
-			ok, bonus := scoreHostDevices(pool, req.Devices)
+			ok, bonus := scoreHostDevicesForHost(pool, req.Devices, snap.MappingDevices, h.Name)
 			if !ok {
 				continue
 			}
@@ -317,7 +413,8 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no eligible host found for VM %q (insufficient resources, constraint violation, or strict-spread pressure cap)", req.VMName)
+		return nil, fmt.Errorf("no eligible host found for VM %q (insufficient resources, constraint violation, or strict-spread pressure cap): %w",
+			req.VMName, ErrNoEligibleHost)
 	}
 
 	// Sort by score descending; ties by fewest VMs then name (stable).
@@ -397,17 +494,28 @@ type BatchDevice struct {
 // Each request's Policy is honored independently: a batch can mix
 // bin-pack batch jobs and spread-strict prod VMs without one's policy
 // influencing the other's placement.
+//
+// capacity/now fold in the effective-capacity observations exactly like the
+// single-VM Select path (BuildSnapshot) does: runtime-only extra usage counts
+// against headroom, and an incomplete or stale observation disqualifies the
+// host. Without them the batch path's CapacityUnknown filter was a permanent
+// no-op — batch placements (deploys, failover) admitted against a database
+// view the runtime had already outgrown, and never excluded a host that
+// cannot account for what it runs.
 func SelectBatch(
 	hosts []corrosion.HostRecord,
 	vms []corrosion.VMRecord,
 	devices map[string][]corrosion.PCIDeviceRecord,
 	containerMemMiB map[string]int,
+	capacity []corrosion.HostCapacityObservation,
+	now time.Time,
 	requests []Request,
 ) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
 	// Containers hold host memory as surely as VMs do; fold them in exactly
 	// like the single-VM Select path (BuildSnapshot) does.
 	snap.AddContainerMemory(containerMemMiB)
+	snap.AddCapacityObservations(capacity, now)
 
 	// Deep-copy device pools so the scoring loop can mutate them as we
 	// place each VM.
@@ -429,26 +537,31 @@ func SelectBatch(
 	results := make(map[string]BatchResult, len(requests))
 
 	for _, req := range requests {
-		// Pinned host — validate and skip scoring.
+		evalSnap := snap
 		if req.PinHost != "" {
-			found := false
-			for _, h := range hosts {
-				if h.Name == req.PinHost && h.State == "active" && !h.IsWitness() {
-					found = true
-					break
-				}
-			}
-			if !found {
+			h, ok := snap.Hosts[req.PinHost]
+			if !ok || h.State != "active" || h.IsWitness() {
 				return nil, fmt.Errorf("pinned host %q not found, not active, or is a witness for VM %q", req.PinHost, req.VMName)
 			}
-			devAssign := assignDevices(snap.Devices, req.PinHost, req.Devices)
-			results[req.VMName] = BatchResult{Host: req.PinHost, Devices: devAssign}
-			snap.CommitPlacement(req.PinHost, req.VMName, req.VMBaseName, req.CPUNeeded, req.MemMiBNeeded)
-			continue
+			// Shallow-copy the snapshot and restrict only its stable candidate
+			// slice. The resource, replica, affinity, and device maps stay shared
+			// with the mutable batch snapshot and therefore remain batch-aware.
+			pinnedSnap := *snap
+			pinnedSnap.HostsBy = []corrosion.HostRecord{h}
+			evalSnap = &pinnedSnap
 		}
 
-		candidates, err := scoreCandidates(snap, &req, true)
+		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
+			// One infeasible VM must not fail the WHOLE batch: failover needs
+			// per-VM isolation (strand the one VM nothing can hold, recover the
+			// rest), and compose re-checks per-VM below. An empty-Host result is
+			// the per-VM "no eligible host" signal; structural errors (a bad
+			// pin) still abort everything.
+			if errors.Is(err, ErrNoEligibleHost) {
+				results[req.VMName] = BatchResult{}
+				continue
+			}
 			return nil, err
 		}
 		chosen := pickBest(candidates)

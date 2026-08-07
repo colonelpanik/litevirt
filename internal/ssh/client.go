@@ -85,11 +85,24 @@ func (c *Client) RunOutput(cmd string) ([]byte, error) {
 
 // CopyFile copies a local file to a remote path using SCP-like semantics.
 func (c *Client) CopyFile(localPath, remotePath string) error {
+	return c.CopyFileMode(localPath, remotePath, 0644)
+}
+
+// CopyFileMode copies a local file to the remote host with an explicit mode.
+//
+// It exists because CopyFile's 0644 default is wrong for private keys, and
+// nothing about the call site made that visible: `lv host init root@<host>` —
+// the form the docs tell you to use for anything multi-node — pushed
+// /etc/litevirt/pki/host.key world-readable on every node it provisioned. That
+// key is the host's whole cluster identity: any local user who can read it can
+// impersonate the host over peer mTLS and sign audit rows in its name. Callers
+// pushing key material MUST pass 0600.
+func (c *Client) CopyFileMode(localPath, remotePath string, mode os.FileMode) error {
 	data, err := os.ReadFile(localPath)
 	if err != nil {
 		return fmt.Errorf("read local file: %w", err)
 	}
-	return c.WriteFile(remotePath, data, 0644)
+	return c.WriteFile(remotePath, data, mode)
 }
 
 // WriteFile writes data to a remote file.

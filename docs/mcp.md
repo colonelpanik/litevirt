@@ -42,7 +42,7 @@ Read tools are available by default. Tool names use `--tool-prefix`, which
 defaults to `litevirt_`; append these suffixes:
 
 - `ping`, `whoami`
-- `cluster_status`, `list_hosts`, `inspect_host`, `host_stats`, `host_health`
+- `cluster_status`, `list_hosts`, `inspect_host`, `host_stats`, `cluster_health`
 - `list_vms`, `inspect_vm`, `vm_stats`, `list_vm_events`
 - `list_containers`
 - `list_networks`, `get_network`

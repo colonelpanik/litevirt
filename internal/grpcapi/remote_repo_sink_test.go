@@ -27,8 +27,11 @@ type fakePushClient struct {
 	frames  []*pb.PushBackupFrame
 }
 
-func (c *fakePushClient) Send(f *pb.PushBackupFrame) error { c.frames = append(c.frames, f); return nil }
-func (c *fakePushClient) CloseSend() error                 { return nil }
+func (c *fakePushClient) Send(f *pb.PushBackupFrame) error {
+	c.frames = append(c.frames, f)
+	return nil
+}
+func (c *fakePushClient) CloseSend() error { return nil }
 func (c *fakePushClient) CloseAndRecv() (*pb.PushBackupResponse, error) {
 	fs := &fakePushServer{ctx: c.peerCtx, frames: c.frames}
 	if err := c.srv.PushBackup(fs); err != nil {
@@ -47,6 +50,10 @@ type fakeLVClient struct {
 	// backupContainerFn, when set, supplies the progress frames a forwarded
 	// BackupContainer returns (simulating the owning daemon). nil → Unimplemented.
 	backupContainerFn func(*pb.BackupContainerRequest) ([]*pb.BackupContainerProgress, error)
+	// restoreContainerFn captures/drives a peer RestoreContainer request. nil →
+	// Unimplemented. Keeping this at the transport seam lets proof-carry tests
+	// inspect the actual request sent by drivePeerRestore.
+	restoreContainerFn func(*pb.RestoreContainerRequest) ([]*pb.RestoreContainerProgress, error)
 }
 
 func (c *fakeLVClient) HasChunks(_ context.Context, in *pb.HasChunksRequest, _ ...grpc.CallOption) (*pb.HasChunksResponse, error) {
@@ -68,10 +75,36 @@ func (c *fakeLVClient) BackupContainer(_ context.Context, in *pb.BackupContainer
 	return &fakeBackupCtStream{frames: frames}, nil
 }
 
+func (c *fakeLVClient) RestoreContainer(_ context.Context, in *pb.RestoreContainerRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.RestoreContainerProgress], error) {
+	if c.restoreContainerFn == nil {
+		return nil, status.Error(codes.Unimplemented, "fake: no RestoreContainer hook")
+	}
+	frames, err := c.restoreContainerFn(in)
+	if err != nil {
+		return nil, err
+	}
+	return &fakeRestoreCtStream{frames: frames}, nil
+}
+
 type fakeBackupCtStream struct {
 	grpc.ServerStreamingClient[pb.BackupContainerProgress]
 	frames []*pb.BackupContainerProgress
 	i      int
+}
+
+type fakeRestoreCtStream struct {
+	grpc.ServerStreamingClient[pb.RestoreContainerProgress]
+	frames []*pb.RestoreContainerProgress
+	i      int
+}
+
+func (f *fakeRestoreCtStream) Recv() (*pb.RestoreContainerProgress, error) {
+	if f.i >= len(f.frames) {
+		return nil, io.EOF
+	}
+	p := f.frames[f.i]
+	f.i++
+	return p, nil
 }
 
 func (f *fakeBackupCtStream) Recv() (*pb.BackupContainerProgress, error) {

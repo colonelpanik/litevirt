@@ -25,6 +25,12 @@ func main() {
 		}
 	}
 	if err := newRootCmd().Execute(); err != nil {
+		// A silent typed exit carries the code and has already said everything
+		// it wants to say (e.g. `lv health` printed its report; the code IS the
+		// answer). Printing a generic Error: line would bury the report.
+		if code, ok := exitCodeOf(err); ok {
+			os.Exit(code)
+		}
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

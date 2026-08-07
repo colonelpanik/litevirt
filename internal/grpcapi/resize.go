@@ -36,7 +36,7 @@ const (
 // resize never clobbers server-owned fields (UUID / resolved MACs / addresses /
 // unknown fields). Callers must NOT hold the VM lock. Returns nil when there is
 // nothing to do.
-func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSpec, idemKey string) (retErr error) {
+func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSpec, idemKey string) error {
 	unlock := s.lockVM(name)
 	defer unlock()
 
@@ -111,30 +111,6 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 		}
 	}
 
-	// Admission (F2): the grow must fit host free capacity + project quota. Only
-	// positive deltas consume capacity (a balloon-down / shrink frees it).
-	//
-	// Reserved for the rest of this call so the grow stays accounted for until the
-	// spec/actuals write lands — otherwise a concurrent grow of a DIFFERENT VM on
-	// this host sees the same free capacity and both pass.
-	// newVMOnHost=false: a live resize acts on a RUNNING VM whose overhead is
-	// already subtracted from free capacity. Charging another would refuse a legal
-	// grow, and refuse it again on every subsequent resize.
-	adm, aerr := s.admitResources(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta), false)
-	// specCommitted is set at the durable desired-spec write (either path below), not
-	// from retErr: the RPC can fail after the spec is persisted, and calling that
-	// "not committed" would free the authority's charge while the larger size is real.
-	specCommitted := false
-	defer func() {
-		adm.Release(CommitFact{
-			Committed: specCommitted, Workload: name, Kind: corrosion.WorkloadVM,
-			CPU: int(wantCPU), MemMiB: int(wantMem),
-		})
-	}()
-	if aerr != nil {
-		return aerr
-	}
-
 	target := proto.Clone(stored).(*pb.VMSpec)
 	target.Cpu = wantCPU
 	target.MemoryMib = wantMem
@@ -150,12 +126,15 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 		obsMem = int(wantMem)
 	}
 
-	// FENCE before either durable path writes the new desired spec; see CreateVM.
-	if ferr := adm.AllowCommit(ctx); ferr != nil {
-		return ferr
-	}
 	if s.operationProtocolActive(ctx) {
-		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey, &specCommitted)
+		return s.resizeVMLiveCoordinated(ctx, vm, stored, target, obsCPU, obsMem, idemKey)
+	}
+
+	// Pre-latch path keeps its direct resource check. The coordinated path moves
+	// admission into a provisional, race-safe reservation and only then claims the
+	// mutation barrier.
+	if err := s.checkResourceAdmission(ctx, vm.HostName, vm.Project, posOnly(cpuDelta), posOnly(memDelta)); err != nil {
+		return err
 	}
 
 	// Pre-latch direct path: apply persistent-then-live (per the fixed primitives),
@@ -164,9 +143,7 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	if err := s.applyLiveResize(ctx, name, target, stored); err != nil {
 		return status.Errorf(codes.Internal, "live resize: %v", err)
 	}
-	var applied bool
-	var newGen int64
-	applied, newGen, err = corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
+	applied, newGen, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
 			if uerr := json.Unmarshal([]byte(old), fresh); uerr != nil {
@@ -184,7 +161,6 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 	if !applied {
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress", name)
 	}
-	specCommitted = true // the new size is durable from here
 	if _, err := corrosion.UpdateObservedActuals(ctx, s.db, name, obsCPU, obsMem, vm.OwnerEpoch, newGen); err != nil {
 		slog.Error("resizeVMLive: persisting actuals failed — accounting will lag until reconciled", "vm", name, "error", err)
 	}
@@ -197,20 +173,48 @@ func (s *Server) resizeVMLive(ctx context.Context, name string, desired *pb.VMSp
 // BeginVMOperation atomically commits the full desired spec (cpu+mem), bumps the
 // generation, and claims the mutation barrier; the apply then runs under the F1
 // durability discipline. Caller holds the VM lock.
-func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRecord, stored, target *pb.VMSpec, obsCPU, obsMem int, idemKey string, specCommitted *bool) error {
+func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRecord, stored, target *pb.VMSpec, obsCPU, obsMem int, idemKey string) error {
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
-	// (No authority "establishment" here. The initial authority is DERIVED, never
-	// written — see corrosion.ResolveProjectAuthority. This call used to mint epoch 1
-	// on whichever owner happened to resize, which is exactly how two owners in one
-	// project produced a permanently divergent authority row.)
+	_, _ = s.ensureProjectAuthority(ctx, vm.Project) // best-effort D1 authority establishment
 
 	cpuDelta := posOnly(int(target.Cpu) - int(stored.Cpu))
 	memDelta := posOnly(int(target.MemoryMib) - int(stored.MemoryMib))
-	rv := corrosion.ReservationVector{
+	if idemKey == "" {
+		// No client key: mint a per-attempt id so distinct resizes never collide on
+		// one deterministic operation id (each deploy attempt is its own operation).
+		idemKey = uuid.NewString()
+	}
+	opID := corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey)
+
+	lease, aerr := s.admitResizeReservation(
+		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta,
+		int(target.Cpu), int(target.MemoryMib))
+	if aerr != nil {
+		return aerr
+	}
+	// One cleanup discipline for every return. Before BeginVMOperation commits,
+	// the WHOLE lease is freed — including the two early error returns below,
+	// which previously leaked it. After the commit, only the delegated QUOTA
+	// half: the local op row is the workload operation itself (terminated by
+	// CompleteVMOperation, or left nonterminal for recovery), but the holder's
+	// quota lease is a separate row nothing else terminates — the success path
+	// previously never released it, so every delegated resize permanently
+	// consumed project quota as an eternal earlier claimant. Releasing it
+	// post-commit is sound: the desired spec is durably committed at the new
+	// size, and the settle rule holds the charge until usage reflects it.
+	committed := false
+	defer func() {
+		if committed {
+			lease.releaseQuota(ctx)
+			return
+		}
+		lease.release(ctx)
+	}()
+
+	resJSON, err := (corrosion.ReservationVector{
 		Project: vm.Project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
 		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
-	}
-	resJSON, err := rv.Encode()
+	}).Encode()
 	if err != nil {
 		return status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
@@ -218,14 +222,9 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	if err != nil {
 		return status.Errorf(codes.Internal, "marshal spec: %v", err)
 	}
-	if idemKey == "" {
-		// No client key: mint a per-attempt id so distinct resizes never collide on
-		// one deterministic operation id (each deploy attempt is its own operation).
-		idemKey = uuid.NewString()
-	}
 
 	op := corrosion.OperationRecord{
-		ID:              corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey),
+		ID:              opID,
 		Method:          "ResizeVMLive",
 		Principal:       principal,
 		Project:         vm.Project,
@@ -236,12 +235,11 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 		IdempotencyKey:  idemKey,
 		ReservationJSON: resJSON,
 	}
-	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
-	if err == nil && applied && specCommitted != nil {
-		// BeginVMOperation atomically committed the desired spec, so the new size is
-		// durable and counts against quota even if the apply below fails.
-		*specCommitted = true
+	// FENCE before BeginVMOperation commits the desired spec; see CreateVM.
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		return ferr
 	}
+	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)
@@ -251,8 +249,99 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	if !applied {
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
 	}
+	committed = true
 	newGen := vm.SpecGeneration + 1
 	return s.driveResourceUpdate(ctx, vm, op.ID, vm.OwnerEpoch, newGen, target, stored, obsCPU, obsMem)
+}
+
+// admitResizeReservation performs reserve-then-verify for a resize operation
+// using the same deterministic operation id that will eventually own the mutation
+// barrier.
+//
+// Using the workload operation id for the reservation is intentional: once
+// BeginVMOperation claims the VM, the same id becomes the authoritative
+// persistence record and drives recovery. Marking the operation as a transient
+// CAPACITY lease would let stale-lease expiry free real in-flight reservations.
+func (s *Server) admitResizeReservation(
+	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
+) (*reservationLease, error) {
+	// The same host-safety gate as the equivalent UpdateVM grow
+	// (admitGrowWithReservation → admitReserved → checkHostSafety): a resize is
+	// not new residency, but a grow of a DISPUTED workload — or onto a host
+	// involved in an active ownership condition — must refuse here exactly as
+	// it does on every other admission path. Before the zero-delta fast path,
+	// same as everywhere else.
+	if err := s.checkHostSafety(ctx, vm.HostName, corrosion.WorkloadVM, vm.Name, false,
+		cpuDelta > 0 || memDelta > 0); err != nil {
+		return nil, err
+	}
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
+	}
+
+	delegated := s.projectAuthorityActive(ctx)
+	// The subject carries the ABSOLUTE resize target: the VM's row is already
+	// visible at its old size, so a released lease may only settle once the row
+	// contributes the grown size — presence alone would free it instantly while
+	// the holder's usage still counted the smaller spec.
+	subject := quotaSubject{
+		Kind: corrosion.WorkloadVM, Host: vm.HostName, Name: vm.Name,
+		Want: corrosion.QuotaAmount{VCPU: wantCPU, MemMiB: wantMem},
+	}
+	rv := corrosion.ReservationVector{
+		Project:    vm.Project,
+		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
+	}
+	if !delegated {
+		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
+		rv.WantCPU, rv.WantMemMiB = subject.Want.VCPU, subject.Want.MemMiB
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+
+	op := corrosion.OperationRecord{
+		ID:              opID,
+		Method:          method,
+		Principal:       principal,
+		Project:         vm.Project,
+		ResourceKind:    "vm",
+		ResourceID:      vm.Name,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	if err := s.stampReservationAuthority(ctx, op.ID, vm.Project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+
+	if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, op.ID); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+
+	if !delegated {
+		if err := s.checkProjectQuotaBefore(ctx, vm.Project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
+			lease.release(ctx)
+			return nil, err
+		}
+		return lease, nil
+	}
+
+	holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
+	if qerr != nil {
+		lease.release(ctx)
+		return nil, qerr
+	}
+	lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, vm.Project, quotaLease
+	lease.quotaEpoch = epoch
+	return lease, nil
 }
 
 // driveResourceUpdate applies target cpu+mem to a VM whose mutation barrier is

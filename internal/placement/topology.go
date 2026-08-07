@@ -5,14 +5,15 @@ import (
 	"strconv"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pci"
 )
 
 // Topology scoring bonuses (per device pair).
 const (
-	bonusLinkClique  = 40 // same NVLink/xGMI clique
-	bonusPCIeBridge  = 25 // same PCIe switch/bridge
-	bonusPCIeRoot    = 15 // same PCIe root complex
-	bonusNUMANode    = 8  // same NUMA node, different root
+	bonusLinkClique = 40 // same NVLink/xGMI clique
+	bonusPCIeBridge = 25 // same PCIe switch/bridge
+	bonusPCIeRoot   = 15 // same PCIe root complex
+	bonusNUMANode   = 8  // same NUMA node, different root
 )
 
 // TopologyScore evaluates how well a set of candidate devices satisfies a
@@ -31,6 +32,9 @@ func TopologyScore(devices []corrosion.PCIDeviceRecord, req DeviceRequest) (scor
 	var candidates []corrosion.PCIDeviceRecord
 	for _, d := range devices {
 		if req.Vendor != "" && d.VendorID != req.Vendor {
+			continue
+		}
+		if req.Model != "" && d.DeviceName != req.Model {
 			continue
 		}
 		candidates = append(candidates, d)
@@ -145,16 +149,37 @@ func intToString(n int) string {
 
 // scoreHostDevices checks device availability and computes a topology bonus.
 func scoreHostDevices(devices []corrosion.PCIDeviceRecord, reqs []DeviceRequest) (ok bool, bonus int) {
+	return scoreHostDevicesForHost(devices, reqs, nil, "")
+}
+
+func scoreHostDevicesForHost(
+	devices []corrosion.PCIDeviceRecord,
+	reqs []DeviceRequest,
+	mappings map[string]map[string][]string,
+	host string,
+) (ok bool, bonus int) {
 	for _, req := range reqs {
 		count := req.Count
 		if count <= 0 {
 			count = 1
 		}
 
+		// Match the allocator's selector precedence exactly:
+		// mapping → SR-IOV → type/vendor → exact address.
+		if req.Mapping != "" {
+			// ResolveMappingAddress, used by the allocator, deterministically
+			// chooses the first address for this host.
+			addresses := mappings[req.Mapping][host]
+			if len(addresses) == 0 || !exactDeviceEligible(devices, addresses[0]) {
+				return false, 0
+			}
+			continue
+		}
+
 		// SR-IOV: gate on an SR-IOV-capable PF (matching type/vendor/parent) being
 		// present — VFs are created or reused on-demand by the owner's allocator, so a
 		// currently-empty managed PF (no unassigned VF rows yet) must still qualify.
-		// A free VF already in inventory also qualifies. Placement never pins a VF here.
+		// Placement never infers VF identity from an ordinary free device or pins a VF.
 		if req.Sriov {
 			if !sriovHostEligible(devices, req) {
 				return false, 0
@@ -162,28 +187,66 @@ func scoreHostDevices(devices []corrosion.PCIDeviceRecord, reqs []DeviceRequest)
 			continue
 		}
 
-		// Filter devices by type.
-		var typed []corrosion.PCIDeviceRecord
-		for _, d := range devices {
-			if d.Type == req.Type && d.VMName == "" {
-				typed = append(typed, d)
+		if req.Type != "" || req.Vendor != "" {
+			// Filter devices by type. An empty type with a vendor-only selector
+			// matches all types, as the selector classification permits it.
+			var typed []corrosion.PCIDeviceRecord
+			for _, d := range devices {
+				if (req.Type == "" || d.Type == req.Type) && d.VMName == "" {
+					typed = append(typed, d)
+				}
 			}
+
+			s, selected := TopologyScore(typed, req)
+			if len(selected) < count {
+				return false, 0
+			}
+			bonus += s
+			continue
 		}
 
-		s, selected := TopologyScore(typed, req)
-		if len(selected) < count {
+		if req.Address == "" || count != 1 || !exactDeviceEligible(devices, req.Address) {
 			return false, 0
 		}
-		bonus += s
 	}
 	return true, bonus
 }
 
-// sriovHostEligible reports whether the host can satisfy an SR-IOV request: it has an
-// SR-IOV-capable PF of the requested type (matching vendor + parent when specified),
-// or an existing free VF of that type. The authoritative capacity/managed-PF decision
-// happens at allocation time on the owner; this is a best-effort host gate.
+func exactDeviceEligible(devices []corrosion.PCIDeviceRecord, address string) bool {
+	want, wantOK := pci.CanonicalBDF(address)
+	var selected *corrosion.PCIDeviceRecord
+	for i := range devices {
+		got, gotOK := pci.CanonicalBDF(devices[i].Address)
+		if (wantOK && gotOK && got == want) || (!wantOK && devices[i].Address == address) {
+			selected = &devices[i]
+			break
+		}
+	}
+	if selected == nil || selected.VMName != "" {
+		return false
+	}
+	if selected.IOMMUGroup < 0 {
+		return true
+	}
+	for _, sibling := range devices {
+		if sibling.IOMMUGroup == selected.IOMMUGroup && sibling.VMName != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// sriovHostEligible reports whether the host can satisfy an SR-IOV request: it
+// requires an SR-IOV-capable PF of the requested type (matching vendor, model,
+// and parent when specified). Inventory has no authoritative VF-to-PF relation,
+// so an ordinary unassigned device never proves VF eligibility. The final
+// managed-PF/create-or-reuse decision happens at allocation time on the owner.
 func sriovHostEligible(devices []corrosion.PCIDeviceRecord, req DeviceRequest) bool {
+	count := req.Count
+	if count <= 0 {
+		count = 1
+	}
+	wantParent, parentOK := pci.CanonicalBDF(req.Parent)
 	for _, d := range devices {
 		if d.Type != req.Type {
 			continue
@@ -192,16 +255,22 @@ func sriovHostEligible(devices []corrosion.PCIDeviceRecord, req DeviceRequest) b
 			continue
 		}
 		// SR-IOV-capable PF (matching the requested parent, if any).
-		if d.SRIOVCapable {
-			if req.Parent == "" || d.Address == req.Parent {
-				return true
-			}
+		if !d.SRIOVCapable {
 			continue
 		}
-		// A free VF already present in inventory (parent unknown here — accept any).
-		if d.VMName == "" && req.Parent == "" {
-			return true
+		if req.Model != "" && d.DeviceName != req.Model {
+			continue
 		}
+		if req.Parent != "" {
+			gotParent, gotOK := pci.CanonicalBDF(d.Address)
+			if !parentOK || !gotOK || gotParent != wantParent {
+				continue
+			}
+		}
+		if d.SRIOVVFsTotal > 0 && count > d.SRIOVVFsTotal {
+			continue
+		}
+		return true
 	}
 	return false
 }

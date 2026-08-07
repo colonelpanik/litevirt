@@ -328,23 +328,15 @@ type EnforcementConfig struct {
 	// local-disk transfer keeps today's gate. Changes live failover behavior for
 	// shared-disk VMs, so enable fleet-uniformly after every node is on the build.
 	SharedStorageFence bool `yaml:"shared_storage_fence,omitempty"`
-	// OperationProtocol: rely on the v41 F1 operation protocol (operations journal,
-	// per-VM epoch/generation, active_operation_id mutation barrier). When true
-	// (and the operation_protocol_v1 capability is latched cluster-wide), an
+	// OperationProtocol: rely on the operation journal and VM/container
+	// epoch/generation/active-operation barriers. When true (and both
+	// operation_protocol_v1 and its dependent capacity_admission_v1 capability
+	// are latched cluster-wide), an
 	// incompatible peer is quarantined from mutating endpoints + replication
 	// sessions (reseed-on-rejoin). The per-host PCI observation/ownership fixes are
-	// unaffected. Default false; the flag is the reversible kill switch.
+	// unaffected. capacity_admission_v1 intentionally has no separate public flag;
+	// this field drives both tokens. Default false; this is the reversible kill switch.
 	OperationProtocol bool `yaml:"operation_protocol,omitempty"`
-	// ProjectQuotaAuthority: route PROJECT-QUOTA admission to the project's
-	// deterministic authority holder so one node serializes it, instead of every
-	// node checking its own CRDT snapshot (two daemons admitting for one project
-	// against different hosts could both pass and take the project over its limit).
-	// When the holder is unreachable this FAILS OPEN — falling back to the old local
-	// check, loudly — because quota is a tenancy limit, not a safety invariant, and
-	// failing closed would let one dead node block every create in the projects it
-	// holds. Default false; the flag is the reversible kill switch AND gates
-	// advertisement of project_quota_authority_v1.
-	ProjectQuotaAuthority bool `yaml:"project_quota_authority,omitempty"`
 	// LiveResize: allow TRUE live CPU hot-add + balloon-memory resize (setting a
 	// max_cpu vCPU-hotplug ceiling). Refused until the live_resize_v1 capability is
 	// latched cluster-wide (every peer must support it, else the field could be
@@ -374,6 +366,47 @@ type EnforcementConfig struct {
 	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
 	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
+	// ProjectAuthority: route the PROJECT-QUOTA half of an admission to the project's
+	// D1 authority holder instead of deciding from this node's replica
+	// (capabilities.ProjectAuthorityV1). One decider per project closes the window
+	// where two nodes that have not yet exchanged operation rows both admit and
+	// together exceed the quota. Host capacity is unaffected — it is already
+	// serialized by the target host's owner.
+	//
+	// Enforced only when this flag is set AND the token has latched cluster-wide, so a
+	// node cannot serialize against a decider its peers are still bypassing. An
+	// unreachable holder fails the admission CLOSED. Default false; reversible kill
+	// switch.
+	ProjectAuthority bool `yaml:"project_authority,omitempty"`
+	// AuditSignature: sign every audit row this node writes with the host's cluster
+	// key (capabilities.AuditSignatureV1). Signing follows this flag ALONE — a signed
+	// row is backward-compatible, so there is nothing to wait for. The cluster-wide
+	// latch gates only the refusal: with the flag set AND the token latched, an audit
+	// write this node cannot sign FAILS instead of landing unsigned, which is what
+	// stops an attacker with database write access from appending unsigned history and
+	// still passing `lv audit verify`. Enable fleet-uniformly (a node with the flag off
+	// keeps emitting unsigned rows, so the token is advertised only while it is on).
+	// Default false; reversible kill switch.
+	AuditSignature bool `yaml:"audit_signature,omitempty"`
+	// OwnerEpoch: activate the Phase 4 ownership-generation regime on this host
+	// (capabilities.OwnerEpochV1). With the flag on, the health sweeps backfill
+	// every workload this host owns from the pre-epoch 0 to a real generation
+	// (stamping its runtime marker in the same pass), and the token is advertised
+	// only once this node is READY — flag on AND no owned workload left at epoch
+	// 0 — so the fleet can never latch across a node whose workloads are still
+	// ungraduated ("never bless an already-diverged cluster"). Marker/epoch
+	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
+	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
+	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
+	// IsolationEpoch: activate the §A isolation regime on this host
+	// (capabilities.IsolationEpochV1). With the flag on and the token latched
+	// cluster-wide, this node REFUSES replication from any host recorded with a
+	// nonzero hosts.isolation_epoch — a node whose state was produced outside
+	// the cluster's compatibility regime (rolled back below a latched token, or
+	// isolated by an operator) can no longer inject that state back, and stays
+	// refused until `lv host reseed` verifies convergence. Pre-latch clusters
+	// behave exactly as today. Enable fleet-uniformly; reversible kill switch.
+	IsolationEpoch bool `yaml:"isolation_epoch,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.
@@ -649,6 +682,14 @@ type CapacityConfig struct {
 	// VMMemoryOverheadMiB is charged per running VM on top of its configured
 	// memory for qemu's own footprint. Default 128.
 	VMMemoryOverheadMiB int `yaml:"vm_memory_overhead_mib,omitempty"`
+	// DiskOvercommitRatio divides a new disk's DECLARED size before it is compared
+	// to its pool's ACTUAL free space. Thin provisioning is the norm, so >1 is the
+	// safe default here — the opposite of memory, for the same reason: count what
+	// is really taken. Default 3.0.
+	DiskOvercommitRatio float64 `yaml:"disk_overcommit_ratio,omitempty"`
+	// PoolReservePct is the share of each storage pool held back so it can never be
+	// driven to zero. Default 5.
+	PoolReservePct int `yaml:"pool_reserve_pct,omitempty"`
 }
 
 // Policy converts the config into the corrosion capacity policy. Every
@@ -666,6 +707,8 @@ func (c CapacityConfig) Policy() corrosion.CapacityPolicy {
 		MemReserveMiB:    orDefault(c.HostMemoryReserveMiB, d.MemReserveMiB),
 		MemReservePct:    orDefault(c.HostMemoryReservePct, d.MemReservePct),
 		VMMemOverheadMiB: orDefault(c.VMMemoryOverheadMiB, d.VMMemOverheadMiB),
+		DiskOvercommit:   orDefault(c.DiskOvercommitRatio, d.DiskOvercommit),
+		PoolReservePct:   orDefault(c.PoolReservePct, d.PoolReservePct),
 	}
 }
 

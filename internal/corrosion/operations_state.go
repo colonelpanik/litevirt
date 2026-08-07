@@ -19,6 +19,8 @@ const (
 	OpRestart               OperationKind = "restart"
 	OpDeviceAttach          OperationKind = "device_attach"
 	OpDeviceDetach          OperationKind = "device_detach"
+	OpWorkloadCreate        OperationKind = "workload_create"
+	OpWorkloadStart         OperationKind = "workload_start"
 )
 
 // Step names. The happy-path steps differ per kind; the terminal + rollback
@@ -37,6 +39,8 @@ const (
 	OpStepClaimed          = "claimed"
 	OpStepBound            = "bound"
 	OpStepAttached         = "attached"
+	OpStepPrepared         = "prepared"
+	OpStepRuntimeStarted   = "runtime_started"
 
 	// Shared, cross-kind steps.
 	OpStepRollbackCompleted = "rollback_completed" // a rollback ran to completion; only then is a failed/cancelled terminal safe
@@ -69,6 +73,13 @@ var opHappyPath = map[OperationKind][]string{
 	// device is confirmed detached, immediately preceding OpStepCompleted. Task
 	// 5.2 must record exactly these three step names, in order, for a detach.
 	OpDeviceDetach: {OpStepPlanned, OpStepReserved, OpStepAttached},
+	OpWorkloadCreate: {
+		OpStepPlanned, OpStepReserved, OpStepDesiredPersisted,
+		OpStepPrepared, OpStepRuntimeStarted, OpStepObserved,
+	},
+	OpWorkloadStart: {
+		OpStepPlanned, OpStepReserved, OpStepRuntimeStarted, OpStepObserved,
+	},
 }
 
 var opTerminalStates = map[string]bool{

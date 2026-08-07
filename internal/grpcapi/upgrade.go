@@ -15,6 +15,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/systemdunit"
 	"github.com/litevirt/litevirt/internal/upgrade"
 )
 
@@ -180,31 +181,7 @@ func (s *Server) forwardUpgrade(incoming grpc.ClientStreamingServer[pb.UpgradeHo
 //   - OnFailure=litevirt-rollback.service: when StartLimitBurst is
 //     exceeded (i.e. the new binary keeps panicking), the rollback unit
 //     fires automatically and restores the `.old` binary.
-const litevirtUnit = `[Unit]
-Description=litevirt daemon
-After=network-online.target libvirtd.service
-Wants=network-online.target
-Wants=libvirtd.service
-# A burst of external restarts (e.g. a package manager's needrestart during an apt
-# run) must NOT trip the start limit — that would fire OnFailure=litevirt-rollback
-# and downgrade a HEALTHY binary. Generous window; genuine upgrade-time crash loops
-# are caught by the sentinel-gated rollback below + the in-process health watchdog.
-StartLimitBurst=10
-StartLimitIntervalSec=300
-OnFailure=litevirt-rollback.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/litevirt daemon
-KillMode=process
-Delegate=no
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-`
+const litevirtUnit = systemdunit.Main
 
 // litevirtRollbackUnit is the companion oneshot that systemd fires when
 // the main litevirtd unit enters a failed state (i.e. StartLimitBurst
@@ -221,41 +198,18 @@ WantedBy=multi-user.target
 //
 // The journal-tagged log line is intentionally loud — operators should
 // notice in `journalctl -u litevirt-rollback` that something rolled back.
-const litevirtRollbackUnit = `[Unit]
-Description=litevirt daemon rollback (auto-restore previous binary on a failed upgrade)
+const litevirtRollbackUnit = systemdunit.Rollback
 
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c '\
-  if [ ! -f /usr/local/bin/litevirt.upgrade-pending ]; then \
-    logger -t litevirt-rollback "litevirt entered a failed state but no upgrade is in progress (no sentinel) — NOT rolling back the binary; leaving it for systemd/operator"; \
-    exit 0; \
-  fi; \
-  if [ -f /usr/local/bin/litevirt.old ]; then \
-    logger -t litevirt-rollback "RESTORING previous litevirt binary after a failed upgrade"; \
-    mv /usr/local/bin/litevirt.old /usr/local/bin/litevirt; \
-    systemctl reset-failed litevirt.service; \
-    systemctl start litevirt.service; \
-  else \
-    logger -t litevirt-rollback "no .old binary to roll back to; leaving litevirt in failed state"; \
-    exit 1; \
-  fi'
-`
+const rollbackUnitPath = systemdunit.RollbackPath
 
-const rollbackUnitPath = "/etc/systemd/system/litevirt-rollback.service"
-
-const unitPath = "/etc/systemd/system/litevirt.service"
+const unitPath = systemdunit.MainPath
 
 // needrestartDropin tells needrestart (run by unattended-upgrades after a library
 // upgrade) to NEVER auto-restart litevirt. A stateful orchestrator daemon must not be
 // bounced mid-operation, and a restart storm can trip the start limit (2026-07-15
 // docker004 outage). Installed idempotently alongside the systemd units.
-const needrestartDropinPath = "/etc/needrestart/conf.d/99-litevirt.conf"
-const needrestartDropin = `# Managed by litevirt. Never let needrestart auto-restart the orchestrator daemon on
-# a library upgrade — a mid-operation restart is disruptive and a restart storm can
-# trip systemd's start limit + the rollback unit.
-push @{$nrconf{blacklist_rc}}, qr(^litevirt\.service$);
-`
+const needrestartDropinPath = systemdunit.NeedrestartPath
+const needrestartDropin = systemdunit.Needrestart
 
 // updateSystemdUnit writes the current unit file templates (main + rollback
 // companion) and reloads systemd if anything changed on disk. Best-effort —

@@ -46,10 +46,37 @@ func (f *fakeImportStream) Send(p *pb.ImportVMProgress) error {
 	return nil
 }
 
+// stubQemuImg puts a fake qemu-img first on PATH: a shim that copies the
+// source to the destination. The import's convert step requires qemu-img on
+// PATH and CI runners do not install it (the first CI run of these tests
+// failed exactly there); the stub makes the tests deterministic on every
+// runner while still driving the real handler end to end. The copied raw
+// bytes do not parse as qcow2, which only skips the best-effort size probe.
+func stubQemuImg(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"# stub qemu-img: 'info' answers the external-ref inspection with a\n" +
+		"# backing-file-free raw image; 'convert' copies SRC (second-to-last\n" +
+		"# arg) to DST (last arg).\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatalf("write qemu-img stub: %v", err)
+	}
+	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
+		t.Fatalf("chmod stub: %v", err)
+	}
+	t.Setenv("PATH", dir+":"+envPath())
+}
+
 // importSmallVM runs a full ImportVM of a one-disk Proxmox conf whose disk is
 // mapped to a tiny local raw file, and returns the terminal error.
 func importSmallVM(t *testing.T, s *Server, name, project string, memMiB int, start bool) error {
 	t.Helper()
+	stubQemuImg(t)
 	raw := t.TempDir() + "/disk0.raw"
 	if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
 		t.Fatalf("write staged disk: %v", err)
@@ -144,4 +171,6 @@ func TestImportVM_QuotaReserved_NotJustChecked(t *testing.T) {
 	}
 }
 
-func writeFileHelper(path string, data []byte) error { return os.WriteFile(path, data, 0o644) }
+func writeFileHelper(path string, data []byte) error  { return os.WriteFile(path, data, 0o644) }
+func chmodHelper(path string, mode os.FileMode) error { return os.Chmod(path, mode) }
+func envPath() string                                 { return os.Getenv("PATH") }

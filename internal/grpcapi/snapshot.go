@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -392,7 +391,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// here — that must NOT block cleanup of the corrosion record + vmstate file
 	// (otherwise they leak). Treat a missing libvirt snapshot as already-deleted.
 	if delErr != nil {
-		if strings.Contains(delErr.Error(), "not found") || strings.Contains(delErr.Error(), "no domain snapshot") {
+		if lv.IsNotFound(delErr) {
 			slog.Info("delete snapshot: libvirt metadata already gone — cleaning up record", "vm", req.VmName, "snap", req.SnapshotName)
 		} else {
 			return nil, status.Errorf(codes.Internal, "delete snapshot: %v", delErr)

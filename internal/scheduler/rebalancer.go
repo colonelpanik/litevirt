@@ -12,8 +12,6 @@ package scheduler
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,6 +20,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/placement"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Default tunables. Operators may override via cluster config.
@@ -344,7 +343,7 @@ func (r *Rebalancer) bestMove(snap *placement.ClusterSnapshot, vm corrosion.VMRe
 	}
 
 	return &Proposal{
-		ID:           newID(),
+		ID:           randid.New(),
 		VMName:       vm.Name,
 		Src:          src,
 		Dst:          bestDst,
@@ -703,11 +702,4 @@ func copyIntMap(m map[string]int) map[string]int {
 		out[k] = v
 	}
 	return out
-}
-
-// newID generates a short random hex ID for proposals.
-func newID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Delegated project-quota admission — the second half of F2.
@@ -184,7 +185,7 @@ func (s *Server) admitProjectLocal(ctx context.Context, method, project, princip
 		return "", status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
 	op := corrosion.OperationRecord{
-		ID:              newID(),
+		ID:              randid.New(),
 		Method:          method,
 		Principal:       principal,
 		Project:         project,

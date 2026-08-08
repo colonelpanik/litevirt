@@ -12,6 +12,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/webhook"
 )
 
@@ -220,7 +221,7 @@ func (s *Server) audit(ctx context.Context, action, target, detail, result strin
 // in trusted peer-mTLS metadata and passed here.
 func (s *Server) auditAs(ctx context.Context, actor, action, target, detail, result string) {
 	rec := corrosion.AuditRecord{
-		ID:       newID(),
+		ID:       randid.New(),
 		Username: actor,
 		HostName: s.hostName,
 		Action:   action,

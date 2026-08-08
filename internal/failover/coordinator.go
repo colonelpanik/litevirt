@@ -5,8 +5,6 @@ package failover
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"sort"
@@ -21,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/placement"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 const (
@@ -879,7 +878,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// Record fence event. Failure to log is a real problem — we are about to
 	// reschedule VMs based on a fence that has no audit trail.
 	if err := corrosion.InsertFenceLog(ctx, c.db, corrosion.FenceLogRecord{
-		ID:       newID(),
+		ID:       randid.New(),
 		HostName: h.Name,
 		Method:   fr.Method,
 		Result:   logResult,
@@ -1011,7 +1010,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			slog.Warn("failover: skipping Secure Boot / vTPM VM — firmware state was host-local and died with the host; restore from backup",
 				"vm", vm.Name, "host", h.Name)
 			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+				ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
 				Target: vm.Name, Detail: "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with " + h.Name + ")", Result: "skipped",
 			})
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
@@ -1037,7 +1036,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
 			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-				ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+				ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
 				Target: vm.Name, Detail: "active ownership condition " + code + " — automated recovery refused", Result: "refused",
 			})
 			continue
@@ -1105,7 +1104,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				c.fenceRelocated[h.Name] = true
 				c.mVM(ActionPromote, ResultSuccess, errClassNone)
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.promote",
+					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.promote",
 					Target: vm.Name, Detail: "promoted replica after fencing " + h.Name, Result: "ok",
 				})
 				continue
@@ -1174,7 +1173,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
 					_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-						ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+						ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
 						Target: plans[i].vm.Name, Detail: "batch placement failed after fencing " + h.Name + ": " + err.Error(), Result: "error",
 					})
 				}
@@ -1196,7 +1195,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 					"vm", vm.Name, "from", h.Name)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-					ID: newID(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
+					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
 					Target: vm.Name, Detail: "no eligible host satisfies its placement constraints after fencing " + h.Name, Result: "skipped",
 				})
 				continue
@@ -1246,7 +1245,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			_, live, needed := c.Gate.QuorumProof(ctx)
 			leaseHolder, leaseExp := c.leaseSnapshot(ctx)
 			proof := corrosion.ActionProof{
-				ID: newID(), Action: corrosion.ActionReschedule, TargetKind: "vm",
+				ID: randid.New(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
@@ -1267,7 +1266,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
 		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-			ID:       newID(),
+			ID:       randid.New(),
 			Username: "failover-coordinator",
 			HostName: c.hostName,
 			Action:   "failover",
@@ -1360,7 +1359,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		// token) so a crash mid-restore is recoverable. The marker is load-bearing
 		// for that recovery, so if its write FAILS we must NOT proceed with the
 		// restore (an unmarked restore the next tick couldn't re-derive) — defer.
-		token := newID()
+		token := randid.New()
 		// Split-brain hardening: under active enforcement, mint a durable single-use
 		// proof bound to this restore token so RestoreContainer validates + claims it
 		// (dest==self + quorum) before importing/recording. Fail-open until cluster-wide.
@@ -1374,7 +1373,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				return
 			}
 			proof := corrosion.ActionProof{
-				ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+				ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 				LeaseHolder: c.hostName, RelocationToken: token,
 				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
@@ -1524,9 +1523,9 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 			return
 		}
-		relocToken = newID()
+		relocToken = randid.New()
 		proof := corrosion.ActionProof{
-			ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+			ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 			LeaseHolder: c.hostName, RelocationToken: relocToken,
 			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
@@ -1619,7 +1618,7 @@ func (c *Coordinator) markerFresh(ct corrosion.ContainerRecord) bool {
 
 func (c *Coordinator) auditRelocate(ctx context.Context, action, target, detail, result string) {
 	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-		ID: newID(), Username: "failover-coordinator", HostName: c.hostName,
+		ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName,
 		Action: action, Target: target, Detail: detail, Result: result,
 	})
 }
@@ -1673,11 +1672,4 @@ func vmUsesFirmwareState(vm corrosion.VMRecord) bool {
 		_ = json.Unmarshal([]byte(vm.Spec), &spec)
 	}
 	return spec.SecureBoot || spec.Tpm
-}
-
-// newID generates a short random hex ID.
-func newID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

@@ -344,17 +344,6 @@ func TestRemoveHost_NoVMs(t *testing.T) {
 	}
 }
 
-func TestNewID_UniqueAndLength(t *testing.T) {
-	id1 := newID()
-	id2 := newID()
-	if id1 == id2 {
-		t.Error("newID returned same value twice")
-	}
-	if len(id1) != 16 { // 8 bytes = 16 hex chars
-		t.Errorf("newID length = %d, want 16", len(id1))
-	}
-}
-
 func TestLiveHostStats_NoVMs(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

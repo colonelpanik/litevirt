@@ -9,6 +9,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Notification CRUD runs in-process against the host-local Corrosion handle
@@ -62,7 +63,7 @@ func (s *Server) handleCreateNotifyTarget(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	id, _ := newUIID()
+	id := randid.New()
 	if err := corrosion.InsertNotificationTarget(r.Context(), s.db, corrosion.NotificationTarget{
 		ID: id, Name: name, Type: typ, Config: string(cfg), Enabled: true,
 	}); err != nil {
@@ -153,7 +154,7 @@ func (s *Server) handleCreateNotifyRoute(w http.ResponseWriter, r *http.Request)
 	if minSev == "" {
 		minSev = "info"
 	}
-	rid, _ := newUIID()
+	rid := randid.New()
 	if err := corrosion.InsertNotificationRoute(r.Context(), s.db, corrosion.NotificationRoute{
 		ID: rid, EventPattern: pattern, TargetID: target, MinSeverity: minSev, Enabled: true,
 	}); err != nil {

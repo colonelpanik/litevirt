@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Distributed-firewall management for the cluster/host tiers, named ip sets,
@@ -71,7 +72,7 @@ func (s *Server) handleCreateFWClusterRule(w http.ResponseWriter, r *http.Reques
 	}
 	_ = r.ParseForm()
 	rule := ruleFromForm(r)
-	rule.ID = mustUIID()
+	rule.ID = randid.New()
 	if err := corrosion.InsertClusterFirewallRule(r.Context(), s.db, rule); err != nil {
 		sendToast(w, "Add failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusBadRequest)
@@ -103,7 +104,7 @@ func (s *Server) handleCreateFWHostRule(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	rule.ID = mustUIID()
+	rule.ID = randid.New()
 	if err := corrosion.InsertHostFirewallRule(r.Context(), s.db, rule); err != nil {
 		sendToast(w, "Add failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusBadRequest)
@@ -142,7 +143,7 @@ func (s *Server) handleCreateFWIPSet(w http.ResponseWriter, r *http.Request) {
 			cidrs = append(cidrs, c)
 		}
 	}
-	if err := corrosion.InsertIPSet(r.Context(), s.db, corrosion.IPSet{ID: mustUIID(), Name: name, CIDRs: cidrs}); err != nil {
+	if err := corrosion.InsertIPSet(r.Context(), s.db, corrosion.IPSet{ID: randid.New(), Name: name, CIDRs: cidrs}); err != nil {
 		sendToast(w, "Create failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -196,12 +197,4 @@ func (s *Server) fwRedirect(w http.ResponseWriter, msg string) {
 	sendToast(w, msg, "success")
 	w.Header().Set("HX-Redirect", "/firewall")
 	w.WriteHeader(http.StatusOK)
-}
-
-// mustUIID returns a random hex id. newUIID only errors if crypto/rand fails,
-// which doesn't happen on a real host; the empty-string fallback is never hit
-// in practice.
-func mustUIID() string {
-	id, _ := newUIID()
-	return id
 }

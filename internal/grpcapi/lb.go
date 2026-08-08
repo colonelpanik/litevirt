@@ -23,6 +23,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.ListLBResponse, error) {
@@ -603,7 +604,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 	// partitioned peer still holds (and this node never saw) can merge under
 	// anti-entropy but never renders — recreating the same name can't re-route
 	// traffic to a removed backend.
-	generation := newID()
+	generation := randid.New()
 
 	// Explicit backends.
 	for _, b := range req.Backends {
@@ -1953,7 +1954,7 @@ func (s *Server) applyLBFromSpec(ctx context.Context, spec *pb.VMSpec) {
 		}
 	}
 	if !haveConfig {
-		generation = newID()
+		generation = randid.New()
 	}
 
 	// Determine which hosts should run the LB.
@@ -2104,7 +2105,7 @@ func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.R
 		return nil
 	}
 	p := corrosion.ActionProof{
-		ID: newID(), Action: corrosion.ActionLBApply, TargetKind: "lb",
+		ID: randid.New(), Action: corrosion.ActionLBApply, TargetKind: "lb",
 		TargetName: lbName, DestHost: destHost, Coordinator: s.hostName,
 	}
 	if err := corrosion.WriteActionProof(ctx, s.db, p); err != nil {

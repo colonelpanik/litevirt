@@ -320,6 +320,21 @@ auth:
   # certs and on-node loopback are unaffected. Default false. This flag is the
   # enforcement + kill switch. See docs/auth.md.
   strict_mtls_identity: false
+  # Trust rotated peer certs — RECOVERY switch, not a steady-state setting.
+  #
+  # Peer trust binds a live host row to the certificate serial recorded in it. A
+  # node re-records its own serial at startup, so an ordinary certificate rotation
+  # converges by replication and needs nothing here. But if those recorded serials
+  # have ALREADY gone stale fleet-wide, every daemon refuses every peer
+  # ("replication RPC requires peer mTLS") and the cluster cannot repair itself:
+  # the correction has to replicate, and replication is what is being refused.
+  #
+  # Set true on EVERY node to break that deadlock — a mismatch is then logged and
+  # admitted for CA-issued HOST certificates instead of refused — wait for the
+  # fleet to replicate, then set it back to false. It never relaxes the removal
+  # tombstone (a decommissioned host stays out) and never lets a distributable
+  # client certificate act as a peer. Default false.
+  trust_rotated_peer_certs: false
   # Forwarded identity: when true (and the forwarded_identity_v1 capability is
   # active cluster-wide), the owning node re-authenticates a forwarded user's
   # bearer and runs RBAC + audit as the real user instead of the peer=admin

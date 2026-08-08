@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // admissionIntent names the two INDEPENDENT facts an admission needs about the
@@ -354,7 +355,7 @@ func (s *Server) reserveWithoutCheck(
 		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
 	op := corrosion.OperationRecord{
-		ID:              newID(),
+		ID:              randid.New(),
 		Method:          method,
 		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
 		Project:         project,
@@ -441,7 +442,7 @@ func (s *Server) admitReserved(
 	}
 
 	if opID == "" {
-		opID = newID()
+		opID = randid.New()
 	}
 	op := corrosion.OperationRecord{
 		ID:              opID,
@@ -635,7 +636,7 @@ func (s *Server) admitQuotaWithReservation(
 		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
 	op := corrosion.OperationRecord{
-		ID:              newID(),
+		ID:              randid.New(),
 		Method:          method,
 		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
 		Project:         project,

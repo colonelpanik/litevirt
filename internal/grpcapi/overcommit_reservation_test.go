@@ -18,7 +18,7 @@ import (
 //
 // Asserted on HostReserved directly rather than by racing a second create past it.
 // The indirect version is the vacuous-test trap this package already documents: ids
-// come from newID(), so whether the reservation is even visible to the next
+// come from randid.New(), so whether the reservation is even visible to the next
 // admission depends on which id sorts first, and a mutation that reserved nothing
 // would survive it whenever the probe happened to sort earlier.
 

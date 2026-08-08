@@ -8,6 +8,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // SetPeerContainerRuntimeChecker injects the peer CheckContainerRuntime client.
@@ -292,7 +293,7 @@ func (c *ContainerChecker) pruneOwnershipDebounce(stillCandidate map[string]bool
 
 func (c *ContainerChecker) auditRekey(ctx context.Context, name, fromHost string) {
 	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-		ID:       ownerAssertID(),
+		ID:       randid.New(),
 		Username: "system",
 		HostName: c.hostName,
 		Action:   "ct.runtime-owner-rekey",

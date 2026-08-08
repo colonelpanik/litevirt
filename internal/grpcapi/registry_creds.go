@@ -11,6 +11,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Registry credentials (v23): per-user and global OCI/Docker registry logins
@@ -52,7 +53,7 @@ func (s *Server) SetRegistryCredential(ctx context.Context, req *pb.SetRegistryC
 		return nil, status.Error(codes.InvalidArgument, "username and password are required")
 	}
 	rc := corrosion.RegistryCredential{
-		ID: newID(), Scope: scope, Owner: owner, Registry: registry,
+		ID: randid.New(), Scope: scope, Owner: owner, Registry: registry,
 		Username: req.Username, Secret: req.Password,
 	}
 	// Uses the legacy mint-new-id writer. The canonical deterministic-id writer is preparatory

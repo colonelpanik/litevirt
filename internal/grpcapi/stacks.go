@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // DeployStack parses a compose YAML, runs the declarative planner to resolve all
@@ -191,7 +192,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 
 	// Security groups + their rules.
 	for name, sg := range f.SecurityGroups {
-		sgID := newID()
+		sgID := randid.New()
 		if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{
 			ID: sgID, Name: name, StackName: f.Name,
 		}); err != nil {
@@ -202,7 +203,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			// sequence renders deterministically — equal priorities would sort
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
 			if err := corrosion.InsertSGRule(ctx, s.db, corrosion.SGRule{
-				ID: newID(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
+				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
 			}); err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
@@ -213,7 +214,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	// IP sets.
 	for name, set := range f.IPSets {
 		if err := corrosion.InsertIPSet(ctx, s.db, corrosion.IPSet{
-			ID: newID(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
+			ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -223,7 +224,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	if fd := f.FirewallDefaults; fd != nil {
 		for i, r := range fd.ClusterRules {
 			if err := corrosion.InsertClusterFirewallRule(ctx, s.db, corrosion.FirewallRule{
-				ID: newID(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
+				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)

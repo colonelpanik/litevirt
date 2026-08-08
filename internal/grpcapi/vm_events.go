@@ -7,6 +7,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // recordVMEvent is the single sink for per-VM operational activity. It (1)
@@ -31,7 +32,7 @@ func (s *Server) recordVMEvent(ctx context.Context, vmName, evType, result, deta
 	}
 	if s.db != nil {
 		rec := corrosion.VMEventRecord{
-			ID:       newID(),
+			ID:       randid.New(),
 			VMName:   vmName,
 			HostName: s.hostName,
 			Type:     evType,

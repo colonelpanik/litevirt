@@ -57,7 +57,7 @@ func (s *Server) authorizeMigrationHelper(ctx context.Context, vmName string) (*
 // roots so they can never touch e.g. {dataDir}/state.db just because it's under
 // the data dir.
 func (s *Server) withinDiskArtifactRoot(p string) bool {
-	if withinDir(filepath.Join(s.dataDir, "disks"), p) {
+	if safename.Contains(filepath.Join(s.dataDir, "disks"), p) {
 		return true
 	}
 	s.storagePoolsMu.RLock()
@@ -70,7 +70,7 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 		if !isFileBasedDriver(pr.Driver) {
 			continue
 		}
-		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && withinDir(dir, p) {
+		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {
 			return true
 		}
 	}

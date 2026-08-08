@@ -82,7 +82,32 @@ func TestAnyStrandedPending(t *testing.T) {
 	if s.anyStrandedPending(ctx) {
 		t.Fatal("a running VM is not a stranded pending transfer")
 	}
-	// A markerless state=pending VM assigned here → stranded.
+	// A state=pending VM that DOES carry a pending_action_id is a legitimately minted
+	// transfer, not stranded — the marker is exactly what startPendingVM validates.
+	// This case was unreachable while ListVMs' projection omitted the column: every
+	// pending VM read as markerless, so a routine reschedule onto this host flapped
+	// legacy_pending_stranded.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vmok", HostName: "test-host", State: "stopped",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// Mint the pending transition the way the failover coordinator does: proof row +
+	// host/state/pending_action_id stamped in ONE batch.
+	if err := corrosion.WriteVMRescheduleProof(ctx, s.db, corrosion.ActionProof{
+		ID: "p-ok", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vmok", DestHost: "test-host", Coordinator: "coord-1",
+		LeaseHolder: "coord-1", QuorumLive: 3, QuorumNeeded: 2,
+	}, "vmok", "test-host"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	if s.anyStrandedPending(ctx) {
+		t.Fatal("a pending VM carrying a pending_action_id is a minted transfer, not stranded")
+	}
+	// A markerless state=pending VM assigned here → stranded. Asserted LAST on purpose:
+	// anyStrandedPending is an OR over rows, so the negative case above has to run while
+	// no stranded row exists. Landing here with vmok already in the table also proves the
+	// predicate is per-row — neither "any pending ⇒ true" nor "any marker ⇒ false".
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 		Name: "vmbad", HostName: "test-host", State: "pending",
 	}, nil, nil); err != nil {

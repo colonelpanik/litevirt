@@ -191,6 +191,39 @@ func TestListVMs_Filter(t *testing.T) {
 	}
 }
 
+// pending_action_id must be in BOTH list projections, because an absent column reads as ""
+// rather than erroring and grpcapi's anyStrandedPending treats an empty marker on a pending
+// VM as a stranded transfer — so an omission on either path reports a legitimately-minted
+// transfer as stranded. (This is a per-column requirement, not a claim that the two
+// projections are otherwise identical: vm_owner_epoch is intentionally ListVMs-only. See
+// scanVMRow's comment for the full per-column breakdown.)
+func TestListVMs_SurfacesPendingActionID(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	apInsertVM(t, c, "vm1", "h1", "running")
+	if err := WriteVMRescheduleProof(ctx, c, apProof("p1", "vm1", "h1"), "vm1", "h1"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		list func() ([]VMRecord, error)
+	}{
+		{"ListVMs", func() ([]VMRecord, error) { return ListVMs(ctx, c, "", "h1") }},
+		{"ListVMsPage", func() ([]VMRecord, error) { return ListVMsPage(ctx, c, "", "h1", "", 10) }},
+	} {
+		vms, err := tc.list()
+		if err != nil || len(vms) != 1 {
+			t.Fatalf("%s: err=%v rows=%d; want 1 row", tc.name, err, len(vms))
+		}
+		if vms[0].State != "pending" {
+			t.Fatalf("%s: state=%q; want pending", tc.name, vms[0].State)
+		}
+		if vms[0].PendingActionID != "p1" {
+			t.Fatalf("%s: PendingActionID=%q; want p1", tc.name, vms[0].PendingActionID)
+		}
+	}
+}
+
 func TestUpdateVMState(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {

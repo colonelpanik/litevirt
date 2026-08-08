@@ -1,6 +1,8 @@
 package lxc
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -97,6 +99,100 @@ func TestParseResourceConfig_RejectsAndGuardsBadInput(t *testing.T) {
 		}
 		if cpu != c.wantCPU {
 			t.Errorf("%s: cpu=%d, want %d", c.name, cpu, c.wantCPU)
+		}
+	}
+}
+
+// TestParseResourceConfig_CeilingArithmeticCannotOverflow pins the arithmetic
+// itself. The ceiling was computed as (quota*100 + period - 1) / period, and the
+// only guard was on quota*100 — so a quota that passes the guard can still
+// overflow int64 when the period is added, and the wrapped negative numerator
+// divides back into a plausible-looking answer:
+//
+//	quota 92233720368547758, period MaxInt64 -> numerator wraps to -10 -> 0
+//	quota 92233720368547758, period 9        -> numerator wraps      -> -1024819115206086200
+//
+// Zero is the codebase's UNLIMITED sentinel, so the first form turns a
+// malformed root-written cap into "no cap at all"; the second yields a negative
+// limit that is not a cap in any sense. Both must error instead. The guard is
+// stated as a property, not a list: no (quota, period) pair may produce a
+// non-positive or wrapped limit while reporting success.
+func TestParseResourceConfig_CeilingArithmeticCannotOverflow(t *testing.T) {
+	const nearMax = math.MaxInt64 / 100 // the largest quota the multiplication guard admits
+
+	// Pairs whose true ratio exceeds what the limit can represent must error,
+	// rather than wrap into a negative or divide down to the sentinel.
+	overflowing := []struct{ name, cfg string }{
+		{"add overflows to a negative limit", "lxc.cgroup2.cpu.max = 92233720368547758 9\n"},
+		{"largest admitted quota, smallest period", "lxc.cgroup2.cpu.max = 92233720368547758 1\n"},
+		{"ordinary period, quota just under the guard", "lxc.cgroup2.cpu.max = 92233720368547757 100000\n"},
+	}
+	for _, c := range overflowing {
+		cpu, _, err := parseResourceConfig(c.cfg)
+		if err == nil {
+			t.Errorf("%s: parsed cpu=%d without error — an unrepresentable limit must fail loudly, "+
+				"never land on 0 (which reads as UNLIMITED) or a negative", c.name, cpu)
+		}
+	}
+
+	// The counterpart: a pair whose ratio IS representable must be computed,
+	// not rejected. The old expression wrapped this one to a numerator of -10
+	// and reported 0 (unlimited); the true ceiling of 9223372036854775800 over
+	// MaxInt64 is 1, and 1 is what a correct ceiling returns.
+	if cpu, _, err := parseResourceConfig("lxc.cgroup2.cpu.max = 92233720368547758 9223372036854775807\n"); err != nil || cpu != 1 {
+		t.Errorf("largest admitted quota over the largest period: cpu=%d err=%v, want 1/nil", cpu, err)
+	}
+
+	// The property, swept over every period that divides the extremes plus a
+	// spread of ordinary ones: success implies a strictly positive limit.
+	periods := []int{1, 2, 9, 7919, 100000, 1 << 20, math.MaxInt32, math.MaxInt64}
+	quotas := []int{1, 500, 2000, 25000, nearMax - 1, nearMax}
+	for _, q := range quotas {
+		for _, p := range periods {
+			cfg := fmt.Sprintf("lxc.cgroup2.cpu.max = %d %d\n", q, p)
+			cpu, _, err := parseResourceConfig(cfg)
+			if err != nil {
+				continue // rejecting an unrepresentable pair is the correct outcome
+			}
+			if cpu <= 0 {
+				t.Errorf("quota=%d period=%d: parsed cpu=%d with no error — a positive quota must yield a "+
+					"positive limit or an error, never the unlimited sentinel", q, p, cpu)
+			}
+		}
+	}
+}
+
+// TestParseResourceConfig_ZeroQuotaAndMaxPeriodValidation covers the two ways a
+// malformed cpu.max still read as unlimited:
+//
+//   - a zero quota passed the "negative" guard and divided down to 0, i.e. the
+//     UNLIMITED sentinel, for a value the kernel itself rejects (it enforces a
+//     minimum bandwidth);
+//   - "max" returned before the period was ever parsed, so "max 0", "max -1"
+//     and "max banana" were accepted as unlimited even though the commit's
+//     stated contract is that a non-positive period is rejected. The period is
+//     part of the line's validity whatever the quota says.
+func TestParseResourceConfig_ZeroQuotaAndMaxPeriodValidation(t *testing.T) {
+	errCases := []struct{ name, cfg string }{
+		{"zero quota with explicit period", "lxc.cgroup2.cpu.max = 0 100000\n"},
+		{"zero quota with default period", "lxc.cgroup2.cpu.max = 0\n"},
+		{"max with zero period", "lxc.cgroup2.cpu.max = max 0\n"},
+		{"max with negative period", "lxc.cgroup2.cpu.max = max -1\n"},
+		{"max with unparseable period", "lxc.cgroup2.cpu.max = max banana\n"},
+	}
+	for _, c := range errCases {
+		cpu, _, err := parseResourceConfig(c.cfg)
+		if err == nil {
+			t.Errorf("%s: parsed cpu=%d without error — a malformed cpu.max must fail loudly, "+
+				"not read as unlimited", c.name, cpu)
+		}
+	}
+
+	// "max" with a VALID period, and bare "max", remain unlimited.
+	for _, cfg := range []string{"lxc.cgroup2.cpu.max = max\n", "lxc.cgroup2.cpu.max = max 100000\n"} {
+		cpu, _, err := parseResourceConfig(cfg)
+		if err != nil || cpu != 0 {
+			t.Errorf("%q: cpu=%d err=%v, want 0/nil — a well-formed max is still unlimited", cfg, cpu, err)
 		}
 	}
 }

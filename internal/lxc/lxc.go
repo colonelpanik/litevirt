@@ -1141,29 +1141,39 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 		case "lxc.cgroup2.cpu.max":
 			quotaStr, periodStr, hasPeriod := strings.Cut(val, " ")
 			quotaStr = strings.TrimSpace(quotaStr)
+			// The period is validated BEFORE the quota is even looked at, so
+			// "max 0" is rejected like "25000 0". The period is part of whether
+			// the line is a valid cpu.max at all; returning early on "max" left
+			// a malformed period reading as "no cap".
+			period := int64(100000) // cgroup2 default when omitted
+			if hasPeriod {
+				p, perr := strconv.ParseInt(strings.TrimSpace(periodStr), 10, 64)
+				if perr != nil {
+					return 0, 0, fmt.Errorf("unparseable cpu.max period %q: %w", val, perr)
+				}
+				if p <= 0 {
+					return 0, 0, fmt.Errorf("non-positive cpu.max period %q", val)
+				}
+				period = p
+			}
 			if quotaStr == "max" {
 				cpuLimit = 0 // cgroup2 unlimited
 				continue
 			}
-			quota, perr := strconv.Atoi(quotaStr)
+			quota, perr := strconv.ParseInt(quotaStr, 10, 64)
 			if perr != nil {
 				return 0, 0, fmt.Errorf("unparseable cpu.max %q: %w", val, perr)
 			}
-			if quota < 0 {
-				return 0, 0, fmt.Errorf("negative cpu.max quota %q", val)
+			// Zero is rejected with the negatives, not admitted with the
+			// positives: the kernel enforces a minimum bandwidth and never
+			// accepts a zero quota, and dividing it down would land on 0 — the
+			// codebase's UNLIMITED sentinel — turning the most restrictive
+			// conceivable cap into no cap at all.
+			if quota <= 0 {
+				return 0, 0, fmt.Errorf("non-positive cpu.max quota %q", val)
 			}
 			if quota > math.MaxInt64/100 {
 				return 0, 0, fmt.Errorf("cpu.max quota %q too large", val)
-			}
-			period := 100000 // cgroup2 default when omitted
-			if hasPeriod {
-				period, perr = strconv.Atoi(strings.TrimSpace(periodStr))
-				if perr != nil {
-					return 0, 0, fmt.Errorf("unparseable cpu.max period %q: %w", val, perr)
-				}
-				if period <= 0 {
-					return 0, 0, fmt.Errorf("non-positive cpu.max period %q", val)
-				}
 			}
 			// litevirt writes quota = cpuLimit*1000 at period 100000; the
 			// general inversion preserves that ratio for any period. Round UP,
@@ -1171,7 +1181,26 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			// truncate to 0, which the codebase reads as UNLIMITED — a genuine
 			// sub-1%-of-a-core cap becomes 1, never 0. litevirt's own emission
 			// (quota = cpuLimit*1000) still round-trips exactly.
-			cpuLimit = int((int64(quota)*100 + int64(period) - 1) / int64(period))
+			//
+			// The ceiling is taken by remainder rather than the usual
+			// (n + d - 1) / d: the guard above only bounds quota*100, so adding
+			// the period could still overflow int64 and wrap the numerator
+			// NEGATIVE — which divided back into a plausible answer instead of
+			// an error. At period 100000, a quota one below the guard's ceiling
+			// produced -92233720368546; at larger periods it produced 0, i.e.
+			// unlimited. This form cannot overflow for any admitted pair.
+			num := quota * 100
+			lim := num / period
+			if num%period != 0 {
+				lim++
+			}
+			// Finally bound the result to what an int holds on every platform,
+			// so a 32-bit build cannot truncate a huge limit back down into a
+			// small — or zero — one.
+			if lim > math.MaxInt32 {
+				return 0, 0, fmt.Errorf("cpu.max %q yields an unrepresentable limit", val)
+			}
+			cpuLimit = int(lim)
 		case "lxc.cgroup2.memory.max":
 			m, perr := parseMemoryMax(val)
 			if perr != nil {

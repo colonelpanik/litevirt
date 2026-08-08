@@ -163,7 +163,7 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 				continue
 			}
 			dst := filepath.Join(swtpmStage, rel)
-			if !withinDir(swtpmStage, dst) {
+			if !safename.Contains(swtpmStage, dst) {
 				return fmt.Errorf("firmware bundle entry %q escapes the swtpm dir", hdr.Name)
 			}
 			if hdr.Typeflag == tar.TypeDir {
@@ -368,12 +368,4 @@ func fsyncPath(path string) error {
 	}
 	defer f.Close()
 	return f.Sync()
-}
-
-func withinDir(dir, path string) bool {
-	rel, err := filepath.Rel(dir, path)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }

@@ -8,8 +8,11 @@ import (
 
 // SafeJoin joins root with the given path parts and guarantees the result stays
 // within root. It rejects any combination (absolute parts, ".." traversal) that
-// would escape, and returns the cleaned path. This generalizes the per-package
-// withinDir/safeJoin helpers (internal/grpcapi/vmimport.go, internal/vmimport).
+// would escape, and returns the cleaned path. Together with Contains this is the
+// single implementation of path containment for callers that need a boolean
+// check; the former per-package withinDir copies in internal/grpcapi and
+// internal/libvirt now call Contains. internal/vmimport/ova.go still keeps its
+// own tar-member safeJoin.
 func SafeJoin(root string, parts ...string) (string, error) {
 	if root == "" {
 		return "", fmt.Errorf("safejoin: empty root")

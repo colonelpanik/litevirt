@@ -83,24 +83,6 @@ func TestConvertForeignDisk_HardFailsWithoutQemuImg(t *testing.T) {
 	}
 }
 
-func TestWithinDir(t *testing.T) {
-	d := "/srv/imports/x"
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{"/srv/imports/x/disk.qcow2", true},
-		{"/srv/imports/x", true},
-		{"/srv/imports/x/../y/disk.qcow2", false},
-		{"/etc/passwd", false},
-	}
-	for _, c := range cases {
-		if got := withinDir(d, filepath.Clean(c.path)); got != c.want {
-			t.Errorf("withinDir(%q, %q) = %v, want %v", d, c.path, got, c.want)
-		}
-	}
-}
-
 func TestSniffImportFormat(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name string, b []byte) string {

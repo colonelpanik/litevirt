@@ -269,7 +269,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmCreated, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
 	// DB view for container-holder legitimacy (names are not cluster-unique).
 	ctBacked, ctIndexOK := s.dbCTIndex(ctx)
 
@@ -402,6 +402,20 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 			if mi.status == MarkerValid && mi.epoch == vmEpoch[vm] {
 				continue
 			}
+			// A PRE-EPOCH row awaiting the owner's backfill. A fresh create is
+			// born at vm_owner_epoch 0 and graduates on the reconciler's next
+			// sweep — which also writes its first marker — so a running VM with
+			// DB epoch 0 and NO marker is the expected newborn state, not a
+			// regime violation. Paging it made every fresh `lv run` flash a
+			// critical for up to a sweep interval (lab, 2026-08-05). Scoped
+			// tightly: a PRESENT marker against an epoch-0 row still pages (the
+			// runtime claims a generation the DB does not know), a missing
+			// marker on a GRADUATED row remains the violation it always was,
+			// AND the exception is time-bounded — a VM still ungraduated past
+			// newbornEpochGrace is a WEDGED backfill, not a newborn, and pages.
+			if vmEpoch[vm] == 0 && mi.status == MarkerMissing && withinNewbornGrace(vmCreated[vm]) {
+				continue
+			}
 			add(kindEpochMismatch, vm, fmt.Sprintf(
 				"VM %q on its DB owner %q carries an owner-epoch marker that is %s (marker %d, DB epoch %d) — "+
 					"the runtime cannot prove it belongs to the current ownership generation.",
@@ -463,19 +477,43 @@ func (s *Server) dbCTIndex(ctx context.Context) (backed map[ctHostName]bool, ok 
 // these maps, so an unreadable index silently detects nothing — and two such
 // passes counted as "clean" would auto-resolve a confirmed ownership condition
 // the detector simply could not see.
-func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64, ok bool) {
-	state, owner, epoch = map[string]string{}, map[string]string{}, map[string]int64{}
+func (s *Server) dbVMIndex(ctx context.Context) (state, owner, created map[string]string, epoch map[string]int64, ok bool) {
+	state, owner, created, epoch = map[string]string{}, map[string]string{}, map[string]string{}, map[string]int64{}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
-		return state, owner, epoch, false
+		return state, owner, created, epoch, false
 	}
 	for _, vm := range vms {
 		state[vm.Name] = vm.State
 		owner[vm.Name] = vm.HostName
+		created[vm.Name] = vm.CreatedAt
 		epoch[vm.Name] = vm.OwnerEpoch
 	}
-	return state, owner, epoch, true
+	return state, owner, created, epoch, true
+}
+
+// newbornEpochGrace bounds how long a VM may sit at the pre-epoch generation 0
+// with no runtime marker before the owner-epoch detector stops treating it as a
+// just-created newborn and pages it. A fresh create graduates on the
+// reconciler's next sweep (seconds to a minute); this window is generous enough
+// to cover several sweeps and cross-host clock skew, so a VM still ungraduated
+// past it is a genuinely WEDGED backfill that must surface, not newborn noise.
+// (Only reachable under owner_epoch_v1 enforcement, which readiness gates on the
+// backfill already being complete — so any epoch-0 row seen here was created
+// AFTER the latch and legitimately carries a recent created_at.)
+const newbornEpochGrace = 5 * time.Minute
+
+// withinNewbornGrace reports whether an epoch-0 VM created at createdAt is still
+// inside its backfill grace. An unparseable or empty timestamp is treated as
+// OUTSIDE the grace: a row we cannot age is not given the newborn exception, so
+// the detector fails toward paging rather than silently suppressing.
+func withinNewbornGrace(createdAt string) bool {
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return false
+	}
+	return time.Since(t) < newbornEpochGrace
 }
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy

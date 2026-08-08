@@ -21,12 +21,12 @@ import (
 // Dual-run detector notification Kinds (stable — notification routes subscribe to these;
 // see docs/notifications.md). Keep these strings stable across releases.
 const (
-	kindDualRunVM       = "ha.dualrun.vm"       // a VM is an active disk-holder on >1 host
-	kindDualRunCT       = "ha.dualrun.ct"       // a container is running on >1 host
-	kindDualRunVIP      = "ha.dualrun.vip"      // a VIP is kernel-assigned on >1 host
-	kindOwnerMismatch   = "ha.owner.mismatch"   // the DB owner is not the sole runtime holder
-	kindLWWUnresolved   = "ha.lww.unresolved"   // a node is tracking unresolved LWW ties
-	kindDualRunCoverage = "ha.dualrun.coverage" // a workload-capable host could not be probed
+	kindDualRunVM       = "ha.dualrun.vm"           // a VM is an active disk-holder on >1 host
+	kindDualRunCT       = "ha.dualrun.ct"           // a container is running on >1 host
+	kindDualRunVIP      = "ha.dualrun.vip"          // a VIP is kernel-assigned on >1 host
+	kindOwnerMismatch   = "ha.owner.mismatch"       // the DB owner is not the sole runtime holder
+	kindLWWUnresolved   = "ha.lww.unresolved"       // a node is tracking unresolved LWW ties
+	kindDualRunCoverage = "ha.dualrun.coverage"     // a workload-capable host could not be probed
 	kindEpochMismatch   = "ha.owner.epoch_mismatch" // the owner's runtime marker disagrees with its DB epoch
 )
 
@@ -508,12 +508,40 @@ const newbornEpochGrace = 5 * time.Minute
 // inside its backfill grace. An unparseable or empty timestamp is treated as
 // OUTSIDE the grace: a row we cannot age is not given the newborn exception, so
 // the detector fails toward paging rather than silently suppressing.
+//
+// The window is bounded in BOTH directions, which a bare "younger than the
+// grace" test is not: time.Since is NEGATIVE for a created_at in the future and
+// every negative duration is less than the grace, so a row stamped in the year
+// 9999 would sit in the exception forever and permanently lose owner-epoch
+// protection without ever paging. That is reachable without an attacker (a
+// creator whose clock is badly wrong) and with one (created_at is a replicated
+// column, and corrosion is last-writer-wins, so any peer can write it) — a
+// detector must not have an input that switches it off indefinitely.
+//
+// A modest future stamp is honest clock skew between the creator and whichever
+// host is evaluating, and still earns the exception; the same grace bounds it on
+// that side, so any ONE stamp buys at most two grace windows of suppression.
+//
+// Be precise about what that does and does not buy. It bounds a stamp that is
+// wrong ONCE — a bad creator clock, a wedged backfill, a row forged and left
+// alone. It does NOT bound a peer that REWRITES created_at before each pass:
+// this is re-evaluated against freshly-read DB state every sweep, so a renewed
+// stamp keeps the exception open indefinitely. That is not a property this
+// predicate can recover on its own, and it is not specific to the newborn
+// grace — the same writer suppresses the whole epoch check more cheaply by
+// setting state to a migrationState, setting deleted_at (ListVMs filters it),
+// or pointing host_name at an unprobed host, none of which need renewing. The
+// detector trusts replicated DB state throughout; closing that means either
+// detector-owned durable state the peers cannot reset, or assigning a positive
+// epoch and writing markers BEFORE a VM is published as running, which removes
+// the newborn window instead of bounding it. Both are tracked separately.
 func withinNewbornGrace(createdAt string) bool {
 	t, err := time.Parse(time.RFC3339, createdAt)
 	if err != nil {
 		return false
 	}
-	return time.Since(t) < newbornEpochGrace
+	age := time.Since(t)
+	return age > -newbornEpochGrace && age < newbornEpochGrace
 }
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy

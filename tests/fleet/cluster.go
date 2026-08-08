@@ -40,6 +40,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/grpcapi"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -382,6 +383,16 @@ func (c *Cluster) buildServer(n *Node) {
 		DB:       n.DB,
 		Virt:     n.Virt,
 	})
+
+	// Domain lifecycle events: the daemon registers this same handler on its
+	// libvirt client (internal/daemon.Run). Wiring it here lets a scenario call
+	// n.Virt.FireEvent(...) and observe the daemon's real reaction rather than a
+	// copy of its logic. Inert for every other scenario — the fake dispatches
+	// nothing unless a test fires an event. context.Background() because the
+	// harness has no daemon-lifetime ctx and the handler's corrosion calls are
+	// synchronous, completing inside FireEvent.
+	n.Virt.RegisterDomainEventCallback(
+		health.NewDomainEventHandler(n.Name, n.DB).Callback(context.Background()))
 
 	// Container runtime: the LXC analogue of n.Virt. Wired unconditionally so
 	// container RPCs run on every node instead of returning "container runtime

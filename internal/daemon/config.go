@@ -273,6 +273,19 @@ type AuthConfig struct {
 	// requires the StrictMTLSIdentityV1 capability active cluster-wide. This flag
 	// is the enforcement + kill switch — set false to disable regardless of latch.
 	StrictMTLSIdentity bool `yaml:"strict_mtls_identity,omitempty"`
+	// TrustRotatedPeerCerts is the RECOVERY switch for the peer certificate-serial
+	// pin. Peer trust binds a live host row to the serial recorded in it; when
+	// those recorded serials go stale (host certificates reissued), every daemon
+	// refuses every peer and the cluster stops replicating — and the correction
+	// cannot be replicated, because replication is what is being refused.
+	//
+	// Set true on EVERY node to break that deadlock: a mismatch is then logged and
+	// admitted for CA-issued host certificates rather than refused. Leave it on
+	// only until the fleet has replicated the serials each node re-records for
+	// itself at startup, then set it back to false. It never relaxes the removal
+	// tombstone, and never lets a distributable client certificate act as a peer.
+	// Default false; an ordinary rotation on a healthy cluster does not need it.
+	TrustRotatedPeerCerts bool `yaml:"trust_rotated_peer_certs,omitempty"`
 	// ForwardedIdentity, when true, makes this node (as the owner of a resource)
 	// re-authenticate the forwarded user's session bearer relayed by the entry
 	// node and run RBAC + audit as the real user, instead of the peer=admin

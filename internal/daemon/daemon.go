@@ -753,6 +753,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetFirmwarePaths(firmwarePaths)
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
+	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
 	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
 	// Split-brain-family enforcement kill-switches — so the HA monitor drives the

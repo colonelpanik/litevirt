@@ -116,6 +116,18 @@ func (s *Server) SetStrictMTLSIdentity(on bool) { s.strictMTLSIdentity = on }
 // session bearer is authenticated as the real user. The flag is the kill switch.
 func (s *Server) SetForwardedIdentity(on bool) { s.forwardedIdentity = on }
 
+// SetTrustRotatedPeerCerts sets this node's RECOVERY switch for the peer
+// certificate-serial pin. When true, a live host row whose recorded serial
+// disagrees with the presented certificate no longer refuses it, provided the
+// certificate is a CA-issued HOST certificate; the mismatch is logged instead.
+//
+// This exists because a fleet whose recorded serials have gone stale locks itself
+// out completely — every daemon refuses every peer, and the correction cannot be
+// replicated because replication is what is refused. Leave it false in steady
+// state: with RegisterHost re-recording each node's own serial at startup, an
+// ordinary rotation converges without it.
+func (s *Server) SetTrustRotatedPeerCerts(on bool) { s.trustRotatedPeerCerts = on }
+
 // SetRBACRealm sets this node's opt-in for realm-aware role-binding grammar.
 // The flag is the reversible kill switch; realm enforcement in GrantRole is
 // gated by this flag AND the RBACRealmV1 latch (see rbacRealmConfigured /
@@ -315,9 +327,28 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 		// Real peer calls carry the leaf certificate. Bind an active name to the
 		// exact CA-issued identity recorded at admission, so re-admitting a name
 		// cannot reopen a lagging peer to that name's old certificate.
-		if cert := peerLeafCert(ctx); cert != nil && cert.SerialNumber != nil &&
-			rows[0].String("cert_serial") != "" {
-			return strings.EqualFold(rows[0].String("cert_serial"), cert.SerialNumber.Text(16))
+		//
+		// The pin only holds while the recorded serial keeps up with reality.
+		// RegisterHost re-records each node's own serial at startup, so an ordinary
+		// rotation converges by replication; trustRotatedPeerCerts is the recovery
+		// switch for a fleet that ALREADY stopped replicating, where the correction
+		// cannot travel because the stale serial is what refuses it. In that mode
+		// a mismatch falls back to the host-vs-client discriminator and is logged
+		// — it never relaxes the tombstone above, so a removed host stays removed.
+		recorded := rows[0].String("cert_serial")
+		if cert := peerLeafCert(ctx); cert != nil && cert.SerialNumber != nil && recorded != "" {
+			presented := cert.SerialNumber.Text(16)
+			if strings.EqualFold(recorded, presented) {
+				return true
+			}
+			if !s.trustRotatedPeerCerts {
+				return false
+			}
+			slog.Warn("peer presented a certificate other than the one recorded at admission; "+
+				"admitting it because trust_rotated_peer_certs recovery mode is on — turn it back off "+
+				"once the fleet has replicated its re-recorded serials",
+				"cn", cn, "recorded_serial", recorded, "presented_serial", presented)
+			return callerCertHasServerAuth(ctx)
 		}
 		return true
 	}

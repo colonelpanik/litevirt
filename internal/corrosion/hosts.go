@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -149,6 +150,19 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 // are idempotent. A re-added machine may clear its local tombstone only when the
 // certificate actually installed on disk has a different serial; peers still
 // require the operator's AdmitHost mutation and the matching certificate.
+//
+// A LIVE row whose serial disagrees with the certificate on disk is RE-RECORDED,
+// because this is the one caller entitled to do that: the daemon passes its own
+// name and the serial it just read from its own PKI directory, so the write only
+// ever touches the node's own row, and anyone able to change what that node
+// presents already holds its private key.
+//
+// It used to error instead, and nothing else wrote the column — AdmitHost refuses
+// a live row, no CLI sets it. So a reissued host certificate left the row stale
+// forever, and since peer trust binds a live row to its recorded serial, every
+// daemon refused every peer and replication stopped fleet-wide. There was no way
+// back in-product: the correction has to reach the PEER, and the stale serial is
+// what blocks the peer channel. Rotation now converges by ordinary replication.
 func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
 	if err != nil {
@@ -158,11 +172,25 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 		return InsertHost(ctx, c, h)
 	}
 	if rows[0].String("deleted_at") == "" {
-		if rows[0].String("cert_serial") == "" ||
-			strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
+		recorded := rows[0].String("cert_serial")
+		if recorded == "" || strings.EqualFold(recorded, h.CertSerial) {
 			return nil
 		}
-		return fmt.Errorf("active host %q has a different certificate serial", h.Name)
+		// The daemon substitutes "unknown" when it cannot read its own
+		// certificate. Recording that would blind the pin for this host on every
+		// peer — a local file-permission problem becoming a cluster-wide trust
+		// downgrade — so the recorded serial stands.
+		if h.CertSerial == "" || h.CertSerial == "unknown" {
+			slog.Warn("could not read this host's own certificate serial; leaving the recorded one in place",
+				"host", h.Name, "recorded_serial", recorded)
+			return nil
+		}
+		slog.Warn("this host's certificate has been reissued since it was admitted; re-recording its serial "+
+			"so peers accept it (rotation converges by replication)",
+			"host", h.Name, "recorded_serial", recorded, "installed_serial", h.CertSerial)
+		return c.Execute(ctx,
+			`UPDATE hosts SET cert_serial = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
+			h.CertSerial, c.NowTS(), h.Name)
 	}
 	return AdmitHost(ctx, c, h)
 }

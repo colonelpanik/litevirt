@@ -188,3 +188,55 @@ func TestPeerTrust_AnUnreadableHostRowRefusesThePeer(t *testing.T) {
 			"falling through here re-admits a decommissioned node whenever the read fails")
 	}
 }
+
+// TestPeerTrust_RecoveryFlagUnblocksARotatedFleet.
+//
+// Self-recording (corrosion.RegisterHost) makes a rotation converge on a HEALTHY
+// cluster, but it cannot rescue one that has already stopped replicating: the
+// corrected row has to reach the PEER, and the stale serial is precisely what
+// blocks the peer channel — in both directions, since a pull is refused by the
+// same check. That deadlock previously had no in-product exit; it was resolved by
+// hand-editing every node's database.
+//
+// So there is a deliberate, default-OFF recovery switch. Turned on fleet-wide it
+// downgrades the pin to trust-and-log for CA-issued HOST certificates, long
+// enough for the self-recorded serials to replicate; then it is turned back off
+// and the pin is enforcing again against correct data.
+func TestPeerTrust_RecoveryFlagUnblocksARotatedFleet(t *testing.T) {
+	ctx := context.Background()
+	s := trustFixture(t)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "node-rot", Address: "10.0.0.12", State: "active", CertSerial: "bb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rotated := certSerialCtx("node-rot", big.NewInt(0xaa),
+		x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+
+	// DEFAULT: the pin is enforcing, so a serial it does not recognise is refused.
+	if s.isTrustedHostCN(rotated, "node-rot") {
+		t.Fatal("the serial pin is not enforcing by default")
+	}
+
+	s.SetTrustRotatedPeerCerts(true)
+	if !s.isTrustedHostCN(rotated, "node-rot") {
+		t.Fatal("recovery mode did not admit a CA-issued HOST certificate whose serial had rotated —" +
+			" a fleet locked out by stale serials has no way back without editing databases by hand")
+	}
+
+	// Recovery mode relaxes the SERIAL check only. The discriminator that keeps a
+	// distributable operator certificate out of the cluster is untouched.
+	clientCert := certSerialCtx("node-rot", big.NewInt(0xcc), x509.ExtKeyUsageClientAuth)
+	if s.isTrustedHostCN(clientCert, "node-rot") {
+		t.Fatal("recovery mode accepted a distributable CLIENT certificate as a peer")
+	}
+
+	// And a REMOVED host stays removed: the tombstone outranks recovery mode, so
+	// this cannot be used to resurrect a decommissioned node.
+	if err := corrosion.DeleteHost(ctx, s.db, "node-rot"); err != nil {
+		t.Fatal(err)
+	}
+	if s.isTrustedHostCN(rotated, "node-rot") {
+		t.Fatal("recovery mode re-admitted a decommissioned host")
+	}
+}

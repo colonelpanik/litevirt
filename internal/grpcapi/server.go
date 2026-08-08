@@ -33,8 +33,8 @@ import (
 type Server struct {
 	pb.UnimplementedLiteVirtServer
 
-	hostName   string
-	dataDir    string
+	hostName string
+	dataDir  string
 	// containersRoot is where per-container state (and the owner-epoch marker)
 	// lives — <dataDir>/containers in production, injected by the daemon so the
 	// runtime-inventory collector can read markers. Empty disables marker reads
@@ -81,6 +81,15 @@ type Server struct {
 	// `lv login`). Enforcement is this flag AND the StrictMTLSIdentityV1 gate
 	// being active cluster-wide; the flag is also the kill switch. Default false.
 	strictMTLSIdentity bool
+
+	// trustRotatedPeerCerts, when true, downgrades the peer certificate-serial pin
+	// to trust-and-log for CA-issued HOST certificates. It is the RECOVERY switch
+	// for a fleet already locked out by stale recorded serials: self-recording
+	// converges a rotation on a healthy cluster, but cannot rescue one that has
+	// stopped replicating, because the corrected row has to travel over the very
+	// channel the stale serial blocks. Default false — turn it on fleet-wide, let
+	// the self-recorded serials replicate, then turn it back off.
+	trustRotatedPeerCerts bool
 
 	// forwardedIdentity, when true, is this node's enforcement switch for owner-
 	// side promotion of a forwarded user identity (x-litevirt-fwd-bearer). Gated
@@ -273,7 +282,6 @@ type Server struct {
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
-
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets

@@ -132,6 +132,68 @@ func TestRegisterHost_ClearsOnlyItsOldCertificateTombstone(t *testing.T) {
 	}
 }
 
+// TestRegisterHost_ReRecordsItsOwnRotatedCertificate is the regression for a
+// cluster-wide control-plane partition.
+//
+// Peer trust binds a live host row to the serial recorded in it. Nothing wrote
+// that serial when a host certificate was reissued — RegisterHost ERRORED on the
+// mismatch and carried on, AdmitHost refuses a live row outright, and no CLI
+// writes it. So on a cluster whose certificates had been rotated, every daemon
+// refused every peer ("replication RPC requires peer mTLS") and there was no
+// in-product way back: the correction has to reach the PEER, and the peer channel
+// is exactly what the stale serial blocks.
+//
+// A node is authoritative for its OWN certificate — it reads it off its own disk,
+// and anyone able to change what it presents already holds that node's private
+// key. So startup re-records its own row. Rotation then converges by ordinary
+// replication instead of by hand.
+func TestRegisterHost_ReRecordsItsOwnRotatedCertificate(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	original := HostRecord{
+		Name: "node5", Address: "10.0.0.5", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", CertSerial: "aaaa",
+	}
+	if err := InsertHost(ctx, c, original); err != nil {
+		t.Fatal(err)
+	}
+	rotated := original
+	rotated.CertSerial = "bbbb"
+	if err := RegisterHost(ctx, c, rotated); err != nil {
+		t.Fatalf("a node restarting with a reissued certificate: %v — this is the lockout: "+
+			"the row keeps the old serial and every peer refuses it", err)
+	}
+	got, _ := GetHost(ctx, c, "node5")
+	if got == nil || got.CertSerial != "bbbb" {
+		t.Fatalf("row = %#v, want the on-disk serial re-recorded", got)
+	}
+}
+
+// TestRegisterHost_NeverRecordsAnUnreadableCertificate: the daemon substitutes
+// "unknown" when it cannot read its own certificate. Writing that over a good
+// serial would blind the pin for this host on every peer, turning a local file
+// permission problem into a cluster-wide trust downgrade.
+func TestRegisterHost_NeverRecordsAnUnreadableCertificate(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	h := HostRecord{
+		Name: "node6", Address: "10.0.0.6", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", CertSerial: "aaaa",
+	}
+	if err := InsertHost(ctx, c, h); err != nil {
+		t.Fatal(err)
+	}
+	blind := h
+	blind.CertSerial = "unknown"
+	if err := RegisterHost(ctx, c, blind); err != nil {
+		t.Fatalf("registration with an unreadable certificate: %v", err)
+	}
+	got, _ := GetHost(ctx, c, "node6")
+	if got == nil || got.CertSerial != "aaaa" {
+		t.Fatalf("row = %#v, want the recorded serial left intact", got)
+	}
+}
+
 func TestListHosts_WithLabels(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

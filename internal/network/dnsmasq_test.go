@@ -40,6 +40,39 @@ func TestCmdlineHasPidFile(t *testing.T) {
 	}
 }
 
+// TestDnsmasqPidFile pins the exact strings both pidfile helpers produce. These
+// are an argv contract, not an internal detail: StopDHCP's direct signal,
+// procIsOurDnsmasq, the drift-restart guard and the pkill backstop all match on
+// them, so a dnsmasq an older binary already started must keep matching.
+func TestDnsmasqPidFile(t *testing.T) {
+	for _, tc := range []struct{ got, want string }{
+		{dnsmasqPidFile("br0"), "/var/run/litevirt-dnsmasq-br0.pid"},
+		{dnsmasqPidFile("br-iso-web"), "/var/run/litevirt-dnsmasq-br-iso-web.pid"},
+		{dnsmasqPidFileVNI(500), "/var/run/litevirt-dnsmasq-vni500.pid"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("pidfile = %q, want %q", tc.got, tc.want)
+		}
+	}
+
+	// The VXLAN pidfile keys on the VNI token, NOT the bridge name. Both VXLAN
+	// call sites have a `bridge` variable in scope, so collapsing the two helpers
+	// into dnsmasqPidFile(bridge) reads like a tidy-up — it silently re-keys the
+	// path, and on upgrade the new binary can neither find nor kill the dnsmasq
+	// still holding the bridge gateway IP:53.
+	if viaVNI, viaBridge := dnsmasqPidFileVNI(500), dnsmasqPidFile(vxlanBridgeName(500)); viaVNI == viaBridge {
+		t.Errorf("VXLAN pidfile must key on the VNI token, not the bridge name; both produced %q", viaVNI)
+	}
+
+	// Round-trip through the consumer: the helpers' output must be matchable by
+	// the argv check that gates every signal, not merely equal to a string.
+	for _, pf := range []string{dnsmasqPidFile("br0"), dnsmasqPidFileVNI(500)} {
+		if !cmdlineHasPidFile([]byte("dnsmasq\x00--pid-file="+pf), pf) {
+			t.Errorf("procIsOurDnsmasq would not recognize our own instance for %q", pf)
+		}
+	}
+}
+
 // TestWaitProcessExit_KillsLingerer proves the drift-restart path won't launch a
 // replacement dnsmasq while the old one still holds the socket: waitProcessExit
 // escalates to SIGKILL and returns only once the process is actually gone.

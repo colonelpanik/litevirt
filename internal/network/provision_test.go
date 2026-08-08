@@ -127,6 +127,98 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 	}
 }
 
+// TestProvision_DnsmasqPidFilePaths pins the pidfile path at every call site, not
+// just inside the helpers. A site that still hand-rolls its own path — or that
+// gets swapped to the wrong helper — is invisible to a helper unit test but
+// breaks stop/kill for a live dnsmasq, so each of the six is observed here.
+// Provision's three sites are captured through startDHCPFunc; Deprovision's three
+// call StopDHCP directly, so they are observed one level down via its
+// `pkill -f pid-file=<path>` backstop (the only pkill in the package).
+//
+// All names are deliberately unreal (lv-pf-br0, VNI 4242, network pfnet):
+// StopDHCP does a real os.ReadFile/os.Remove on the path — only the pkill goes
+// through the stub — so the test must never name a pidfile a live host could own.
+func TestProvision_DnsmasqPidFilePaths(t *testing.T) {
+	newDB := func(t *testing.T) *corrosion.Client {
+		t.Helper()
+		db, err := corrosion.NewTestClient()
+		if err != nil {
+			t.Fatalf("NewTestClient: %v", err)
+		}
+		if err := corrosion.InitSchema(context.Background(), db); err != nil {
+			t.Fatalf("InitSchema: %v", err)
+		}
+		return db
+	}
+
+	cases := []struct {
+		name string
+		def  compose.NetworkDef
+		want string
+	}{
+		// lv-pf-br0 does not exist on the host, so bridgePreExisted is false and the
+		// (!bridgePreExisted || def.DHCP) DHCP gate opens. Kept ≤15 chars for EnsureBridge.
+		{"bridge", compose.NetworkDef{Type: "bridge", Interface: "lv-pf-br0", Subnet: "10.88.0.0/24"},
+			"/var/run/litevirt-dnsmasq-lv-pf-br0.pid"},
+		// Underlay is explicit so defaultRouteInterface() (empty under the exec stub)
+		// is never consulted. Provision upserts this host's own VTEP, so isGatewayHost
+		// elects it from a single-host list and DHCP starts.
+		{"vxlan", compose.NetworkDef{Type: "vxlan", VNI: 4242, Underlay: "eth0", Subnet: "10.89.0.0/24"},
+			"/var/run/litevirt-dnsmasq-vni4242.pid"},
+		// IsolatedBridgeName("pfnet") is "br-iso-pfnet" — 12 chars, below the hash
+		// fallback threshold, so the expected path stays stable and readable.
+		{"isolated", compose.NetworkDef{Type: "isolated", Subnet: "10.90.0.0/24"},
+			"/var/run/litevirt-dnsmasq-br-iso-pfnet.pid"},
+	}
+
+	for _, tc := range cases {
+		t.Run("provision_"+tc.name, func(t *testing.T) {
+			execCommand = func(name string, args ...string) ([]byte, error) { return nil, nil }
+			defer func() { execCommand = defaultExec }()
+			var started []string
+			startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error {
+				started = append(started, pidFile)
+				return nil
+			}
+			defer func() { startDHCPFunc = StartDHCP }()
+
+			if _, err := Provision(context.Background(), newDB(t), "pfnet", tc.def, "10.0.0.1", "host1"); err != nil {
+				t.Fatalf("Provision: %v", err)
+			}
+			if len(started) != 1 {
+				t.Fatalf("expected exactly 1 DHCP start, got %d: %v", len(started), started)
+			}
+			if started[0] != tc.want {
+				t.Errorf("Provision passed pidFile %q, want %q", started[0], tc.want)
+			}
+		})
+	}
+
+	for _, tc := range cases {
+		t.Run("deprovision_"+tc.name, func(t *testing.T) {
+			var pkills []string
+			execCommand = func(name string, args ...string) ([]byte, error) {
+				if name == "pkill" {
+					pkills = append(pkills, args[len(args)-1])
+				}
+				return nil, nil
+			}
+			defer func() { execCommand = defaultExec }()
+
+			// A nil db is fine here: Deprovision's only db use is guarded by db != nil.
+			if err := Deprovision(context.Background(), nil, "pfnet", tc.def, "host1"); err != nil {
+				t.Fatalf("Deprovision: %v", err)
+			}
+			if len(pkills) != 1 {
+				t.Fatalf("expected exactly 1 pkill (StopDHCP's backstop), got %d: %v", len(pkills), pkills)
+			}
+			if want := "pid-file=" + tc.want; pkills[0] != want {
+				t.Errorf("StopDHCP pkill pattern %q, want %q", pkills[0], want)
+			}
+		})
+	}
+}
+
 func TestProvision_VXLAN(t *testing.T) {
 	var calls [][]string
 	execCommand = func(name string, args ...string) ([]byte, error) {

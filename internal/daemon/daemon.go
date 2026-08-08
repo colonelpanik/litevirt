@@ -594,24 +594,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.virt.StartReconnectLoop(ctx)
 
 	// Register domain event callback for immediate VM death detection (#44).
-	d.virt.RegisterDomainEventCallback(func(domName string, event libvirt.DomainEventType, detail int) {
-		switch event {
-		case libvirt.DomainEventCrashed, libvirt.DomainEventStopped:
-			vm, err := corrosion.GetVM(ctx, d.db, domName)
-			if err != nil || vm == nil || vm.HostName != d.cfg.HostName {
-				return
-			}
-			if vm.StateDetail == "operator-stop" {
-				return // don't act on intentional stops
-			}
-			slog.Warn("domain event: VM stopped/crashed", "vm", domName, "event", event, "detail", detail)
-			if err := corrosion.UpdateVMState(ctx, d.db, domName, "error",
-				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail)); err != nil {
-				slog.Error("domain event: failed to record crash state — reconciler will re-detect", "vm", domName, "error", err)
-				stateWriteMetrics.Failed(corrosion.OpVMState, corrosion.ClassifyWriteErr(err))
-			}
-		}
-	})
+	eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
+	eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	d.virt.RegisterDomainEventCallback(eventHandler.Callback(ctx))
 
 	// Create the VM reconciler (picks up "pending" VMs from failover and starts
 	// them). Wire the split-brain gate now, but DON'T start the reconcile loop or

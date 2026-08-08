@@ -98,7 +98,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				if err != nil {
 					return "", fmt.Errorf("derive DHCP range: %w", err)
 				}
-				pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-%s.pid", bridge)
+				pidFile := dnsmasqPidFile(bridge)
 				if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
 					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
 				}
@@ -188,7 +188,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 					if err != nil {
 						return "", fmt.Errorf("derive DHCP range: %w", err)
 					}
-					pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-vni%d.pid", vni)
+					pidFile := dnsmasqPidFileVNI(vni)
 					if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
 						return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
 					}
@@ -242,7 +242,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				if err != nil {
 					return "", fmt.Errorf("derive DHCP range: %w", err)
 				}
-				pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-%s.pid", bridge)
+				pidFile := dnsmasqPidFile(bridge)
 				if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
 					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
 				}
@@ -302,7 +302,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		RemoveProxyARP(bridge)
 		// Stop DHCP and remove gateway IP + NAT if subnet was configured.
 		if def.Subnet != "" {
-			pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-%s.pid", bridge)
+			pidFile := dnsmasqPidFile(bridge)
 			StopDHCP(pidFile) //nolint:errcheck
 			// Remove the gateway IP that StartDHCP added to the bridge.
 			if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil {
@@ -332,7 +332,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		if def.Subnet != "" {
 			RemoveIRB(vni, def.Subnet)    //nolint:errcheck
 			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
-			pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-vni%d.pid", vni)
+			pidFile := dnsmasqPidFileVNI(vni)
 			StopDHCP(pidFile) //nolint:errcheck
 		}
 		return DeprovisionVXLAN(vni)
@@ -343,7 +343,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		RemoveSNAT(bridge)          //nolint:errcheck
 		// Stop DHCP if subnet was configured.
 		if def.Subnet != "" {
-			pidFile := fmt.Sprintf("/var/run/litevirt-dnsmasq-%s.pid", bridge)
+			pidFile := dnsmasqPidFile(bridge)
 			StopDHCP(pidFile) //nolint:errcheck
 		}
 		// Delete the isolated bridge (litevirt created it, safe to remove).

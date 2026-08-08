@@ -103,14 +103,28 @@ jobs:
         run: ./scripts/ci/build-release.sh
 
       # Publish the tarballs + checksums as a GitHub release.
+      #
+      # Idempotent, because the release may ALREADY exist: cutting a release by
+      # hand (`gh release create` right after pushing the tag, to write release
+      # notes) races this job and used to fail it outright with "a release with
+      # the same tag name already exists". The tag still built fine, so the only
+      # visible symptom was a red X — while the real damage was silent, since the
+      # step that failed is also the step that UPLOADS the artifacts. Two releases
+      # shipped with no binaries attached at all before anyone noticed.
+      #
+      # So: create it if absent, and upload the assets either way. --clobber makes
+      # a re-run replace what it already put there rather than fail on conflict.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${VERSION}" \
-            --title "${VERSION}" \
-            --generate-notes \
-            dist/*.tar.gz dist/*checksums.txt
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "release ${VERSION} already exists — uploading artifacts to it"
+          else
+            gh release create "${VERSION}" --title "${VERSION}" --generate-notes
+          fi
+          gh release upload "${VERSION}" \
+            dist/*.tar.gz dist/*checksums.txt --clobber
 
       # Regenerate the Homebrew formula and push it to the tap. No-ops until the
       # HOMEBREW_TAP_REPO variable + HOMEBREW_TAP_TOKEN secret are configured.

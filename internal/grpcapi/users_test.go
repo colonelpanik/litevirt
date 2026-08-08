@@ -186,14 +186,3 @@ func TestRevokeToken(t *testing.T) {
 		t.Fatalf("RevokeToken: %v", err)
 	}
 }
-
-func TestGenerateID(t *testing.T) {
-	id1 := generateID()
-	id2 := generateID()
-	if id1 == id2 {
-		t.Error("generateID returned same value twice")
-	}
-	if len(id1) != 16 {
-		t.Errorf("length = %d, want 16", len(id1))
-	}
-}

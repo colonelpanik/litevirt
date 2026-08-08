@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Distributed-firewall management RPCs for the cluster/host tiers, ip sets, and
@@ -52,7 +53,7 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 		return nil, status.Error(codes.InvalidArgument, "rule with direction required")
 	}
 	row := corrosion.FirewallRule{
-		ID: newID(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
+		ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 		CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
 	if err := corrosion.InsertClusterFirewallRule(ctx, s.db, row); err != nil {
@@ -101,7 +102,7 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 		return nil, status.Error(codes.InvalidArgument, "rule with host_name and direction required")
 	}
 	row := corrosion.FirewallRule{
-		ID: newID(), HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
+		ID: randid.New(), HostName: r.HostName, Direction: r.Direction, Proto: r.Proto,
 		PortRange: r.Port, CIDR: r.Cidr, Action: r.Action, Priority: int(r.Priority), Comment: r.Comment,
 	}
 	if err := corrosion.InsertHostFirewallRule(ctx, s.db, row); err != nil {
@@ -148,7 +149,7 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	row := corrosion.IPSet{ID: newID(), Name: req.Name, CIDRs: req.Cidrs}
+	row := corrosion.IPSet{ID: randid.New(), Name: req.Name, CIDRs: req.Cidrs}
 	if err := corrosion.InsertIPSet(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.Internal, "create ipset: %v", err)
 	}

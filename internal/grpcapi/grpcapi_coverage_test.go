@@ -3668,19 +3668,6 @@ func TestVmStateToPB_AllStates(t *testing.T) {
 	}
 }
 
-// ─── generateID and GenerateMAC ────────────────────────────────────────────────
-
-func TestGenerateID_Unique(t *testing.T) {
-	ids := make(map[string]bool)
-	for i := 0; i < 100; i++ {
-		id := generateID()
-		if ids[id] {
-			t.Fatalf("duplicate ID: %s", id)
-		}
-		ids[id] = true
-	}
-}
-
 // ─── replaceDomainName and replaceFirst ────────────────────────────────────────
 
 func TestReplaceFirst_NoMatch(t *testing.T) {
@@ -3814,19 +3801,6 @@ func TestRequireRole_NoRole(t *testing.T) {
 	err := RequireRole(ctx, "viewer")
 	if err == nil {
 		t.Fatal("expected error for no role")
-	}
-}
-
-// ─── newID ─────────────────────────────────────────────────────────────────────
-
-func TestNewID_Unique(t *testing.T) {
-	ids := make(map[string]bool)
-	for i := 0; i < 100; i++ {
-		id := newID()
-		if ids[id] {
-			t.Fatalf("duplicate newID: %s", id)
-		}
-		ids[id] = true
 	}
 }
 

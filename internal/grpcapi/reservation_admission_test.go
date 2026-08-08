@@ -99,7 +99,7 @@ func TestAdmitWithReservation_IgnoresALaterClaimant(t *testing.T) {
 // load-bearing as reserve.
 //
 // Asserted on HostReserved directly rather than by attempting a second admission.
-// That indirect version was 50/50: ids come from newID(), so whether a leaked
+// That indirect version was 50/50: ids come from randid.New(), so whether a leaked
 // reservation is even VISIBLE to the next admission depends on which id sorts
 // first — and a mutation that never released survived it half the time.
 func TestAdmitWithReservation_ReleaseFreesTheCapacity(t *testing.T) {

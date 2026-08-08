@@ -18,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // MigrateContainer cold-migrates a container to another host by reusing the
@@ -389,9 +390,9 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 		return nil
 	}
 	pr := corrosion.ActionProof{
-		ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+		ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 		TargetName: containerName, DestHost: destHost, Coordinator: s.hostName,
-		LeaseHolder: s.hostName, RelocationToken: newID(),
+		LeaseHolder: s.hostName, RelocationToken: randid.New(),
 		OwnerEpoch: strconv.FormatInt(ownerEpoch, 10),
 	}
 	if err := corrosion.WriteActionProof(ctx, s.db, pr); err != nil {

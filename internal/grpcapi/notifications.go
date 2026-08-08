@@ -2,8 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // notify dispatches a notification (#5) to every enabled target whose route
@@ -88,12 +87,6 @@ func (s *Server) NotifyHostFenced(host, method, result, detail string) {
 	})
 }
 
-func newNotifyID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
 func toPbTarget(t corrosion.NotificationTarget) *pb.NotificationTarget {
 	return &pb.NotificationTarget{Id: t.ID, Name: t.Name, Type: t.Type, Config: t.Config, Enabled: t.Enabled}
 }
@@ -113,7 +106,7 @@ func (s *Server) CreateNotificationTarget(ctx context.Context, req *pb.CreateNot
 	if _, err := notify.NewTarget(req.Name, req.Type, req.Config); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	t := corrosion.NotificationTarget{ID: newNotifyID(), Name: req.Name, Type: req.Type, Config: req.Config, Enabled: req.Enabled}
+	t := corrosion.NotificationTarget{ID: randid.New(), Name: req.Name, Type: req.Type, Config: req.Config, Enabled: req.Enabled}
 	if err := corrosion.InsertNotificationTarget(ctx, s.db, t); err != nil {
 		return nil, status.Errorf(codes.Internal, "create target: %v", err)
 	}
@@ -183,7 +176,7 @@ func (s *Server) CreateNotificationRoute(ctx context.Context, req *pb.CreateNoti
 	if req.EventPattern == "" || req.TargetId == "" {
 		return nil, status.Error(codes.InvalidArgument, "event_pattern and target_id required")
 	}
-	r := corrosion.NotificationRoute{ID: newNotifyID(), EventPattern: req.EventPattern, TargetID: req.TargetId, MinSeverity: req.MinSeverity, Enabled: req.Enabled}
+	r := corrosion.NotificationRoute{ID: randid.New(), EventPattern: req.EventPattern, TargetID: req.TargetId, MinSeverity: req.MinSeverity, Enabled: req.Enabled}
 	if err := corrosion.InsertNotificationRoute(ctx, s.db, r); err != nil {
 		return nil, status.Errorf(codes.Internal, "create route: %v", err)
 	}

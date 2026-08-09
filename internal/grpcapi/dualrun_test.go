@@ -1161,3 +1161,159 @@ func TestDualRun_RelocatingSourceDoesNotLegitimizeHolder(t *testing.T) {
 		t.Fatal("a still-running relocation source beside its landed target must page — the source row is not backing, it is the move itself")
 	}
 }
+
+// TestEpochMismatch_PreEpochRowAwaitingBackfillDoesNotFire: a fresh create is
+// born at vm_owner_epoch 0 and graduates on the reconciler's next sweep, which
+// also writes its first marker. In that window the VM is RUNNING on its owner
+// with no marker — the expected newborn state, not a regime violation — and
+// paging it made every fresh `lv run` flash a critical owner_epoch_mismatch
+// for a sweep interval (lab, 2026-08-05). A PRESENT marker against an epoch-0
+// row is different and must still page: the runtime claims a generation the
+// DB does not know. So must a missing marker once the row has graduated.
+func TestEpochMismatch_PreEpochRowAwaitingBackfillDoesNotFire(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running") // vm_owner_epoch stays 0: awaiting backfill
+
+	// Newborn: running on its owner, marker not yet written.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 0, status: MarkerMissing}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if lc := condLifecycle(s, kindEpochMismatch, "vmA"); lc != "" {
+		t.Fatalf("pre-epoch newborn raised owner_epoch_mismatch (lifecycle %q) — "+
+			"a row awaiting backfill has no generation to prove yet", lc)
+	}
+
+	// A marker CLAIMING a generation against the epoch-0 row still pages.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 3, status: MarkerValid}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindEpochMismatch, "vmA") {
+		t.Fatal("a present marker against an epoch-0 row must confirm — the runtime claims a generation the DB does not know")
+	}
+}
+
+// TestEpochMismatch_GraduatedRowMissingMarkerStillFires pins the boundary of
+// the newborn exception: once the backfill has graduated the row, a missing
+// marker is a genuine violation again.
+func TestEpochMismatch_GraduatedRowMissingMarkerStillFires(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 1 WHERE name = 'vmA'`); err != nil {
+		t.Fatalf("graduate epoch: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 0, status: MarkerMissing}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindEpochMismatch, "vmA") {
+		t.Fatal("a graduated row with a missing marker must confirm owner_epoch_mismatch")
+	}
+}
+
+// TestEpochMismatch_WedgedPreEpochRowStillFires: the newborn skip is bounded by
+// workload age. A VM that has sat at epoch 0 with no marker for far longer than
+// a fresh create ever should (the reconciler's backfill wedged and never
+// graduated it) must page owner_epoch_mismatch rather than be silently skipped
+// as a newborn — otherwise owner-epoch protection is permanently absent for it.
+func TestEpochMismatch_WedgedPreEpochRowStillFires(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+	// Backdate created_at well past the newborn grace: a genuine newborn
+	// graduates within a sweep or two; this one never did.
+	old := time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339)
+	if err := s.db.Execute(ctx, `UPDATE vms SET created_at = ? WHERE name = 'vmA'`, old); err != nil {
+		t.Fatalf("backdate created_at: %v", err)
+	}
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 0, status: MarkerMissing}}},
+		"h2": {},
+	})
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindEpochMismatch, "vmA") {
+		t.Fatal("a long-wedged epoch-0 row must page owner_epoch_mismatch, not be skipped as a newborn")
+	}
+}
+
+// TestEpochMismatch_FutureCreatedAtStillFires pins the FAR side of the newborn
+// window. `time.Since` is NEGATIVE for a timestamp in the future, and every
+// negative duration is less than the grace, so an unbounded "is it younger than
+// 5m" test suppressed the finding forever: a row carrying created_at in the
+// year 9999 — a wedged backfill, a bad creator clock, or a forged row replicated
+// in by a peer (corrosion is last-writer-wins, any peer can write the column) —
+// would silently lose owner-epoch protection for good, never paging. Grace is
+// therefore bounded in BOTH directions: a modest future timestamp is honest
+// clock skew and still earns the exception, but a wildly future one does not.
+func TestEpochMismatch_FutureCreatedAtStillFires(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		created time.Time
+	}{
+		{"far future", time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"just past the skew bound", time.Now().Add(newbornEpochGrace + time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := dualRunTestServer(t, 2)
+			s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+			ctx := context.Background()
+			seedVM(t, s, "vmA", "h1", "running")
+			future := tc.created.UTC().Format(time.RFC3339)
+			if err := s.db.Execute(ctx, `UPDATE vms SET created_at = ? WHERE name = 'vmA'`, future); err != nil {
+				t.Fatalf("post-date created_at: %v", err)
+			}
+			s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+				"h1": {diskHolderVMs: []string{"vmA"},
+					vmMarkers: map[string]markerInfo{"vmA": {epoch: 0, status: MarkerMissing}}},
+				"h2": {},
+			})
+			s.detectDualRunPass(ctx)
+			s.detectDualRunPass(ctx)
+			if !confirmedCond(s, kindEpochMismatch, "vmA") {
+				t.Fatalf("created_at %s suppressed owner_epoch_mismatch — a future timestamp must not "+
+					"buy unbounded newborn grace, or the protection is permanently absent for that row", future)
+			}
+		})
+	}
+}
+
+// TestWithinNewbornGrace_BoundedBothWays exercises the predicate directly, so
+// the bound is pinned independently of the detector's plumbing.
+func TestWithinNewbornGrace_BoundedBothWays(t *testing.T) {
+	at := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+	for _, tc := range []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"just created", at(0), true},
+		{"inside the grace", at(-newbornEpochGrace / 2), true},
+		{"past the grace", at(-newbornEpochGrace - time.Minute), false},
+		{"modest skew ahead is honest", at(newbornEpochGrace / 2), true},
+		{"wildly ahead is not", at(newbornEpochGrace + time.Minute), false},
+		{"year 9999", "9999-01-01T00:00:00Z", false},
+		{"empty", "", false},
+		{"malformed", "not-a-timestamp", false},
+	} {
+		if got := withinNewbornGrace(tc.in); got != tc.want {
+			t.Errorf("%s: withinNewbornGrace(%q) = %v, want %v", tc.name, tc.in, got, tc.want)
+		}
+	}
+}

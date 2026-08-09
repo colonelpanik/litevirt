@@ -21,12 +21,12 @@ import (
 // Dual-run detector notification Kinds (stable — notification routes subscribe to these;
 // see docs/notifications.md). Keep these strings stable across releases.
 const (
-	kindDualRunVM       = "ha.dualrun.vm"       // a VM is an active disk-holder on >1 host
-	kindDualRunCT       = "ha.dualrun.ct"       // a container is running on >1 host
-	kindDualRunVIP      = "ha.dualrun.vip"      // a VIP is kernel-assigned on >1 host
-	kindOwnerMismatch   = "ha.owner.mismatch"   // the DB owner is not the sole runtime holder
-	kindLWWUnresolved   = "ha.lww.unresolved"   // a node is tracking unresolved LWW ties
-	kindDualRunCoverage = "ha.dualrun.coverage" // a workload-capable host could not be probed
+	kindDualRunVM       = "ha.dualrun.vm"           // a VM is an active disk-holder on >1 host
+	kindDualRunCT       = "ha.dualrun.ct"           // a container is running on >1 host
+	kindDualRunVIP      = "ha.dualrun.vip"          // a VIP is kernel-assigned on >1 host
+	kindOwnerMismatch   = "ha.owner.mismatch"       // the DB owner is not the sole runtime holder
+	kindLWWUnresolved   = "ha.lww.unresolved"       // a node is tracking unresolved LWW ties
+	kindDualRunCoverage = "ha.dualrun.coverage"     // a workload-capable host could not be probed
 	kindEpochMismatch   = "ha.owner.epoch_mismatch" // the owner's runtime marker disagrees with its DB epoch
 )
 
@@ -269,7 +269,7 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmCreated, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
 	// DB view for container-holder legitimacy (names are not cluster-unique).
 	ctBacked, ctIndexOK := s.dbCTIndex(ctx)
 
@@ -402,6 +402,20 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 			if mi.status == MarkerValid && mi.epoch == vmEpoch[vm] {
 				continue
 			}
+			// A PRE-EPOCH row awaiting the owner's backfill. A fresh create is
+			// born at vm_owner_epoch 0 and graduates on the reconciler's next
+			// sweep — which also writes its first marker — so a running VM with
+			// DB epoch 0 and NO marker is the expected newborn state, not a
+			// regime violation. Paging it made every fresh `lv run` flash a
+			// critical for up to a sweep interval (lab, 2026-08-05). Scoped
+			// tightly: a PRESENT marker against an epoch-0 row still pages (the
+			// runtime claims a generation the DB does not know), a missing
+			// marker on a GRADUATED row remains the violation it always was,
+			// AND the exception is time-bounded — a VM still ungraduated past
+			// newbornEpochGrace is a WEDGED backfill, not a newborn, and pages.
+			if vmEpoch[vm] == 0 && mi.status == MarkerMissing && withinNewbornGrace(vmCreated[vm]) {
+				continue
+			}
 			add(kindEpochMismatch, vm, fmt.Sprintf(
 				"VM %q on its DB owner %q carries an owner-epoch marker that is %s (marker %d, DB epoch %d) — "+
 					"the runtime cannot prove it belongs to the current ownership generation.",
@@ -463,19 +477,71 @@ func (s *Server) dbCTIndex(ctx context.Context) (backed map[ctHostName]bool, ok 
 // these maps, so an unreadable index silently detects nothing — and two such
 // passes counted as "clean" would auto-resolve a confirmed ownership condition
 // the detector simply could not see.
-func (s *Server) dbVMIndex(ctx context.Context) (state, owner map[string]string, epoch map[string]int64, ok bool) {
-	state, owner, epoch = map[string]string{}, map[string]string{}, map[string]int64{}
+func (s *Server) dbVMIndex(ctx context.Context) (state, owner, created map[string]string, epoch map[string]int64, ok bool) {
+	state, owner, created, epoch = map[string]string{}, map[string]string{}, map[string]string{}, map[string]int64{}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
-		return state, owner, epoch, false
+		return state, owner, created, epoch, false
 	}
 	for _, vm := range vms {
 		state[vm.Name] = vm.State
 		owner[vm.Name] = vm.HostName
+		created[vm.Name] = vm.CreatedAt
 		epoch[vm.Name] = vm.OwnerEpoch
 	}
-	return state, owner, epoch, true
+	return state, owner, created, epoch, true
+}
+
+// newbornEpochGrace bounds how long a VM may sit at the pre-epoch generation 0
+// with no runtime marker before the owner-epoch detector stops treating it as a
+// just-created newborn and pages it. A fresh create graduates on the
+// reconciler's next sweep (seconds to a minute); this window is generous enough
+// to cover several sweeps and cross-host clock skew, so a VM still ungraduated
+// past it is a genuinely WEDGED backfill that must surface, not newborn noise.
+// (Only reachable under owner_epoch_v1 enforcement, which readiness gates on the
+// backfill already being complete — so any epoch-0 row seen here was created
+// AFTER the latch and legitimately carries a recent created_at.)
+const newbornEpochGrace = 5 * time.Minute
+
+// withinNewbornGrace reports whether an epoch-0 VM created at createdAt is still
+// inside its backfill grace. An unparseable or empty timestamp is treated as
+// OUTSIDE the grace: a row we cannot age is not given the newborn exception, so
+// the detector fails toward paging rather than silently suppressing.
+//
+// The window is bounded in BOTH directions, which a bare "younger than the
+// grace" test is not: time.Since is NEGATIVE for a created_at in the future and
+// every negative duration is less than the grace, so a row stamped in the year
+// 9999 would sit in the exception forever and permanently lose owner-epoch
+// protection without ever paging. That is reachable without an attacker (a
+// creator whose clock is badly wrong) and with one (created_at is a replicated
+// column, and corrosion is last-writer-wins, so any peer can write it) — a
+// detector must not have an input that switches it off indefinitely.
+//
+// A modest future stamp is honest clock skew between the creator and whichever
+// host is evaluating, and still earns the exception; the same grace bounds it on
+// that side, so any ONE stamp buys at most two grace windows of suppression.
+//
+// Be precise about what that does and does not buy. It bounds a stamp that is
+// wrong ONCE — a bad creator clock, a wedged backfill, a row forged and left
+// alone. It does NOT bound a peer that REWRITES created_at before each pass:
+// this is re-evaluated against freshly-read DB state every sweep, so a renewed
+// stamp keeps the exception open indefinitely. That is not a property this
+// predicate can recover on its own, and it is not specific to the newborn
+// grace — the same writer suppresses the whole epoch check more cheaply by
+// setting state to a migrationState, setting deleted_at (ListVMs filters it),
+// or pointing host_name at an unprobed host, none of which need renewing. The
+// detector trusts replicated DB state throughout; closing that means either
+// detector-owned durable state the peers cannot reset, or assigning a positive
+// epoch and writing markers BEFORE a VM is published as running, which removes
+// the newborn window instead of bounding it. Both are tracked separately.
+func withinNewbornGrace(createdAt string) bool {
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return false
+	}
+	age := time.Since(t)
+	return age > -newbornEpochGrace && age < newbornEpochGrace
 }
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy

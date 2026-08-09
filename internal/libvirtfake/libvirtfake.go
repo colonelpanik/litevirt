@@ -60,6 +60,11 @@ type Fake struct {
 	ownerEpochs map[string]int64  // domain → Phase 4 owner-epoch metadata marker
 	events      []Event
 
+	// eventCB is the domain lifecycle callback registered by
+	// RegisterDomainEventCallback; nil until something registers. FireEvent
+	// delivers to it. Guarded by f.mu.
+	eventCB libvirt.DomainEventCallback
+
 	// Optional time source for events. Defaults to time.Now.
 	Now func() time.Time
 
@@ -1238,13 +1243,46 @@ func (f *Fake) TapDevice(domainName, mac string) (string, error) {
 	return "tap-" + domainName, nil
 }
 
-// Lifecycle hooks — daemon-only paths; the fake no-ops them.
+// Lifecycle hooks — daemon-only paths. Connection management is a no-op (there
+// is no connection to lose); domain events are recorded so a scenario can drive
+// them via FireEvent.
 
 func (f *Fake) StartReconnectLoop(ctx context.Context) {}
+
+// RegisterDomainEventCallback stores the callback the daemon would install on a
+// real libvirt client. Storing it has no effect on its own — the fake dispatches
+// nothing until a scenario calls FireEvent — so this stays inert for harnesses
+// that never drive events. A second registration replaces the first, matching
+// libvirt.Client.
 func (f *Fake) RegisterDomainEventCallback(cb libvirt.DomainEventCallback) {
-	// Scenarios that want to drive callbacks can call Fake.FireEvent
-	// directly (TODO if needed).
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.eventCB = cb
 }
+
+// FireEvent delivers a libvirt domain lifecycle event to the registered
+// callback, so a scenario can drive the crash/stop path without a real
+// libvirtd. A no-op when nothing is registered.
+//
+// The callback is copied out and f.mu is RELEASED before it runs: it is
+// arbitrary daemon code that may call back into the fake (DomainExists,
+// SetState, DomainState, …), and f.mu is not reentrant. Do NOT "simplify" this
+// to `defer f.mu.Unlock()` — that is a self-deadlock.
+//
+// FireEvent deliberately does not touch f.domains; a scenario that wants the
+// fake's domain state to agree with the event calls SetState itself, keeping
+// event injection and state orthogonal (same split as SetStateReason).
+func (f *Fake) FireEvent(domainName string, event libvirt.DomainEventType, detail int) {
+	f.mu.Lock()
+	f.record("fire-event", domainName, fmt.Sprintf("event=%d detail=%d", int(event), detail))
+	cb := f.eventCB
+	f.mu.Unlock()
+	if cb == nil {
+		return
+	}
+	cb(domainName, event, detail)
+}
+
 func (f *Fake) Close() error { return nil }
 
 // SetDomainOwnerEpoch / GetDomainOwnerEpoch mirror the Phase 4 runtime marker

@@ -143,6 +143,24 @@ func TestContains(t *testing.T) {
 	}
 }
 
+func TestContains_Table(t *testing.T) {
+	d := "/srv/imports/x"
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/srv/imports/x/disk.qcow2", true},
+		{"/srv/imports/x", true},
+		{"/srv/imports/x/../y/disk.qcow2", false},
+		{"/etc/passwd", false},
+	}
+	for _, c := range cases {
+		if got := Contains(d, c.path); got != c.want {
+			t.Errorf("Contains(%q, %q) = %v, want %v", d, c.path, got, c.want)
+		}
+	}
+}
+
 // --- tar extraction ---
 
 type tarEnt struct {

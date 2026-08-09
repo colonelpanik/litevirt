@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/vmimport"
 	"log/slog"
@@ -459,7 +460,7 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 	if root, e := filepath.EvalSymlinks(stagingRoot); e == nil {
 		stagingRoot = root
 	}
-	if !withinDir(stagingRoot, resolved) {
+	if !safename.Contains(stagingRoot, resolved) {
 		// Outside the staging root → privileged, require admin.
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return "", status.Errorf(codes.PermissionDenied,
@@ -784,7 +785,7 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 				continue
 			}
 			ext := line[a+1 : b]
-			if filepath.IsAbs(ext) || strings.Contains(ext, "..") || !withinDir(allowedDir, filepath.Join(allowedDir, ext)) {
+			if filepath.IsAbs(ext) || strings.Contains(ext, "..") || !safename.Contains(allowedDir, filepath.Join(allowedDir, ext)) {
 				return fmt.Errorf("VMDK descriptor references an external/escaping extent %q", ext)
 			}
 		}
@@ -805,7 +806,7 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 			if !filepath.IsAbs(b) {
 				resolved = filepath.Join(filepath.Dir(file), b)
 			}
-			if !withinDir(allowedDir, resolved) {
+			if !safename.Contains(allowedDir, resolved) {
 				return fmt.Errorf("disk has an external backing file %q outside the import directory", b)
 			}
 		}
@@ -814,14 +815,6 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 }
 
 // ── small helpers ──
-
-func withinDir(dir, path string) bool {
-	rel, err := filepath.Rel(dir, path)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
-}
 
 func fileExists(p string) bool {
 	if p == "" {

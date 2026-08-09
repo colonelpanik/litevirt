@@ -13,7 +13,6 @@ package libvirt
 import (
 	"encoding/xml"
 	"fmt"
-	"strings"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
 )
@@ -88,7 +87,7 @@ func (c *Client) DeleteCheckpoint(domain, checkpointName string, withChildren bo
 	}
 	cp, err := c.virt.DomainCheckpointLookupByName(dom, checkpointName, 0)
 	if err != nil {
-		if isNotFound(err) {
+		if IsNotFound(err) {
 			return nil // already gone — idempotent
 		}
 		return fmt.Errorf("lookup checkpoint %s: %w", checkpointName, err)
@@ -155,24 +154,4 @@ func buildBackupXML(diskTarget, parentCheckpoint, socket, scratch string) (strin
 		return "", fmt.Errorf("marshal backup xml: %w", err)
 	}
 	return string(b), nil
-}
-
-// isNotFound classifies a libvirt error as "object does not exist" so
-// existence probes don't conflate a missing checkpoint with a real fault.
-func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	if e, ok := err.(golibvirt.Error); ok {
-		switch e.Code {
-		case uint32(golibvirt.ErrNoDomainCheckpoint),
-			uint32(golibvirt.ErrNoDomain),
-			uint32(golibvirt.ErrNoDomainSnapshot):
-			return true
-		}
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "no domain checkpoint") ||
-		strings.Contains(msg, "cannot find")
 }

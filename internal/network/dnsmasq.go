@@ -64,6 +64,35 @@ var startDHCPFunc = StartDHCP
 // scanner doesn't read.
 const dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq"
 
+// dnsmasqPidFile returns the pidfile path for the dnsmasq instance keyed on
+// `key`. It is the ONLY place this path is constructed: StopDHCP signals the
+// recorded PID, procIsOurDnsmasq matches the live `--pid-file=<path>` argv
+// element, and the pkill backstop matches `pid-file=<path>` — so a path built
+// two different ways silently orphans a running dnsmasq instead of stopping it.
+//
+// `key` is the bridge name for bridge and isolated networks. VXLAN networks key
+// on the VNI token instead (see dnsmasqPidFileVNI) — NOT on the bridge name.
+//
+// /var/run is deliberately not normalised to /run: they are the same directory
+// via symlink, but the stop/kill paths match the argv STRING, so a dnsmasq
+// started by a previous binary with --pid-file=/var/run/... would stop matching.
+func dnsmasqPidFile(key string) string {
+	return "/var/run/litevirt-dnsmasq-" + key + ".pid"
+}
+
+// dnsmasqPidFileVNI returns the pidfile path for a VXLAN network's dnsmasq. Its
+// key is "vni<N>", deliberately NOT vxlanBridgeName(vni) ("br-vni<N>"): the path
+// predates this helper and is what the running fleet's dnsmasq processes already
+// carry in their command line. Both VXLAN call sites have a `bridge` variable in
+// scope, which makes dnsmasqPidFile(bridge) look like the obvious tidy-up — it is
+// not. On upgrade, a new binary looking at .../litevirt-dnsmasq-br-vni500.pid
+// finds no pidfile, fails procIsOurDnsmasq, misses with the pkill backstop, and
+// spawns a second dnsmasq that dies on bind against the survivor still holding
+// the bridge gateway IP:53 — a DHCP outage on every VXLAN network with a subnet.
+func dnsmasqPidFileVNI(vni int) string {
+	return dnsmasqPidFile(fmt.Sprintf("vni%d", vni))
+}
+
 func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, upstreamDNS []string, localDomain string, localPort int) []string {
 	args := []string{
 		"--interface=" + bridge,

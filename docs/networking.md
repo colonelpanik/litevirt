@@ -38,7 +38,25 @@ networks:
     dhcp: true
 ```
 
-litevirt manages VTEP configuration and FDB entries. BGP peering between hosts distributes MAC/IP mappings.
+litevirt manages VTEP and forwarding-database (FDB) state itself — there is no
+BGP or EVPN control plane, and no routing daemon to install. When a host
+provisions the network it records its VTEP address in the replicated cluster
+database, then reads that table back and installs an all-zeros
+`00:00:00:00:00:00` flood entry for each peer VTEP already listed, so BUM
+traffic is head-end replicated to the peers it knows about; a peer that
+provisions later can also push its VTEP straight to this host, which adds the
+entry on the spot. Those kernel flood entries are only ever added — an
+individual entry is never withdrawn when a host leaves the network (they go away
+only with the local VXLAN device), and nothing re-derives the set from the
+database outside a provisioning pass, so a newly-joined host may stay absent
+from an existing peer's entries until that peer next provisions, which a daemon
+restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
+learned: when a VM's address is discovered, and again when that VM migrates or
+is deleted, its host fans a `bridge fdb` add/delete out to every peer over the
+cluster's mTLS gRPC, so remote hosts point the MAC at whichever host now owns
+it. Setting `subnet:` also gives every host the same anycast gateway — the first
+usable address in the subnet — on the VNI bridge, so a VM's default route is
+host-local.
 
 ### Isolated
 

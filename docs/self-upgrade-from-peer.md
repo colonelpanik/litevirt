@@ -87,8 +87,9 @@ spreads the binary pulls across the ~R relays instead of all hammering one node.
 
 ## Safety / anti-thrash
 
-- Config-gated: `auto_upgrade.from_peer` (default **on**); `auto_upgrade.interval`
-  (default 5m). Set off to require manual `lv host upgrade`.
+- Config-gated: `auto_upgrade.from_peer` (default **on**);
+  `auto_upgrade.interval_minutes` (integer minutes, default **5**). Set off to
+  require manual `lv host upgrade`.
 - **Jittered** startup delay and tick (±50%) so a synchronized fleet reboot
   doesn't herd on the first check or on each interval.
 - Only pulls from **active** peers; verifies the **checksum** and the

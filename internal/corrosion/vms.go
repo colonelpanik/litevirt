@@ -58,7 +58,9 @@ type VMRecord struct {
 	// protocol columns: OwnerEpoch bumps on every ownership transfer (ABA-proof
 	// recovery), SpecGeneration bumps on every desired-spec mutation, and
 	// ActiveOperationID is the VM-wide mutation barrier (non-empty ⇒ an operation
-	// holds the VM). Populated by GetVM; the ListVMs projection omits them.
+	// holds the VM). All three are populated by GetVM; SpecGeneration and
+	// ActiveOperationID are omitted by BOTH list projections, while OwnerEpoch
+	// rides the unpaginated ListVMs read only (not ListVMsPage) — see scanVMRow.
 	OwnerEpoch        int64
 	SpecGeneration    int64
 	ActiveOperationID string
@@ -248,6 +250,7 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
 		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
 		COALESCE(is_template, 0) AS is_template,
+		COALESCE(pending_action_id, '') AS pending_action_id,
 		COALESCE(vm_owner_epoch, 0) AS vm_owner_epoch, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
@@ -273,27 +276,45 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 	return vms, nil
 }
 
-// scanVMRow maps a row carrying the ListVMs column set to a VMRecord.
+// scanVMRow maps a row from a VM-list projection to a VMRecord. It reads the UNION of the
+// columns its callers select, and an absent column reads as a ZERO VALUE, not an error
+// (Row.String/Int64 on a missing column) — so a field is only trustworthy on the paths whose
+// SELECT actually carries it:
+//
+//   - pending_action_id: carried by BOTH ListVMs and ListVMsPage. It must be, because
+//     grpcapi's anyStrandedPending treats an empty marker on a pending VM as a stranded
+//     transfer — an omission here reads as "markerless" and reports a legitimately-minted
+//     transfer as stranded (fixed here; previously omitted by both).
+//   - vm_owner_epoch: carried by ListVMs ONLY, so OwnerEpoch reads 0 through ListVMsPage.
+//     Deliberate: the dual-run detector's index is built from the unpaginated ListVMs and no
+//     ListVMsPage consumer reads OwnerEpoch. Anything that starts reading it on the
+//     paginated path must add the column there first.
+//   - spec_generation / active_operation_id: read by NEITHER list projection. Use GetVM or
+//     ListVMsWithActiveOperation.
+//
+// Adding a field to this scanner therefore means adding its column to every caller whose
+// consumers actually read that field.
 func scanVMRow(r Row) VMRecord {
 	return VMRecord{
-		Name:        r.String("name"),
-		StackName:   r.String("stack_name"),
-		HostName:    r.String("host_name"),
-		Spec:        r.String("spec"),
-		State:       r.String("state"),
-		StateDetail: r.String("state_detail"),
-		CPUActual:   r.Int("cpu_actual"),
-		MemActual:   r.Int("mem_actual"),
-		Project:     r.String("project"),
-		IsTemplate:  r.Int("is_template") == 1,
+		Name:            r.String("name"),
+		StackName:       r.String("stack_name"),
+		HostName:        r.String("host_name"),
+		Spec:            r.String("spec"),
+		State:           r.String("state"),
+		StateDetail:     r.String("state_detail"),
+		CPUActual:       r.Int("cpu_actual"),
+		MemActual:       r.Int("mem_actual"),
+		Project:         r.String("project"),
+		IsTemplate:      r.Int("is_template") == 1,
+		PendingActionID: r.String("pending_action_id"),
 		// OwnerEpoch rides the list read because the dual-run detector's DB
 		// index is built from ListVMs. Omitting it made every epoched running
 		// VM read as marker-vs-0 and page a false owner_epoch_mismatch — a bug
 		// the LAB caught, not the unit tests: the fixture VMs happened to be
 		// epoch 0, so marker 0 == "missing epoch" 0 and nothing fired.
-		OwnerEpoch:  r.Int64("vm_owner_epoch"),
-		CreatedAt:   r.String("created_at"),
-		UpdatedAt:   r.String("updated_at"),
+		OwnerEpoch: r.Int64("vm_owner_epoch"),
+		CreatedAt:  r.String("created_at"),
+		UpdatedAt:  r.String("updated_at"),
 	}
 }
 
@@ -304,7 +325,8 @@ func scanVMRow(r Row) VMRecord {
 func ListVMsPage(ctx context.Context, c *Client, stackName, hostName, afterName string, limit int) ([]VMRecord, error) {
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
 		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
-		COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		COALESCE(is_template, 0) AS is_template,
+		COALESCE(pending_action_id, '') AS pending_action_id, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
 	if stackName != "" {

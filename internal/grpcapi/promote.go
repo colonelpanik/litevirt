@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // PromoteReplica brings an inert replica online for disaster recovery: it
@@ -119,7 +120,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 		// persist a row that fails the exact dest binding (and INSERT OR IGNORE would
 		// then keep the empty-dest row over the carried full proof).
 		req.Proof = &pb.RuntimeActionProof{
-			Id: newID(), Action: corrosion.ActionPromote, TargetKind: "vm",
+			Id: randid.New(), Action: corrosion.ActionPromote, TargetKind: "vm",
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
 			OwnerEpoch: strconv.FormatInt(vm.OwnerEpoch, 10),
 			FenceEpoch: fenceEpoch,

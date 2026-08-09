@@ -1,13 +1,12 @@
 package ui
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Security-group CRUD is performed in-process against the host-local Corrosion
@@ -72,12 +71,7 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	id, err := newUIID()
-	if err != nil {
-		sendToast(w, "id generation failed", "error")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	id := randid.New()
 	if err := corrosion.InsertSecurityGroup(r.Context(), s.db, corrosion.SecurityGroup{
 		ID: id, Name: name, StackName: strings.TrimSpace(r.FormValue("stack")),
 	}); err != nil {
@@ -126,12 +120,7 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sgID := r.PathValue("id")
-	id, err := newUIID()
-	if err != nil {
-		sendToast(w, "id generation failed", "error")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	id := randid.New()
 	priority, _ := strconv.Atoi(strings.TrimSpace(r.FormValue("priority")))
 	if err := corrosion.InsertSGRule(r.Context(), s.db, corrosion.SGRule{
 		ID:        id,
@@ -167,13 +156,4 @@ func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
 	sendToast(w, "Rule removed", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
-}
-
-// newUIID generates a random hex id (matches the `lv` CLI's newID scheme).
-func newUIID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }

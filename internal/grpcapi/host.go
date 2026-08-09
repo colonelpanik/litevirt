@@ -2,8 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.ListHostsResponse, error) {
@@ -609,7 +608,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 			return nil, status.Errorf(codes.Internal, "update host state: %v", err)
 		}
 		if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
-			ID:       newID(),
+			ID:       randid.New(),
 			HostName: req.Name,
 			Method:   "manual",
 			Result:   "manual-confirmed",
@@ -671,7 +670,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 
 	// Record in fencing log.
 	if logErr := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
-		ID:       newID(),
+		ID:       randid.New(),
 		HostName: req.Name,
 		Method:   method,
 		Result:   result,
@@ -928,11 +927,4 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 		return nil
 	}
 	return timestamppb.New(t)
-}
-
-// newID generates a random 8-byte hex ID.
-func newID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

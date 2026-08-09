@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,6 +12,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // newSGCmd groups security-group subcommands. These mutate the cluster
@@ -89,10 +88,7 @@ func newSGCreateCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			id, err := newID()
-			if err != nil {
-				return err
-			}
+			id := randid.New()
 			if err := corrosion.InsertSecurityGroup(cmd.Context(), db, corrosion.SecurityGroup{
 				ID: id, Name: args[0], StackName: stack,
 			}); err != nil {
@@ -169,10 +165,7 @@ func newSGRuleAddCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			id, err := newID()
-			if err != nil {
-				return err
-			}
+			id := randid.New()
 			if err := corrosion.InsertSGRule(cmd.Context(), db, corrosion.SGRule{
 				ID: id, SGID: args[0],
 				Direction: direction, Proto: proto, PortRange: port,
@@ -237,14 +230,4 @@ func newSGRuleRemoveCmd() *cobra.Command {
 			return nil
 		},
 	}
-}
-
-// newID returns a random hex id for SGs and rules. We use raw 8-byte
-// random rather than UUIDs to keep ids short in CLI output.
-func newID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }

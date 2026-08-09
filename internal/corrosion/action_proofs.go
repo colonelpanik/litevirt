@@ -214,7 +214,7 @@ func ProofStepDone(stepState, step string) bool {
 // GetActionProofByToken reads the proof bound to a relocation token (container
 // relocation binds by token, not by a VM pending pointer). ok=false if absent.
 //
-// A relocation token is single-mint (newID per relocation), so at most one live proof
+// A relocation token is single-mint (randid.New() per relocation), so at most one live proof
 // carries it — the LIMIT 1 is exact today. It is ORDER BY id'd so the pick is at least
 // DETERMINISTIC if that ever failed to hold. TODO(schema): fold a partial UNIQUE index on
 // relocation_token (non-empty tokens only) into the next schema migration to make the

@@ -2,13 +2,12 @@ package health
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // VM runtime states reported by the runtime inventory — the single vocabulary the
@@ -322,7 +321,7 @@ func (r *Reconciler) pruneOwnershipDebounce(stillCandidate map[string]bool) {
 
 func (r *Reconciler) auditOwnerAssert(ctx context.Context, name, fromHost string) {
 	_ = corrosion.InsertAuditLog(ctx, r.db, corrosion.AuditRecord{
-		ID:       ownerAssertID(),
+		ID:       randid.New(),
 		Username: "system",
 		HostName: r.hostName,
 		Action:   "vm.runtime-owner-assert",
@@ -330,10 +329,4 @@ func (r *Reconciler) auditOwnerAssert(ctx context.Context, name, fromHost string
 		Detail:   "reclaimed from " + fromHost + " (runs locally; all workload-capable peers absent)",
 		Result:   "ok",
 	})
-}
-
-func ownerAssertID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

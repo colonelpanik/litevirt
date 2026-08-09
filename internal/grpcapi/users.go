@@ -18,6 +18,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Login validates credentials via the configured realm and mints a
@@ -393,7 +394,7 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 		return nil, status.Errorf(codes.Internal, "hash token: %v", err)
 	}
 
-	id := generateID()
+	id := randid.New()
 	var expiresAt string
 	if req.Expires != "" {
 		expiresAt = req.Expires
@@ -431,10 +432,4 @@ func (s *Server) RevokeToken(ctx context.Context, req *pb.RevokeTokenRequest) (*
 	slog.Info("token revoked", "id", req.Id)
 	s.audit(ctx, "token.revoke", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil
-}
-
-func generateID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

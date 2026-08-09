@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -1113,9 +1114,22 @@ func (r *LxcRunner) Limits(_ context.Context, name string) (int, int, error) {
 	return parseResourceConfig(string(raw))
 }
 
-// parseResourceConfig inverts ResourceConfig: cpu from the cgroup-v2
-// "lxc.cgroup2.cpu.max = <quota> <period>" line (quota/1000 = the CPULimit that
-// was configured), memory from "lxc.cgroup2.memory.max = <MiB>M".
+// parseResourceConfig inverts ResourceConfig — but the config file is
+// root-editable and cgroup2 accepts forms litevirt never writes, so the parse
+// accepts the full cgroup2/lxc vocabulary rather than only its own emission:
+//
+//   - cpu.max: "<quota> <period>" (period defaults to 100000 when absent, the
+//     cgroup2 default; litevirt writes cpuLimit*1000 with period 100000, so the
+//     limit is quota scaled by the ACTUAL period — a hand-written period keeps
+//     the same ratio instead of silently mis-scaling), or "max" = unlimited;
+//   - memory.max: litevirt's "<MiB>M", any K/M/G/T-suffixed size, "max" =
+//     unlimited, or a BARE INTEGER — which is BYTES, the cgroup2 native unit.
+//     The old parse read bare bytes as MiB, turning a hand-written 256 MiB cap
+//     into a 268435456 MiB charge (conservative, but absurd), and failed the
+//     whole parse on "max" instead of reading it as unlimited.
+//
+// Byte figures round UP to MiB: a cap is a cap, and a charge may not
+// undercount it. Genuinely unparseable values still error loudly.
 func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 	for _, line := range strings.Split(cfg, "\n") {
 		key, val, ok := strings.Cut(line, "=")
@@ -1125,19 +1139,115 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
 		switch key {
 		case "lxc.cgroup2.cpu.max":
-			quota, _, _ := strings.Cut(val, " ")
-			n, perr := strconv.Atoi(strings.TrimSpace(quota))
+			quotaStr, periodStr, hasPeriod := strings.Cut(val, " ")
+			quotaStr = strings.TrimSpace(quotaStr)
+			// The period is validated BEFORE the quota is even looked at, so
+			// "max 0" is rejected like "25000 0". The period is part of whether
+			// the line is a valid cpu.max at all; returning early on "max" left
+			// a malformed period reading as "no cap".
+			period := int64(100000) // cgroup2 default when omitted
+			if hasPeriod {
+				p, perr := strconv.ParseInt(strings.TrimSpace(periodStr), 10, 64)
+				if perr != nil {
+					return 0, 0, fmt.Errorf("unparseable cpu.max period %q: %w", val, perr)
+				}
+				if p <= 0 {
+					return 0, 0, fmt.Errorf("non-positive cpu.max period %q", val)
+				}
+				period = p
+			}
+			if quotaStr == "max" {
+				cpuLimit = 0 // cgroup2 unlimited
+				continue
+			}
+			quota, perr := strconv.ParseInt(quotaStr, 10, 64)
 			if perr != nil {
 				return 0, 0, fmt.Errorf("unparseable cpu.max %q: %w", val, perr)
 			}
-			cpuLimit = n / 1000
+			// Zero is rejected with the negatives, not admitted with the
+			// positives: the kernel enforces a minimum bandwidth and never
+			// accepts a zero quota, and dividing it down would land on 0 — the
+			// codebase's UNLIMITED sentinel — turning the most restrictive
+			// conceivable cap into no cap at all.
+			if quota <= 0 {
+				return 0, 0, fmt.Errorf("non-positive cpu.max quota %q", val)
+			}
+			if quota > math.MaxInt64/100 {
+				return 0, 0, fmt.Errorf("cpu.max quota %q too large", val)
+			}
+			// litevirt writes quota = cpuLimit*1000 at period 100000; the
+			// general inversion preserves that ratio for any period. Round UP,
+			// symmetric with the memory round-up: a positive cap must never
+			// truncate to 0, which the codebase reads as UNLIMITED — a genuine
+			// sub-1%-of-a-core cap becomes 1, never 0. litevirt's own emission
+			// (quota = cpuLimit*1000) still round-trips exactly.
+			//
+			// The ceiling is taken by remainder rather than the usual
+			// (n + d - 1) / d: the guard above only bounds quota*100, so adding
+			// the period could still overflow int64 and wrap the numerator
+			// NEGATIVE — which divided back into a plausible answer instead of
+			// an error. At period 100000, a quota one below the guard's ceiling
+			// produced -92233720368546; at larger periods it produced 0, i.e.
+			// unlimited. This form cannot overflow for any admitted pair.
+			num := quota * 100
+			lim := num / period
+			if num%period != 0 {
+				lim++
+			}
+			// Finally bound the result to what an int holds on every platform,
+			// so a 32-bit build cannot truncate a huge limit back down into a
+			// small — or zero — one.
+			if lim > math.MaxInt32 {
+				return 0, 0, fmt.Errorf("cpu.max %q yields an unrepresentable limit", val)
+			}
+			cpuLimit = int(lim)
 		case "lxc.cgroup2.memory.max":
-			n, perr := strconv.Atoi(strings.TrimSuffix(val, "M"))
+			m, perr := parseMemoryMax(val)
 			if perr != nil {
 				return 0, 0, fmt.Errorf("unparseable memory.max %q: %w", val, perr)
 			}
-			memMiB = n
+			memMiB = m
 		}
 	}
 	return cpuLimit, memMiB, nil
+}
+
+// parseMemoryMax reads a cgroup2/lxc memory limit into MiB: "max" = unlimited
+// (0), a K/M/G/T suffix (either case) scales, and a bare integer is BYTES —
+// the cgroup2 native unit. Byte figures round up to a whole MiB, and a negative
+// value or a size that overflows int64 errors loudly rather than yielding a
+// silent negative or zero cap (a zero reads as UNLIMITED).
+func parseMemoryMax(val string) (int, error) {
+	if val == "max" {
+		return 0, nil
+	}
+	mult, digits := int64(1), val // bytes per unit
+	if n := len(val); n > 0 {
+		switch val[n-1] {
+		case 'K', 'k':
+			mult, digits = 1<<10, val[:n-1]
+		case 'M', 'm':
+			mult, digits = 1<<20, val[:n-1]
+		case 'G', 'g':
+			mult, digits = 1<<30, val[:n-1]
+		case 'T', 't':
+			mult, digits = 1<<40, val[:n-1]
+		}
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(digits))
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("negative memory limit %q", val)
+	}
+	bytes := int64(n)
+	if bytes > math.MaxInt64/mult {
+		return 0, fmt.Errorf("memory limit %q too large", val)
+	}
+	bytes *= mult
+	if bytes > math.MaxInt64-((1<<20)-1) {
+		return 0, fmt.Errorf("memory limit %q too large", val)
+	}
+	return int((bytes + (1 << 20) - 1) >> 20), nil
 }

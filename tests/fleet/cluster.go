@@ -641,4 +641,15 @@ func (c *Cluster) wireNetBox(n *Node) {
 	}
 	n.Server.SetNetBoxClient(client)
 	n.Server.SetNetBoxIPAM(true)
+
+	// Host bridges: CreateVM preflights every non-macvtap NIC with ensureBridge,
+	// which runs `ip link add … type bridge` when the interface is missing. The
+	// harness is unprivileged, so a VM on ANY network would fail there for want
+	// of root — a property of the test process, not of the code under test.
+	// Stubbing the seam lets NetBox scenarios reach the addressing logic; the
+	// bridge itself is not what they assert on.
+	//
+	// Scoped to NetBox clusters (like the `cluster` row above) so every existing
+	// scenario keeps the real validation path byte-for-byte.
+	n.Server.SetBridgeEnsure(func(string) error { return nil })
 }

@@ -53,9 +53,25 @@ func latchNetBoxIPAM(t *testing.T, c *Cluster, gates map[string]*health.Checker)
 // through the real CreateNetwork RPC over the harness's mTLS loopback.
 //
 // Type "sriov" is deliberate: it is the one network type Provision returns from
-// without touching the host (no `ip link`, no dnsmasq), so the scenario tests
-// the BINDING, not whether the test process can create bridges as an
-// unprivileged user.
+// without touching the host (no `ip link`, no sysctl, no dnsmasq), so the
+// scenario tests the BINDING, not whether the test process can create bridges
+// as an unprivileged user.
+//
+// "bridge" — the type a NetBox-bound production VLAN really is — was tried and
+// does not work here, for reasons no seam on Server can reach: CreateNetwork
+// provisions for real (networks.go, provisionAndPersistNetwork →
+// network.SafeProvision) and a bridge network with a subnet needs root TWICE,
+// at `ip link add … type bridge` and at `sysctl -w net.ipv4.ip_forward=1`
+// (NATEnabled defaults to TRUE, and CreateNetwork has no way to set it false).
+// Both are inside package network, below the grpcapi seam. It also drags the
+// host's REAL routing table into the test via the SafeProvision snapshot.
+//
+// The type does not weaken what this file proves. What matters for a VM on a
+// bound network is that CreateVM preflights the resolved device through
+// ensureBridge — and it does that for sriov too, with the PF name (vm.go,
+// resolveBridge returns def.PF, which is not "direct:"-prefixed). That is the
+// seam wireNetBox stubs, and TestFleetVMCreateOnBoundNetworkIsBridgeStubbed
+// mutation-fails without it.
 func mustCreateBoundNetwork(t *testing.T, c *Cluster, n *Node, name, subnet string, prefixID int) *pb.NetworkInfo {
 	t.Helper()
 	ni, err := c.SelfClient(n).CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
@@ -112,6 +128,47 @@ func TestFleetNetBoxWiring(t *testing.T) {
 	}
 	if b.ClusterFingerprint == "" {
 		t.Fatal("binding must pin a cluster fingerprint")
+	}
+}
+
+// TestFleetVMCreateOnBoundNetworkIsBridgeStubbed proves the harness can create a
+// VM on a NetBox-bound network at all.
+//
+// It looks trivial and is not. No fleet scenario had ever attached a VM to a
+// network, so nothing had exercised CreateVM's bridge preflight: it resolves the
+// network to a host device and calls ensureBridge, which runs
+// `ip link add … type bridge` when the device is missing. Unprivileged, that is
+// EPERM, and every create on a bound network fails FailedPrecondition before it
+// reaches any addressing logic — a property of the test process, not of the code
+// under test. wireNetBox stubs Server.bridgeEnsure to make the preflight inert.
+//
+// Deliberately asserts NOTHING about the VM's address. VM-side allocation from a
+// bound prefix does not exist yet; today the VM simply gets no address, and an
+// assertion here would either be vacuous or would fail for the right reason at
+// the wrong time. The single claim is: the bridge path no longer blocks.
+func TestFleetVMCreateOnBoundNetworkIsBridgeStubbed(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+
+	vm, err := c.SelfClient(n).CreateVM(context.Background(), &pb.CreateVMRequest{
+		Spec: &pb.VMSpec{
+			Name: "on-bound", Cpu: 1, MemoryMib: 512,
+			Network: []*pb.NetworkAttachment{{Name: "bound"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVM on a bound network: %v", err)
+	}
+	if vm.Name != "on-bound" {
+		t.Fatalf("created VM is named %q, want \"on-bound\"", vm.Name)
 	}
 }
 

@@ -640,6 +640,10 @@ func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 // changes nothing until every node has opted in and the token has latched.
 func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
 
+// SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
+// rootless harness cannot create a real bridge, so it substitutes a no-op.
+func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
 // SetNetBoxClient wires the NetBox REST client the daemon builds from config.
 // nil (the default) means every NetBox-dependent path refuses: binding a
 // network to a prefix, and claiming from a bound one. The kill-switch above and

@@ -157,7 +157,25 @@ func (a *netboxAllocator) recover(ctx context.Context, req ClaimRequest) (netbox
 // If persistence fails the remote claim is compensated HERE, because the caller
 // has not yet added it to its claim set and so cannot compensate it.
 func (a *netboxAllocator) persist(ctx context.Context, req ClaimRequest, ip netbox.IPAddress, src claimSource) (ClaimResult, error) {
-	bare := stripPrefix(ip.Address)
+	// The lease key is the PARSED address in canonical form, never a textual
+	// strip of ip.Address. ip_allocations is keyed on (network, ip), and one
+	// IPv6 address has many spellings — "2001:db8::1" and "2001:0db8::1" are the
+	// same address but different text. Keyed on text, NetBox handing back a
+	// differently-spelled form of an address litevirt already leases would open
+	// a SECOND row for it, and the guarded upsert that exists to stop a live
+	// lease being stolen would never even see the row it has to lose to.
+	//
+	// validateClaim has already parsed this strictly on both routes into persist,
+	// so a failure here cannot happen by construction — but it is handled rather
+	// than assumed, and handled fail-closed: ErrClaimUnknown, so the caller
+	// enqueues the orphan follow-up instead of this deleting an object it could
+	// not even read.
+	addr, perr := parseHostCIDR(ip.Address)
+	if perr != nil {
+		return ClaimResult{}, fmt.Errorf("%w: claimed address %q is unparseable: %v",
+			ErrClaimUnknown, ip.Address, perr)
+	}
+	bare := addr.String()
 	res, err := a.persistGuarded(ctx, req, ip, bare)
 	if err == nil {
 		return res, nil
@@ -358,15 +376,4 @@ func (a *netboxAllocator) Release(ctx context.Context, req ReleaseRequest) error
 		return nil
 	}
 	return a.nb.ReleaseIP(ctx, req.NetBoxIPID)
-}
-
-// stripPrefix turns "10.0.5.100/24" into "10.0.5.100". ip_allocations stores a
-// bare host address.
-func stripPrefix(addr string) string {
-	for i := range addr {
-		if addr[i] == '/' {
-			return addr[:i]
-		}
-	}
-	return addr
 }

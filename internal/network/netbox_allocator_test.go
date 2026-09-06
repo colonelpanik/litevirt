@@ -680,6 +680,49 @@ func TestClaimResurrectsATombstonedLease(t *testing.T) {
 	}
 }
 
+// TestPersistKeysLeaseOnCanonicalAddress pins that the lease key is the PARSED
+// address, not the text NetBox happened to send.
+//
+// ip_allocations is keyed on (network, ip), and IPv6 has many spellings of one
+// address: "2001:0db8::0001" and "2001:db8::1" are the same address and
+// different strings. Keyed on text, those are two rows — so the guarded upsert
+// that exists to stop a live lease being stolen would not see the row it must
+// lose to, and Release, which is given the address litevirt recorded, would
+// tombstone one spelling while the other stayed live.
+//
+// The stub returns the LONG form deliberately: with a textual strip this test
+// reads back "2001:0db8::0001" and fails.
+func TestPersistKeysLeaseOnCanonicalAddress(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+	nb := &stubNetBox{claimed: stubIP{ID: 41, Address: "2001:0db8::0001/64", VRFID: 3}}
+	a := NewNetBoxAllocator(db, nb, noopMetrics{})
+
+	req := boundReq()
+	req.Subnet = "2001:db8::/64"
+	req.PrefixCIDR = "2001:db8::/64"
+
+	got, err := a.Claim(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "2001:db8::1"
+	if got.IP != want {
+		t.Fatalf("ClaimResult.IP = %q, want the canonical %q", got.IP, want)
+	}
+	rows, err := db.Query(ctx,
+		`SELECT ip FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, "net-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one lease row, got %d", len(rows))
+	}
+	if ip := rows[0].String("ip"); ip != want {
+		t.Fatalf("lease row ip = %q, want the canonical %q — two spellings of one address would key two rows", ip, want)
+	}
+}
+
 // ── release ordering ────────────────────────────────────────────────────────
 
 // TestReleaseSkipsNetBoxWhenTheLocalTombstoneFails pins the order: the local

@@ -60,8 +60,10 @@ type NetBoxFake struct {
 	// some of a prefix's objects and not the rest.
 	OnPatch func(id int) error
 
-	// Down makes every request fail at the transport layer.
-	Down bool
+	// down makes every request fail at the transport layer. A test flips it from
+	// its own goroutine while the httptest server reads it from the handler's,
+	// so it is unexported and reached only through SetDown/IsDown under f.mu.
+	down bool
 }
 
 type fakeIP struct {
@@ -99,6 +101,21 @@ func NewNetBoxFake() *NetBoxFake {
 
 func (f *NetBoxFake) URL() string { return f.srv.URL }
 func (f *NetBoxFake) Close()      { f.srv.Close() }
+
+// SetDown makes every subsequent request fail at the transport layer (true), or
+// serve normally again (false).
+func (f *NetBoxFake) SetDown(down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.down = down
+}
+
+// IsDown reports whether the fake is currently refusing requests.
+func (f *NetBoxFake) IsDown() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.down
+}
 
 // AddPrefix registers a prefix in a VRF. enforceUnique controls whether bind
 // validation will accept it; vrfID 0 makes it a global-table prefix.
@@ -159,10 +176,7 @@ func (f *NetBoxFake) Addresses() []string {
 }
 
 func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	down := f.Down
-	f.mu.Unlock()
-	if down {
+	if f.IsDown() {
 		// Closing the connection without a response is a TRANSPORT failure,
 		// which is what an unreachable NetBox actually looks like. A 5xx would
 		// be a SERVER that answered, which classifies differently and would

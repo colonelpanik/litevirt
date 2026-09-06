@@ -249,7 +249,7 @@ func TestBoundCreateRefusedWhileNetBoxDown(t *testing.T) {
 	latchNetBoxIPAM(t, c, gates)
 	mustCreateBoundNetwork(t, c, c.Nodes[0], "bound", "10.0.5.0/24", 7)
 
-	nb.Down = true
+	nb.SetDown(true)
 	if _, err := createVMOnNetwork(c, c.Nodes[0], "vm-a", "bound"); err == nil {
 		t.Fatal("node 0 must refuse while NetBox is down")
 	}

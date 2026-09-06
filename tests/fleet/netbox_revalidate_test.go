@@ -228,9 +228,9 @@ func TestBindingNotSuspendedWhenNetBoxUnreachable(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
 
-	nb.Down = true
+	nb.SetDown(true)
 	mustRevalidate(t, n)
-	nb.Down = false
+	nb.SetDown(false)
 
 	if bindingSuspended(t, n, orphanPrefixID) {
 		t.Fatalf("an unreachable NetBox must not suspend a binding, reason %q",

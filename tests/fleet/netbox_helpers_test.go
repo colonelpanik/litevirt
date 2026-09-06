@@ -260,7 +260,7 @@ func TestNetBoxFakeDownIsATransportFailure(t *testing.T) {
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
 	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
-	nb.Down = true
+	nb.SetDown(true)
 
 	resp, err := http.Get(nb.URL() + "/api/ipam/prefixes/7/")
 	if err == nil {

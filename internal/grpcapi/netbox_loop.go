@@ -66,6 +66,10 @@ func (s *Server) StartNetBoxMaintenance(ctx context.Context, interval time.Durat
 // RunNetBoxMaintenanceOnce runs exactly one maintenance pass. It exists so a
 // test can drive the pass deterministically instead of waiting on a ticker; the
 // daemon runs the same pass on an interval.
+//
+// The leader lease is sized from the DEFAULT interval rather than a
+// caller-supplied one because this path is test-only; the daemon's own loop
+// passes its configured interval through netboxMaintenanceTick.
 func (s *Server) RunNetBoxMaintenanceOnce(ctx context.Context) error {
 	return s.netboxMaintenanceTick(ctx, defaultNetBoxSweepInterval)
 }

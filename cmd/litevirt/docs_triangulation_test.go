@@ -45,11 +45,11 @@ var assignRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 // last entry and shipped with v45 audit signing.
 var knownAbsentIdentifiers = map[string]string{
 	// The orphan sweeper already counts stuck leases through the NetBox metrics
-	// sink (Server.nbMetrics().IncStuckLease) and logs the address at ERROR; the
-	// Prometheus counter itself is registered with the rest of the NetBox
-	// metrics. Documented ahead of that because a stuck lease is never resolved
-	// automatically — an operator who meets one needs the name to alert on.
-	"litevirt_netbox_stuck_leases_total": "NetBox sweeper counter; registered with the rest of the NetBox metrics",
+	// sink (Server.nbMetrics().IncStuckLease) and logs the address at ERROR, but
+	// nothing registers the Prometheus counter yet. Documented ahead of that
+	// because a stuck lease is never resolved automatically — an operator who
+	// meets one needs the name to alert on.
+	"litevirt_netbox_stuck_leases_total": "documented ahead of registration; Task 14 registers it — delete this entry then",
 }
 
 // TestDocsReferenceRealCLICommands fails if README/docs show an `lv` or

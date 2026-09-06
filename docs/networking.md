@@ -304,8 +304,10 @@ Every node configured for NetBox runs a maintenance pass on the
 `netbox.sweep_interval_sec` cadence (900 seconds by default). One pass does two
 things, in this order:
 
-1. **Re-validate every binding** against NetBox, suspending any that has drifted
-   (the section above).
+1. **Re-validate every binding** against NetBox, suspending any that has drifted.
+   Nothing lifts a suspension on its own: `lv netbox resume` clears one whose
+   drift you have repaired in NetBox, and `lv netbox rekey` rewrites the
+   identities a CA replacement invalidated so a resume can then succeed.
 2. **Reclaim orphans** — addresses NetBox still holds under this cluster's
    identity that nothing claims any more.
 

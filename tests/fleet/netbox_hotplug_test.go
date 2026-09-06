@@ -242,7 +242,7 @@ func TestHotplugAttachRefusedWhileNetBoxDown(t *testing.T) {
 	n := c.Nodes[0]
 	mustCreateNICLessVM(t, c, n, "vm-1")
 
-	nb.Down = true
+	nb.SetDown(true)
 	if _, err := attachNIC(c, n, "vm-1", orphanNetwork); err == nil {
 		t.Fatal("attach on a bound network must refuse while NetBox is down")
 	}
@@ -619,7 +619,7 @@ func TestHotplugDetachRemoteReleaseFailureRetryRemovesRow(t *testing.T) {
 		t.Fatalf("want one NetBox identity before the detach, got %v", ids)
 	}
 
-	nb.Down = true
+	nb.SetDown(true)
 	err := detachNIC(c, n, "vm-1", nic.MAC)
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("a failed remote release must surface as Internal, got %v", err)
@@ -634,7 +634,7 @@ func TestHotplugDetachRemoteReleaseFailureRetryRemovesRow(t *testing.T) {
 		t.Fatalf("the remote object must still be held after an unreachable NetBox, got %v", got)
 	}
 
-	nb.Down = false
+	nb.SetDown(false)
 	mustDetachNIC(t, c, n, "vm-1", nic.MAC)
 
 	if nics := liveNICs(t, n, "vm-1"); len(nics) != 0 {

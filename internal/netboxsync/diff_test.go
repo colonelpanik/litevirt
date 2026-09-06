@@ -62,11 +62,15 @@ func TestDiffUpdatesOnDeviceChange(t *testing.T) {
 }
 
 func TestDiffCreatesAndDeletesNICs(t *testing.T) {
+	// The actual VM MATCHES the desired one in every mirrored field, so the whole
+	// action set is attributable to the NICs. With a mismatched actual VM the
+	// count below would still pass while an unnoticed vm/update rode along, and
+	// the test would no longer pin only what its name claims.
 	got := Diff([]DesiredVM{{
 		Name: "vm-1", UUID: "u1", Status: "active",
 		NICs: []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:bb:01"}},
 	}}, Actual{
-		VMs:  map[string]netbox.VirtualMachine{vmIdent("u1"): {ID: 11, Status: "active"}},
+		VMs:  map[string]netbox.VirtualMachine{vmIdent("u1"): {ID: 11, Name: "vm-1", Status: "active"}},
 		NICs: map[string]netbox.VMInterface{nicIdent("u1", "52:54:00:aa:bb:02"): {ID: 21}},
 	}, fp)
 
@@ -85,6 +89,115 @@ func TestDiffCreatesAndDeletesNICs(t *testing.T) {
 	// Hotplug attach and detach cannot converge without both.
 	if creates != 1 || deletes != 1 {
 		t.Fatalf("want one NIC create and one delete, got %+v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("the matching VM must contribute no action of its own, got %+v", got)
+	}
+}
+
+func TestDiffUpdatesNICOnRenameUsingDecodedActual(t *testing.T) {
+	// An interface identity is derived from the MAC, so a NIC rename keeps the
+	// SAME object — exactly the case that must be updated rather than recreated.
+	// NIC names are VM-derived, so a VM rename routinely renames every interface
+	// under it while their identities stay put. Without the nic/update branch
+	// NetBox keeps the old name forever and nothing else ever carries the new one
+	// across.
+	//
+	// Actual state is DECODED from the real interface payload BuildActual
+	// consumes: a hand-built netbox.VMInterface would pass even if ifaceJSON.toIface
+	// stopped populating Name, which is the same field nicDiffers compares.
+	const mac = "52:54:00:aa:bb:01"
+	actual := decodeActualWithIPs(t,
+		`{"results":[{"id":11,"name":"new-name","vcpus":2,"memory":2048,"disk":20,`+
+			`"status":{"value":"active"},"cluster":{"id":5},`+
+			`"custom_fields":{"litevirt_identity":"`+vmIdent("u1")+`"}}],"next":""}`,
+		// Stored under the OLD VM-derived name, same MAC and so the same identity.
+		`{"results":[{"id":21,"name":"old-name-eth0","mac_address":"52:54:00:AA:BB:01",`+
+			`"virtual_machine":{"id":11},`+
+			`"custom_fields":{"litevirt_identity":"`+nicIdent("u1", mac)+`"}}],"next":""}`,
+		`{"results":[],"next":""}`)
+
+	got := Diff([]DesiredVM{{
+		Name: "new-name", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		NICs: []DesiredNIC{{Name: "new-name-eth0", MAC: mac}},
+	}}, actual, fp)
+
+	if len(got) != 1 {
+		t.Fatalf("a NIC rename must emit exactly one action, got %+v", got)
+	}
+	a := got[0]
+	if a.Kind != "nic" || a.Op != "update" {
+		t.Fatalf("want a nic/update, got %+v", a)
+	}
+	if a.Key != nicIdent("u1", mac) {
+		t.Fatalf("nic/update must carry the MAC-derived identity, got %+v", a)
+	}
+	if a.NetBoxID != 21 || a.ParentNetBoxID != 11 {
+		t.Fatalf("nic/update must target iface 21 under VM 11, got %+v", a)
+	}
+	// A rename must not FORK the interface. Keying on the MAC-derived identity is
+	// the whole reason it cannot: a name-keyed diff would miss the existing object,
+	// create a second one, and delete the first as unseen on the same pass.
+	for _, x := range got {
+		if x.Kind == "nic" && (x.Op == "create" || x.Op == "delete") {
+			t.Fatalf("a rename must not create or delete an interface: %+v", x)
+		}
+	}
+}
+
+func TestDiffClearsEveryOwnedAddressWhenNoneDesired(t *testing.T) {
+	// The NIC's address did not come from a bound network (NetBoxIPID 0), but the
+	// interface still holds litevirt-owned addresses from an earlier binding.
+	// EVERY one of them must be released and nothing assigned: skipping the clear
+	// loop when nothing is desired would strand those addresses in NetBox forever,
+	// and the IPAM view would keep showing a VM holding an address it no longer has.
+	const mac = "52:54:00:aa:bb:01"
+	actual := decodeActualWithIPs(t,
+		`{"results":[{"id":11,"name":"vm-1","vcpus":2,"memory":2048,"disk":20,`+
+			`"status":{"value":"active"},"cluster":{"id":5},`+
+			`"custom_fields":{"litevirt_identity":"`+vmIdent("u1")+`"}}],"next":""}`,
+		`{"results":[{"id":21,"name":"eth0","mac_address":"52:54:00:aa:bb:01",`+
+			`"virtual_machine":{"id":11},`+
+			`"custom_fields":{"litevirt_identity":"`+nicIdent("u1", mac)+`"}}],"next":""}`,
+		// Two litevirt-owned addresses on the ONE interface, returned newest first
+		// so the sort below is doing real work.
+		`{"results":[`+
+			`{"id":43,"address":"10.0.5.101/24","assigned_object_id":21,`+
+			`"custom_fields":{"litevirt_identity":"`+nicIdent("u1", mac)+`"}},`+
+			`{"id":41,"address":"10.0.5.100/24","assigned_object_id":21,`+
+			`"custom_fields":{"litevirt_identity":"`+nicIdent("u1", mac)+`"}}`+
+			`],"next":""}`)
+
+	if len(actual.OwnedIPsByIface[21]) != 2 {
+		t.Fatalf("fixture must present two owned addresses, got %+v", actual.OwnedIPsByIface[21])
+	}
+
+	got := Diff([]DesiredVM{{
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		NICs: []DesiredNIC{{Name: "eth0", MAC: mac, NetBoxIPID: 0}},
+	}}, actual, fp)
+
+	var clears []Action
+	for _, a := range got {
+		if a.Op == "assign" {
+			t.Fatalf("nothing is desired, so nothing may be assigned: %+v", a)
+		}
+		if a.Op == "clear" {
+			clears = append(clears, a)
+		}
+	}
+	if len(clears) != 2 || len(got) != 2 {
+		t.Fatalf("want exactly two clears and nothing else, got %+v", got)
+	}
+	// Sorted by address id, so identical state yields an identical list whatever
+	// order the API returned.
+	if clears[0].IPID != 41 || clears[1].IPID != 43 {
+		t.Fatalf("clears must be sorted by address id, got %+v", clears)
+	}
+	for _, a := range clears {
+		if a.Kind != "nic" || a.Key != nicIdent("u1", mac) || a.NetBoxID != 21 || a.ParentNetBoxID != 11 {
+			t.Fatalf("clear must target iface 21 under VM 11 by identity, got %+v", a)
+		}
 	}
 }
 

@@ -1498,6 +1498,19 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			}
 			continue
 		}
+		// A compose file cannot create a NetBox binding. This path calls
+		// provisionAndPersistNetwork directly, so it never runs bind validation
+		// (prefix exists, VRF enforces uniqueness, prefix unclaimed) and never
+		// takes the claim — it would persist a network whose config names a
+		// prefix nothing reserved, which allocatorFor then refuses to allocate
+		// on. Stack networks are also scoped, torn down and recreated with the
+		// stack, and a prefix binding does not follow that lifecycle. Fail
+		// closed and name the command that does bind.
+		if netDef.NetBoxPrefixID != 0 {
+			errs = append(errs, fmt.Sprintf(
+				"network %q: NetBox prefix bindings are created with `lv network create --netbox-prefix-id`, not from a compose file", name))
+			continue
+		}
 		if netDef.Interface == "" {
 			netDef.Interface = name
 		}

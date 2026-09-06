@@ -134,6 +134,16 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			return nil, err
 		}
 
+		// Allocator selection happens HERE, before any provisioning or address
+		// work, because for a container it is also an ADMISSION decision: a
+		// NetBox-bound network is VM-only and must be refused outright rather
+		// than allocated around. Resolving it early makes the refusal cover the
+		// static-IP and subnet-less NICs too, which never reach the claim below.
+		alloc, _, aerr := s.allocatorFor(ctx, "ct", netName)
+		if aerr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", aerr)
+		}
+
 		// Managed NIC. Containers support only L2 bridge-family networks; direct
 		// (macvtap) and SR-IOV are VM-only (they'd render VM-shaped link values
 		// like "direct:<iface>" into lxc.net.N.link).
@@ -186,7 +196,7 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			}
 			ip = n.Ip
 		case def.Subnet != "":
-			cand, aerr := s.allocatorFor(ctx, netName).Claim(ctx, network.ClaimRequest{
+			cand, aerr := alloc.Claim(ctx, network.ClaimRequest{
 				Network:   netName,
 				Subnet:    def.Subnet,
 				MAC:       mac,

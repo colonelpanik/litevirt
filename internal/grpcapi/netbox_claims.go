@@ -6,14 +6,19 @@ import (
 	"log/slog"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // claimedAddr is one address claimed from NetBox during a create, held so it can
 // be compensated if any later step fails.
 type claimedAddr struct {
-	Network  string
-	IP       string
-	MAC      string
+	Network string
+	IP      string
+	MAC     string
+	// VMName is the owner of the LOCAL ip_allocations lease this claim
+	// persisted, and is what releaseAll tombstones it by. Empty means the claim
+	// never got as far as a local lease, so there is nothing local to undo.
+	VMName   string
 	Identity string
 	NetBoxID int
 }
@@ -35,6 +40,24 @@ func (c *claimSet) empty() bool       { return len(c.items) == 0 }
 // dropped — otherwise it is stranded until a human notices.
 func (c *claimSet) releaseAll(ctx context.Context) {
 	for _, a := range c.items {
+		// The LOCAL lease goes first, and a failure to tombstone it stops the
+		// remote delete — the same order and the same reason as
+		// netboxAllocator.Release. Freeing the address in NetBox while litevirt
+		// still holds the lease lets another system take an address litevirt
+		// believes is its own; the reverse order only risks an address the
+		// orphan sweep can reclaim. A claim that never persisted a lease
+		// (VMName empty) has nothing local to undo.
+		if a.VMName != "" {
+			if err := network.ReleaseLease(ctx, c.srv.db, a.Network, a.IP, a.MAC, "vm", "", a.VMName); err != nil {
+				slog.Warn("netbox: local lease tombstone failed during rollback; NetBox delete skipped",
+					"address", a.IP, "vm", a.VMName, "error", err)
+				if eerr := c.srv.enqueueOrphanCheck(ctx, a.Identity); eerr != nil {
+					slog.Error("netbox: could not enqueue orphan check — address may be stranded",
+						"identity", a.Identity, "error", eerr)
+				}
+				continue
+			}
+		}
 		if a.NetBoxID == 0 {
 			continue
 		}

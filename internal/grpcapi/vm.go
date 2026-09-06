@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/placement"
@@ -499,6 +501,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 
+	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
+	// REMOTE side-effect: it cannot join the local atomic write, so every failure
+	// path from here to the end of CreateVM compensates it explicitly.
+	claims := &claimSet{srv: s}
+
+	// The cluster fingerprint is read at most ONCE, and only if some NIC is
+	// actually on a bound network. A VM on unbound networks must not gain a DB
+	// read it does not have today.
+	clusterFP := ""
+	fingerprint := func() (string, error) {
+		if clusterFP == "" {
+			fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+			if err != nil {
+				return "", err
+			}
+			clusterFP = fp
+		}
+		return clusterFP, nil
+	}
+
 	for i, n := range spec.Network {
 		bridge := n.Name // default: use network name as bridge
 		mac := n.Mac
@@ -519,6 +541,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// create if nft can't apply it: host isolation must not be fail-open
 			// (nor NAT silently absent) on a VM we report as created.
 			if ferr := s.reconcileFirewallRequired(ctx); ferr != nil {
+				claims.releaseAll(ctx)
 				return nil, status.Errorf(codes.Internal,
 					"apply firewall after provisioning network %q: %v", n.Name, ferr)
 			}
@@ -540,6 +563,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// Bridge preflight: ensure the bridge exists on this host.
 			// For plain bridges, auto-create if missing.
 			if err := s.ensureBridge(bridge); err != nil {
+				claims.releaseAll(ctx)
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
@@ -551,12 +575,84 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			})
 		}
 
+		// Claim the address BEFORE the NIC records are built, and after the NIC's
+		// host wiring is known to be viable — a claim taken and then abandoned by
+		// a bridge preflight failure is a remote round trip for nothing.
+		//
+		// Populating ifaceRecords[i].IP is enough for everything downstream: the
+		// static-config loop below already falls back to it, so cloud-init
+		// network-config, the vm_nics row and the lease all pick the address up
+		// with no further changes.
+		nicIP := n.Ip
+		alloc, binding, aerr := s.allocatorFor(ctx, "vm", n.Name)
+		if aerr != nil {
+			claims.releaseAll(ctx)
+			cleanupDisks()
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", aerr)
+		}
+		if alloc != nil {
+			// allocatorFor pairs a VM allocator with the binding it claims from,
+			// and only ever hands a VM the NetBox one. An allocator with no
+			// binding would mean claiming from a prefix nothing reserved, so it
+			// fails closed here rather than being assumed impossible.
+			if binding == nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.Internal,
+					"network %q: an address allocator was selected for a VM with no NetBox binding", n.Name)
+			}
+			fp, ferr := fingerprint()
+			if ferr != nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.Internal, "cluster fingerprint: %v", ferr)
+			}
+			identity := netbox.Identity(fp, spec.Uuid, mac)
+			subnet := ""
+			if def := lookupNetworkDef(ctx, s.db, n.Name); def != nil {
+				subnet = def.Subnet
+			}
+			res, cerr := alloc.Claim(ctx, network.ClaimRequest{
+				Network:    n.Name,
+				Subnet:     subnet,
+				MAC:        mac,
+				OwnerKind:  "vm",
+				OwnerHost:  "", // VM names are cluster-global
+				Name:       spec.Name,
+				Identity:   identity,
+				ExplicitIP: n.Ip,
+				PrefixID:   binding.PrefixID,
+				PrefixCIDR: binding.ObservedCIDR,
+				VRFID:      binding.VRFID,
+			})
+			if cerr != nil {
+				// ErrClaimUnknown means we never learned whether NetBox committed.
+				// There may be an object out there carrying this identity and
+				// nothing referencing it, so name it for the sweep — releasing
+				// blind would risk freeing an address another incarnation holds.
+				if errors.Is(cerr, network.ErrClaimUnknown) {
+					if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
+						slog.Error("netbox: could not enqueue orphan check for an unknown claim",
+							"identity", identity, "error", eerr)
+					}
+				}
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.FailedPrecondition, "claim address from NetBox: %v", cerr)
+			}
+			nicIP = res.IP
+			claims.add(claimedAddr{
+				Network: n.Name, IP: res.IP, MAC: mac, VMName: spec.Name,
+				Identity: identity, NetBoxID: res.NetBoxIPID,
+			})
+		}
+
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName:         spec.Name,
 			NetworkName:    n.Name,
 			Ordinal:        i,
 			MAC:            mac,
-			IP:             n.Ip,
+			IP:             nicIP,
 			SecurityGroups: n.SecurityGroups,
 		})
 
@@ -572,7 +668,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			Model:          n.Model,
 			MAC:            mac,
 			Ordinal:        i,
-			IP:             n.Ip,
+			IP:             nicIP,
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
@@ -661,6 +757,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			NetworkConfig: netCfg,
 		}, isoPath)
 		if err != nil {
+			claims.releaseAll(ctx)
 			cleanupDisks()
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 		}
@@ -691,6 +788,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, err
 	}
@@ -700,6 +798,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if len(spec.Devices) > 0 {
 		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
+			claims.releaseAll(ctx)
 			cleanupDisks()
 			return nil, devErr
 		}
@@ -721,6 +820,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
@@ -740,6 +840,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
@@ -747,6 +848,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
 		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
@@ -831,6 +933,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"name", spec.Name, "error", derr)
 		}
 		_ = s.virt.UndefineDomain(spec.Name, false)
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr

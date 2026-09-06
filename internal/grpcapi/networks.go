@@ -331,7 +331,24 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
-	return corrosion.DeleteNetwork(ctx, s.db, name)
+	if err := corrosion.DeleteNetwork(ctx, s.db, name); err != nil {
+		return err
+	}
+
+	// Release the NetBox prefix, exactly as DeleteNetwork does. A binding that
+	// outlives its network names something no operator command can see, and it
+	// refuses every future bind of that prefix forever — recoverable only by
+	// hand. Fail closed: report the leak rather than returning success.
+	b, err := corrosion.GetBindingByNetwork(ctx, s.db, name)
+	if err != nil {
+		return fmt.Errorf("network %q deleted, but reading its NetBox binding failed: %w", name, err)
+	}
+	if b != nil {
+		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
+			return fmt.Errorf("network %q deleted, but releasing NetBox prefix %d failed: %w", name, b.PrefixID, err)
+		}
+	}
+	return nil
 }
 
 // networkRecordToInfo converts a corrosion.NetworkRecord to a pb.NetworkInfo.

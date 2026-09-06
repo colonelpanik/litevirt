@@ -14,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // fakeNetBoxDeletes is a minimal NetBox stand-in that serves only the
@@ -126,5 +127,79 @@ func TestClaimSetEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].Key != "id-1" {
 		t.Fatalf("want an orphan check enqueued, got %v", items)
+	}
+}
+
+// TestClaimSetTombstonesTheLocalLeaseBeforeReleasingNetBox pins that rollback
+// undoes BOTH halves of a claim.
+//
+// A successful claim persists a local ip_allocations lease as well as the NetBox
+// object. Compensating only the remote half leaves a live lease for a VM that
+// was never created: the orphan sweeper deliberately skips any address a live
+// local lease references, so nothing would ever reclaim it, and a later create
+// handed that same address by NetBox would fail its read-back against the stale
+// row.
+func TestClaimSetTombstonesTheLocalLeaseBeforeReleasingNetBox(t *testing.T) {
+	s, nb := newTestServerWithFakeNetBox(t)
+	ctx := context.Background()
+
+	// The state a successful claim leaves behind: a live lease owned by the VM.
+	const mac = "52:54:00:aa:bb:cc"
+	ip, err := network.AllocateIPFor(ctx, s.db, "n", "10.0.5.0/24", mac, "vm", "", "vm-1")
+	if err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	cs := &claimSet{srv: s}
+	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, VMName: "vm-1", NetBoxID: 41, Identity: "id-1"})
+
+	cs.releaseAll(ctx)
+
+	rows, err := s.db.Query(ctx,
+		`SELECT ip FROM ip_allocations WHERE network = 'n' AND ip = ? AND deleted_at IS NULL`, ip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rollback must tombstone the local lease for %s, it is still live", ip)
+	}
+	if got := nb.Released(); len(got) != 1 || got[0] != 41 {
+		t.Fatalf("rollback must also release the NetBox object, got %v", got)
+	}
+}
+
+// TestClaimSetSkipsTheNetBoxDeleteWhenTheLocalTombstoneFails pins the ORDER,
+// which is the safety half of the previous test.
+//
+// Freeing the address in NetBox while litevirt still holds the lease lets
+// another system take an address litevirt believes is its own — the one
+// direction that cannot be repaired by a sweep. So a local tombstone that does
+// not happen must stop the remote delete, and hand the address to the sweeper.
+func TestClaimSetSkipsTheNetBoxDeleteWhenTheLocalTombstoneFails(t *testing.T) {
+	s, nb := newTestServerWithFakeNetBox(t)
+	ctx := context.Background()
+
+	// The lease is held by a DIFFERENT owner, so the owner-scoped release
+	// refuses it — the same refusal a stale or mismatched rollback would hit.
+	const mac = "52:54:00:aa:bb:cc"
+	ip, err := network.AllocateIPFor(ctx, s.db, "n", "10.0.5.0/24", mac, "vm", "", "someone-else")
+	if err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	cs := &claimSet{srv: s}
+	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, VMName: "vm-1", NetBoxID: 41, Identity: "id-1"})
+
+	cs.releaseAll(ctx)
+
+	if got := nb.Released(); len(got) != 0 {
+		t.Fatalf("the NetBox object must NOT be released while the lease is still held, got %v", got)
+	}
+	items, err := corrosion.DrainSyncQueue(ctx, s.db, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Key != "id-1" {
+		t.Fatalf("want an orphan check enqueued for the address left behind, got %v", items)
 	}
 }

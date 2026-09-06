@@ -1433,9 +1433,62 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 // owner-epoch markers live (the same root the container checker converges).
 func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }
 
-// allocatorFor picks the allocator for one network. Containers ALWAYS get the
-// builtin allocator: a container on a bound network is refused before this point
-// (see refuseContainerOnBoundNetwork), so there is no container/NetBox path.
-func (s *Server) allocatorFor(ctx context.Context, netName string) network.Allocator {
-	return network.NewBuiltinAllocator(s.db)
+// noopAPIErrorCounter satisfies the allocator's metrics sink until the real
+// counters exist. Classification is used for metrics ONLY — never to decide
+// whether a remote write happened — so discarding it changes no outcome.
+type noopAPIErrorCounter struct{}
+
+func (noopAPIErrorCounter) IncAPIError(netbox.ErrClass) {} // TODO(task 14): real metrics
+
+// allocatorFor picks the allocator for one workload on one network, and hands
+// back the binding the claim request needs.
+//
+// Selection is by workload kind AND binding together, never by binding alone:
+//
+//	VM        + unbound  -> nil, nil, nil  (NO allocation — today's behaviour)
+//	VM        + bound    -> netbox
+//	Container + unbound  -> builtin
+//	Container + bound    -> refused
+//
+// A nil allocator with a nil error is not "nothing to do here" by omission: VMs
+// have never allocated (network.AllocateIP had no non-test callers), so handing
+// an unbound VM NIC the builtin allocator would newly address every VM on every
+// existing network and push static cloud-init config to guests that DHCP today.
+func (s *Server) allocatorFor(ctx context.Context, ownerKind, netName string) (network.Allocator, *corrosion.BindingRecord, error) {
+	b, err := corrosion.GetBindingByNetwork(ctx, s.db, netName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read binding for network %q: %w", netName, err)
+	}
+	if b == nil {
+		// A network whose CONFIG names a prefix while no binding row exists is a
+		// disagreement, not an unbound network: nothing validated that prefix
+		// against NetBox and nothing holds a claim on it. Allocating from the
+		// builtin allocator across an address space someone believes is
+		// externally managed is exactly the silent double-allocation this design
+		// exists to prevent, so it is loud. (Reachable through a compose file
+		// written before the refusal in provisionComposeNetworks, or a binding
+		// released while its network survived.)
+		if def := lookupNetworkDef(ctx, s.db, netName); def != nil && def.NetBoxPrefixID != 0 {
+			return nil, nil, fmt.Errorf(
+				"network %q config names NetBox prefix %d but no binding exists; rebind with `lv network create --netbox-prefix-id`",
+				netName, def.NetBoxPrefixID)
+		}
+		if ownerKind == "vm" {
+			return nil, nil, nil // VMs do not allocate on unbound networks
+		}
+		return network.NewBuiltinAllocator(s.db), nil, nil
+	}
+	if ownerKind != "vm" {
+		return nil, nil, fmt.Errorf(
+			"network %q is bound to NetBox prefix %d; containers are not supported on bound networks",
+			netName, b.PrefixID)
+	}
+	if b.Suspended {
+		return nil, nil, fmt.Errorf("network %q binding is suspended: %s", netName, b.SuspendReason)
+	}
+	if s.netbox == nil {
+		return nil, nil, fmt.Errorf(
+			"network %q is bound to a NetBox prefix but this node has no netbox configuration", netName)
+	}
+	return network.NewNetBoxAllocator(s.db, s.netbox, noopAPIErrorCounter{}), b, nil
 }

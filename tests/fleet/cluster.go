@@ -80,6 +80,11 @@ type Cluster struct {
 	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
 	// read options the harness applies after the nodes exist.
 	opts Options
+	// reach is the cluster-wide "this peer is up again" overlay every node's
+	// gate unions into HealthyPeers. Nothing populates the real health
+	// checker's peer table in-process (no probe loop runs), so without this a
+	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
+	reach *reachSet
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -100,6 +105,10 @@ type Node struct {
 	// peerConn caches a self-loopback client for scenario assertions
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
+
+	// cluster is the fleet this node belongs to, so a node-scoped helper can
+	// reach cluster-wide state (the self client, the reachability overlay).
+	cluster *Cluster
 
 	// repl is the node's Replicator (wired into the server for PushMutations;
 	// background loop not started — see buildServer).
@@ -132,7 +141,7 @@ func New(t *testing.T, opts Options) *Cluster {
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
-	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts}
+	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
 	c.mintCA()
 
 	// Step 1 — mint pki for every node and pre-allocate ports so the
@@ -146,6 +155,7 @@ func New(t *testing.T, opts Options) *Cluster {
 			Address:     "127.0.0.1",
 			PKIDir:      filepath.Join(c.tmpRoot, name, "pki"),
 			blockedFrom: make(map[string]bool),
+			cluster:     c,
 		}
 		c.mintHostCert(n)
 		// Reserve an ephemeral port — close the listener immediately

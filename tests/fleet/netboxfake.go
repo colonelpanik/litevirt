@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // NetBoxFake is an in-process NetBox serving the real REST shapes.
@@ -41,6 +42,18 @@ type NetBoxFake struct {
 	// first — a POST that commits and then loses its response, for instance.
 	OnClaim func(prefixID int) error
 
+	// OnBeforeDelete runs on the IDENTITY LOOKUP a caller makes immediately
+	// before deleting an address — the sweeper's time-of-check-to-time-of-use
+	// re-read, and the only interception point a REST fake has for "somebody
+	// changed this object between the proof and the delete".
+	//
+	// It deliberately does NOT hang off the DELETE: a NetBox delete is by id and
+	// succeeds whatever the object now contains, so a hook there could only
+	// observe the damage, never model the race that has to prevent it. Firing on
+	// the re-read is what lets a scenario mutate the object at the one instant
+	// the sweeper is required to notice. It is passed the id being looked at.
+	OnBeforeDelete func(id int)
+
 	// Down makes every request fail at the transport layer.
 	Down bool
 }
@@ -53,6 +66,11 @@ type fakeIP struct {
 	// AssignedObjectID mirrors NetBox: assignment lives on the ADDRESS, not on
 	// the interface.
 	AssignedObjectID int
+	// Created is NetBox's own creation timestamp, served in the `created` field.
+	// The orphan sweeper's grace window is the only reader, so a fake that never
+	// emitted one would make every address look ageless and let a grace-window
+	// bug pass unnoticed.
+	Created time.Time
 }
 
 type fakePrefix struct {
@@ -307,6 +325,15 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 		parent = n
 	}
 
+	// A lookup BY IDENTITY is the pre-delete re-read (the sweeper's enumeration
+	// uses the negated filter instead), so it is where OnBeforeDelete fires —
+	// BEFORE matching, so a hook that changes the object changes what this very
+	// response reports. See the field's comment for why the DELETE handler
+	// cannot host this.
+	if f.OnBeforeDelete != nil && q.Get("cf_litevirt_identity") != "" {
+		f.fireBeforeDelete(q.Get("cf_litevirt_identity"))
+	}
+
 	f.mu.Lock()
 	ids := make([]int, 0, len(f.byID))
 	for id := range f.byID {
@@ -475,12 +502,54 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 
 // commit records one address and returns it.
 func (f *NetBoxFake) commit(address string, vrfID int, identity string) fakeIP {
+	return f.commitAt(address, vrfID, identity, time.Now().UTC())
+}
+
+// commitAt records one address with an explicit creation time.
+func (f *NetBoxFake) commitAt(address string, vrfID int, identity string, created time.Time) fakeIP {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := f.nextID()
-	ip := &fakeIP{ID: id, Address: address, Identity: identity, VRFID: vrfID}
+	ip := &fakeIP{ID: id, Address: address, Identity: identity, VRFID: vrfID, Created: created}
 	f.byID[id] = ip
 	return *ip
+}
+
+// SeedIP plants an address NO litevirt operation created — the shape a leaked
+// object has: a real identity, a real address, and no local row anywhere
+// pointing at it. `created` is explicit because age is the sweeper's grace
+// input, and a seeded orphan usually has to be older than the window.
+func (f *NetBoxFake) SeedIP(address string, vrfID int, identity string, created time.Time) int {
+	return f.commitAt(address, vrfID, identity, created).ID
+}
+
+// fireBeforeDelete invokes the hook once per object currently carrying the
+// looked-up identity. The lock is released around the call so the hook can
+// mutate the fake (Reassign takes the same mutex).
+func (f *NetBoxFake) fireBeforeDelete(identity string) {
+	f.mu.Lock()
+	var ids []int
+	for id, ip := range f.byID {
+		if ip.Identity == identity {
+			ids = append(ids, id)
+		}
+	}
+	hook := f.OnBeforeDelete
+	f.mu.Unlock()
+	sort.Ints(ids)
+	for _, id := range ids {
+		hook(id)
+	}
+}
+
+// Reassign rewrites one object's identity in place, as an operator (or another
+// cluster) editing the custom field in NetBox would.
+func (f *NetBoxFake) Reassign(id int, identity string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ip, ok := f.byID[id]; ok {
+		ip.Identity = identity
+	}
 }
 
 // nextID hands out object ids from a band that cannot collide with the address
@@ -541,6 +610,7 @@ type ipView struct {
 	VRF              *vrfRef           `json:"vrf"`
 	AssignedObjectID *int              `json:"assigned_object_id"`
 	CustomFields     map[string]string `json:"custom_fields"`
+	Created          string            `json:"created"`
 }
 
 type vrfRef struct {
@@ -555,6 +625,9 @@ func ipJSON(ip fakeIP) ipView {
 		// every defined custom field on every object, and a fake that omitted
 		// it would hide a decoder that only works when the key exists.
 		CustomFields: map[string]string{"litevirt_identity": ip.Identity},
+	}
+	if !ip.Created.IsZero() {
+		out.Created = ip.Created.UTC().Format(time.RFC3339)
 	}
 	if ip.VRFID != 0 {
 		out.VRF = &vrfRef{ID: ip.VRFID}

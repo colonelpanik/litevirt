@@ -55,7 +55,10 @@ func gateFor(t *testing.T, c *Cluster, n *Node) *health.Checker {
 	ch := health.NewChecker(n.Name, n.PKIDir, n.DB)
 	ch.SetPeerPinger(n.Server.PeerCapabilities)
 	ch.SetActivationMarker(markerBase(c, n))
-	n.Server.SetGate(ch)
+	// The server sees the checker THROUGH the fleet's reachability overlay, so a
+	// scenario can model a host rejoining (see Node.Rejoin). The overlay is empty
+	// unless a scenario adds to it, so every decision here is the checker's own.
+	n.Server.SetGate(&fleetGate{Checker: ch, reach: c.reach})
 	return ch
 }
 

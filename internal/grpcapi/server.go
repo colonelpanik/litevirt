@@ -62,6 +62,19 @@ type Server struct {
 	// orphan sweep) rather than dereferencing a nil pointer.
 	netbox *netbox.Client
 
+	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
+	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
+	// claim or a sweep behaves differently.
+	nbMetricsSink netboxMetrics
+
+	// onProofCollected and onProofsGathered are ORPHAN-SWEEPER TEST SEAMS,
+	// documented at their setters. Both are nil in production and are the only
+	// way a test can reach the two windows the sweeper's safety rests on: a
+	// membership change landing between the two host samples, and a host that
+	// answers nothing at all without failing.
+	onProofCollected func()
+	onProofsGathered func(map[string]OrphanProof)
+
 	version   string // build version, reported via Ping and ListHosts
 	dnsDomain string // DNS domain for VM record names (e.g. "litevirt.local")
 
@@ -1433,12 +1446,44 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 // owner-epoch markers live (the same root the container checker converges).
 func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }
 
-// noopAPIErrorCounter satisfies the allocator's metrics sink until the real
-// counters exist. Classification is used for metrics ONLY — never to decide
-// whether a remote write happened — so discarding it changes no outcome.
-type noopAPIErrorCounter struct{}
+// netboxMetrics is every counter the NetBox IPAM paths emit. It is one
+// interface rather than several because the sink is one object; a caller that
+// only needs IncAPIError still passes the whole thing (the allocator's own
+// narrower interface is satisfied structurally).
+//
+// IncSweepSkipped takes a BOUNDED reason label, never a raw error string: the
+// error text carries addresses and host names, and a Prometheus label with
+// unbounded cardinality is a cluster-wide memory bug, not a diagnostic. The
+// full error is logged instead.
+type netboxMetrics interface {
+	IncAPIError(netbox.ErrClass)
+	IncSweepSkipped(reason string)
+	IncOrphansReclaimed()
+	IncStuckLease()
+}
 
-func (noopAPIErrorCounter) IncAPIError(netbox.ErrClass) {} // TODO(task 14): real metrics
+// noopNetBoxMetrics satisfies the sink until the real counters exist.
+// Classification is used for metrics ONLY — never to decide whether a remote
+// write happened — so discarding it changes no outcome.
+type noopNetBoxMetrics struct{} // TODO(task 14): real metrics
+
+func (noopNetBoxMetrics) IncAPIError(netbox.ErrClass) {}
+func (noopNetBoxMetrics) IncSweepSkipped(string)      {}
+func (noopNetBoxMetrics) IncOrphansReclaimed()        {}
+func (noopNetBoxMetrics) IncStuckLease()              {}
+
+// SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
+func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }
+
+// nbMetrics is the nil-safe accessor. Every emit site goes through it so an
+// unwired sink can never panic a sweep midway through — the point at which a
+// panic would leave a half-finished reclamation.
+func (s *Server) nbMetrics() netboxMetrics {
+	if s.nbMetricsSink == nil {
+		return noopNetBoxMetrics{}
+	}
+	return s.nbMetricsSink
+}
 
 // allocatorFor picks the allocator for one workload on one network, and hands
 // back the binding the claim request needs.
@@ -1490,5 +1535,5 @@ func (s *Server) allocatorFor(ctx context.Context, ownerKind, netName string) (n
 		return nil, nil, fmt.Errorf(
 			"network %q is bound to a NetBox prefix but this node has no netbox configuration", netName)
 	}
-	return network.NewNetBoxAllocator(s.db, s.netbox, noopAPIErrorCounter{}), b, nil
+	return network.NewNetBoxAllocator(s.db, s.netbox, s.nbMetrics()), b, nil
 }

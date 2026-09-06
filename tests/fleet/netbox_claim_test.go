@@ -17,6 +17,7 @@ package fleet
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 
@@ -284,7 +285,11 @@ func TestBoundCreateOnTwoNodesGetsDistinctAddresses(t *testing.T) {
 		t.Fatalf("two VMs on one prefix share address %q", a)
 	}
 	for name, ip := range map[string]string{"vm-a": a, "vm-b": b} {
-		if !strings.HasPrefix(ip, "10.0.5.1") {
+		// Parse, do not prefix-match: "10.0.5.1" also admits .1 and .10-.19,
+		// which the builtin allocator hands out, so the assertion would still
+		// pass with NetBox out of the picture entirely.
+		v4 := net.ParseIP(ip).To4()
+		if v4 == nil || v4[3] < 100 {
 			t.Fatalf("%s got %q, which is not from the NetBox band (.100+)", name, ip)
 		}
 	}

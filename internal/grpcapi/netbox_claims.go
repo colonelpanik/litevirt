@@ -15,12 +15,20 @@ type claimedAddr struct {
 	Network string
 	IP      string
 	MAC     string
-	// VMName is the owner of the LOCAL ip_allocations lease this claim
-	// persisted, and is what releaseAll tombstones it by. Empty means the claim
-	// never got as far as a local lease, so there is nothing local to undo.
-	VMName   string
-	Identity string
-	NetBoxID int
+	// OwnerKind, OwnerHost and Name are the owner triple of the LOCAL
+	// ip_allocations lease this claim persisted, and are what releaseAll
+	// tombstones it by. ReleaseLease is owner-scoped and refuses a row it does
+	// not match, so the triple has to travel with the claim rather than be
+	// assumed by the rollback — a claimant with a different owner would
+	// otherwise fail its tombstone silently and strand the address.
+	//
+	// An empty Name means the claim never got as far as a local lease, so there
+	// is nothing local to undo.
+	OwnerKind string
+	OwnerHost string
+	Name      string
+	Identity  string
+	NetBoxID  int
 }
 
 // claimSet accumulates the claims one create has taken.
@@ -46,11 +54,11 @@ func (c *claimSet) releaseAll(ctx context.Context) {
 		// still holds the lease lets another system take an address litevirt
 		// believes is its own; the reverse order only risks an address the
 		// orphan sweep can reclaim. A claim that never persisted a lease
-		// (VMName empty) has nothing local to undo.
-		if a.VMName != "" {
-			if err := network.ReleaseLease(ctx, c.srv.db, a.Network, a.IP, a.MAC, "vm", "", a.VMName); err != nil {
+		// (Name empty) has nothing local to undo.
+		if a.Name != "" {
+			if err := network.ReleaseLease(ctx, c.srv.db, a.Network, a.IP, a.MAC, a.OwnerKind, a.OwnerHost, a.Name); err != nil {
 				slog.Warn("netbox: local lease tombstone failed during rollback; NetBox delete skipped",
-					"address", a.IP, "vm", a.VMName, "error", err)
+					"address", a.IP, "owner", a.Name, "error", err)
 				if eerr := c.srv.enqueueOrphanCheck(ctx, a.Identity); eerr != nil {
 					slog.Error("netbox: could not enqueue orphan check — address may be stranded",
 						"identity", a.Identity, "error", eerr)

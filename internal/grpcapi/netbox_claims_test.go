@@ -101,8 +101,8 @@ func newTestServerWithFakeNetBox(t *testing.T) (*Server, *fakeNetBoxDeletes) {
 func TestClaimSetReleasesEveryClaim(t *testing.T) {
 	s, nb := newTestServerWithFakeNetBox(t)
 	cs := &claimSet{srv: s}
-	cs.add(claimedAddr{Network: "n", IP: "10.0.5.100", NetBoxID: 41, Identity: "id-1"})
-	cs.add(claimedAddr{Network: "n", IP: "10.0.5.101", NetBoxID: 42, Identity: "id-2"})
+	cs.add(claimedAddr{Network: "n", IP: "10.0.5.100", OwnerKind: "vm", OwnerHost: "", NetBoxID: 41, Identity: "id-1"})
+	cs.add(claimedAddr{Network: "n", IP: "10.0.5.101", OwnerKind: "vm", OwnerHost: "", NetBoxID: 42, Identity: "id-2"})
 
 	cs.releaseAll(context.Background())
 
@@ -115,7 +115,7 @@ func TestClaimSetEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 	s, nb := newTestServerWithFakeNetBox(t)
 	nb.FailRelease = true
 	cs := &claimSet{srv: s}
-	cs.add(claimedAddr{Network: "n", IP: "10.0.5.100", NetBoxID: 41, Identity: "id-1"})
+	cs.add(claimedAddr{Network: "n", IP: "10.0.5.100", OwnerKind: "vm", OwnerHost: "", NetBoxID: 41, Identity: "id-1"})
 
 	cs.releaseAll(context.Background())
 
@@ -151,7 +151,7 @@ func TestClaimSetTombstonesTheLocalLeaseBeforeReleasingNetBox(t *testing.T) {
 	}
 
 	cs := &claimSet{srv: s}
-	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, VMName: "vm-1", NetBoxID: 41, Identity: "id-1"})
+	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, OwnerKind: "vm", OwnerHost: "", Name: "vm-1", NetBoxID: 41, Identity: "id-1"})
 
 	cs.releaseAll(ctx)
 
@@ -188,7 +188,7 @@ func TestClaimSetSkipsTheNetBoxDeleteWhenTheLocalTombstoneFails(t *testing.T) {
 	}
 
 	cs := &claimSet{srv: s}
-	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, VMName: "vm-1", NetBoxID: 41, Identity: "id-1"})
+	cs.add(claimedAddr{Network: "n", IP: ip, MAC: mac, OwnerKind: "vm", OwnerHost: "", Name: "vm-1", NetBoxID: 41, Identity: "id-1"})
 
 	cs.releaseAll(ctx)
 
@@ -202,4 +202,90 @@ func TestClaimSetSkipsTheNetBoxDeleteWhenTheLocalTombstoneFails(t *testing.T) {
 	if len(items) != 1 || items[0].Key != "id-1" {
 		t.Fatalf("want an orphan check enqueued for the address left behind, got %v", items)
 	}
+}
+
+// TestReleaseAllUsesTheRecordedOwner pins that rollback tombstones the lease by
+// the owner triple the CLAIM recorded, not by an owner the rollback assumes.
+//
+// ReleaseLease is owner-scoped and refuses a row whose (kind, host, name) it
+// does not match. A rollback that hardcoded one claimant's owner would, for any
+// other claimant, fail its tombstone, skip the NetBox delete by the safety rule
+// above, and strand the address behind a lease nothing will ever reclaim — and
+// it would do so silently, because a failed tombstone is only a warning.
+func TestReleaseAllUsesTheRecordedOwner(t *testing.T) {
+	const (
+		mac    = "52:54:00:dd:ee:ff"
+		subnet = "10.0.5.0/24"
+	)
+
+	t.Run("the recorded owner releases the lease", func(t *testing.T) {
+		s, nb := newTestServerWithFakeNetBox(t)
+		ctx := context.Background()
+
+		// A claimant that is NOT a VM: host-scoped, different kind and name.
+		ip, err := network.AllocateIPFor(ctx, s.db, "n", subnet, mac, "ct", "host-1", "ct-1")
+		if err != nil {
+			t.Fatalf("seed lease: %v", err)
+		}
+
+		cs := &claimSet{srv: s}
+		cs.add(claimedAddr{
+			Network: "n", IP: ip, MAC: mac,
+			OwnerKind: "ct", OwnerHost: "host-1", Name: "ct-1",
+			NetBoxID: 41, Identity: "id-1",
+		})
+
+		cs.releaseAll(ctx)
+
+		rows, err := s.db.Query(ctx,
+			`SELECT ip FROM ip_allocations WHERE network = 'n' AND ip = ? AND deleted_at IS NULL`, ip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 0 {
+			t.Fatalf("rollback must tombstone the lease held by ct/host-1/ct-1 for %s, it is still live", ip)
+		}
+		if got := nb.Released(); len(got) != 1 || got[0] != 41 {
+			t.Fatalf("rollback must release the NetBox object once the lease is gone, got %v", got)
+		}
+	})
+
+	t.Run("a mismatched owner releases nothing", func(t *testing.T) {
+		s, nb := newTestServerWithFakeNetBox(t)
+		ctx := context.Background()
+
+		ip, err := network.AllocateIPFor(ctx, s.db, "n", subnet, mac, "ct", "host-1", "ct-1")
+		if err != nil {
+			t.Fatalf("seed lease: %v", err)
+		}
+
+		// The owner triple the old hardcoded rollback would have used.
+		cs := &claimSet{srv: s}
+		cs.add(claimedAddr{
+			Network: "n", IP: ip, MAC: mac,
+			OwnerKind: "vm", OwnerHost: "", Name: "ct-1",
+			NetBoxID: 41, Identity: "id-1",
+		})
+
+		cs.releaseAll(ctx)
+
+		rows, err := s.db.Query(ctx,
+			`SELECT ip FROM ip_allocations WHERE network = 'n' AND ip = ? AND deleted_at IS NULL`, ip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 {
+			t.Fatalf("a mismatched owner must NOT tombstone someone else's lease for %s", ip)
+		}
+		if got := nb.Released(); len(got) != 0 {
+			t.Fatalf("the NetBox object must NOT be released while the lease is still live, got %v", got)
+		}
+		items, err := corrosion.DrainSyncQueue(ctx, s.db, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].Key != "id-1" {
+			t.Fatalf("want an orphan check enqueued for the address left behind, got %v", items)
+		}
+	})
 }

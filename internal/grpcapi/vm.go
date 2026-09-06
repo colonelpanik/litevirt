@@ -642,7 +642,8 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			nicIP = res.IP
 			claims.add(claimedAddr{
-				Network: n.Name, IP: res.IP, MAC: mac, VMName: spec.Name,
+				Network: n.Name, IP: res.IP, MAC: mac,
+				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
 				Identity: identity, NetBoxID: res.NetBoxIPID,
 			})
 		}

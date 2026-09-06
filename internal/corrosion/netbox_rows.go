@@ -23,14 +23,32 @@ type BindingRecord struct {
 //
 // A read-then-upsert is not enough: two concurrent binds both see nil from
 // GetBindingByPrefix, both upsert, and the second silently steals the prefix
-// from the first. DO NOTHING plus a read-back makes the first writer win.
+// from the first. A conflict clause that cannot touch a LIVE row, plus the
+// read-back, makes the first writer win.
+//
+// The conflict target is the prefix_id PRIMARY KEY, which a TOMBSTONED row
+// still occupies — so a released prefix (DeleteBinding) would conflict forever
+// and read back nil. The guarded DO UPDATE resurrects a tombstone and only a
+// tombstone: `WHERE netbox_bindings.deleted_at IS NOT NULL` leaves a live row
+// untouched, exactly as DO NOTHING did. Same shape as the reclaim guard in
+// internal/network/ipam.go's AllocateIPFor.
 func ClaimBinding(ctx context.Context, c *Client, r BindingRecord) (bool, error) {
 	if err := c.Execute(ctx,
 		`INSERT INTO netbox_bindings
 		   (prefix_id, network, observed_cidr, vrf_id, cluster_fingerprint,
 		    suspended, suspend_reason, validated_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, 0, '', ?, ?, ?)
-		 ON CONFLICT(prefix_id) DO NOTHING`,
+		 ON CONFLICT(prefix_id) DO UPDATE SET
+		   network = excluded.network,
+		   observed_cidr = excluded.observed_cidr,
+		   vrf_id = excluded.vrf_id,
+		   cluster_fingerprint = excluded.cluster_fingerprint,
+		   suspended = 0,
+		   suspend_reason = '',
+		   validated_at = excluded.validated_at,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL
+		 WHERE netbox_bindings.deleted_at IS NOT NULL`,
 		r.PrefixID, r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint,
 		c.NowWall(), c.NowWall(), c.NowTS()); err != nil {
 		return false, fmt.Errorf("claim binding: %w", err)
@@ -85,6 +103,22 @@ func SuspendBinding(ctx context.Context, c *Client, prefixID int, reason string)
 		`UPDATE netbox_bindings SET suspended = 1, suspend_reason = ?, updated_at = ?
 		 WHERE prefix_id = ?`,
 		reason, c.NowTS(), prefixID)
+}
+
+// DeleteBinding RELEASES a prefix: the network behind the binding is gone (or
+// never landed), so nothing may keep holding the NetBox prefix. It tombstones
+// rather than hard-deletes, because a hard DELETE does not replicate as an LWW
+// row — and the tombstone is what ClaimBinding reclaims when the prefix is
+// bound again. Releasing an already-released (or never-created) binding is a
+// no-op, so a compensating caller can retry it.
+func DeleteBinding(ctx context.Context, c *Client, prefixID int) error {
+	if err := c.Execute(ctx,
+		`UPDATE netbox_bindings SET deleted_at = ?, updated_at = ?
+		 WHERE prefix_id = ? AND deleted_at IS NULL`,
+		c.NowWall(), c.NowTS(), prefixID); err != nil {
+		return fmt.Errorf("delete binding for prefix %d: %w", prefixID, err)
+	}
+	return nil
 }
 
 const bindingCols = `prefix_id, network, observed_cidr, vrf_id, cluster_fingerprint,

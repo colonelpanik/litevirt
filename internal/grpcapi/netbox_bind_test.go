@@ -8,10 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/netbox"
 )
 
@@ -90,8 +93,14 @@ func newTestServerWithNetBox(t *testing.T, fb fakeNetBox) *Server {
 
 	s := &Server{
 		hostName: "test-host",
+		dataDir:  t.TempDir(),
 		db:       db,
 		netbox:   client,
+		events:   events.NewBus(),
+		vmLocks:  make(map[string]*sync.Mutex),
+		bridgeEnsure: func(string) error {
+			return nil
+		},
 	}
 	s.SetGate(fakeServerGate{enforced: true})
 	return s
@@ -207,5 +216,119 @@ func TestBindRefusesWhenLatchNotDurable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "durably latched") {
 		t.Fatalf("error must name the durable-latch requirement, got: %v", err)
+	}
+}
+
+// TestBindRefusesSecondPrefixForSameNetwork pins the OTHER direction of the
+// 1:1. The prefix-side check alone leaves netbox_bindings.network free to
+// repeat — nothing in the schema forbids it — and a network holding two
+// prefixes is a state GetBindingByNetwork (one row) cannot even represent, so
+// the allocator would silently pick whichever row SQLite returned first.
+func TestBindRefusesSecondPrefixForSameNetwork(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	ctx := context.Background()
+	if err := s.validateAndBindPrefix(ctx, "net-a", 7); err != nil {
+		t.Fatal(err)
+	}
+	err := s.validateAndBindPrefix(ctx, "net-a", 8)
+	if err == nil {
+		t.Fatal("want refusal: one NetBox prefix per litevirt network")
+	}
+	if !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("error must say the network is already bound, got: %v", err)
+	}
+	// And the refusal must not have created the second row.
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != nil {
+		t.Fatalf("refused bind must not have claimed prefix 8, got %+v", b)
+	}
+}
+
+// failNetworkInserts installs a BEFORE INSERT trigger that aborts every write
+// to `networks`, which is how these tests reach the failure window between the
+// prefix claim and the network row: reads still resolve (so the duplicate check
+// and the bind run normally) and only the persist fails.
+func failNetworkInserts(t *testing.T, s *Server) {
+	t.Helper()
+	if err := s.db.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_network_insert BEFORE INSERT ON networks
+		 BEGIN SELECT RAISE(ABORT, 'induced persist failure'); END`); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+}
+
+// TestCreateNetworkReleasesBindingWhenUpsertFails pins the compensation. The
+// prefix is claimed BEFORE the network row is written, so a failed write used
+// to leave a binding with no network behind it: invisible to every operator
+// command, and blocking that prefix against any later bind — including a bind
+// of the same prefix under a different network name — until someone edited the
+// database by hand.
+func TestCreateNetworkReleasesBindingWhenUpsertFails(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	ctx := adminCtx()
+	failNetworkInserts(t, s)
+
+	_, err := s.CreateNetwork(ctx, &pb.CreateNetworkRequest{
+		Name: "net-a", Type: "sriov", Pf: "ens1f0", NetboxPrefixId: 7,
+	})
+	if err == nil {
+		t.Fatal("CreateNetwork must fail when the network row cannot be persisted")
+	}
+
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != nil {
+		t.Fatalf("a failed create must not leave the prefix bound, got %+v", b)
+	}
+	// The real recovery the operator needs: the prefix is bindable again, under
+	// a different network name.
+	if err := s.validateAndBindPrefix(ctx, "net-b", 7); err != nil {
+		t.Fatalf("released prefix must be bindable again, got: %v", err)
+	}
+}
+
+// TestDeleteNetworkReleasesBinding: a network that no longer exists must not
+// keep holding a NetBox prefix. Nothing else in the system releases one, so
+// without this the prefix stays claimed by a deleted network forever.
+func TestDeleteNetworkReleasesBinding(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	ctx := adminCtx()
+
+	if _, err := s.CreateNetwork(ctx, &pb.CreateNetworkRequest{
+		Name: "net-a", Type: "sriov", Pf: "ens1f0", NetboxPrefixId: 7,
+	}); err != nil {
+		t.Fatalf("CreateNetwork: %v", err)
+	}
+	if b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7); err != nil || b == nil {
+		t.Fatalf("create must have bound the prefix, got %+v err=%v", b, err)
+	}
+
+	if _, err := s.DeleteNetwork(ctx, &pb.DeleteNetworkRequest{Name: "net-a"}); err != nil {
+		t.Fatalf("DeleteNetwork: %v", err)
+	}
+
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != nil {
+		t.Fatalf("deleting the network must release its prefix, got %+v", b)
+	}
+	if err := s.validateAndBindPrefix(ctx, "net-b", 7); err != nil {
+		t.Fatalf("released prefix must be bindable by another network, got: %v", err)
 	}
 }

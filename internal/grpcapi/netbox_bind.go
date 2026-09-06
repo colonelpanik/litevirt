@@ -22,7 +22,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	//    already-bound prefix. DurablyLatched requires the persisted marker, not
 	//    just the in-memory flag.
 	if s.gate == nil || !s.gate.DurablyLatched(capabilities.NetBoxIPAMV1) {
-		return fmt.Errorf("netbox_ipam_v1 is not durably latched cluster-wide — enable netbox on every node first")
+		return fmt.Errorf("%s is not durably latched cluster-wide — enable netbox on every node first", capabilities.NetBoxIPAMV1)
 	}
 
 	// 2. The prefix exists, and we record its CIDR as the drift baseline.
@@ -56,7 +56,20 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		return fmt.Errorf("NetBox prefix %d is already bound to network %q", prefixID, existing.Network)
 	}
 
-	// 5. Pin the fingerprint. Pinned, not recomputed: a CA replacement must
+	// 5. …and one prefix per litevirt network, the other direction of the same
+	//    1:1. netbox_bindings.network carries no UNIQUE constraint, so nothing
+	//    below stops a network that already holds prefix 7 from also claiming
+	//    prefix 8 — and GetBindingByNetwork, which returns a single row, could
+	//    not then say which prefix the network allocates from.
+	bound, err := corrosion.GetBindingByNetwork(ctx, s.db, netName)
+	if err != nil {
+		return fmt.Errorf("check existing binding for network %q: %w", netName, err)
+	}
+	if bound != nil && bound.PrefixID != prefixID {
+		return fmt.Errorf("network %q is already bound to NetBox prefix %d", netName, bound.PrefixID)
+	}
+
+	// 6. Pin the fingerprint. Pinned, not recomputed: a CA replacement must
 	//    SUSPEND the binding rather than silently re-identify every object.
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {

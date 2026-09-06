@@ -306,7 +306,7 @@ lv network create <name> --type bridge [flags]    # Create a network
   --subnet <cidr> [--dhcp]
   --pf <iface> --spoof-check                      # SR-IOV variants
   --project <name>                                # owning project (empty = global/shared)
-  --netbox-prefix-id <id>                          # bind to a NetBox prefix
+  --netbox-prefix-id <id>                         # bind to a NetBox prefix
 lv network rm <name> [--force]
 ```
 

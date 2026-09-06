@@ -152,3 +152,93 @@ func TestUpsertBindingRefusesToCreate(t *testing.T) {
 		t.Fatalf("UpsertBinding must not have created a row, got %+v", got)
 	}
 }
+
+// TestClaimBindingReclaimsTombstone pins the release→rebind cycle. The conflict
+// target is the prefix_id PRIMARY KEY, which a TOMBSTONED row still occupies:
+// a plain DO NOTHING would leave a released prefix permanently unclaimable —
+// the insert would collide with the tombstone, the read-back (which filters
+// deleted_at IS NULL) would see nothing, and the claim would fail with
+// "vanished after insert". Releasing a prefix has to make it bindable again,
+// or DeleteBinding just converts one leak into another.
+func TestClaimBindingReclaimsTombstone(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	if claimed, err := ClaimBinding(ctx, c, BindingRecord{
+		Network: "net-a", PrefixID: 7, ObservedCIDR: "10.0.5.0/24",
+		VRFID: 3, ClusterFingerprint: "abc123",
+	}); err != nil || !claimed {
+		t.Fatalf("first claim: claimed=%v err=%v", claimed, err)
+	}
+	if err := DeleteBinding(ctx, c, 7); err != nil {
+		t.Fatal(err)
+	}
+	got, err := GetBindingByPrefix(ctx, c, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("released prefix must read back as unbound, got %+v", got)
+	}
+
+	claimed, err := ClaimBinding(ctx, c, BindingRecord{
+		Network: "net-b", PrefixID: 7, ObservedCIDR: "10.0.6.0/24",
+		VRFID: 4, ClusterFingerprint: "def456",
+	})
+	if err != nil {
+		t.Fatalf("re-claim of a released prefix: %v", err)
+	}
+	if !claimed {
+		t.Fatal("a released prefix must be claimable again")
+	}
+
+	got, err = GetBindingByPrefix(ctx, c, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("re-claimed binding not found")
+	}
+	// The resurrected row must carry the NEW holder's values throughout, not a
+	// mix of the tombstone's and the claimant's.
+	if got.Network != "net-b" || got.ObservedCIDR != "10.0.6.0/24" || got.VRFID != 4 ||
+		got.ClusterFingerprint != "def456" {
+		t.Fatalf("re-claim must fully rewrite the row, got %+v", got)
+	}
+	if got.Suspended {
+		t.Fatal("a re-claimed binding must not inherit a suspension")
+	}
+	if b, err := GetBindingByNetwork(ctx, c, "net-a"); err != nil || b != nil {
+		t.Fatalf("the released network must hold nothing, got %+v err=%v", b, err)
+	}
+}
+
+// TestDeleteBindingIsIdempotent: a compensating caller retries a release, and a
+// release of a prefix that was never bound must not error either.
+func TestDeleteBindingIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	if err := DeleteBinding(ctx, c, 99); err != nil {
+		t.Fatalf("releasing an unbound prefix must be a no-op, got %v", err)
+	}
+	if _, err := ClaimBinding(ctx, c, BindingRecord{
+		Network: "net-a", PrefixID: 7, ObservedCIDR: "10.0.5.0/24",
+		VRFID: 3, ClusterFingerprint: "abc123",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteBinding(ctx, c, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteBinding(ctx, c, 7); err != nil {
+		t.Fatalf("second release must be a no-op, got %v", err)
+	}
+	all, err := ListBindings(ctx, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("want no live bindings after release, got %d", len(all))
+	}
+}

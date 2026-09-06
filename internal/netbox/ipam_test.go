@@ -2,6 +2,8 @@ package netbox
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"testing"
 )
@@ -206,5 +208,63 @@ func TestIdentityFormat(t *testing.T) {
 	want := "lv:abc123:550e8400-e29b-41d4-a716-446655440000:52:54:00:aa:bb:cc"
 	if got != want {
 		t.Fatalf("Identity = %q, want %q", got, want)
+	}
+}
+
+// TestSetIPIdentity pins the re-key wire shape: a PATCH at the id-scoped
+// ip-address path carrying ONLY the identity custom field.
+//
+// Every part is load-bearing. A PUT would blank every field the body omits
+// (NetBox's PUT is a full replace), so the method is not cosmetic; the id-scoped
+// path is what makes this an update rather than a create; and a body that
+// carried `address` or `vrf` would let a re-key silently move an address a guest
+// is using.
+func TestSetIPIdentity(t *testing.T) {
+	var gotMethod, gotPath, gotBody string
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{"id":41,"address":"10.0.5.100/24","custom_fields":{"litevirt_identity":"lv:new:uuid:aa:bb"}}`))
+	})
+	if err := c.SetIPIdentity(context.Background(), 41, "lv:new:uuid:aa:bb"); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH — a PUT would blank every omitted field", gotMethod)
+	}
+	if gotPath != "/api/ipam/ip-addresses/41/" {
+		t.Errorf("path = %q, want the id-scoped ip-address path", gotPath)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(gotBody), &body); err != nil {
+		t.Fatalf("body %q is not JSON: %v", gotBody, err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("body = %v, want ONLY custom_fields — anything else can move a live address", body)
+	}
+	cf, ok := body["custom_fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("body = %v, want a custom_fields object", body)
+	}
+	if cf[IdentityField] != "lv:new:uuid:aa:bb" {
+		t.Fatalf("custom_fields = %v, want %s set to the new identity", cf, IdentityField)
+	}
+}
+
+// TestSetIPIdentityPropagatesFailure pins that a refused PATCH is an ERROR the
+// caller sees. A re-key that swallowed one failed rewrite would resume the
+// binding with objects still carrying the old fingerprint.
+func TestSetIPIdentityPropagatesFailure(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"no write permission"}`))
+	})
+	err := c.SetIPIdentity(context.Background(), 41, "lv:new:uuid:aa:bb")
+	if err == nil {
+		t.Fatal("a refused PATCH must be an error")
+	}
+	if Classify(err) != ClassClient {
+		t.Fatalf("Classify = %v, want ClassClient", Classify(err))
 	}
 }

@@ -219,6 +219,48 @@ Binding requires:
 While NetBox is unreachable, creating a VM on a bound network fails. Existing
 VMs are unaffected, and unbound networks are unaffected.
 
+### Suspended bindings
+
+Bind-time validation is re-run continuously, because it goes stale: a prefix can
+be re-CIDRed, moved out of its VRF, or have that VRF's `enforce_unique` switched
+off, all in NetBox and none of it announced to litevirt. The prefix ID keeps
+naming the same object, so a binding never silently follows a change — but when
+the prefix no longer satisfies what the bind checked, the binding is
+**suspended**:
+
+- new allocations on that network refuse, with the reason in the message;
+- running VMs are untouched, and keep the addresses they hold.
+
+An unreachable NetBox is *not* drift and never suspends a binding — silence is
+not a change.
+
+Suspension is deliberately sticky: nothing lifts it automatically. Repair the
+prefix in NetBox, then resume the binding with the same command a CA replacement
+needs:
+
+```bash
+lv netbox rekey <network>
+```
+
+If the drift is still present, the next revalidation suspends the binding again.
+
+### Recovering from a CA replacement
+
+The cluster fingerprint in every NetBox identity is derived from the cluster CA
+certificate — that is what stops two litevirt clusters sharing one NetBox from
+reclaiming each other's addresses. Replacing the CA changes it, so bindings
+suspend and new allocations refuse until the existing objects are re-stamped:
+
+```bash
+lv netbox rekey <network>
+```
+
+Running VMs are unaffected by the suspension. The command rewrites the identity
+on every address the binding owns and then resumes the binding — in that order,
+so a run that fails partway leaves the binding suspended rather than live with
+half its objects unrecognisable. Re-running finishes the job; objects already
+rewritten are skipped. Complete a re-key before replacing the CA again.
+
 ## NAT
 
 By default, litevirt enables IP masquerading (NAT) for networks with a subnet defined. This gives VMs outbound internet access through the host.

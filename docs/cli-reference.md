@@ -318,6 +318,19 @@ shows the owner. See `docs/tenancy.md`.
 their address from NetBox. See `docs/networking.md#binding-a-network-to-netbox`
 for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 
+## NetBox IPAM
+
+```bash
+lv netbox rekey <network>                         # re-stamp identities, resume a suspended binding
+```
+
+A bound network's binding is suspended when the NetBox prefix drifts out of what
+the bind validated, or when the cluster CA — and with it the fingerprint stamped
+on every NetBox object litevirt owns — is replaced. New allocations then refuse
+while running VMs continue untouched. `lv netbox rekey` rewrites those
+identities under the current fingerprint and resumes the binding; it is safe to
+re-run. See `docs/networking.md#recovering-from-a-ca-replacement`.
+
 ## Storage pools
 
 ```bash

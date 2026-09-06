@@ -101,6 +101,7 @@ const (
 	LiteVirt_GetNetwork_FullMethodName                 = "/litevirt.v1.LiteVirt/GetNetwork"
 	LiteVirt_DeleteNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteNetwork"
 	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
+	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
 	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
 	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
 	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
@@ -382,6 +383,11 @@ type LiteVirtClient interface {
 	GetNetwork(ctx context.Context, in *GetNetworkRequest, opts ...grpc.CallOption) (*NetworkInfo, error)
 	DeleteNetwork(ctx context.Context, in *DeleteNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListNetworks(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListNetworksResponse, error)
+	// RekeyBinding recovers a NetBox binding suspended by a cluster CA
+	// replacement: it rewrites every owned object's identity under the new
+	// fingerprint and resumes allocation. Idempotent and resumable — a partial
+	// rewrite leaves the binding suspended for the next run to finish.
+	RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLBResponse, error)
 	InspectLoadBalancer(ctx context.Context, in *InspectLBRequest, opts ...grpc.CallOption) (*LoadBalancer, error)
@@ -1610,6 +1616,16 @@ func (c *liteVirtClient) ListNetworks(ctx context.Context, in *emptypb.Empty, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListNetworksResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_RekeyBinding_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3398,6 +3414,11 @@ type LiteVirtServer interface {
 	GetNetwork(context.Context, *GetNetworkRequest) (*NetworkInfo, error)
 	DeleteNetwork(context.Context, *DeleteNetworkRequest) (*emptypb.Empty, error)
 	ListNetworks(context.Context, *emptypb.Empty) (*ListNetworksResponse, error)
+	// RekeyBinding recovers a NetBox binding suspended by a cluster CA
+	// replacement: it rewrites every owned object's identity under the new
+	// fingerprint and resumes allocation. Idempotent and resumable — a partial
+	// rewrite leaves the binding suspended for the next run to finish.
+	RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error)
 	InspectLoadBalancer(context.Context, *InspectLBRequest) (*LoadBalancer, error)
@@ -3926,6 +3947,9 @@ func (UnimplementedLiteVirtServer) DeleteNetwork(context.Context, *DeleteNetwork
 }
 func (UnimplementedLiteVirtServer) ListNetworks(context.Context, *emptypb.Empty) (*ListNetworksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListNetworks not implemented")
+}
+func (UnimplementedLiteVirtServer) RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RekeyBinding not implemented")
 }
 func (UnimplementedLiteVirtServer) ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListLoadBalancers not implemented")
@@ -5699,6 +5723,24 @@ func _LiteVirt_ListNetworks_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListNetworks(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RekeyBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RekeyBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RekeyBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RekeyBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RekeyBinding(ctx, req.(*RekeyBindingRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8633,6 +8675,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListNetworks",
 			Handler:    _LiteVirt_ListNetworks_Handler,
+		},
+		{
+			MethodName: "RekeyBinding",
+			Handler:    _LiteVirt_RekeyBinding_Handler,
 		},
 		{
 			MethodName: "ListLoadBalancers",

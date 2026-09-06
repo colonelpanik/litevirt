@@ -54,6 +54,12 @@ type NetBoxFake struct {
 	// the sweeper is required to notice. It is passed the id being looked at.
 	OnBeforeDelete func(id int)
 
+	// OnPatch runs before an identity rewrite is applied. A non-nil error fails
+	// the request WITHOUT applying the change — a definite refusal (403), not a
+	// lost connection — which is the only way to reach a re-key that rewrote
+	// some of a prefix's objects and not the rest.
+	OnPatch func(id int) error
+
 	// Down makes every request fail at the transport layer.
 	Down bool
 }
@@ -176,6 +182,8 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	// release would fall through to the 404.
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodDelete:
 		f.release(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") && r.Method == http.MethodPatch:
+		f.patchIdentity(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/prefixes/"):
 		f.getPrefix(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/vrfs/"):
@@ -496,6 +504,86 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// patchIdentity is PATCH /api/ipam/ip-addresses/{id}/ — the identity rewrite a
+// CA re-key performs.
+//
+// It refuses a body carrying anything but the custom field. NetBox would accept
+// one, and a re-key that had somehow started sending `address` or `vrf` would
+// silently MOVE an address a guest is using; a fake that tolerated it would let
+// that bug pass in the fleet and only surface against a real server.
+func (f *NetBoxFake) patchIdentity(w http.ResponseWriter, r *http.Request) {
+	id, ok := idFromPath(r.URL.Path, "/api/ipam/ip-addresses/")
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unparseable ip id in %s", r.URL.Path)
+		return
+	}
+	var body map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+		return
+	}
+	raw, hasCF := body["custom_fields"]
+	if len(body) != 1 || !hasCF {
+		writeErr(w, http.StatusBadRequest,
+			`{"detail":["an identity rewrite must send custom_fields and nothing else"]}`)
+		return
+	}
+	var cf map[string]string
+	if err := json.Unmarshal(raw, &cf); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed custom_fields: %v", err)
+		return
+	}
+	identity, present := cf["litevirt_identity"]
+	if !present {
+		writeErr(w, http.StatusBadRequest, `{"custom_fields":["litevirt_identity is required"]}`)
+		return
+	}
+
+	// Before the write, so a refusal leaves the object exactly as it was.
+	if f.OnPatch != nil {
+		if err := f.OnPatch(id); err != nil {
+			writeErr(w, http.StatusForbidden, "%v", err)
+			return
+		}
+	}
+
+	f.mu.Lock()
+	ip, known := f.byID[id]
+	var updated fakeIP
+	if known {
+		ip.Identity = identity
+		updated = *ip
+	}
+	f.mu.Unlock()
+	if !known {
+		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
+		return
+	}
+	writeJSON(w, ipJSON(updated))
+}
+
+// SetVRFEnforceUnique flips a VRF's enforce_unique flag. An operator can do this
+// in NetBox at any time after a bind validated it, and nothing in NetBox tells
+// litevirt it happened — which is why the binding has to re-ask.
+func (f *NetBoxFake) SetVRFEnforceUnique(vrfID int, unique bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vrfs[vrfID] = unique
+}
+
+// MovePrefixToGlobalTable drops a prefix out of its VRF. The addresses already
+// handed out keep their own VRF, exactly as NetBox leaves them.
+func (f *NetBoxFake) MovePrefixToGlobalTable(id int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.prefixes[id]
+	if !ok {
+		return
+	}
+	p.VRFID = 0
+	f.prefixes[id] = p
 }
 
 // ── internals ───────────────────────────────────────────────────────────────

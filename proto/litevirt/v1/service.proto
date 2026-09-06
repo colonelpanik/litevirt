@@ -321,6 +321,14 @@ message OrphanProofResponse {
     bool holds_address = 6;
 }
 
+// RekeyBindingRequest re-stamps every NetBox object a bound network owns with
+// the cluster's CURRENT fingerprint, then resumes the binding. It names the
+// litevirt network rather than the prefix id because that is what an operator
+// reading a suspension message has in hand.
+message RekeyBindingRequest {
+    string network = 1;
+}
+
 // CloneVM creates a new VM from a template or an existing VM (optionally a
 // snapshot of it). mode "" → storage-aware auto (linked on shared storage,
 // full on local); "linked" / "full" force a mode. The clone gets a fresh
@@ -2113,6 +2121,11 @@ service LiteVirt {
     rpc GetNetwork(GetNetworkRequest)         returns (NetworkInfo);
     rpc DeleteNetwork(DeleteNetworkRequest)   returns (google.protobuf.Empty);
     rpc ListNetworks(google.protobuf.Empty)   returns (ListNetworksResponse);
+    // RekeyBinding recovers a NetBox binding suspended by a cluster CA
+    // replacement: it rewrites every owned object's identity under the new
+    // fingerprint and resumes allocation. Idempotent and resumable — a partial
+    // rewrite leaves the binding suspended for the next run to finish.
+    rpc RekeyBinding(RekeyBindingRequest)     returns (google.protobuf.Empty);
 
     // ── Load Balancers ──
     rpc ListLoadBalancers(google.protobuf.Empty) returns (ListLBResponse);

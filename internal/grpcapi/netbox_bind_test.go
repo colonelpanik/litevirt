@@ -37,6 +37,12 @@ type fakeNetBox struct {
 func (f fakeNetBox) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case r.URL.Path == "/api/ipam/ip-addresses/" && r.Method == http.MethodGet:
+		// A re-key enumerates the bound prefix before rewriting anything. An
+		// empty list is the honest answer from a fake that never claimed an
+		// address, and it keeps the enumeration on the real code path rather
+		// than short-circuiting it with a 404.
+		fmt.Fprint(w, `{"results":[],"next":""}`)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/prefixes/"):
 		if f.prefix.VRFID == 0 {
 			fmt.Fprintf(w, `{"id":%d,"prefix":%q,"vrf":null}`, f.prefix.ID, f.prefix.Prefix)

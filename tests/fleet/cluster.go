@@ -67,6 +67,16 @@ type Options struct {
 	// leaves the client nil and netbox_ipam_v1 unadvertised, so every existing
 	// scenario is untouched.
 	NetBoxURL string
+	// NamePrefix names the nodes ("node-" by default, giving node-0, node-1…).
+	//
+	// It is REQUIRED for a second cluster in the same test, and the reason is a
+	// trap: each node's in-memory SQLite DB is a shared-cache database NAMED
+	// after the node ("file:fleet-node-0?mode=memory&cache=shared"). Two
+	// clusters whose nodes share a name therefore share one database — every
+	// row, including the `cluster` row every identity is derived from — and a
+	// scenario meaning "two independent installations" would silently be
+	// testing one.
+	NamePrefix string
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -147,8 +157,12 @@ func New(t *testing.T, opts Options) *Cluster {
 	// Step 1 — mint pki for every node and pre-allocate ports so the
 	// host records can carry the right addresses before any daemon
 	// starts listening.
+	namePrefix := opts.NamePrefix
+	if namePrefix == "" {
+		namePrefix = "node-"
+	}
 	for i := 0; i < opts.Nodes; i++ {
-		name := fmt.Sprintf("node-%d", i)
+		name := fmt.Sprintf("%s%d", namePrefix, i)
 		n := &Node{
 			Name:        name,
 			Region:      regionFor(opts.RegionByIndex, i),
@@ -608,6 +622,18 @@ func NewClusterWithNetBox(t *testing.T, nodes int, nb *NetBoxFake) *Cluster {
 	return New(t, Options{Nodes: nodes, NetBoxURL: nb.URL()})
 }
 
+// NewClusterWithNetBoxNamed is NewClusterWithNetBox for a SECOND cluster in the
+// same test — two installations sharing one NetBox.
+//
+// The distinct name prefix is load-bearing, not cosmetic: node names are the
+// in-memory database names (see Options.NamePrefix), so two clusters both
+// calling their node "node-0" would share one DB and one cluster row, and a
+// scenario about two installations would quietly be about one.
+func NewClusterWithNetBoxNamed(t *testing.T, nodes int, nb *NetBoxFake, namePrefix string) *Cluster {
+	t.Helper()
+	return New(t, Options{Nodes: nodes, NetBoxURL: nb.URL(), NamePrefix: namePrefix})
+}
+
 // wireNetBox gives one node the two things the daemon derives from
 // config.netbox: a real *netbox.Client built from a token FILE (the production
 // constructor, not a hand-assembled struct) and the advertise kill-switch.
@@ -662,6 +688,28 @@ func (c *Cluster) wireNetBox(n *Node) {
 	// Scoped to NetBox clusters (like the `cluster` row above) so every existing
 	// scenario keeps the real validation path byte-for-byte.
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
+}
+
+// ReplaceClusterCA rewrites cluster.ca_cert on EVERY node, modeling a cluster
+// CA replacement as the NetBox identity path sees one.
+//
+// No real TLS re-issue happens, and none is needed: corrosion.ClusterFingerprint
+// is a SHA-256 of that column, so ANY different string is a different cluster
+// identity. Re-minting the PKI would additionally invalidate every node
+// certificate the harness dials with — a second, unrelated failure that would
+// stop these scenarios reaching the binding logic at all. Every node is written
+// so the fleet stays uniform, exactly as a replicated CA row would be.
+func (c *Cluster) ReplaceClusterCA() {
+	c.t.Helper()
+	replacement := fmt.Sprintf("-----BEGIN CERTIFICATE-----\nreplacement-ca-%d\n-----END CERTIFICATE-----\n",
+		time.Now().UnixNano())
+	for _, n := range c.Nodes {
+		if err := n.DB.Execute(context.Background(),
+			`UPDATE cluster SET ca_cert = ?, updated_at = ? WHERE id = 'default'`,
+			replacement, n.DB.NowWall()); err != nil {
+			c.t.Fatalf("replace cluster CA on %s: %v", n.Name, err)
+		}
+	}
 }
 
 // ── induced write failures ──────────────────────────────────────────────────

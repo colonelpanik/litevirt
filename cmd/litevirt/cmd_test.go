@@ -18,6 +18,7 @@ func buildRootCmd() *cobra.Command {
 	root.AddCommand(
 		newHostCmd(),
 		newNetworkCmd(),
+		newNetboxCmd(),
 		newComposeCmd(),
 		newLBCmd(),
 		newRunCmd(),
@@ -83,7 +84,7 @@ func TestRootCommandHasSubcommands(t *testing.T) {
 	root := buildRootCmd()
 
 	required := []string{
-		"host", "network", "compose", "lb",
+		"host", "network", "netbox", "compose", "lb",
 		"run", "ls", "inspect", "start", "stop", "restart", "rm",
 		"console", "vnc", "exec", "ssh",
 		"ansible-inventory", "migrate",

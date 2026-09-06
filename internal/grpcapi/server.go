@@ -1460,6 +1460,11 @@ type netboxMetrics interface {
 	IncSweepSkipped(reason string)
 	IncOrphansReclaimed()
 	IncStuckLease()
+	// IncBindingSuspended counts one binding taken out of service by drift.
+	// Suspension is otherwise silent to anything but a log line: it produces no
+	// error, no deletion, and no change a running workload can feel — the first
+	// symptom is a create refusing, long after the fact.
+	IncBindingSuspended()
 }
 
 // noopNetBoxMetrics satisfies the sink until the real counters exist.
@@ -1471,6 +1476,7 @@ func (noopNetBoxMetrics) IncAPIError(netbox.ErrClass) {}
 func (noopNetBoxMetrics) IncSweepSkipped(string)      {}
 func (noopNetBoxMetrics) IncOrphansReclaimed()        {}
 func (noopNetBoxMetrics) IncStuckLease()              {}
+func (noopNetBoxMetrics) IncBindingSuspended()        {}
 
 // SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
 func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }

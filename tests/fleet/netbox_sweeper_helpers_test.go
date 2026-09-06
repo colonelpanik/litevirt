@@ -29,6 +29,21 @@ const (
 // scenarios accidentally turn on.
 const orphanAge = 24 * time.Hour
 
+// boundCluster builds a NetBox-bound fleet with one bound network and nothing
+// in NetBox yet: the clean starting point every binding scenario begins from.
+func boundCluster(t *testing.T, nodes int) (*NetBoxFake, *Cluster) {
+	t.Helper()
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
+
+	c := NewClusterWithNetBox(t, nodes, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
+	return nb, c
+}
+
 // boundClusterWithOrphan builds a NetBox-bound fleet holding exactly ONE
 // leaked address: a real cluster identity, no local lease, no VM, no NIC row
 // anywhere. That is the only shape the sweeper is ever allowed to reclaim, so
@@ -43,14 +58,7 @@ func boundClusterWithOrphan(t *testing.T, nodes int) (*NetBoxFake, *Cluster) {
 // creation time for the leaked address, so the grace window can be exercised.
 func boundClusterWithOrphanAged(t *testing.T, nodes int, created time.Time) (*NetBoxFake, *Cluster) {
 	t.Helper()
-	nb := NewNetBoxFake()
-	t.Cleanup(nb.Close)
-	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
-
-	c := NewClusterWithNetBox(t, nodes, nb)
-	gates := gateAll(t, c)
-	latchNetBoxIPAM(t, c, gates)
-	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
+	nb, c := boundCluster(t, nodes)
 
 	// The identity has to carry THIS cluster's fingerprint. An orphan stamped
 	// with any other value is another cluster's address, which the sweeper must
@@ -124,6 +132,7 @@ type sweepMetrics struct {
 	skipped     []string
 	reclaimed   int
 	stuckLeases int
+	suspended   int
 }
 
 func newSweepMetrics() *sweepMetrics { return &sweepMetrics{} }
@@ -156,4 +165,10 @@ func (m *sweepMetrics) stuck() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.stuckLeases
+}
+
+func (m *sweepMetrics) IncBindingSuspended() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.suspended++
 }

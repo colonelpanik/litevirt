@@ -231,3 +231,16 @@ func (c *Client) ListIPsByPrefix(ctx context.Context, prefixCIDR string, vrfID i
 func (c *Client) ReleaseIP(ctx context.Context, id int) error {
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/api/ipam/ip-addresses/%d/", id), nil, nil)
 }
+
+// SetIPIdentity rewrites ONE address's litevirt identity custom field.
+//
+// It is the CA re-key's only write. PATCH, not PUT: NetBox's PUT is a full
+// replace, so an omitted `address` or `vrf` would be blanked — a re-key would
+// then destroy the very objects it exists to preserve. The body carries nothing
+// but the custom field for the same reason.
+func (c *Client) SetIPIdentity(ctx context.Context, id int, identity string) error {
+	body := map[string]any{
+		"custom_fields": map[string]string{IdentityField: identity},
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/api/ipam/ip-addresses/%d/", id), body, nil)
+}

@@ -272,3 +272,23 @@ func GetLeaseByIPForOwner(ctx context.Context, c *Client, network, ip, ownerKind
 		NetBoxPrefix: r.Int("netbox_prefix_id"),
 	}, nil
 }
+
+// LeaseExistsByIP reports whether ANY live lease references (network, ip).
+//
+// Deliberately owner-BLIND, unlike GetLeaseByIPForOwner. The orphan sweeper asks
+// a different question: not "may I retire this owner's row?" but "does litevirt
+// still believe this address is taken?". A lease whose owner triple no longer
+// matches anything is exactly the half-finished state a crashed release leaves —
+// and it is still a lease, still standing between the sweeper and an address a
+// guest may be using. Scoping this read to an owner would hide those rows and
+// let the sweeper free an address the cluster still holds.
+func LeaseExistsByIP(ctx context.Context, c *Client, network, ip string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT 1 AS hit FROM ip_allocations
+		 WHERE network = ? AND ip = ? AND deleted_at IS NULL`,
+		network, ip)
+	if err != nil {
+		return false, fmt.Errorf("query lease by ip: %w", err)
+	}
+	return len(rows) > 0, nil
+}

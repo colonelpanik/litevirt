@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // IPAddress is one ipam.ip-address as litevirt cares about it.
@@ -26,6 +27,15 @@ type IPAddress struct {
 	// interface can carry several addresses — so P2's mirror reads assignment
 	// from here rather than from a synthetic field on the interface.
 	AssignedObjectID int
+	// Created is when NetBox first recorded this object, or the zero time when
+	// it could not be read.
+	//
+	// The orphan sweeper's grace window is the only consumer, and it treats the
+	// zero value as "not old enough" — an object whose age is unknown is never
+	// reclaimed. That is why an unparseable timestamp is silently zeroed rather
+	// than raised: every failure mode of this field must land on the side that
+	// keeps an address, not the side that frees one.
+	Created time.Time
 }
 
 type ipJSON struct {
@@ -36,6 +46,36 @@ type ipJSON struct {
 	} `json:"vrf"`
 	AssignedObjectID *int           `json:"assigned_object_id"`
 	CustomFields     map[string]any `json:"custom_fields"`
+	// Created is NetBox's own creation timestamp. NetBox 3.x serialized it as a
+	// DATE ("2026-01-02"); 4.x serializes a full RFC3339 datetime. Both are
+	// accepted, and anything else yields the zero time.
+	Created string `json:"created"`
+}
+
+// createdLayouts are the shapes NetBox has served in the `created` field, most
+// specific first. RFC3339 covers both the "Z" and the "+01:00" offset forms.
+var createdLayouts = []string{
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05.999999",
+	"2006-01-02T15:04:05",
+	"2006-01-02",
+}
+
+// parseCreated is deliberately lenient AND fail-closed: an unrecognised or
+// missing value returns the zero time, which the sweeper reads as "age unknown"
+// and therefore never reclaims.
+func parseCreated(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range createdLayouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 func (j ipJSON) toIP() IPAddress {
@@ -49,6 +89,7 @@ func (j ipJSON) toIP() IPAddress {
 	if v, ok := j.CustomFields[IdentityField].(string); ok {
 		out.Identity = v
 	}
+	out.Created = parseCreated(j.Created)
 	return out
 }
 

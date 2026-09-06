@@ -298,6 +298,29 @@ message RuntimeInventory {
     string sampled_at = 7;          // RFC3339
 }
 
+// OrphanProofRequest asks ONE host whether anything on it still claims an
+// address candidate. The three identifiers are the components of the NetBox
+// identity the sweeper is considering reclaiming; any of them may be empty,
+// which simply drops that half of the question.
+message OrphanProofRequest {
+    string vm_uuid = 1;
+    string mac     = 2;
+    string address = 3;   // bare host form, no prefix length
+}
+// OrphanProofResponse is one host's answer. It is NEGATIVE evidence: complete
+// is false when ANY probe errored (libvirt enumeration, a domain state or XML
+// read, or a local row query), and an INCOMPLETE proof proves nothing — a
+// caller must abort the reclamation rather than read absence into it. The
+// holds_* flags are only ever positive statements and remain trustworthy.
+message OrphanProofResponse {
+    string host = 1;
+    bool complete = 2;
+    repeated string errors = 3;
+    bool holds_uuid = 4;
+    bool holds_mac = 5;
+    bool holds_address = 6;
+}
+
 // CloneVM creates a new VM from a template or an existing VM (optionally a
 // snapshot of it). mode "" → storage-aware auto (linked on shared storage,
 // full on local); "linked" / "full" force a mode. The clone gets a fresh
@@ -2023,6 +2046,11 @@ service LiteVirt {
     rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
     rpc GetRuntimeInventory(GetRuntimeInventoryRequest) returns (RuntimeInventory);
+    // CollectOrphanProof answers, for THIS host, "does anything here still claim
+    // this address" — every defined domain in every state plus this host's local
+    // rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
+    // from every host before reclaiming an address in NetBox.
+    rpc CollectOrphanProof(OrphanProofRequest) returns (OrphanProofResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);

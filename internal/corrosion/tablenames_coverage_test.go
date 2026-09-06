@@ -35,6 +35,7 @@ var antiEntropyExcluded = map[string]string{
 	"host_runtime_usage":     "per-host runtime telemetry (disk_iops/net_mbps); replicates via the WAL/mutation_log but is excluded from full-state anti-entropy — stale telemetry self-corrects on the next sample (cf. vm_events), so it needn't be repaired and shouldn't bloat the digest/dump",
 	"idempotency_keys":       "ephemeral request-dedup records (v39); LOCAL-only (owned by the entry node, never replicated), so no anti-entropy repair applies — see localOnly",
 	"host_fw_intent":         "per-host firewall infra decisions (v40, NAT/SNAT/isolation); LOCAL-only (nft rules are per-host state, never replicated) — see localOnly",
+	"netbox_sync_queue":      "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
 }

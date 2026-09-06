@@ -325,7 +325,17 @@ import (
 //	     mixed-version operation; this branch keeps its existing authority-ledger
 //	     admission implementation, so upstream's emitted statement shapes are
 //	     retained as historical receiver contracts. Four new tables.
-const CurrentSchemaVersion = 50
+//	v51: NetBox IPAM foundation — netbox_bindings (one row per bound NetBox
+//	     prefix; PK is prefix_id, not network, which makes "one litevirt
+//	     network per NetBox prefix" structural, since ip_allocations keys leases
+//	     on the litevirt network name), netbox_objects (litevirt object -> NetBox
+//	     object identity map, PK (litevirt_kind, litevirt_key)), and
+//	     netbox_sync_queue (work queue for the P2 inventory mirror; a latency
+//	     optimisation only, since the periodic full sweep is the correctness
+//	     mechanism). Also ip_allocations.netbox_ip_id / netbox_prefix_id — the
+//	     join keys linking a lease back to its NetBox IP/prefix. Three new
+//	     tables + two ADD COLUMNs.
+const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1645,6 +1655,8 @@ var schemaDDL = []string{
 		vm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind
 		owner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)
 		owner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)
+		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
+		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		allocated_at TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
@@ -2096,6 +2108,55 @@ var schemaDDL = []string{
 		deleted_at         TEXT,
 		PRIMARY KEY (host_name)
 	)`,
+
+	// ═══════════ NETBOX IPAM (v51) ═══════════
+	// One row per BOUND prefix. The PK is prefix_id, not network, which makes
+	// "one litevirt network per NetBox prefix" structural: two networks bound to
+	// one prefix would allocate the same address independently, because
+	// ip_allocations is keyed (network, ip) on the LITEVIRT network name.
+	`CREATE TABLE IF NOT EXISTS netbox_bindings (
+		prefix_id           INTEGER PRIMARY KEY,
+		network             TEXT NOT NULL,
+		observed_cidr       TEXT NOT NULL,
+		vrf_id              INTEGER NOT NULL,
+		cluster_fingerprint TEXT NOT NULL,
+		suspended           INTEGER NOT NULL DEFAULT 0,
+		suspend_reason      TEXT NOT NULL DEFAULT '',
+		validated_at        TEXT NOT NULL,
+		created_at          TEXT NOT NULL,
+		updated_at          TEXT NOT NULL,
+		deleted_at          TEXT
+	)`,
+
+	// Identity map: litevirt object -> NetBox object. Interfaces key on MAC, NOT
+	// on DeterministicNICID, because that id is derived from the VM name and
+	// RenameVM re-derives it — keying on it would fork a duplicate vminterface
+	// on every rename.
+	`CREATE TABLE IF NOT EXISTS netbox_objects (
+		litevirt_kind TEXT NOT NULL,
+		litevirt_key  TEXT NOT NULL,
+		netbox_kind   TEXT NOT NULL,
+		netbox_id     INTEGER NOT NULL,
+		synced_at     TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (litevirt_kind, litevirt_key)
+	)`,
+
+	// Work queue for the P2 inventory mirror. A LATENCY optimisation only — the
+	// full sweep is the correctness mechanism, because a node that dies mid-create
+	// never enqueues anything.
+	`CREATE TABLE IF NOT EXISTS netbox_sync_queue (
+		id         TEXT PRIMARY KEY,
+		kind       TEXT NOT NULL,
+		key        TEXT NOT NULL,
+		op         TEXT NOT NULL,
+		attempts   INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2251,6 +2312,9 @@ var tablePrimaryKeys = map[string][]string{
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
 	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
+	"netbox_bindings":         {"prefix_id"},
+	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
+	"netbox_sync_queue":       {"id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2466,6 +2530,9 @@ var schemaMigrations = []string{
 	// writer. 0 = not isolated (the legacy-compatible default).
 	`ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''`,
+	// v51: NetBox join keys on the lease.
+	`ALTER TABLE ip_allocations ADD COLUMN netbox_ip_id INTEGER`,
+	`ALTER TABLE ip_allocations ADD COLUMN netbox_prefix_id INTEGER`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2553,6 +2620,7 @@ var alterVersions = []int{
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
+	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2582,6 +2650,7 @@ var createTableUnits = []struct {
 	{50, "health_conditions"}, {50, "health_evaluator_status"},
 	{50, "host_capacity_observations"},
 	{50, "quota_reservations"},
+	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

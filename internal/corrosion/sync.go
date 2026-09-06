@@ -265,6 +265,11 @@ var tableNames = []string{
 	// by the UI/CLI and repaired from peers if a host loses its DB. LWW-safe
 	// (PK + updated_at); the owning host is the only writer of its rows.
 	"host_networks",
+	// v51 NetBox IPAM — operator-facing bindings + identity map, no secrets.
+	// PK'd + LWW-safe (updated_at); a node that lost its DB re-learns which
+	// prefixes are bound and which litevirt objects have a NetBox counterpart
+	// from peers, same as any other cluster-fact table.
+	"netbox_bindings", "netbox_objects",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

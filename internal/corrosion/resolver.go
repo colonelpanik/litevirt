@@ -463,6 +463,12 @@ var capabilityMap = map[string]tableResolver{
 	// v47 cluster CRL. Append-only; the composite key includes the signed PEM, so
 	// a hash-squatting row cannot conflict with the genuine row.
 	"cluster_crl": {category: "content", chain: contentDefaultChain()},
+	// v51 NetBox IPAM. netbox_bindings (a bound prefix) and netbox_objects (the
+	// litevirt<->NetBox identity map) are plain scalar cluster facts, no opaque
+	// blob, tenancy, or runtime-ownership column — same treatment as
+	// ip_allocations/resource_mappings: tombstone-first, then content-max.
+	"netbox_bindings": {category: "content", chain: contentDefaultChain()},
+	"netbox_objects":  {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

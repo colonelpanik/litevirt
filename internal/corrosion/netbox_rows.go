@@ -224,3 +224,42 @@ func AckSyncItem(ctx context.Context, c *Client, id string) error {
 		`UPDATE netbox_sync_queue SET deleted_at = ?, updated_at = ? WHERE id = ?`,
 		c.NowWall(), c.NowTS(), id)
 }
+
+// LeaseRecord is one ip_allocations row with its NetBox join keys.
+type LeaseRecord struct {
+	Network      string
+	IP           string
+	MAC          string
+	NetBoxIPID   int
+	NetBoxPrefix int
+}
+
+// GetLeaseByIP reads one lease by its (network, ip) PRIMARY KEY, or nil.
+//
+// Keyed on the ADDRESS, not on the owner: a release has to name the exact row
+// it is retiring, and an owner-keyed read cannot distinguish two NICs of one
+// workload. The NetBox columns are nullable — every pre-v51 lease has them
+// empty — so they are COALESCEd, and a builtin lease reads back as id 0, which
+// is what tells a release there is no remote object to delete.
+func GetLeaseByIP(ctx context.Context, c *Client, network, ip string) (*LeaseRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT network, ip, mac,
+		        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
+		        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id
+		 FROM ip_allocations WHERE network = ? AND ip = ? AND deleted_at IS NULL`,
+		network, ip)
+	if err != nil {
+		return nil, fmt.Errorf("query lease: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	r := rows[0]
+	return &LeaseRecord{
+		Network:      r.String("network"),
+		IP:           r.String("ip"),
+		MAC:          r.String("mac"),
+		NetBoxIPID:   r.Int("netbox_ip_id"),
+		NetBoxPrefix: r.Int("netbox_prefix_id"),
+	}, nil
+}

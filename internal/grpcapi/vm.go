@@ -940,6 +940,27 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, ferr
 	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
+		// deployment keeps today's behaviour exactly. With a claim in play, a
+		// running VM with no row is the one state that lets the orphan sweeper
+		// release a LIVE guest's address: the address carries our identity, and
+		// the proof the sweeper reclaims on is that no VM row anywhere in the
+		// cluster references it. Nothing later re-creates the row, so the only
+		// fail-closed answer is to undo the create — teardown, disks, firmware
+		// state, and the claims themselves, matching the admission fence above.
+		if !claims.empty() {
+			slog.Error("vm create: row persistence failed after an address claim — aborting",
+				"name", spec.Name, "error", err)
+			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
+				slog.Warn("vm create: teardown after failed persistence also failed",
+					"name", spec.Name, "error", derr)
+			}
+			_ = s.virt.UndefineDomain(spec.Name, false)
+			cleanupDisks()
+			lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+			claims.releaseAll(ctx)
+			return nil, status.Errorf(codes.Internal, "persist VM state: %v", err)
+		}
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	}
@@ -1825,12 +1846,68 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		slog.Warn("failed to delete DNS record", "vm", req.Name, "error", err)
 	}
 
-	// Release per-interface IP allocations.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.Name)
-	for _, iface := range ifaces {
-		if err := network.ReleaseIP(ctx, s.db, iface.NetworkName, req.Name); err != nil {
-			slog.Warn("failed to release IP", "vm", req.Name, "network", iface.NetworkName, "error", err)
+	// Release per-interface IP allocations, ONE LEASE AT A TIME, and before the
+	// mandatory tombstone below so a failure here is retryable.
+	//
+	// The old ReleaseIP is keyed (network, vm_name), which cannot name a single
+	// lease: with two NICs on one network the first iteration tombstoned BOTH.
+	// Reading the lease by its (network, ip) key is also what carries the NetBox
+	// join id, and without it a release could never delete the remote object.
+	var releaseErrs []string
+	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
+	if nerr != nil {
+		// Fail closed: an unreadable NIC list means we do not know which
+		// addresses this VM holds, and tombstoning the row over that is what
+		// strands them. Retryable — nothing destructive is skipped by returning.
+		return nil, status.Errorf(codes.Internal,
+			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
+	}
+	for _, nic := range nics {
+		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
+		if aerr != nil {
+			// A suspended or misconfigured binding must not block a delete —
+			// the workload is already gone and the address is reclaimable by
+			// the orphan sweep, which is strictly better than a VM that cannot
+			// be deleted at all.
+			slog.Warn("delete: no allocator for network, skipping address release",
+				"vm", req.Name, "network", nic.NetworkName, "error", aerr)
+			continue
 		}
+		if alloc == nil {
+			// An UNBOUND network: VMs have never held a lease there, so there
+			// is nothing to release and nothing to report.
+			continue
+		}
+		lease, lerr := corrosion.GetLeaseByIP(ctx, s.db, nic.NetworkName, nic.IP)
+		if lerr != nil {
+			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: read lease %s: %v", nic.NetworkName, nic.IP, lerr))
+			continue
+		}
+		if lease == nil {
+			continue // already released; the delete is idempotent
+		}
+		if err := alloc.Release(ctx, network.ReleaseRequest{
+			Network:    nic.NetworkName,
+			IP:         nic.IP,
+			MAC:        nic.MAC,
+			OwnerKind:  "vm",
+			OwnerHost:  "", // VM names are cluster-global
+			Name:       req.Name,
+			NetBoxIPID: lease.NetBoxIPID,
+		}); err != nil {
+			// SURFACED, not just logged. A release failure means either the
+			// lease is still live (so the external object must stay, and the
+			// operator has to know litevirt still holds the address) or
+			// ownership moved under us. The release is idempotent and runs
+			// before the tombstone, so a retry re-runs it.
+			slog.Error("release IP failed", "vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: %v", nic.NetworkName, err))
+		}
+	}
+	if len(releaseErrs) > 0 {
+		return nil, status.Errorf(codes.Internal,
+			"delete %s: address release failed (retry is safe): %s",
+			req.Name, strings.Join(releaseErrs, "; "))
 	}
 
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.

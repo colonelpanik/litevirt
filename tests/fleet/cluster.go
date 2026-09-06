@@ -653,3 +653,57 @@ func (c *Cluster) wireNetBox(n *Node) {
 	// scenario keeps the real validation path byte-for-byte.
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 }
+
+// ── induced write failures ──────────────────────────────────────────────────
+//
+// Both seams install a SQLite trigger that aborts one specific write. A trigger
+// is the only way to reach these windows from the fleet: the failure has to
+// happen INSIDE the daemon's own transaction, after every earlier step has
+// really run, which no stub above the corrosion client can produce. Reads stay
+// unaffected, so the operation under test proceeds normally right up to the
+// write that must fail.
+//
+// Each returns a drop function so a scenario can restore normal writes partway
+// through, and each also registers that drop with t.Cleanup so a trigger can
+// never leak into another test sharing the process.
+
+// FailNextVMRowWrite aborts every INSERT into `vms` on this node. It is how a
+// scenario reaches the window between a started domain and its durable row.
+func (n *Node) FailNextVMRowWrite(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_vm_insert BEFORE INSERT ON vms
+		 BEGIN SELECT RAISE(ABORT, 'induced vm persist failure'); END`); err != nil {
+		t.Fatalf("install vm-insert failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_vm_insert`); err != nil {
+			t.Fatalf("drop vm-insert failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// FailNextLeaseTombstone aborts every ip_allocations TOMBSTONE on this node
+// (an UPDATE that sets deleted_at on a live row), leaving inserts and every
+// other update alone. It is how a scenario reaches a release whose LOCAL half
+// failed while the remote IPAM object still exists.
+func (n *Node) FailNextLeaseTombstone(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_lease_tombstone BEFORE UPDATE ON ip_allocations
+		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
+		 BEGIN SELECT RAISE(ABORT, 'induced tombstone failure'); END`); err != nil {
+		t.Fatalf("install lease-tombstone failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_lease_tombstone`); err != nil {
+			t.Fatalf("drop lease-tombstone failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}

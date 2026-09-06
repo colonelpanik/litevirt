@@ -66,7 +66,9 @@ func TestFindInterfaceByIdentity(t *testing.T) {
 
 func TestToVMPopulatesEveryComparedField(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"results":[{"id":11,"name":"vm-1","vcpus":2,"memory":2048,"disk":20,` +
+		// Every number in the fixture differs from every other one, so no
+		// assertion can pass by reading a neighbouring field's value.
+		_, _ = w.Write([]byte(`{"results":[{"id":11,"name":"vm-1","vcpus":3,"memory":2049,"disk":41,` +
 			`"status":{"value":"active"},"cluster":{"id":5},"device":{"id":9},` +
 			`"custom_fields":{"litevirt_identity":"lv:fp:uuid"}}],"next":""}`))
 	})
@@ -74,9 +76,29 @@ func TestToVMPopulatesEveryComparedField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(got) != 1 {
+		t.Fatalf("got %d VMs, want 1", len(got))
+	}
 	v := got[0]
-	// Every field vmDiffers compares must survive decoding, or the mirror sees a
-	// difference on every sweep and write-on-change never fires.
+	// EVERY field the diff compares must survive decoding, not just the nullable
+	// objects: a decoder that drops VCPUs, MemoryMB, DiskGB or Name makes every
+	// VM look changed on every sweep, defeating write-on-change exactly as
+	// completely as dropping Status does. So all of them are pinned here.
+	if v.ID != 11 {
+		t.Errorf("ID = %d, want 11", v.ID)
+	}
+	if v.Name != "vm-1" {
+		t.Errorf("Name = %q, want vm-1", v.Name)
+	}
+	if v.VCPUs != 3 {
+		t.Errorf("VCPUs = %d, want 3", v.VCPUs)
+	}
+	if v.MemoryMB != 2049 {
+		t.Errorf("MemoryMB = %d, want 2049", v.MemoryMB)
+	}
+	if v.DiskGB != 41 {
+		t.Errorf("DiskGB = %d, want 41", v.DiskGB)
+	}
 	if v.Status != "active" {
 		t.Errorf("Status = %q, want active", v.Status)
 	}
@@ -87,7 +109,7 @@ func TestToVMPopulatesEveryComparedField(t *testing.T) {
 		t.Errorf("DeviceID = %d, want 9", v.DeviceID)
 	}
 	if v.Identity != "lv:fp:uuid" {
-		t.Errorf("Identity = %q", v.Identity)
+		t.Errorf("Identity = %q, want lv:fp:uuid", v.Identity)
 	}
 }
 
@@ -144,12 +166,56 @@ func TestListOwnedIPsForInterfacesBatchesAndPaginates(t *testing.T) {
 		if len(q["vminterface_id"]) == 0 {
 			t.Error("every request must scope by vminterface_id")
 		}
+		// The identity filter is the sole structural barrier keeping an
+		// operator-owned address out of the mirror's clear path, so it must ride
+		// on EVERY request, not just the first batch's first page.
+		k := "cf_" + IdentityField + "__n"
+		if !q.Has(k) || q.Get(k) != "" {
+			t.Errorf("request must carry %s= (non-empty identity), got %q", k, q[k])
+		}
 	}
 	if batches != 2 {
 		t.Errorf("51 ids must produce 2 batches, got %d", batches)
 	}
 	if pages < 3 {
 		t.Errorf("the first batch must paginate, got %d requests total", pages)
+	}
+}
+
+// TestListOwnedIPsForInterfacesFiltersToLitevirtIdentities pins the identity
+// filter by BEHAVIOUR rather than by query-string shape. The fake serves an
+// operator-owned address alongside a litevirt one whenever the filter is absent,
+// which is what a real NetBox does: the filter is the only thing that hides it.
+// Losing it hands the reconciler an address it would take for ours and could
+// detach from the operator's interface.
+func TestListOwnedIPsForInterfacesFiltersToLitevirtIdentities(t *testing.T) {
+	const ours = `{"id":41,"address":"10.0.5.100/24","assigned_object_id":1,` +
+		`"custom_fields":{"litevirt_identity":"lv:fp:uuid"}}`
+	const operators = `{"id":42,"address":"10.0.5.101/24","assigned_object_id":1,` +
+		`"custom_fields":{"litevirt_identity":null}}`
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		// NetBox reads cf_<field>__n= as "custom field not equal to empty", so
+		// with the filter present only identity-carrying addresses come back.
+		k := "cf_" + IdentityField + "__n"
+		if q.Has(k) && q.Get(k) == "" {
+			_, _ = w.Write([]byte(`{"results":[` + ours + `],"next":""}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[` + ours + `,` + operators + `],"next":""}`))
+	})
+	got, err := c.ListOwnedIPsForInterfaces(context.Background(), []int{1, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ip := range got {
+		if ip.Identity == "" {
+			t.Fatalf("operator-owned address %d (%s) reached the caller: the mirror "+
+				"would treat it as litevirt-owned and could detach it", ip.ID, ip.Address)
+		}
+	}
+	if len(got) != 1 || got[0].ID != 41 {
+		t.Fatalf("got %+v, want only the litevirt-owned address 41", got)
 	}
 }
 

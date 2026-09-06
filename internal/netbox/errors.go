@@ -41,9 +41,3 @@ func Classify(err error) ErrClass {
 	}
 	return ClassTransport
 }
-
-// Ambiguous reports whether an error leaves the server-side outcome UNKNOWN.
-// Only a 4xx is a definite "did not happen"; everything else may have committed.
-func Ambiguous(err error) bool {
-	return Classify(err) != ClassClient
-}

@@ -37,12 +37,19 @@ type NetBoxFake struct {
 	// released records every id deleted through the REST API, in order.
 	released []int
 
-	// OnClaim runs INSIDE the claim handler, before the address is committed.
+	// The hooks below are all set by a test from ITS goroutine and read by the
+	// httptest server from the handler's, so every one of them is unexported and
+	// reached only through its Set*/take* pair under f.mu — the same treatment
+	// as `down`. Exported function fields raced exactly as an exported bool did;
+	// -race catches it only when a scenario happens to set one while a request
+	// is in flight, which is precisely the scenario these hooks exist to build.
+
+	// onClaim runs INSIDE the claim handler, before the address is committed.
 	// It is the only way to reach failures a caller-side check would catch
 	// first — a POST that commits and then loses its response, for instance.
-	OnClaim func(prefixID int) error
+	onClaim func(prefixID int) error
 
-	// OnBeforeDelete runs on the IDENTITY LOOKUP a caller makes immediately
+	// onBeforeDelete runs on the IDENTITY LOOKUP a caller makes immediately
 	// before deleting an address — the sweeper's time-of-check-to-time-of-use
 	// re-read, and the only interception point a REST fake has for "somebody
 	// changed this object between the proof and the delete".
@@ -52,18 +59,61 @@ type NetBoxFake struct {
 	// observe the damage, never model the race that has to prevent it. Firing on
 	// the re-read is what lets a scenario mutate the object at the one instant
 	// the sweeper is required to notice. It is passed the id being looked at.
-	OnBeforeDelete func(id int)
+	onBeforeDelete func(id int)
 
-	// OnPatch runs before an identity rewrite is applied. A non-nil error fails
+	// onPatch runs before an identity rewrite is applied. A non-nil error fails
 	// the request WITHOUT applying the change — a definite refusal (403), not a
 	// lost connection — which is the only way to reach a re-key that rewrote
 	// some of a prefix's objects and not the rest.
-	OnPatch func(id int) error
+	onPatch func(id int) error
 
 	// down makes every request fail at the transport layer. A test flips it from
 	// its own goroutine while the httptest server reads it from the handler's,
 	// so it is unexported and reached only through SetDown/IsDown under f.mu.
 	down bool
+}
+
+// SetOnClaim installs (or, with nil, clears) the claim hook.
+func (f *NetBoxFake) SetOnClaim(h func(prefixID int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onClaim = h
+}
+
+// SetOnBeforeDelete installs (or, with nil, clears) the pre-delete re-read hook.
+func (f *NetBoxFake) SetOnBeforeDelete(h func(id int)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onBeforeDelete = h
+}
+
+// SetOnPatch installs (or, with nil, clears) the identity-rewrite hook.
+func (f *NetBoxFake) SetOnPatch(h func(id int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onPatch = h
+}
+
+// takeOnClaim / takeOnBeforeDelete / takeOnPatch read one hook under the lock
+// and return it to be CALLED outside the lock — a hook is free to re-enter the
+// fake (Reassign takes the same mutex), so holding it across the call would
+// deadlock.
+func (f *NetBoxFake) takeOnClaim() func(int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.onClaim
+}
+
+func (f *NetBoxFake) takeOnBeforeDelete() func(int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.onBeforeDelete
+}
+
+func (f *NetBoxFake) takeOnPatch() func(int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.onPatch
 }
 
 type fakeIP struct {
@@ -250,8 +300,8 @@ func (f *NetBoxFake) claimAvailable(w http.ResponseWriter, r *http.Request) {
 	// then fails the response. That is the "committed then lost the response"
 	// case: NetBox did the write and the caller never learned the address.
 	var hookErr error
-	if f.OnClaim != nil {
-		hookErr = f.OnClaim(prefixID)
+	if hook := f.takeOnClaim(); hook != nil {
+		hookErr = hook(prefixID)
 	}
 
 	ip := f.commit(addr, p.VRFID, body.CustomFields["litevirt_identity"])
@@ -352,7 +402,7 @@ func (f *NetBoxFake) lookup(w http.ResponseWriter, r *http.Request) {
 	// BEFORE matching, so a hook that changes the object changes what this very
 	// response reports. See the field's comment for why the DELETE handler
 	// cannot host this.
-	if f.OnBeforeDelete != nil && q.Get("cf_litevirt_identity") != "" {
+	if q.Get("cf_litevirt_identity") != "" {
 		f.fireBeforeDelete(q.Get("cf_litevirt_identity"))
 	}
 
@@ -556,8 +606,8 @@ func (f *NetBoxFake) patchIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Before the write, so a refusal leaves the object exactly as it was.
-	if f.OnPatch != nil {
-		if err := f.OnPatch(id); err != nil {
+	if hook := f.takeOnPatch(); hook != nil {
+		if err := hook(id); err != nil {
 			writeErr(w, http.StatusForbidden, "%v", err)
 			return
 		}
@@ -630,13 +680,17 @@ func (f *NetBoxFake) SeedIP(address string, vrfID int, identity string, created 
 // mutate the fake (Reassign takes the same mutex).
 func (f *NetBoxFake) fireBeforeDelete(identity string) {
 	f.mu.Lock()
+	hook := f.onBeforeDelete
+	if hook == nil {
+		f.mu.Unlock()
+		return
+	}
 	var ids []int
 	for id, ip := range f.byID {
 		if ip.Identity == identity {
 			ids = append(ids, id)
 		}
 	}
-	hook := f.OnBeforeDelete
 	f.mu.Unlock()
 	sort.Ints(ids)
 	for _, id := range ids {

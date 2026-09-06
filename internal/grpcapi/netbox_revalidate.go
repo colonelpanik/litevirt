@@ -33,7 +33,10 @@ func (s *Server) RevalidateBindingsOnce(ctx context.Context) error {
 // Drift SUSPENDS the binding: new allocations refuse, running VMs are untouched.
 // A suspension is never lifted by this pass — an already-suspended binding is
 // skipped entirely — because the whole point is that litevirt stopped trusting
-// the binding and only an operator's `lv netbox rekey` says otherwise.
+// the binding, and only an operator says otherwise: `lv netbox resume` for a
+// binding that re-validates cleanly again, or `lv netbox rekey` when the CA
+// changed and the identity pin itself has to be rewritten (resume refuses that
+// case and names rekey).
 func (s *Server) revalidateBindings(ctx context.Context) error {
 	if s.db == nil || s.netbox == nil {
 		// A node with no NetBox configuration cannot read the facts a
@@ -177,8 +180,13 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 type stillDriftedError struct{ reason string }
 
 func (e stillDriftedError) Error() string {
+	// NOT "run `lv netbox resume`": resume re-validates first and refuses a
+	// binding whose identity pin is stale, telling the operator to re-key —
+	// which is the command that just produced this error. Pointing at resume
+	// sends them round that loop. The re-key is what re-pins the fingerprint,
+	// so it is the re-key that has to be run again once NetBox is repaired.
 	return fmt.Sprintf("identities re-keyed, but the binding remains suspended: %s"+
-		" — repair it in NetBox, then run `lv netbox resume`", e.reason)
+		" — repair it in NetBox, then run `lv netbox rekey` again once the drift is repaired", e.reason)
 }
 
 // rekeyBinding is the re-key itself: rewrite, then re-validate, then resume —

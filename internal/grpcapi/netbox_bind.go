@@ -6,6 +6,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netbox"
 )
 
 // validateAndBindPrefix runs every bind-time precondition and records the
@@ -28,6 +29,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	// 2. The prefix exists, and we record its CIDR as the drift baseline.
 	p, err := s.netbox.GetPrefix(ctx, prefixID)
 	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return fmt.Errorf("read NetBox prefix %d: %w", prefixID, err)
 	}
 
@@ -40,6 +42,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	}
 	unique, err := s.netbox.VRFEnforcesUnique(ctx, p.VRFID)
 	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return fmt.Errorf("read NetBox VRF %d: %w", p.VRFID, err)
 	}
 	if !unique {

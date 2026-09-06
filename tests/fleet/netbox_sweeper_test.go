@@ -178,7 +178,7 @@ func TestSweeperBlockedByIncompleteScan(t *testing.T) {
 func TestSweeperAbortsWhenNetBoxObjectChanged(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 2)
 
-	nb.OnBeforeDelete = func(id int) { nb.Reassign(id, "someone-else") }
+	nb.SetOnBeforeDelete(func(id int) { nb.Reassign(id, "someone-else") })
 
 	mustSweep(t, c.Nodes[0])
 

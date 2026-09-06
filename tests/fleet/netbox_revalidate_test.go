@@ -294,17 +294,17 @@ func TestRekeyPartialFailureLeavesBindingSuspended(t *testing.T) {
 	mustRevalidate(t, n)
 
 	var patches int
-	nb.OnPatch = func(int) error {
+	nb.SetOnPatch(func(int) error {
 		patches++
 		if patches == 2 {
 			return errNetBoxPatchRefused
 		}
 		return nil
-	}
+	})
 	if err := rekey(c, n, orphanNetwork); err == nil {
 		t.Fatal("a refused rewrite must fail the re-key")
 	}
-	nb.OnPatch = nil
+	nb.SetOnPatch(nil)
 
 	if !bindingSuspended(t, n, orphanPrefixID) {
 		t.Fatal("a partial rewrite must leave the binding suspended")

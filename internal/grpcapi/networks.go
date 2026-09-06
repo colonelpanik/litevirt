@@ -91,13 +91,23 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		// Past that stage the network DOES exist — its binding belongs to it
 		// until DeleteNetwork releases it, even though this create failed.
 		var np *networkNotPersistedError
+		heldPrefix := 0
 		if def.NetBoxPrefixID != 0 && errors.As(err, &np) {
 			if relErr := corrosion.DeleteBinding(ctx, s.db, def.NetBoxPrefixID); relErr != nil {
-				// Surface the create failure, not this one — but say the prefix
-				// is still held so it can be released by hand.
+				// Surface the create failure, not this one — but SAY the prefix
+				// is still held, in the error the operator actually sees. A log
+				// line on one node is not where they will look, and a prefix
+				// that stays claimed refuses every future bind of it with a
+				// message about a network that does not exist.
 				slog.Warn("failed to release NetBox binding after a failed network create",
 					"network", req.Name, "prefix_id", def.NetBoxPrefixID, "error", relErr)
+				heldPrefix = def.NetBoxPrefixID
 			}
+		}
+		if heldPrefix != 0 {
+			return nil, status.Errorf(codes.Internal,
+				"provision network: %v (NetBox prefix %d is STILL BOUND — its release also failed; clear it by hand before rebinding that prefix)",
+				err, heldPrefix)
 		}
 		return nil, status.Errorf(codes.Internal, "provision network: %v", err)
 	}
@@ -183,17 +193,33 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	// Release the NetBox prefix. A network that no longer exists must not keep
 	// holding one: the binding is what refuses every future bind of that prefix,
 	// and nothing else in the system would ever release it.
-	if b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.Name); err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"network %q deleted, but reading its NetBox binding failed: %v", req.Name, err)
-	} else if b != nil {
+	//
+	// The network is ALREADY GONE by this point, so the event and the audit
+	// entry are facts whether or not the release succeeds — emitting them only
+	// on the happy path left the one failure an operator most needs a trail for
+	// (a deleted network whose prefix is still bound) as the one delete with no
+	// audit row at all. Emit both, then report the failure.
+	relErr := func() error {
+		b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.Name)
+		if err != nil {
+			return status.Errorf(codes.Internal,
+				"network %q deleted, but reading its NetBox binding failed: %v", req.Name, err)
+		}
+		if b == nil {
+			return nil
+		}
 		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
-			return nil, status.Errorf(codes.Internal,
+			return status.Errorf(codes.Internal,
 				"network %q deleted, but releasing NetBox prefix %d failed: %v", req.Name, b.PrefixID, err)
 		}
-	}
+		return nil
+	}()
 
 	s.publish("network.deleted", req.Name, "")
+	if relErr != nil {
+		s.audit(ctx, "network.delete", req.Name, "netbox binding release failed: "+relErr.Error(), "error")
+		return nil, relErr
+	}
 	s.audit(ctx, "network.delete", req.Name, "", "ok")
 	return &emptypb.Empty{}, nil
 }

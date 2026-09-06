@@ -373,12 +373,12 @@ func TestRecoveryRunsAfterA4xxToo(t *testing.T) {
 	}
 }
 
-// TestRecoveryRunsAfterEveryDefiniteStatus generalises the case above: a 403 is
-// just as "definite" as a 400 to netbox.Ambiguous, and just as unusable as a
-// decision about whether a write landed.
+// TestRecoveryRunsAfterEveryDefiniteStatus generalises the case above: a 403
+// classifies as ClassClient — a DEFINITE answer, exactly like a 400 — and is
+// just as unusable as a decision about whether a write landed.
 func TestRecoveryRunsAfterEveryDefiniteStatus(t *testing.T) {
 	ctx := context.Background()
-	if netbox.Ambiguous(errForbidden) {
+	if netbox.Classify(errForbidden) != netbox.ClassClient {
 		t.Fatal("fixture is wrong: a 403 must classify as definite for this test to mean anything")
 	}
 	nb := &stubNetBox{

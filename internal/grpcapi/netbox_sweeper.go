@@ -233,6 +233,7 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	//    something that no longer exists.
 	live, err := s.netbox.LookupByIdentity(ctx, cand.Identity, cand.VRFID, cand.PrefixCIDR)
 	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return skipf(skipRemoteReread, "re-read NetBox object: %v", err)
 	}
 	if len(live) != 1 ||
@@ -250,6 +251,7 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 		return skipf(skipLeaseLost, "leader lease lost immediately before delete")
 	}
 	if err := s.netbox.ReleaseIP(ctx, cand.NetBoxID); err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return skipf(skipReleaseFailed, "release: %v", err)
 	}
 	slog.Info("netbox sweep: reclaimed an orphaned address",
@@ -548,6 +550,7 @@ func (s *Server) orphanCandidates(ctx context.Context, grace time.Duration) ([]o
 		remote, err := s.netbox.ListIPsByPrefix(ctx, b.ObservedCIDR, b.VRFID)
 		if err != nil {
 			// A partial enumeration would make live addresses look absent.
+			s.nbMetrics().IncAPIError(netbox.Classify(err))
 			return nil, fmt.Errorf("enumerate prefix %d: %w", b.PrefixID, err)
 		}
 		for _, ip := range remote {
@@ -740,6 +743,7 @@ func (s *Server) handleOrphanCheck(ctx context.Context, it corrosion.QueueItem, 
 		}
 		found, err := s.netbox.LookupByIdentity(ctx, it.Key, b.VRFID, b.ObservedCIDR)
 		if err != nil {
+			s.nbMetrics().IncAPIError(netbox.Classify(err))
 			slog.Warn("netbox sweep: orphan-check lookup failed; will retry",
 				"identity", it.Key, "prefix", b.PrefixID, "error", err)
 			return false // keep the item queued

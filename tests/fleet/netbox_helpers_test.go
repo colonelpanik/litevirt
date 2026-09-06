@@ -277,7 +277,7 @@ func TestNetBoxFakeCommitsThenFailsTheResponse(t *testing.T) {
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
 	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
-	nb.OnClaim = func(int) error { return errors.New("response lost") }
+	nb.SetOnClaim(func(int) error { return errors.New("response lost") })
 
 	body := strings.NewReader(`{"custom_fields":{"litevirt_identity":"lv:fp:uuid:aa:bb"}}`)
 	resp, err := http.Post(nb.URL()+"/api/ipam/prefixes/7/available-ips/", "application/json", body)

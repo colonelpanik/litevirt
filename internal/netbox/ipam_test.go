@@ -195,11 +195,11 @@ func TestClaimSpecificIPConflictIsClientClass(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error")
 	}
+	// ClassClient is the DEFINITE "did not happen" answer — the one class a
+	// caller may treat as certain. Every other class leaves the server-side
+	// outcome unknown and sends the claim path into identity recovery.
 	if Classify(err) != ClassClient {
 		t.Fatalf("Classify = %v, want ClassClient", Classify(err))
-	}
-	if Ambiguous(err) {
-		t.Fatal("a 400 is a definite answer, not ambiguous")
 	}
 }
 

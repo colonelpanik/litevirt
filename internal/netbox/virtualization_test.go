@@ -1,0 +1,366 @@
+package netbox
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"testing"
+)
+
+// decodeBody JSON-decodes a request body inside a test handler.
+func decodeBody(t *testing.T, r *http.Request, out any) {
+	t.Helper()
+	if err := json.NewDecoder(r.Body).Decode(out); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+}
+
+func TestCreateVMSendsIdentityCustomField(t *testing.T) {
+	var gotIdentity string
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/virtualization/virtual-machines/" {
+			var body struct {
+				CustomFields map[string]string `json:"custom_fields"`
+			}
+			decodeBody(t, r, &body)
+			gotIdentity = body.CustomFields[IdentityField]
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":11,"name":"vm-1","vcpus":2,"memory":2048}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	got, err := c.CreateVM(context.Background(), VirtualMachine{
+		Name: "vm-1", ClusterID: 5, VCPUs: 2, MemoryMB: 2048,
+		Identity: "lv:fp:uuid",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != 11 {
+		t.Fatalf("VM id = %d, want 11", got.ID)
+	}
+	// Without the identity field the orphan sweep cannot reclaim an object whose
+	// local mapping was lost.
+	if gotIdentity != "lv:fp:uuid" {
+		t.Fatalf("identity custom field = %q, want lv:fp:uuid", gotIdentity)
+	}
+}
+
+func TestFindInterfaceByIdentity(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query().Get("cf_" + IdentityField); q != "lv:fp:uuid:52:54:00:aa:bb:cc" {
+			t.Errorf("query = %q", q)
+		}
+		_, _ = w.Write([]byte(`{"results":[{"id":21,"name":"eth0","mac_address":"52:54:00:AA:BB:CC","virtual_machine":{"id":11}}]}`))
+	})
+	got, err := c.FindInterfaceByIdentity(context.Background(), "lv:fp:uuid:52:54:00:aa:bb:cc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != 21 || got[0].VMID != 11 {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestToVMPopulatesEveryComparedField(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"results":[{"id":11,"name":"vm-1","vcpus":2,"memory":2048,"disk":20,` +
+			`"status":{"value":"active"},"cluster":{"id":5},"device":{"id":9},` +
+			`"custom_fields":{"litevirt_identity":"lv:fp:uuid"}}],"next":""}`))
+	})
+	got, err := c.ListVMsByCluster(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := got[0]
+	// Every field vmDiffers compares must survive decoding, or the mirror sees a
+	// difference on every sweep and write-on-change never fires.
+	if v.Status != "active" {
+		t.Errorf("Status = %q, want active", v.Status)
+	}
+	if v.ClusterID != 5 {
+		t.Errorf("ClusterID = %d, want 5", v.ClusterID)
+	}
+	if v.DeviceID != 9 {
+		t.Errorf("DeviceID = %d, want 9", v.DeviceID)
+	}
+	if v.Identity != "lv:fp:uuid" {
+		t.Errorf("Identity = %q", v.Identity)
+	}
+}
+
+func TestListOwnedIPsForInterfacesBatchesAndPaginates(t *testing.T) {
+	var reqs []url.Values
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		reqs = append(reqs, q)
+
+		// NetBox has no cluster filter on addresses. Rejecting unknown
+		// parameters here is what stops a query like virtual_machine_cluster_id
+		// from passing locally while silently losing its scope against a real
+		// server.
+		allowed := map[string]bool{
+			"vminterface_id": true, "limit": true, "offset": true,
+			"cf_" + IdentityField + "__n": true,
+		}
+		for k := range q {
+			if !allowed[k] {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"detail":"unknown query parameter ` + k + `"}`))
+				return
+			}
+		}
+		// One extra page inside the first batch.
+		if q.Get("offset") == "" || q.Get("offset") == "0" {
+			if len(q["vminterface_id"]) == 50 {
+				_, _ = w.Write([]byte(`{"results":[{"id":41,"address":"10.0.5.100/24","assigned_object_id":1}],"next":"more"}`))
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`{"results":[],"next":""}`))
+	})
+
+	ids := make([]int, 51)
+	for i := range ids {
+		ids[i] = i + 1
+	}
+	got, err := c.ListOwnedIPsForInterfaces(context.Background(), ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].AssignedObjectID != 1 {
+		t.Fatalf("got %+v", got)
+	}
+
+	// 51 ids at 50 per batch = two batches, and the first batch pages twice.
+	var batches, pages int
+	for _, q := range reqs {
+		pages++
+		if q.Get("offset") == "" || q.Get("offset") == "0" {
+			batches++
+		}
+		if len(q["vminterface_id"]) == 0 {
+			t.Error("every request must scope by vminterface_id")
+		}
+	}
+	if batches != 2 {
+		t.Errorf("51 ids must produce 2 batches, got %d", batches)
+	}
+	if pages < 3 {
+		t.Errorf("the first batch must paginate, got %d requests total", pages)
+	}
+}
+
+func TestUnknownQueryParameterIsRejected(t *testing.T) {
+	// Guards the guard: if the fake silently ignored an unknown parameter, the
+	// batching test above could not detect a filter NetBox does not implement.
+	//
+	// The test is in package netbox, so it calls the unexported do() directly.
+	// Adding an exported wrapper purely so a test can reach it would put
+	// test-only surface into the production client.
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("virtual_machine_cluster_id") {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[],"next":""}`))
+	})
+	var out struct {
+		Results []ipJSON `json:"results"`
+	}
+	err := c.do(context.Background(), http.MethodGet,
+		"/api/ipam/ip-addresses/?virtual_machine_cluster_id=5", nil, &out)
+	if err == nil {
+		t.Fatal("an unknown filter must be rejected, not silently ignored")
+	}
+	if Classify(err) != ClassClient {
+		t.Fatalf("a rejected filter is a 4xx, got class %v", Classify(err))
+	}
+}
+
+func TestFindDeviceByNameReturnsZeroWhenAbsent(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	})
+	// A host that is not modelled as a DCIM device must NOT be an error — the
+	// host link is best-effort, and requiring it would break the whole mirror
+	// for operators who do not model hosts in NetBox.
+	id, err := c.FindDeviceByName(context.Background(), "some-host")
+	if err != nil {
+		t.Fatalf("an absent device must not error, got %v", err)
+	}
+	if id != 0 {
+		t.Fatalf("id = %d, want 0", id)
+	}
+}
+
+// TestUpdateVMSendsDeviceExplicitlyWhenAbsent pins the one thing an omitted key
+// would break silently: a PATCH that leaves out "device" cannot CLEAR a stale
+// host link, so the diff keeps seeing a device the VM no longer sits on and
+// re-emits the same update on every sweep.
+func TestUpdateVMSendsDeviceExplicitlyWhenAbsent(t *testing.T) {
+	var body map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/api/virtualization/virtual-machines/11/" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		decodeBody(t, r, &body)
+		_, _ = w.Write([]byte(`{"id":11}`))
+	})
+	err := c.UpdateVM(context.Background(), 11, VirtualMachine{
+		Name: "vm-1", ClusterID: 5, VCPUs: 2, MemoryMB: 2048, Status: "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok := body["device"]
+	if !ok {
+		t.Fatal("device must be sent explicitly, even when absent — omitting the key leaves a stale link")
+	}
+	if v != nil {
+		t.Fatalf("device = %v, want null", v)
+	}
+}
+
+// TestListInterfacesByClusterPaginatesAndLowercasesMAC covers both halves of the
+// interface list: a truncated walk would make live interfaces look deleted, and
+// a MAC left in NetBox's uppercase form would never match the lower-cased MAC
+// the identity is built from.
+func TestListInterfacesByClusterPaginatesAndLowercasesMAC(t *testing.T) {
+	var reqs []url.Values
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		reqs = append(reqs, r.URL.Query())
+		if len(reqs) == 1 {
+			_, _ = w.Write([]byte(`{"results":[{"id":21,"name":"eth0","mac_address":"52:54:00:AA:BB:CC",` +
+				`"virtual_machine":{"id":11},"custom_fields":{"litevirt_identity":"lv:fp:uuid:52:54:00:aa:bb:cc"}}],` +
+				`"next":"http://x/api/virtualization/interfaces/?limit=200&offset=1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[{"id":22,"name":"eth1","mac_address":"52:54:00:dd:ee:ff",` +
+			`"virtual_machine":{"id":11}}],"next":""}`))
+	})
+	got, err := c.ListInterfacesByCluster(context.Background(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("want 2 requests (the walk must follow next), got %d", len(reqs))
+	}
+	if q := reqs[0].Get("cluster_id"); q != "5" {
+		t.Errorf("cluster_id = %q, want 5", q)
+	}
+	if len(got) != 2 || got[0].ID != 21 || got[1].ID != 22 {
+		t.Fatalf("got %+v, want ids [21 22]", got)
+	}
+	if got[0].MAC != "52:54:00:aa:bb:cc" {
+		t.Errorf("MAC = %q, want it lower-cased to match the identity", got[0].MAC)
+	}
+	if got[0].VMID != 11 {
+		t.Errorf("VMID = %d, want 11", got[0].VMID)
+	}
+	if got[0].Identity != "lv:fp:uuid:52:54:00:aa:bb:cc" {
+		t.Errorf("Identity = %q", got[0].Identity)
+	}
+}
+
+func TestEnsureClusterReusesExisting(t *testing.T) {
+	posts := 0
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":99}`))
+			return
+		}
+		if r.URL.Path != "/api/virtualization/clusters/" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("name"); got != "lab" {
+			t.Errorf("name filter = %q, want lab", got)
+		}
+		_, _ = w.Write([]byte(`{"results":[{"id":5,"name":"lab"}]}`))
+	})
+	id, err := c.EnsureCluster(context.Background(), "lab", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 5 {
+		t.Fatalf("id = %d, want the existing 5", id)
+	}
+	// A second cluster with the same name would split the mirror in two.
+	if posts != 0 {
+		t.Fatalf("an existing cluster must be reused, got %d create(s)", posts)
+	}
+}
+
+func TestEnsureClusterTypeCreatesWhenAbsent(t *testing.T) {
+	var body map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/virtualization/cluster-types/" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.Method == http.MethodPost {
+			decodeBody(t, r, &body)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":7}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	})
+	id, err := c.EnsureClusterType(context.Background(), "litevirt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 7 {
+		t.Fatalf("id = %d, want 7", id)
+	}
+	if body["name"] != "litevirt" {
+		t.Errorf("name = %v", body["name"])
+	}
+	// NetBox requires a slug on create and will not derive one for the API.
+	if body["slug"] != "litevirt" {
+		t.Errorf("slug = %v, want litevirt", body["slug"])
+	}
+}
+
+func TestAssignAndClearIPAssignment(t *testing.T) {
+	var bodies []map[string]any
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/api/ipam/ip-addresses/41/" {
+			t.Errorf("got %s %s", r.Method, r.URL.Path)
+		}
+		var b map[string]any
+		decodeBody(t, r, &b)
+		bodies = append(bodies, b)
+		_, _ = w.Write([]byte(`{"id":41}`))
+	})
+	if err := c.AssignIPToInterface(context.Background(), 41, 21); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ClearIPAssignment(context.Background(), 41); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 PATCHes, got %d", len(bodies))
+	}
+	if bodies[0]["assigned_object_type"] != "virtualization.vminterface" {
+		t.Errorf("assigned_object_type = %v", bodies[0]["assigned_object_type"])
+	}
+	if bodies[0]["assigned_object_id"] != float64(21) {
+		t.Errorf("assigned_object_id = %v, want 21", bodies[0]["assigned_object_id"])
+	}
+	// Clearing needs EXPLICIT nulls on both halves: an omitted key is a no-op
+	// PATCH, so the address would stay attached to a VM that no longer exists.
+	for _, k := range []string{"assigned_object_type", "assigned_object_id"} {
+		v, ok := bodies[1][k]
+		if !ok {
+			t.Errorf("clear must send %s explicitly", k)
+			continue
+		}
+		if v != nil {
+			t.Errorf("clear sent %s = %v, want null", k, v)
+		}
+	}
+}

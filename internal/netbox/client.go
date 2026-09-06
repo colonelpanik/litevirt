@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -89,6 +91,53 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		return fmt.Errorf("netbox: decode response: %w", err)
 	}
 	return nil
+}
+
+// pageSize is the per-request page size asked of every list endpoint. NetBox
+// paginates at 50 by default and caps the value server-side, so this is a hint,
+// never a promise that one request returns everything.
+const pageSize = 200
+
+// pageOf is one page of any NetBox list response: the rows in their raw
+// per-endpoint shape, plus the URL of the next page ("" on the last one).
+type pageOf[J any] struct {
+	Results []J    `json:"results"`
+	Next    string `json:"next"`
+}
+
+// paginate walks EVERY page of a list endpoint and maps each raw row with
+// convert.
+//
+// It exists so that no caller can accidentally read only the first page: a
+// truncated list makes the full sweep believe live objects have vanished, and
+// the sweep then deletes them. Every list operation in this package goes
+// through here rather than issuing its own loop.
+func paginate[J, T any](ctx context.Context, c *Client, path string, q url.Values, convert func(J) T) ([]T, error) {
+	var res []T
+	offset := 0
+	for {
+		page := url.Values{}
+		for k, v := range q {
+			page[k] = v
+		}
+		page.Set("limit", strconv.Itoa(pageSize))
+		page.Set("offset", strconv.Itoa(offset))
+
+		var out pageOf[J]
+		if err := c.do(ctx, http.MethodGet, path+"?"+page.Encode(), nil, &out); err != nil {
+			return nil, err
+		}
+		for _, r := range out.Results {
+			res = append(res, convert(r))
+		}
+		if out.Next == "" {
+			return res, nil
+		}
+		offset += len(out.Results)
+		if len(out.Results) == 0 {
+			return res, nil // defensive: a Next that never drains
+		}
+	}
 }
 
 // Prefix is one ipam.prefix. VRFID is 0 for a global-table prefix, which bind

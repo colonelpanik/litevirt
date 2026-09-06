@@ -48,6 +48,11 @@ type IPAddress struct {
 	Created time.Time
 }
 
+// ipAddressesPath is the ipam address collection. It is a const because the
+// virtualization mirror reaches for the same endpoint: assignment lives on the
+// ADDRESS object, not on the interface.
+const ipAddressesPath = "/api/ipam/ip-addresses/"
+
 type ipJSON struct {
 	ID      int    `json:"id"`
 	Address string `json:"address"`
@@ -166,15 +171,10 @@ func (c *Client) ClaimSpecificIP(ctx context.Context, address string, vrfID int,
 		"custom_fields": map[string]string{IdentityField: identity},
 	}
 	var out ipJSON
-	if err := c.do(ctx, http.MethodPost, "/api/ipam/ip-addresses/", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, ipAddressesPath, body, &out); err != nil {
 		return IPAddress{}, err
 	}
 	return out.toIP(), nil
-}
-
-type listJSON struct {
-	Results []ipJSON `json:"results"`
-	Next    string   `json:"next"`
 }
 
 // LookupByAddress finds addresses matching an exact address within one VRF.
@@ -204,34 +204,12 @@ func (c *Client) LookupByIdentity(ctx context.Context, identity string, vrfID in
 	return c.list(ctx, q)
 }
 
-// list walks EVERY page. NetBox paginates at 50 by default; a truncated list
-// would make the full sweep believe live objects had vanished and delete them.
+// list walks EVERY page of the address endpoint. NetBox paginates at 50 by
+// default; a truncated list would make the full sweep believe live objects had
+// vanished and delete them. The walk itself lives in paginate, which every list
+// operation in this package shares.
 func (c *Client) list(ctx context.Context, q url.Values) ([]IPAddress, error) {
-	var res []IPAddress
-	offset := 0
-	for {
-		page := url.Values{}
-		for k, v := range q {
-			page[k] = v
-		}
-		page.Set("limit", "200")
-		page.Set("offset", strconv.Itoa(offset))
-
-		var out listJSON
-		if err := c.do(ctx, http.MethodGet, "/api/ipam/ip-addresses/?"+page.Encode(), nil, &out); err != nil {
-			return nil, err
-		}
-		for _, r := range out.Results {
-			res = append(res, r.toIP())
-		}
-		if out.Next == "" {
-			return res, nil
-		}
-		offset += len(out.Results)
-		if len(out.Results) == 0 {
-			return res, nil // defensive: a Next that never drains
-		}
-	}
+	return paginate(ctx, c, ipAddressesPath, q, ipJSON.toIP)
 }
 
 // ListIPsByPrefix enumerates every litevirt-tagged address in a prefix. The
@@ -247,7 +225,7 @@ func (c *Client) ListIPsByPrefix(ctx context.Context, prefixCIDR string, vrfID i
 
 // ReleaseIP deletes one address by id.
 func (c *Client) ReleaseIP(ctx context.Context, id int) error {
-	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/api/ipam/ip-addresses/%d/", id), nil, nil)
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf(ipAddressesPath+"%d/", id), nil, nil)
 }
 
 // SetIPIdentity rewrites ONE address's litevirt identity custom field.
@@ -260,5 +238,5 @@ func (c *Client) SetIPIdentity(ctx context.Context, id int, identity string) err
 	body := map[string]any{
 		"custom_fields": map[string]string{IdentityField: identity},
 	}
-	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/api/ipam/ip-addresses/%d/", id), body, nil)
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf(ipAddressesPath+"%d/", id), body, nil)
 }

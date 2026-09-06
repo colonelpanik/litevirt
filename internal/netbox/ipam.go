@@ -1,0 +1,192 @@
+package netbox
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+// IPAddress is one ipam.ip-address as litevirt cares about it.
+//
+// VRFID is carried because an identity match alone is not enough to adopt an
+// object: a uniquely-matching address that has been MOVED into another VRF is
+// not the one this binding claims, and adopting it would write a lease
+// pointing outside the bound prefix.
+type IPAddress struct {
+	ID       int
+	Address  string
+	Identity string
+	VRFID    int
+	// AssignedObjectID is the object this address is attached to, or 0.
+	// Assignment lives on the ADDRESS in NetBox, not on the interface — an
+	// interface can carry several addresses — so P2's mirror reads assignment
+	// from here rather than from a synthetic field on the interface.
+	AssignedObjectID int
+}
+
+type ipJSON struct {
+	ID      int    `json:"id"`
+	Address string `json:"address"`
+	VRF     *struct {
+		ID int `json:"id"`
+	} `json:"vrf"`
+	AssignedObjectID *int           `json:"assigned_object_id"`
+	CustomFields     map[string]any `json:"custom_fields"`
+}
+
+func (j ipJSON) toIP() IPAddress {
+	out := IPAddress{ID: j.ID, Address: j.Address}
+	if j.VRF != nil {
+		out.VRFID = j.VRF.ID
+	}
+	if j.AssignedObjectID != nil {
+		out.AssignedObjectID = *j.AssignedObjectID
+	}
+	if v, ok := j.CustomFields[IdentityField].(string); ok {
+		out.Identity = v
+	}
+	return out
+}
+
+// ClaimAvailableIP claims the next free address in a prefix. NetBox serializes
+// this endpoint with a PostgreSQL advisory lock, so it is atomic across entry
+// nodes and litevirt needs no distributed locking of its own.
+//
+// NOTE: on a timeout this call does NOT reveal which address NetBox picked, so
+// recovery is by identity lookup only — never by address.
+//
+// RESPONSE SHAPE: NetBox mirrors the request. A single-object POST returns a
+// single object; only a LIST request returns a list. We send a single object,
+// so we expect an object — but decode tolerantly, because the shape has varied
+// across NetBox versions and guessing wrong here fails at runtime against a
+// real server while passing against a fake that shares the guess.
+func (c *Client) ClaimAvailableIP(ctx context.Context, prefixID int, identity string) (IPAddress, error) {
+	body := map[string]any{
+		"custom_fields": map[string]string{IdentityField: identity},
+	}
+	var raw json.RawMessage
+	path := fmt.Sprintf("/api/ipam/prefixes/%d/available-ips/", prefixID)
+	if err := c.do(ctx, http.MethodPost, path, body, &raw); err != nil {
+		return IPAddress{}, err
+	}
+	return decodeOneOrMany(raw, prefixID)
+}
+
+// decodeOneOrMany accepts either a single ip object or a one-element array.
+func decodeOneOrMany(raw json.RawMessage, prefixID int) (IPAddress, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, "[") {
+		var many []ipJSON
+		if err := json.Unmarshal(raw, &many); err != nil {
+			return IPAddress{}, fmt.Errorf("netbox: decode available-ips array: %w", err)
+		}
+		if len(many) == 0 {
+			return IPAddress{}, fmt.Errorf("netbox: available-ips returned no address for prefix %d", prefixID)
+		}
+		return many[0].toIP(), nil
+	}
+	var one ipJSON
+	if err := json.Unmarshal(raw, &one); err != nil {
+		return IPAddress{}, fmt.Errorf("netbox: decode available-ips object: %w", err)
+	}
+	if one.ID == 0 {
+		return IPAddress{}, fmt.Errorf("netbox: available-ips returned no address for prefix %d", prefixID)
+	}
+	return one.toIP(), nil
+}
+
+// ClaimSpecificIP creates one exact address in a VRF.
+func (c *Client) ClaimSpecificIP(ctx context.Context, address string, vrfID int, identity string) (IPAddress, error) {
+	body := map[string]any{
+		"address":       address,
+		"vrf":           vrfID,
+		"custom_fields": map[string]string{IdentityField: identity},
+	}
+	var out ipJSON
+	if err := c.do(ctx, http.MethodPost, "/api/ipam/ip-addresses/", body, &out); err != nil {
+		return IPAddress{}, err
+	}
+	return out.toIP(), nil
+}
+
+type listJSON struct {
+	Results []ipJSON `json:"results"`
+	Next    string   `json:"next"`
+}
+
+// LookupByAddress finds addresses matching an exact address within one VRF.
+// Used only for EXPLICIT claims — a dynamic claim has no address to look up.
+func (c *Client) LookupByAddress(ctx context.Context, address string, vrfID int) ([]IPAddress, error) {
+	q := url.Values{}
+	q.Set("address", address)
+	q.Set("vrf_id", strconv.Itoa(vrfID))
+	return c.list(ctx, q)
+}
+
+// LookupByIdentity finds addresses carrying our identity custom field, SCOPED to
+// one VRF and prefix. This is the only recovery path for an ambiguous dynamic
+// claim.
+//
+// The scope is not optional. An unscoped lookup would adopt a uniquely-matching
+// object that has since been moved into a different VRF or prefix — which is not
+// the address this binding claims.
+func (c *Client) LookupByIdentity(ctx context.Context, identity string, vrfID int, prefixCIDR string) ([]IPAddress, error) {
+	q := url.Values{}
+	q.Set("cf_"+IdentityField, identity)
+	q.Set("vrf_id", strconv.Itoa(vrfID))
+	// parent takes a CIDR, not a prefix id. NetBox's IPAddressFilterSet.parent
+	// parses the value as a network — an address has no parent-prefix FK — so
+	// passing an id here silently filters on nonsense.
+	q.Set("parent", prefixCIDR)
+	return c.list(ctx, q)
+}
+
+// list walks EVERY page. NetBox paginates at 50 by default; a truncated list
+// would make the full sweep believe live objects had vanished and delete them.
+func (c *Client) list(ctx context.Context, q url.Values) ([]IPAddress, error) {
+	var res []IPAddress
+	offset := 0
+	for {
+		page := url.Values{}
+		for k, v := range q {
+			page[k] = v
+		}
+		page.Set("limit", "200")
+		page.Set("offset", strconv.Itoa(offset))
+
+		var out listJSON
+		if err := c.do(ctx, http.MethodGet, "/api/ipam/ip-addresses/?"+page.Encode(), nil, &out); err != nil {
+			return nil, err
+		}
+		for _, r := range out.Results {
+			res = append(res, r.toIP())
+		}
+		if out.Next == "" {
+			return res, nil
+		}
+		offset += len(out.Results)
+		if len(out.Results) == 0 {
+			return res, nil // defensive: a Next that never drains
+		}
+	}
+}
+
+// ListIPsByPrefix enumerates every litevirt-tagged address in a prefix. The
+// orphan sweeper needs this to find candidates; without it there is no way to
+// discover an address whose local row was lost.
+func (c *Client) ListIPsByPrefix(ctx context.Context, prefixCIDR string, vrfID int) ([]IPAddress, error) {
+	q := url.Values{}
+	q.Set("parent", prefixCIDR) // a CIDR, not an id — see LookupByIdentity
+	q.Set("vrf_id", strconv.Itoa(vrfID))
+	q.Set("cf_"+IdentityField+"__n", "") // has a non-empty litevirt identity
+	return c.list(ctx, q)
+}
+
+// ReleaseIP deletes one address by id.
+func (c *Client) ReleaseIP(ctx context.Context, id int) error {
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/api/ipam/ip-addresses/%d/", id), nil, nil)
+}

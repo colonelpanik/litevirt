@@ -306,12 +306,17 @@ lv network create <name> --type bridge [flags]    # Create a network
   --subnet <cidr> [--dhcp]
   --pf <iface> --spoof-check                      # SR-IOV variants
   --project <name>                                # owning project (empty = global/shared)
+  --netbox-prefix-id <id>                          # bind to a NetBox prefix
 lv network rm <name> [--force]
 ```
 
 `--project` makes the network owned + isolated: only that project's workloads (or
 a root operator) may attach. Omit it for a global/shared network. `lv network ls`
 shows the owner. See `docs/tenancy.md`.
+
+`--netbox-prefix-id` binds the network to a NetBox prefix so VM NICs on it claim
+their address from NetBox. See `docs/networking.md#binding-a-network-to-netbox`
+for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 
 ## Storage pools
 

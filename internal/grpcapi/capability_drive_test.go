@@ -36,6 +36,11 @@ func (g *recordingGate) Latched(token string) bool {
 	return g.latched[token]
 }
 
+// DurablyLatched mirrors Latched: this fake models the durable latch directly
+// (see the type comment), so once Enforced confirms a token it is both
+// latched and durable.
+func (g *recordingGate) DurablyLatched(token string) bool { return g.Latched(token) }
+
 func (g *recordingGate) drivenUnique() map[string]bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()

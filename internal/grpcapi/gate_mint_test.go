@@ -25,6 +25,11 @@ type fakeServerGate struct {
 	// token -> enforced (when non-nil, authoritative for Enforced/CapabilityActive).
 	supportsTok map[string]map[string]bool
 	enforcedTok map[string]bool
+
+	// durablyLatchedTok optionally overrides DurablyLatched per-token, letting a
+	// test assert on a token that is latched only in memory (not yet durable) —
+	// the case a plain Latched-mirroring default cannot express.
+	durablyLatchedTok map[string]bool
 }
 
 func (f fakeServerGate) ExecutionGate(context.Context) health.GateResult {
@@ -47,6 +52,17 @@ func (f fakeServerGate) CapabilityActiveForHealth(_ context.Context, token strin
 }
 func (f fakeServerGate) Enforced(_ context.Context, token string) bool { return f.enforcedFor(token) }
 func (f fakeServerGate) Latched(token string) bool                     { return f.enforcedFor(token) }
+
+// DurablyLatched mirrors Latched by default (this fake conflates "latched" and
+// "persisted" — the same simplification Latched already makes). A test that
+// needs to exercise the latched-but-not-yet-durable distinction sets
+// durablyLatchedTok explicitly to override.
+func (f fakeServerGate) DurablyLatched(token string) bool {
+	if f.durablyLatchedTok != nil {
+		return f.durablyLatchedTok[token]
+	}
+	return f.enforcedFor(token)
+}
 func (f fakeServerGate) enforcedFor(token string) bool {
 	if f.enforcedTok != nil {
 		return f.enforcedTok[token]

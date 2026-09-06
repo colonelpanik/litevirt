@@ -70,6 +70,17 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		def.Interface = req.Name
 	}
 
+	// A NetBox bind is validated and CLAIMED before the network is persisted at
+	// all: the binding row and the network's config blob must agree, and a
+	// failed bind must abort the create rather than leave a network whose
+	// config names a prefix nothing actually reserved.
+	if req.NetboxPrefixId != 0 {
+		if err := s.validateAndBindPrefix(ctx, req.Name, int(req.NetboxPrefixId)); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		def.NetBoxPrefixID = int(req.NetboxPrefixId)
+	}
+
 	ni, err := s.provisionAndPersistNetwork(ctx, req.Name, "", project, def)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network: %v", err)

@@ -608,6 +608,7 @@ message CreateNetworkRequest {
     string pf         = 11; // SR-IOV physical function
     bool   spoof_check = 12;
     string project    = 13; // owning tenant; empty = global/shared (usable by all)
+    int32  netbox_prefix_id = 14; // bind to a NetBox prefix; 0 = unbound
 }
 message GetNetworkRequest      { string name = 1; }
 message DeleteNetworkRequest   { string name = 1; bool force = 2; }

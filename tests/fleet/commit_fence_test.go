@@ -55,7 +55,10 @@ func (quotaOnlyGate) CapabilityActiveForHealth(_ context.Context, token string) 
 func (quotaOnlyGate) Enforced(_ context.Context, token string) bool {
 	return token == capabilities.ProjectAuthorityV1
 }
-func (quotaOnlyGate) Latched(token string) bool                              { return token == capabilities.ProjectAuthorityV1 }
+func (quotaOnlyGate) Latched(token string) bool { return token == capabilities.ProjectAuthorityV1 }
+func (quotaOnlyGate) DurablyLatched(token string) bool {
+	return token == capabilities.ProjectAuthorityV1
+}
 func (quotaOnlyGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
 func (quotaOnlyGate) HealthyPeers(context.Context) []string                  { return nil }
 

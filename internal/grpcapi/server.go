@@ -591,6 +591,13 @@ type serverGate interface {
 	// Ping). The HA monitor's bounded latch-driver uses it to skip already-latched
 	// tokens so it drives at most one unlatched token per cycle.
 	Latched(token string) bool
+	// DurablyLatched is the STRONGER form of Latched: the latch must be active
+	// in memory AND persisted to its durable marker. A contract whose safety
+	// must survive a restart — like binding a network to a NetBox prefix, where
+	// a node that latched only in memory would, after a reboot that reloads no
+	// marker, revert to allocating from the builtin allocator across an
+	// already-bound prefix — gates on this, not Latched.
+	DurablyLatched(token string) bool
 	// PeerSupportsFresh fresh-Pings peer (UNcached) and reports whether it advertises
 	// token — used before stamping/forwarding a proof-bearing action, so a
 	// regressed/replaced target that can't honor the proof is never sent one.

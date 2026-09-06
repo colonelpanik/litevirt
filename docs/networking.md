@@ -201,6 +201,24 @@ How a VM gets its address depends on when and how you set it:
 lv config my-vm --ip 10.0.1.50 --network lan
 ```
 
+### Binding a network to NetBox
+
+`lv network create <name> --netbox-prefix-id <id>` binds a network to a NetBox
+prefix. VM NICs on a bound network claim their address from NetBox instead of
+requiring an operator-supplied IP.
+
+Binding requires:
+
+- the `netbox_ipam_v1` capability latch, DURABLY — persisted to disk, not just
+  active in this process's memory — which requires `netbox.enabled` on every
+  node;
+- the prefix to live in a VRF with `enforce_unique` set — global-table prefixes
+  are refused, because NetBox does not expose the global uniqueness setting;
+- the prefix not to be bound to another litevirt network already.
+
+While NetBox is unreachable, creating a VM on a bound network fails. Existing
+VMs are unaffected, and unbound networks are unaffected.
+
 ## NAT
 
 By default, litevirt enables IP masquerading (NAT) for networks with a subnet defined. This gives VMs outbound internet access through the host.

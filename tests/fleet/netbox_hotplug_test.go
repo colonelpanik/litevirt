@@ -651,3 +651,122 @@ func TestHotplugDetachRemoteReleaseFailureRetryRemovesRow(t *testing.T) {
 		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %v", ids[0], queued)
 	}
 }
+
+// ── detach: stopped VM ──────────────────────────────────────────────────────
+
+// stoppedVMWithNIC brings up a VM holding exactly ONE hotplugged NIC on a bound
+// network and then stops it — the state the stopped detach path acts on.
+//
+// hardware_v2 is latched AFTER the VM exists (so the audit pass adopts it rather
+// than blocking it) and BEFORE the attach, which is what both makes the stopped
+// path reachable at all and keeps the NIC on the journaled vm_nics row alone.
+func stoppedVMWithNIC(t *testing.T, c *Cluster, gates map[string]*health.Checker, n *Node, vmName, netName string) nicInfo {
+	t.Helper()
+	ctx := context.Background()
+	mustCreateNICLessVM(t, c, n, vmName)
+	latchHardwareV2(t, c, gates)
+
+	nic := mustAttachNIC(t, c, n, vmName, netName)
+	if !isNetBoxBand(nic.IP) {
+		t.Fatalf("the NIC must hold a NetBox address before the VM is stopped, got %q", nic.IP)
+	}
+	if _, err := c.SelfClient(n).StopVM(ctx, &pb.StopVMRequest{Name: vmName, Force: true}); err != nil {
+		t.Fatalf("StopVM %s on %s: %v", vmName, n.Name, err)
+	}
+	vm, err := corrosion.GetVM(ctx, n.DB, vmName)
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM(%s): %+v (err=%v)", vmName, vm, err)
+	}
+	if vm.State != "stopped" {
+		t.Fatalf("test setup: %s must be stopped to reach the stopped detach path, state = %q", vmName, vm.State)
+	}
+	return nic
+}
+
+// TestHotplugStoppedDetachTombstonesRowBeforeRelease pins the stopped path's
+// ORDER, and it is the same property TestHotplugDetachReleasesAfterLiveDetach
+// pins for a running VM.
+//
+// A stopped VM has no live device, but it is NOT true that nothing is applied
+// until the row goes: for a stopped VM the ROW IS the applied state, because
+// reconcileDomainDefinition rebuilds the domain from the NIC rows, so the next
+// define/start boots the guest with whatever the row says. Removing it is a
+// separate replicated write that can fail on its own. Release first and a
+// tombstone that then fails leaves a row naming an address NetBox has already
+// handed to someone else — a collision on the next start.
+//
+// The failing tombstone is what makes this non-vacuous: both orderings return an
+// error, and only one of them has already given the address away under a NIC the
+// VM still declares.
+func TestHotplugStoppedDetachTombstonesRowBeforeRelease(t *testing.T) {
+	nb, c, gates := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	nic := stoppedVMWithNIC(t, c, gates, n, "vm-1", orphanNetwork)
+
+	n.FailNICRowDelete(t)
+
+	err := detachNIC(c, n, "vm-1", nic.MAC)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("a detach whose row tombstone fails must surface as Internal, got %v", err)
+	}
+
+	// The row step ran FIRST and failed, so NOTHING was released: the NIC the
+	// next start would define still names an address both systems still hold.
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 1 {
+		t.Fatalf("test setup: the tombstone should have been unable to remove the NIC row, got %+v", nics)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the address was freed while the NIC row still names it: %d leases live", got)
+	}
+	if ids := nb.Identities(); len(ids) != 1 {
+		t.Fatalf("the NetBox object was released while the NIC row still names it: %v", ids)
+	}
+}
+
+// TestHotplugStoppedDetachReleaseFailureIsALeak is what that ordering BUYS: the
+// failure it prefers is a leak, and a leak has to be reclaimable.
+//
+// The row is gone and the release then fails, so litevirt still holds the address
+// with the VM already unable to boot that NIC. Unlike the running path there is
+// no row left for a retry to release from — a retried detach can only answer
+// NotFound — so the identity must be named for the orphan sweep, which is the one
+// mechanism that can still reclaim a lease and a NetBox object nothing references.
+func TestHotplugStoppedDetachReleaseFailureIsALeak(t *testing.T) {
+	nb, c, gates := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	nic := stoppedVMWithNIC(t, c, gates, n, "vm-1", orphanNetwork)
+	ids := nb.Identities()
+	if len(ids) != 1 {
+		t.Fatalf("want one NetBox identity before the detach, got %v", ids)
+	}
+
+	dropTombstoneFailure := n.FailLeaseTombstones(t)
+
+	err := detachNIC(c, n, "vm-1", nic.MAC)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("a failed release must surface as Internal, got %v", err)
+	}
+
+	// A LEAK, not a collision: the row is gone (so no start can bring the NIC
+	// back), and the address stays held in both systems.
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 0 {
+		t.Fatalf("the row tombstone runs first and must have landed, got %+v", nics)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the lease must still be live after a failed release, got %d", got)
+	}
+	if got := nb.Identities(); len(got) != 1 {
+		t.Fatalf("the NetBox object must still be held after a failed release, got %v", got)
+	}
+
+	// ...and it is RECLAIMABLE: named for the sweep, which is the only thing left
+	// that can reclaim it, because a retry of the detach no longer finds the NIC.
+	queued := orphanChecksQueued(t, n)
+	if !contains(queued, ids[0]) {
+		t.Fatalf("the retained address %q must be named for the orphan sweep, queue = %v", ids[0], queued)
+	}
+	dropTombstoneFailure()
+	if err := detachNIC(c, n, "vm-1", nic.MAC); status.Code(err) != codes.NotFound {
+		t.Fatalf("with the row already gone a retried detach can only answer NotFound, got %v", err)
+	}
+}

@@ -776,25 +776,36 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 
 // executeNICDetach realizes the detach DAG under the lock: journal the plan →
 // (running) live detach, then release this NIC's address, then tombstone rows;
-// (stopped) release this NIC's address, then tombstone rows and reconcile →
-// verify absence → CompleteVMOperation. Row writes are ordered
+// (stopped) tombstone rows and reconcile the definition, then release this NIC's
+// address → verify absence → CompleteVMOperation. Row writes are ordered
 // vm_nics-first (authoritative), then the pre-latch legacy dual-write — so a
 // legacy-write failure after the authoritative tombstone lands is forward progress
 // (left recoverable), never reported as a clean no-op failure.
 //
-// The RUNNING order is load-bearing and is the inverse of the attach path's:
-// unplug FIRST, give the address back SECOND. Releasing before the live detach
-// means a release that succeeds and a detach that then fails leaves the guest
-// using an address both litevirt and the external IPAM consider free — a
-// collision, and the very outcome failNICAttach's rolledBack guard exists to
-// prevent on the way in. Doing it in this order can only ever leak: the address
-// stays held with the NIC already gone, which a retry or the orphan sweep
-// clears. Leak over collision, every time.
+// BOTH orders obey ONE rule: take the address away from whatever still USES it
+// FIRST, and give it back to the external IPAM SECOND. Leak over collision,
+// every time. What differs between them is only which artifact is the thing
+// still using it.
 //
-// The STOPPED path keeps the release first, and for the same principle rather
-// than in spite of it: there is no live device and no guest, nothing is applied
-// to the domain until the row tombstone below, and so a release failure there is
-// a genuinely clean refusal with the NIC and its address both untouched.
+// RUNNING: the LIVE DEVICE is. Unplug first, release second. Releasing before
+// the live detach means a release that succeeds and a detach that then fails
+// leaves the guest using an address both litevirt and the external IPAM consider
+// free — a collision, and the very outcome failNICAttach's rolledBack guard
+// exists to prevent on the way in. In this order the same failure can only ever
+// leak: the address stays held with the NIC already gone, which a retry or the
+// orphan sweep clears.
+//
+// STOPPED: the NIC ROW is. There is no live device, but the row is not
+// bookkeeping trailing behind an applied state — for a stopped VM it IS the
+// applied state, because reconcileDomainDefinition rebuilds the domain FROM the
+// rows (MergedVMNICs), so the next define/start boots the guest with whatever the
+// row says. And removing it is a separate, independently failable replicated
+// write. Release first and a tombstone that then fails leaves a row naming an
+// address NetBox has already handed to someone else — the same collision, merely
+// deferred to the next start. So the row goes first here too: the running order
+// minus the unplug. A release that then fails is a pure leak — the row is gone,
+// the lease and the NetBox object linger, the VM starts without that NIC, and the
+// sweep reclaims.
 func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, mac, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepReserved)
 
@@ -854,16 +865,12 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			return nil, status.Errorf(codes.Internal, "nic detach for %q applied but bookkeeping incomplete; left recoverable", vm.Name)
 		}
 	} else {
-		// Nothing is applied to the domain until the row tombstone below (the
-		// definition is rebuilt FROM the rows), so the release runs first here:
-		// a failure leaves the NIC and its address exactly as they were, which is
-		// a strictly better refusal than one that has already changed something.
-		if err := s.releaseOneNICLease(ctx, vm, nic); err != nil {
-			return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac, codes.Internal,
-				fmt.Errorf("detach %s: address release failed; the NIC and its address are retained — retry to release: %w", mac, err))
-		}
+		// (1) REMOVE THE ROW FIRST, while the address is still held on both
+		// sides. The row is what the next define/start builds the guest's NIC
+		// from, so a failure here changed nothing at all — the NIC is still in
+		// the definition a start would produce, its row still stands and its
+		// address is still ours — and it is a clean terminal failure.
 		if err := corrosion.TombstoneNIC(ctx, s.db, vm.Name, nicID); err != nil {
-			// Nothing applied to the domain yet → clean terminal fail.
 			return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac,
 				codes.Internal, fmt.Errorf("tombstone nic row: %w", err))
 		}
@@ -871,13 +878,24 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, n
 			if err := corrosion.SoftDeleteInterfaceByMAC(ctx, s.db, vm.Name, mac); err != nil {
 				// The authoritative row is already gone (forward progress via the
 				// overlay) → roll FORWARD: leave NON-TERMINAL, never re-attach.
+				// The address was NOT released, so this is a leak recovery can
+				// finish, never an address freed under a row that survived.
 				slog.Error("nic detach: legacy interface soft-delete failed after nic tombstone — left recoverable", "vm", vm.Name, "op", opID, "error", err)
-				return nil, status.Errorf(codes.Internal, "nic detach for %q applied but legacy bookkeeping incomplete; left recoverable: %v", vm.Name, err)
+				return nil, status.Errorf(codes.Internal, "nic detach for %q applied but legacy bookkeeping incomplete; the address is retained; left recoverable: %v", vm.Name, err)
 			}
 		}
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
 			slog.Error("nic detach: reconcile after row tombstone failed — left recoverable", "vm", vm.Name, "op", opID, "error", err)
-			return nil, status.Errorf(codes.Internal, "nic detach for %q applied but definition not reconciled; left recoverable: %v", vm.Name, err)
+			return nil, status.Errorf(codes.Internal, "nic detach for %q applied but definition not reconciled; the address is retained; left recoverable: %v", vm.Name, err)
+		}
+		// (2) Only now give the address back: nothing on this cluster names it
+		// any more. A failure here is a pure LEAK, and unlike the running path
+		// no retry of this detach can clear it — the row a retry would look the
+		// NIC up by is gone, so the detach answers NotFound — which is why the
+		// failure hands the identity to the orphan sweep instead.
+		if err := s.releaseOneNICLease(ctx, vm, nic); err != nil {
+			return s.failNICDetachAfterRowRemoval(ctx, vm, nic, opID, epoch, newGen, mac, codes.Internal,
+				fmt.Errorf("detach %s: address release failed; the NIC row is removed but its address is retained and named for the orphan sweep: %w", mac, err))
 		}
 	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepAttached)
@@ -944,7 +962,26 @@ func (s *Server) failNICDetachAfterUnplug(ctx context.Context, vm *corrosion.VMR
 	return s.failNICDetachTerminal(ctx, vm, opID, epoch, newGen, mac, code, cause)
 }
 
-// failNICDetachTerminal is the shared body of both: record the terminal failure,
+// failNICDetachAfterRowRemoval records a terminal detach failure + clears the
+// barrier when the NIC ROW is ALREADY GONE — which for a stopped VM is the
+// applied state, the definition being rebuilt from the rows — but its address was
+// deliberately RETAINED, the release having failed after the row was removed.
+//
+// Distinct from failNICDetachClean so the log line cannot claim nothing was
+// applied when the next start will already boot the guest without that NIC. It is
+// also NOT failNICDetachAfterUnplug: there the RETAINED row is what a retry finds
+// and re-releases from, and here that row is exactly what is gone — a retried
+// detach can only answer NotFound. So the identity goes to the orphan sweep,
+// which is the one mechanism that can still reclaim a lease and a NetBox object
+// nothing references.
+func (s *Server) failNICDetachAfterRowRemoval(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, opID string, epoch, newGen int64, mac string, code codes.Code, cause error) (*pb.VM, error) {
+	slog.Error("nic detach: the NIC row is removed but its address could not be released — address retained and named for the orphan sweep",
+		"vm", vm.Name, "op", opID, "mac", mac, "error", cause)
+	s.enqueueNICOrphanCheck(ctx, vm, nic)
+	return s.failNICDetachTerminal(ctx, vm, opID, epoch, newGen, mac, code, cause)
+}
+
+// failNICDetachTerminal is the shared body of all three: record the terminal failure,
 // clear the barrier, drop the journal entry, and surface the cause.
 func (s *Server) failNICDetachTerminal(ctx context.Context, vm *corrosion.VMRecord, opID string, epoch, newGen int64, mac string, code codes.Code, cause error) (*pb.VM, error) {
 	applied, ferr := s.db.FailVMOperation(ctx, vm.Name, opID, epoch, newGen, deviceFailureFacts(code, cause))

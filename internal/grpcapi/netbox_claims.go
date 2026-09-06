@@ -104,6 +104,11 @@ func (c *claimSet) releaseAll(ctx context.Context) {
 // Naming each one hands it to the sweep's stuck-lease surfacing, which reports
 // exactly this shape: an identity whose local lease is still live with nothing
 // driving it forward.
+//
+// The set is emptied afterwards exactly as releaseAll empties it: this is the
+// terminal disposition of every claim in it, so a second caller must not be able
+// to enqueue the same identities again (or, worse, release addresses this
+// disposition deliberately kept).
 func (c *claimSet) enqueueOrphanChecks(ctx context.Context) {
 	for _, a := range c.items {
 		if a.Identity == "" {
@@ -114,6 +119,7 @@ func (c *claimSet) enqueueOrphanChecks(ctx context.Context) {
 				"identity", a.Identity, "error", eerr)
 		}
 	}
+	c.items = nil
 }
 
 // enqueueOrphanCheck records that an identity may name an unreferenced NetBox

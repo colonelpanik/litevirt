@@ -44,30 +44,35 @@ func ClaimBinding(ctx context.Context, c *Client, r BindingRecord) (bool, error)
 }
 
 // UpsertBinding rewrites an EXISTING binding — used by revalidation and re-key,
-// never to create one. Use ClaimBinding for a new bind.
+// never to create one. Use ClaimBinding for a new bind. It refuses (returns an
+// error) when no row exists for the prefix, rather than silently creating one
+// — a silent create would bypass ClaimBinding's uniqueness read-back.
 func UpsertBinding(ctx context.Context, c *Client, r BindingRecord) error {
-	now := c.NowTS()
 	susp := 0
 	if r.Suspended {
 		susp = 1
 	}
-	return c.Execute(ctx,
-		`INSERT INTO netbox_bindings
-		   (prefix_id, network, observed_cidr, vrf_id, cluster_fingerprint,
-		    suspended, suspend_reason, validated_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(prefix_id) DO UPDATE SET
-		   network = excluded.network,
-		   observed_cidr = excluded.observed_cidr,
-		   vrf_id = excluded.vrf_id,
-		   cluster_fingerprint = excluded.cluster_fingerprint,
-		   suspended = excluded.suspended,
-		   suspend_reason = excluded.suspend_reason,
-		   validated_at = excluded.validated_at,
-		   updated_at = excluded.updated_at,
-		   deleted_at = NULL`,
-		r.PrefixID, r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint,
-		susp, r.SuspendReason, c.NowWall(), c.NowWall(), now)
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE netbox_bindings SET
+		   network = ?,
+		   observed_cidr = ?,
+		   vrf_id = ?,
+		   cluster_fingerprint = ?,
+		   suspended = ?,
+		   suspend_reason = ?,
+		   validated_at = ?,
+		   updated_at = ?,
+		   deleted_at = NULL
+		 WHERE prefix_id = ?`,
+		r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint,
+		susp, r.SuspendReason, c.NowWall(), c.NowTS(), r.PrefixID)
+	if err != nil {
+		return fmt.Errorf("update binding: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("binding for prefix %d does not exist; use ClaimBinding", r.PrefixID)
+	}
+	return nil
 }
 
 // SuspendBinding marks a binding unusable for NEW allocations. Running VMs are

@@ -100,6 +100,53 @@ func TestSweeperGraceTreatsUnknownAgeAsTooYoung(t *testing.T) {
 	}
 }
 
+// TestSweeperGraceIsInertOnANetBox3DateOnlyCreated pins the two halves together
+// on the version of NetBox that serves the coarse timestamp.
+//
+// 3.x serializes `created` as a DATE. Parsed as midnight UTC it is not merely
+// imprecise, it is systematically EARLY: against a 30-minute grace window every
+// object created after 00:30 UTC reads as already past it, so the window that
+// keeps the sweeper off an address a create is still claiming would be open for
+// nearly the whole day — the sweeper could reclaim an address seconds after it
+// was issued. Refusing the layout leaves Created zero and olderThan false, so on
+// 3.x the sweeper reclaims nothing and the addresses are freed by hand.
+//
+// Asserted through the REAL client decode, not parseCreated: the field is
+// unexported to this package, and what matters is the value the sweeper's own
+// input carries.
+func TestSweeperGraceIsInertOnANetBox3DateOnlyCreated(t *testing.T) {
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A NetBox 3.x list response: a date, no time.
+		_, _ = w.Write([]byte(
+			`{"results":[{"id":41,"address":"10.0.5.100/24","created":"` +
+				time.Now().UTC().Format("2006-01-02") + `"}],"next":""}`))
+	}))
+	t.Cleanup(httpSrv.Close)
+
+	tokenPath := filepath.Join(t.TempDir(), "netbox-token")
+	if err := os.WriteFile(tokenPath, []byte("test-token\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	client, err := netbox.New(netbox.Config{BaseURL: httpSrv.URL, TokenPath: tokenPath, Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatalf("netbox.New: %v", err)
+	}
+
+	ips, err := client.ListIPsByPrefix(context.Background(), "10.0.5.0/24", 3)
+	if err != nil {
+		t.Fatalf("ListIPsByPrefix: %v", err)
+	}
+	if len(ips) != 1 {
+		t.Fatalf("want one address, got %d", len(ips))
+	}
+	if !ips[0].Created.IsZero() {
+		t.Fatalf("a date-only `created` must decode to the zero time (age unknown), got %v", ips[0].Created)
+	}
+	if olderThan(ips[0].Created, time.Now().UTC().Add(-orphanGrace)) {
+		t.Fatal("an object whose age NetBox did not report must never pass the grace window")
+	}
+}
+
 // TestSweeperSameHostSetIsOrderSensitiveOnSortedInput pins the membership
 // comparison. Both samples come out of eligibleProofHosts sorted, so a
 // positional compare is exact — and a set that differs anywhere must not

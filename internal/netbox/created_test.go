@@ -49,7 +49,13 @@ func TestParseCreatedShapes(t *testing.T) {
 		{"rfc3339_offset", "2026-01-02T04:04:05+01:00", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
 		{"rfc3339_nano", "2026-01-02T03:04:05.123456Z", time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)},
 		{"naive_datetime", "2026-01-02T03:04:05", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
-		{"date_only_netbox3", "2026-01-02", time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)},
+		// NetBox 3.x's date-only form is REFUSED, not coerced. Midnight UTC is
+		// not an approximate answer, it is a systematically EARLY one: against a
+		// 30-minute grace window it puts every object created after 00:30 UTC
+		// already past the cutoff, so the window that protects an in-flight
+		// create would be open for 23½ hours of every day. Zero means "age
+		// unknown", which the sweeper reads as too young to reclaim.
+		{"date_only_netbox3", "2026-01-02", time.Time{}},
 		{"empty", "", time.Time{}},
 		{"whitespace", "   ", time.Time{}},
 		{"garbage", "yesterday", time.Time{}},

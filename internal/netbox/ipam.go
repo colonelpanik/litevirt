@@ -35,6 +35,16 @@ type IPAddress struct {
 	// reclaimed. That is why an unparseable timestamp is silently zeroed rather
 	// than raised: every failure mode of this field must land on the side that
 	// keeps an address, not the side that frees one.
+	//
+	// Which is why the DATE-only form NetBox 3.x serves is deliberately NOT
+	// parsed. Reading "2026-01-02" as midnight UTC does not lose a little
+	// precision, it collapses the grace window: every object created after 00:30
+	// UTC is instantly older than a 30-minute cutoff, so the window that exists
+	// to protect an in-flight create protects nothing for most of the day. Left
+	// unparsed the field stays zero, the sweeper reclaims nothing on 3.x, and
+	// the addresses are freed by hand — inert, which is the side of this field
+	// every failure belongs on. Reclamation therefore requires a NetBox that
+	// serves a full RFC3339 `created` (4.x).
 	Created time.Time
 }
 
@@ -46,20 +56,28 @@ type ipJSON struct {
 	} `json:"vrf"`
 	AssignedObjectID *int           `json:"assigned_object_id"`
 	CustomFields     map[string]any `json:"custom_fields"`
-	// Created is NetBox's own creation timestamp. NetBox 3.x serialized it as a
-	// DATE ("2026-01-02"); 4.x serializes a full RFC3339 datetime. Both are
-	// accepted, and anything else yields the zero time.
+	// Created is NetBox's own creation timestamp. 4.x serializes a full RFC3339
+	// datetime; NetBox 3.x serialized a DATE ("2026-01-02"), which is NOT
+	// accepted — see createdLayouts. Anything else yields the zero time.
 	Created string `json:"created"`
 }
 
 // createdLayouts are the shapes NetBox has served in the `created` field, most
 // specific first. RFC3339 covers both the "Z" and the "+01:00" offset forms.
+//
+// The date-only "2006-01-02" that NetBox 3.x serves is deliberately absent. It
+// parses to midnight UTC, which is not a coarse timestamp but a systematically
+// EARLY one: against a 30-minute grace window every object created after 00:30
+// UTC reads as already past it, so the window that keeps the sweeper off an
+// in-flight create would be open for 23 and a half hours of every day. Refusing
+// it leaves Created zero, olderThan reads zero as "not old enough", and the
+// sweeper stays inert on 3.x — the conservative outcome this field's contract
+// demands.
 var createdLayouts = []string{
 	time.RFC3339Nano,
 	time.RFC3339,
 	"2006-01-02T15:04:05.999999",
 	"2006-01-02T15:04:05",
-	"2006-01-02",
 }
 
 // parseCreated is deliberately lenient AND fail-closed: an unrecognised or

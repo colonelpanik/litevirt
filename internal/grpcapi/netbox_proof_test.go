@@ -168,20 +168,87 @@ func TestProofHoldsMACInLiveXMLOnly(t *testing.T) {
 }
 
 func TestProofHoldsAddressFromLocalLease(t *testing.T) {
-	s, _ := newProofServer(t)
 	// The lease is the address's own record: it can outlive the NIC row and the
-	// domain, and while it stands the address is not free.
-	insertTestLease(t, s.db, "net-a", proofIP, "52:54:00:00:00:09", "vm-gone")
+	// domain, and while it stands the address is not free. The rows hold the bare
+	// host form, so an address that arrives carrying a prefix has to be reduced to
+	// it — the external system this proof answers to writes addresses that way,
+	// and an unreduced one would match nothing and read as free.
+	cases := []struct {
+		name         string
+		query        string
+		wantHeld     bool
+		wantComplete bool
+	}{
+		{"bare host address", proofIP, true, true},
+		{"address carrying a prefix", proofIP + "/24", true, true},
+		{"prefix length out of range", proofIP + "/33", true, true},
+		// An address nobody can interpret must not yield a confident "free".
+		{"uninterpretable", "not-an-address/24", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newProofServer(t)
+			insertTestLease(t, s.db, "net-a", proofIP, "52:54:00:00:00:09", "vm-gone")
+
+			p, err := s.collectOrphanProof(context.Background(), proofUUID, proofMAC, tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.HoldsAddress != tc.wantHeld {
+				t.Fatalf("HoldsAddress for %q = %v, want %v (errors %v)", tc.query, p.HoldsAddress, tc.wantHeld, p.Errors)
+			}
+			if p.Complete != tc.wantComplete {
+				t.Fatalf("Complete for %q = %v, want %v (errors %v)", tc.query, p.Complete, tc.wantComplete, p.Errors)
+			}
+			if p.HoldsMAC {
+				t.Fatal("a lease under a DIFFERENT MAC must not report the queried MAC as held")
+			}
+		})
+	}
+}
+
+// TestProofHoldsMACInLiveXMLOfPausedDomain pins the reason the live view is read
+// for EVERY domain rather than for the ones whose state looks active: a PAUSED
+// domain is active and carries a live XML, but libvirt's coarse vocabulary
+// reports it with the same "stopped" string a shut-off domain gets. A NIC
+// hotplugged in before the pause exists ONLY in that live XML.
+func TestProofHoldsMACInLiveXMLOfPausedDomain(t *testing.T) {
+	s, virt := newProofServer(t)
+	const name = "vm-paused"
+	virt.DefineStoppedDomain(name, "52:54:00:00:00:02") // persistent config: a DIFFERENT MAC
+	virt.SetState(name, libvirtfake.StatePaused)
+	virt.SetActiveXML(name, libvirtfake.StoppedDomainXML(name, libvirtfake.DomainUUIDFor(name), proofMAC))
+
+	// The fixture is only meaningful while the paused domain is indistinguishable
+	// from a shut-off one by state alone — that ambiguity is what it exists to
+	// exercise.
+	if st, err := virt.DomainState(name); err != nil || st != "stopped" {
+		t.Fatalf("fixture no longer models the coarse-state trap: DomainState = %q, %v; want %q", st, err, "stopped")
+	}
 
 	p, err := s.collectOrphanProof(context.Background(), proofUUID, proofMAC, proofIP)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !p.HoldsAddress {
-		t.Fatal("a live ip_allocations row for the address must block reclamation")
+	if !p.HoldsMAC {
+		t.Fatal("a MAC present only in a PAUSED domain's LIVE XML must block reclamation")
 	}
-	if p.HoldsMAC {
-		t.Fatal("a lease under a DIFFERENT MAC must not report the queried MAC as held")
+	if !p.Complete {
+		t.Fatalf("a scan with no probe error must be complete, got errors %v", p.Errors)
+	}
+}
+
+func TestProofIsIncompleteOnDumpXMLInactiveFailure(t *testing.T) {
+	s, virt := newProofServer(t)
+	virt.DefineStoppedDomain("vm-x", proofMAC)
+	virt.FailDumpXMLInactive = func(string) error { return errors.New("libvirtd: persistent xml read failed") }
+
+	p, err := s.collectOrphanProof(context.Background(), proofUUID, proofMAC, proofIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Complete {
+		t.Fatal("a domain whose PERSISTENT XML could not be read is a scan gap, not an absence")
 	}
 }
 

@@ -36,6 +36,12 @@ const (
 	StateRunning  State = "running"
 	StateShutdown State = "shutoff"
 	StateNoDomain State = "no-domain"
+	// StatePaused is an ACTIVE domain that is not executing. It exists so a
+	// scenario can model libvirt's coarse-state trap: DomainState reports a
+	// paused domain as "stopped" (libvirt.coarseDomainState folds DomainPaused
+	// and DomainPmsuspended in with DomainShutoff), yet the domain has a LIVE
+	// instance whose XML can carry devices the persistent config does not.
+	StatePaused State = "paused"
 )
 
 // Event captures an interesting transition for scenario asserts.
@@ -127,6 +133,10 @@ type Fake struct {
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
 	// left the live domain).
 	FailDumpXML func(name string) error
+	// FailDumpXMLInactive is the PERSISTENT-view twin of FailDumpXML, for a
+	// fail-closed path that reads both views of a domain and must treat an
+	// unreadable persistent config as a gap rather than an absence.
+	FailDumpXMLInactive func(name string) error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -415,6 +425,14 @@ func (f *Fake) DomainState(name string) (string, error) {
 	if !ok {
 		return string(StateNoDomain), nil
 	}
+	// The fake's raw vocabulary ("shutoff") is historical and callers cope with
+	// it, but StatePaused has no raw analogue — reporting it verbatim would
+	// invent a state real libvirt never surfaces here. Report it the way
+	// libvirt.coarseDomainState does, so a scenario built on it exercises the
+	// real ambiguity: paused and shut-off are the SAME string.
+	if s == StatePaused {
+		return "stopped", nil
+	}
 	return string(s), nil
 }
 
@@ -454,14 +472,17 @@ func (f *Fake) DomainStateReason(name string) (libvirt.DomainStatus, error) {
 	switch s {
 	case StateRunning:
 		coarse = "running"
-	case StateShutdown: // == StateDefined == "shutoff"
+	case StateShutdown, StatePaused: // == StateDefined == "shutoff"; paused folds in too
 		coarse = "stopped"
 	}
 	reason := f.reasons[name]
 	if reason == "" {
-		if s == StateRunning {
+		switch s {
+		case StateRunning:
 			reason = "running"
-		} else {
+		case StatePaused:
+			reason = "paused" // libvirt.normalizeDomainReason's value for DomainPaused
+		default:
 			reason = "unknown"
 		}
 	}
@@ -502,27 +523,46 @@ func (f *Fake) DumpXML(name string) (string, error) {
 	if x, ok := f.xml[name]; ok {
 		return x, nil
 	}
-	// A domain seeded via SetState alone has no explicit XML — synthesize a
-	// minimal definition, because REAL libvirt cannot have a domain without
-	// one. Erroring here made every SetState-only rig read as an incomplete
-	// runtime inventory, which is a fake artifact, not a modeled failure
-	// (tests that want a broken DumpXML use FailDumpXML).
+	return f.synthesizeXMLLocked(name)
+}
+
+// synthesizeXMLLocked stands in for the definition a domain seeded via SetState
+// alone never got. REAL libvirt cannot have a domain without one, so erroring
+// here made every SetState-only rig read as an incomplete runtime inventory,
+// which is a fake artifact, not a modeled failure — and both dump paths need the
+// same answer, because a caller that reads the live AND persistent view of every
+// domain would otherwise see one half of the same domain fail. A domain the fake
+// has never heard of is still an error. Tests that want a broken read inject one
+// via FailDumpXML / FailDumpXMLInactive. Caller holds f.mu.
+//
+// The stub carries an EMPTY <devices> element because real libvirt always emits
+// one: a document without it is not a device-less domain, it is a document no
+// device patcher can add to, and omitting it turned a SetState-only rig into a
+// synthetic "cannot add devices" failure that production cannot produce.
+func (f *Fake) synthesizeXMLLocked(name string) (string, error) {
 	if _, ok := f.domains[name]; ok {
-		return `<domain type='kvm'><name>` + name + `</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu></domain>`, nil
+		return `<domain type='kvm'><name>` + name +
+			`</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu><devices></devices></domain>`, nil
 	}
 	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
 }
 
 // DumpXMLInactive returns the domain's PERSISTENT (inactive) view — what a cold boot
 // loads. Tests that need to model a post-pivot live/persistent divergence set them
-// explicitly via SetInactiveXML/SetActiveXML.
+// explicitly via SetInactiveXML/SetActiveXML. A domain with no configured XML is a
+// valid empty domain, not an error: it synthesizes exactly as DumpXML does.
 func (f *Fake) DumpXMLInactive(name string) (string, error) {
+	if f.FailDumpXMLInactive != nil {
+		if err := f.FailDumpXMLInactive(name); err != nil {
+			return "", err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if x, ok := f.xml[name]; ok {
 		return x, nil
 	}
-	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
+	return f.synthesizeXMLLocked(name)
 }
 
 // activeBaseline returns the current live-view baseline for domain: the tracked

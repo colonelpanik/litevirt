@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -51,16 +52,54 @@ func (p *OrphanProof) failf(format string, args ...any) {
 // only checks err treat a failed scan as no claim at all.
 func (s *Server) collectOrphanProof(ctx context.Context, vmUUID, mac, address string) (OrphanProof, error) {
 	p := OrphanProof{Host: s.hostName, Complete: true}
+	address = normalizeProofAddress(&p, address)
 	s.proveFromLibvirt(&p, vmUUID, mac)
 	s.proveFromLocalRows(ctx, &p, vmUUID, mac, address)
 	return p, nil
 }
 
-// proveFromLibvirt scans EVERY defined domain, in EVERY state. ListDomains
-// already passes ConnectListDomainsActive|Inactive, so a shut-off definition is
-// included — and it has to be: libvirt will start that definition again on the
-// MAC written in it, so a stopped domain holds its address just as firmly as a
-// running one.
+// normalizeProofAddress reduces address to the bare host form the local rows
+// store. The proto documents a bare host address, but the external system this
+// proof answers to carries addresses WITH a prefix ("10.0.5.100/24"); one
+// arriving that way would match no row and read as "nothing holds it", which is
+// the catastrophic direction for a negative proof.
+//
+// An address that parses as neither a CIDR nor an IP is NOT quietly reduced to
+// nothing: it marks the proof incomplete and names itself, because a value
+// nobody can interpret must never produce a confident HoldsAddress=false.
+func normalizeProofAddress(p *OrphanProof, address string) string {
+	if address == "" || !strings.Contains(address, "/") {
+		return address
+	}
+	if ip, _, err := net.ParseCIDR(address); err == nil {
+		return ip.String()
+	}
+	// Not a valid CIDR, but the host half may still be a real address carrying a
+	// nonsense prefix length ("10.0.5.100/33"). That is a claim we can still
+	// check, and checking it is the safe direction.
+	if ip := net.ParseIP(strings.SplitN(address, "/", 2)[0]); ip != nil {
+		return ip.String()
+	}
+	p.failf("address %q is neither a bare IP nor a CIDR — cannot prove it unclaimed", address)
+	return ""
+}
+
+// proveFromLibvirt scans EVERY defined domain, in EVERY state, and reads BOTH
+// views of each. ListDomains already passes ConnectListDomainsActive|Inactive,
+// so a shut-off definition is included — and it has to be: libvirt will start
+// that definition again on the MAC written in it, so a stopped domain holds its
+// address just as firmly as a running one.
+//
+// Both views are read UNCONDITIONALLY, without consulting the domain's state,
+// because litevirt's coarse state vocabulary cannot support that decision:
+// libvirt.coarseDomainState folds DomainPaused and DomainPmsuspended in with
+// DomainShutoff as "stopped", yet a paused domain is ACTIVE — a NIC hotplugged
+// into it exists ONLY in its live XML. Any gate built on that string reads a MAC
+// in active use as free. Reading both costs one extra call per domain and has no
+// failure mode: real libvirt answers both in every state (a shut-off domain's
+// "live" query returns its persistent config; a transient domain's "inactive"
+// query returns its live definition), so a failure of EITHER is a genuine scan
+// gap and marks the proof incomplete.
 func (s *Server) proveFromLibvirt(p *OrphanProof, vmUUID, mac string) {
 	// A host with NO libvirt client cannot answer at all, so its proof is
 	// INCOMPLETE — not a clean bill of health. Skipping the scan silently would
@@ -77,17 +116,14 @@ func (s *Server) proveFromLibvirt(p *OrphanProof, vmUUID, mac string) {
 		p.failf("list domains: %v", err)
 	}
 	for _, n := range names {
-		// The state is consulted for two reasons: an UNREADABLE one is a scan
-		// gap (a domain we cannot classify might be the claimant), and a domain
-		// with a live instance needs its LIVE view read as well as its
-		// persistent one.
-		state, serr := s.virt.DomainState(n)
-		if serr != nil {
+		// The state is read as a PROBE only: a domain this host cannot classify
+		// at all might be the claimant, so an error is a scan gap. The result
+		// itself gates nothing — see the note above on why it cannot.
+		if _, serr := s.virt.DomainState(n); serr != nil {
 			p.failf("domain %s: read state: %v", n, serr)
 		}
 
-		// The PERSISTENT definition: what a cold boot loads, and the only view a
-		// shut-off domain has.
+		// The PERSISTENT definition: what a cold boot loads.
 		inactive, ierr := s.virt.DumpXMLInactive(n)
 		if ierr != nil {
 			p.failf("domain %s: read persistent XML: %v", n, ierr)
@@ -95,14 +131,10 @@ func (s *Server) proveFromLibvirt(p *OrphanProof, vmUUID, mac string) {
 			claimsInXML(p, inactive, vmUUID, mac)
 		}
 
-		// The LIVE definition, which a RUNNING domain can carry beyond its
+		// The LIVE definition, which an active domain can carry beyond its
 		// persistent config: a hotplugged NIC exists only here until something
 		// writes it back, so a persistent-only scan reads a MAC in active use as
-		// free. An unreadable state falls through to here too — unknown means
-		// look harder, not look less.
-		if !mayHaveLiveView(state) {
-			continue
-		}
+		// free.
 		live, lerr := s.virt.DumpXML(n)
 		if lerr != nil {
 			p.failf("domain %s: read live XML: %v", n, lerr)
@@ -110,24 +142,6 @@ func (s *Server) proveFromLibvirt(p *OrphanProof, vmUUID, mac string) {
 		}
 		claimsInXML(p, live, vmUUID, mac)
 	}
-}
-
-// mayHaveLiveView reports whether a domain in this state can have a live
-// instance whose XML differs from its persistent config. Only a definitively
-// inactive domain is excluded; "unknown" and an unreadable ("") state are not,
-// because reading the live view of an inactive domain merely returns the
-// persistent config again — harmless — whereas skipping it for a domain that
-// IS running would hide a hotplugged claimant.
-//
-// The vocabulary spans both producers of this string: *libvirt.Client's coarse
-// states (running | stopping | stopped | error | unknown) and libvirtfake's raw
-// ones (running | shutoff | no-domain).
-func mayHaveLiveView(state string) bool {
-	switch state {
-	case "stopped", "shutoff", "no-domain":
-		return false
-	}
-	return true
 }
 
 // claimsInXML marks the identifiers this domain XML contains. Substring

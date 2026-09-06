@@ -2,7 +2,9 @@ package netboxsync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 
@@ -74,6 +76,70 @@ func TestApplyDeletesADetachedInterface(t *testing.T) {
 	}
 	if ref, _ := getRef(r, "nic", id); ref != nil {
 		t.Fatal("the identity mapping must be tombstoned with the interface")
+	}
+}
+
+// TestApplyDeleteTombstonesRefWhenObjectAlreadyGone pins that a 404 counts as
+// success. Aborting on it strands the netbox_objects row PERMANENTLY: the next
+// sweep sees no such object in actual state, so it emits no delete, and nothing
+// else prunes a mapping.
+func TestApplyDeleteTombstonesRefWhenObjectAlreadyGone(t *testing.T) {
+	for _, tc := range []struct {
+		kind       string
+		netboxKind string
+		netboxID   int
+		mac        string
+	}{
+		{kind: kindVM, netboxKind: netboxKindVM, netboxID: 11},
+		{kind: kindNIC, netboxKind: netboxKindNIC, netboxID: 21, mac: "52:54:00:aa:bb:01"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			nb := &stubVirt{deleteErr: &netbox.APIError{Status: 404, Body: "Not found."}}
+			r := newTestReconciler(t, nb)
+			key := netbox.Identity(fp, "uuid-1", tc.mac)
+			if err := r.recordRef(context.Background(), tc.kind, key, tc.netboxKind, tc.netboxID); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.apply(context.Background(),
+				[]Action{{Kind: tc.kind, Op: "delete", Key: key, NetBoxID: tc.netboxID}},
+				indexDesired(nil, fp), fp,
+			); err != nil {
+				t.Fatalf("an object that is already gone IS the desired end state: %v", err)
+			}
+			if ref, _ := getRef(r, tc.kind, key); ref != nil {
+				t.Fatalf("the mapping must be tombstoned anyway, or nothing ever prunes it: %+v", *ref)
+			}
+		})
+	}
+}
+
+// TestApplyDeleteKeepsTheRefWhenTheDeleteFails is the other half: only a proven
+// absence may tombstone. A 500 or a transport failure may have left the object
+// standing, and dropping the mapping there orphans it beyond any later sweep.
+func TestApplyDeleteKeepsTheRefWhenTheDeleteFails(t *testing.T) {
+	for name, delErr := range map[string]error{
+		"server":    &netbox.APIError{Status: 500, Body: "boom"},
+		"transport": errors.New("connection refused"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			nb := &stubVirt{deleteErr: delErr}
+			r := newTestReconciler(t, nb)
+			key := netbox.Identity(fp, "uuid-1", "")
+			if err := r.recordRef(context.Background(), kindVM, key, netboxKindVM, 11); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := r.apply(context.Background(),
+				[]Action{{Kind: "vm", Op: "delete", Key: key, NetBoxID: 11}},
+				indexDesired(nil, fp), fp,
+			); err == nil {
+				t.Fatal("an unproven delete must be reported, not tombstoned")
+			}
+			if ref, _ := getRef(r, kindVM, key); ref == nil {
+				t.Fatal("the mapping must survive a delete that may not have happened")
+			}
+		})
 	}
 }
 
@@ -353,6 +419,64 @@ func TestVMCreateSurvivesAnUnresolvableHostLink(t *testing.T) {
 	}
 }
 
+// TestVMUpdateWritesTheDiffsDeviceIDNotAReResolvedOne pins the update path
+// against a perpetual-update loop.
+//
+// The diff compared DesiredVM.DeviceID. If the applier re-resolves the host
+// instead, a host deliberately no longer modelled as a DCIM device gets its link
+// RE-ADDED by the very update that was emitted to clear it — and the next sweep
+// diffs it again, forever. Any transient disagreement between the two
+// resolutions does the same.
+func TestVMUpdateWritesTheDiffsDeviceIDNotAReResolvedOne(t *testing.T) {
+	// The host WOULD resolve, which is the whole point: a re-resolving applier
+	// finds 9 here, while the diff decided on 0.
+	nb := &stubVirt{devices: map[string]int{"host-a": 9}}
+	r := newTestReconciler(t, nb)
+	vmKey := netbox.Identity(fp, "uuid-1", "")
+
+	if err := r.apply(context.Background(),
+		[]Action{{Kind: "vm", Op: "update", Key: vmKey, NetBoxID: 11}},
+		indexDesired([]DesiredVM{{
+			Name: "vm-1", UUID: "uuid-1", Status: "active", Host: "host-a", DeviceID: 0,
+		}}, fp), fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.updatedVMs) != 1 {
+		t.Fatalf("want one VM patched, got %+v", nb.updatedVMs)
+	}
+	if got := nb.updatedVMs[0].VM.DeviceID; got != 0 {
+		t.Fatalf("the update must carry the diff's device id 0, got %d", got)
+	}
+	if len(nb.deviceLookups) != 0 {
+		t.Fatalf("the update path must not re-resolve the link, looked up %v", nb.deviceLookups)
+	}
+	// What NetBox actually receives: an explicit null. An omitted key is a no-op
+	// on a PATCH, which leaves the stale link standing.
+	body := vmWireBody(t, nb.updatedVMs[0].VM)
+	if v, ok := body["device"]; !ok || v != nil {
+		t.Fatalf("device must be sent as an explicit null, got %v (present=%v)", v, ok)
+	}
+}
+
+// TestVMCreateStillResolvesTheDeviceLink pins the other side of that split. A
+// first mirror has no prior link to preserve and desiredState may not have
+// resolved one yet, so the CREATE path keeps the fallback lookup.
+func TestVMCreateStillResolvesTheDeviceLink(t *testing.T) {
+	nb := &stubVirt{devices: map[string]int{"host-a": 9}}
+	r := newTestReconciler(t, nb)
+
+	if err := r.apply(context.Background(),
+		[]Action{{Kind: "vm", Op: "create", Key: netbox.Identity(fp, "uuid-1", "")}},
+		indexDesired([]DesiredVM{{Name: "vm-1", UUID: "uuid-1", Host: "host-a"}}, fp), fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.created) != 1 || nb.created[0].DeviceID != 9 {
+		t.Fatalf("create must resolve host-a to device 9, got %+v", nb.created)
+	}
+}
+
 // TestApplyAppliesEveryActionInABatch exercises the worker pool: a batch is
 // applied concurrently, so every action must still land exactly once.
 func TestApplyAppliesEveryActionInABatch(t *testing.T) {
@@ -413,6 +537,24 @@ func newTestReconciler(t *testing.T, nb netboxWriter) *Reconciler {
 		t.Fatalf("InitSchema: %v", err)
 	}
 	return &Reconciler{nb: nb, db: db, clusterID: 5, metrics: &countingMetrics{}}
+}
+
+// vmWireBody returns the body the PRODUCTION client puts on the wire for the VM
+// the applier handed it, captured off a real UpdateVM. Reconstructing the body
+// here would assert on a copy of the rule instead of on the rule.
+func vmWireBody(t *testing.T, vm netbox.VirtualMachine) map[string]any {
+	t.Helper()
+	var got map[string]any
+	c := netboxClientFor(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode PATCH body: %v", err)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	})
+	if err := c.UpdateVM(context.Background(), 11, vm); err != nil {
+		t.Fatal(err)
+	}
+	return got
 }
 
 func getRef(r *Reconciler, kind, key string) (*corrosion.ObjectRef, error) {
@@ -482,6 +624,7 @@ type stubVirt struct {
 	devices              map[string]int
 	deviceErr            error
 	createErr            map[string]error
+	deleteErr            error
 
 	createCalls       int
 	created           []netbox.VirtualMachine
@@ -536,6 +679,9 @@ func (s *stubVirt) UpdateVM(_ context.Context, id int, vm netbox.VirtualMachine)
 func (s *stubVirt) DeleteVM(_ context.Context, id int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	s.deleted = append(s.deleted, id)
 	return nil
 }
@@ -568,6 +714,9 @@ func (s *stubVirt) UpdateInterface(_ context.Context, id int, i netbox.VMInterfa
 func (s *stubVirt) DeleteInterface(_ context.Context, id int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	s.deletedInterfaces = append(s.deletedInterfaces, id)
 	return nil
 }

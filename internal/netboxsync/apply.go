@@ -2,8 +2,10 @@ package netboxsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"sync"
 
@@ -260,12 +262,15 @@ func (r *Reconciler) updateVM(ctx context.Context, a Action, idx desiredIndex) e
 	if err := r.nb.UpdateVM(ctx, a.NetBoxID, netbox.VirtualMachine{
 		Name:      d.Name,
 		ClusterID: r.clusterID,
-		DeviceID:  r.deviceID(ctx, d),
-		VCPUs:     d.VCPUs,
-		MemoryMB:  d.MemoryMB,
-		DiskGB:    d.DiskGB,
-		Status:    d.Status,
-		Identity:  a.Key,
+		// VERBATIM, never re-resolved: the diff compared THIS id, so a second
+		// lookup here could write back the very link the diff decided to clear,
+		// and the next sweep would diff it again — forever.
+		DeviceID: d.DeviceID,
+		VCPUs:    d.VCPUs,
+		MemoryMB: d.MemoryMB,
+		DiskGB:   d.DiskGB,
+		Status:   d.Status,
+		Identity: a.Key,
 	}); err != nil {
 		return fmt.Errorf("netboxsync: update VM %d: %w", a.NetBoxID, err)
 	}
@@ -339,9 +344,12 @@ func (r *Reconciler) updateNIC(ctx context.Context, a Action, idx desiredIndex) 
 	if !ok {
 		return fmt.Errorf("netboxsync: nic/update %s has no desired NIC", a.Key)
 	}
+	// The parent link is deliberately NOT passed: UpdateInterface never sends
+	// virtual_machine, so an assignment here would be silently dropped while
+	// reading like a re-parent. A NIC that moved to another VM has a different
+	// identity anyway — that is a create plus a delete, not an update.
 	if err := r.nb.UpdateInterface(ctx, a.NetBoxID, netbox.VMInterface{
 		ID:       a.NetBoxID,
-		VMID:     a.ParentNetBoxID,
 		Name:     dn.NIC.Name,
 		MAC:      dn.NIC.MAC,
 		Identity: a.Key,
@@ -368,7 +376,16 @@ func (r *Reconciler) deleteObject(ctx context.Context, a Action) error {
 	default:
 		return fmt.Errorf("netboxsync: delete of unknown kind %q for %s", a.Kind, a.Key)
 	}
-	if err != nil {
+	switch {
+	case err == nil:
+	case isNotFound(err):
+		// Already gone IS the desired end state, so this falls through to the
+		// tombstone. Aborting here would strand the mapping PERMANENTLY: the
+		// next sweep finds no such object in actual state, so it emits no
+		// delete, and nothing else prunes a netbox_objects row.
+		slog.Info("netbox: object already absent; retiring its mapping",
+			"kind", a.Kind, "netbox_id", a.NetBoxID)
+	default:
 		return fmt.Errorf("netboxsync: delete %s %d: %w", a.Kind, a.NetBoxID, err)
 	}
 	// Tombstoned under the SAME identity the object was recorded under, so a
@@ -377,6 +394,13 @@ func (r *Reconciler) deleteObject(ctx context.Context, a Action) error {
 		return fmt.Errorf("netboxsync: retire mapping %s/%s: %w", kind, a.Key, err)
 	}
 	return nil
+}
+
+// isNotFound reports whether NetBox answered 404. Only an APIError carries a
+// status: a transport failure is an AMBIGUOUS outcome, not a proven absence.
+func isNotFound(err error) bool {
+	var ae *netbox.APIError
+	return errors.As(err, &ae) && ae.Status == http.StatusNotFound
 }
 
 // parentVMID resolves the VM a NIC hangs off.
@@ -442,12 +466,15 @@ func (r *Reconciler) recordRef(ctx context.Context, kind, identity, netboxKind s
 
 // deviceID resolves the DCIM device this VM's host is modelled as.
 //
-// desiredState resolves it for the diff; this is the fallback for a desired
-// record that names a host but carries no resolved id. Best-effort in BOTH
-// directions: a lookup failure and a host that is simply not modelled both mean
-// "no link", and the write body then sends device: null. An operator who does
-// not model hosts in NetBox must still get a working mirror, so this can never
-// return an error.
+// desiredState resolves it for the diff; this is the CREATE-path fallback for a
+// desired record that names a host but carries no resolved id — a first mirror
+// has no prior link to preserve. The UPDATE path must not use it, or it writes
+// back a link the diff decided to clear; see updateVM.
+//
+// Best-effort in BOTH directions: a lookup failure and a host that is simply not
+// modelled both mean "no link", and the write body then sends device: null. An
+// operator who does not model hosts in NetBox must still get a working mirror,
+// so this can never return an error.
 func (r *Reconciler) deviceID(ctx context.Context, d DesiredVM) int {
 	if d.DeviceID != 0 || d.Host == "" {
 		return d.DeviceID

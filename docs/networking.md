@@ -153,8 +153,11 @@ lv ct create web --network network=app-net,name=eth0,security-groups=web;db
 ```
 
 Bridge-family networks (bridge / vxlan / isolated) are supported; `direct` and
-`sriov` are VM-only. See [containers.md](containers.md) for the full container
-networking model.
+`sriov` are VM-only, and so is any network **bound to a NetBox prefix** whatever
+its type — a container on one is refused at create rather than allocated around
+the external IPAM (see [Binding a network to NetBox](#binding-a-network-to-netbox)
+below). See
+[containers.md](containers.md) for the full container networking model.
 
 ## Network ownership (project isolation)
 
@@ -357,6 +360,16 @@ back is to make the host reachable again.
 does not implement the proof RPC counts as unreachable, so no proof is complete
 until every node has been upgraded. Nothing needs doing about it — the sweep
 resumes on its own once the upgrade finishes.
+
+**Reclamation requires a NetBox that reports a full RFC3339 `created`
+timestamp** — that is NetBox 4.x. NetBox 3.x serializes `created` as a bare date,
+which carries no time of day, and reading it as midnight would put every address
+created after 00:30 UTC past the 30-minute grace window the moment it was
+claimed. litevirt therefore does not interpret it at all: on 3.x every address
+has an unknown age, the grace check treats unknown as too young, and the sweeper
+reclaims nothing. Everything else — binding revalidation, suspension, re-key,
+stuck-lease reporting — works normally; only reclamation is inert, and addresses
+are freed by hand (confirm nothing holds the address, then delete it in NetBox).
 
 ### Stuck leases
 

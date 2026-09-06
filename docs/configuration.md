@@ -313,7 +313,7 @@ netbox:
                             # and would silently allocate from the builtin
                             # allocator across the whole prefix, so replicated
                             # state alone cannot make a bound prefix safe.
-  url: ""                  # NetBox base URL, e.g. "https://netbox.corp".
+  url: ""                   # NetBox base URL, e.g. "https://netbox.corp".
   token_path: ""            # path to a file containing the API token. The token
                             # is read from this file at startup and is NEVER held
                             # inline in config.

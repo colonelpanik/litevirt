@@ -26,11 +26,6 @@ const orphanGrace = 30 * time.Minute
 // it; the lease makes "the cluster's answer" a single writer's answer.
 const netBoxLeaseKey = "netbox"
 
-// netBoxLeaseInterval is the sweep cadence the lease TTL is derived from (2x,
-// exactly as the dual-run detector's lease does). A pass is bounded well inside
-// it by orphanProofTimeout, so leadership only moves on a genuine failure.
-const netBoxLeaseInterval = 10 * time.Minute
-
 // orphanProofTimeout bounds ONE peer's proof RPC so a single hung host cannot
 // stretch a pass past the lease TTL. A timeout is an UNREACHABLE host, which
 // aborts the reclamation — the fail-closed direction.
@@ -58,9 +53,10 @@ const orphanCheckMaxAttempts = 10
 // a host that has rejoined is never excluded from a proof, whatever the fencing
 // log says. The window therefore only bounds how long an UNREACHABLE host's
 // attestation keeps counting — and it must EXCEED the sweep cadence
-// (netBoxLeaseInterval), or an operator's confirmation expires before the next
-// sweep can honour it: after a permanent host loss the sweeper would then be
-// inert forever, with no practical escape.
+// (netbox.sweep_interval_sec, defaultNetBoxSweepInterval when unset), or an
+// operator's confirmation expires before the next sweep can honour it: after a
+// permanent host loss the sweeper would then be inert forever, with no
+// practical escape.
 const netboxFenceWindow = 24 * time.Hour
 
 // ── skip reasons ────────────────────────────────────────────────────────────
@@ -111,7 +107,9 @@ const (
 // SweepOrphansOnce runs exactly one sweep pass. It exists so a test can drive
 // the sweeper deterministically instead of waiting on a ticker; the daemon runs
 // the same pass on an interval.
-func (s *Server) SweepOrphansOnce(ctx context.Context) error { return s.sweepOrphans(ctx) }
+func (s *Server) SweepOrphansOnce(ctx context.Context) error {
+	return s.sweepOrphans(ctx, defaultNetBoxSweepInterval)
+}
 
 // sweepOrphans reclaims NetBox addresses nothing claims any more.
 //
@@ -126,11 +124,14 @@ func (s *Server) SweepOrphansOnce(ctx context.Context) error { return s.sweepOrp
 //
 // Any deviation aborts and leaves the address allocated. Leaking an address the
 // next sweep can reclaim is always preferable to freeing one a live guest uses.
-func (s *Server) sweepOrphans(ctx context.Context) error {
+func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error {
 	if s.db == nil || s.netbox == nil {
 		return nil // nothing to sweep against
 	}
-	if !s.acquireNetBoxLease(ctx, netBoxLeaseInterval) {
+	// The lease TTL is derived from the cadence the CALLER actually runs at, so
+	// a cluster that configured a slower sweep does not hand leadership away
+	// between its own passes.
+	if !s.acquireNetBoxLease(ctx, interval) {
 		return nil
 	}
 

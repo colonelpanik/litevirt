@@ -90,6 +90,11 @@ type Cluster struct {
 	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
 	// read options the harness applies after the nodes exist.
 	opts Options
+	// ctx bounds every background loop the harness starts on a node's behalf
+	// (the NetBox maintenance loop today). Cancelled by Stop, so a scenario's
+	// goroutines never outlive the cluster that owns them.
+	ctx    context.Context
+	cancel context.CancelFunc
 	// reach is the cluster-wide "this peer is up again" overlay every node's
 	// gate unions into HealthyPeers. Nothing populates the real health
 	// checker's peer table in-process (no probe loop runs), so without this a
@@ -124,6 +129,12 @@ type Node struct {
 	// background loop not started — see buildServer).
 	repl *corrosion.Replicator
 
+	// netboxMaintenance records what StartNetBoxMaintenance ANSWERED for this
+	// node. The harness does not decide for itself whether the loop runs — the
+	// server does, from whether it has a NetBox client — so a scenario asserting
+	// "no config, no goroutine" asserts on production code.
+	netboxMaintenance bool
+
 	// partition gate: replication/state-sync RPCs whose mTLS caller CN is in
 	// blockedFrom are refused, modeling a network partition on the real
 	// transport. Guarded by partMu (Partition/Heal mutate it concurrently with
@@ -152,6 +163,7 @@ func New(t *testing.T, opts Options) *Cluster {
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
 	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.mintCA()
 
 	// Step 1 — mint pki for every node and pre-allocate ports so the
@@ -206,6 +218,9 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
+	if c.cancel != nil {
+		c.cancel()
+	}
 	for _, n := range c.Nodes {
 		if n.selfConn != nil {
 			_ = n.selfConn.Close()
@@ -456,6 +471,13 @@ func (c *Cluster) buildServer(n *Node) {
 	if c.opts.NetBoxURL != "" {
 		c.wireNetBox(n)
 	}
+	// The maintenance loop, started exactly as the daemon starts it — through
+	// the server's own guard, on EVERY node, so an unconfigured cluster
+	// exercises the refusal rather than a harness branch that skipped the call.
+	// The interval is the production default (15 minutes), which is far longer
+	// than any scenario: nothing ticks under a test, and scenarios drive a pass
+	// explicitly through RunNetBoxMaintenanceOnce.
+	n.netboxMaintenance = n.Server.StartNetBoxMaintenance(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it
@@ -609,6 +631,10 @@ func regionFor(by []string, i int) string {
 // HLCClock returns a node's HLC. Used by scenarios that need to
 // fabricate mutation entries with deterministic timestamps.
 func (n *Node) HLCClock() *hlc.Clock { return n.DB.Clock() }
+
+// NetBoxMaintenanceRunning reports whether this node started the NetBox
+// maintenance loop (binding revalidation + the orphan sweep).
+func (n *Node) NetBoxMaintenanceRunning() bool { return n.netboxMaintenance }
 
 // ── external IPAM wiring ────────────────────────────────────────────────────
 

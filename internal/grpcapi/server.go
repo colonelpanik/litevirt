@@ -75,6 +75,11 @@ type Server struct {
 	onProofCollected func()
 	onProofsGathered func(map[string]OrphanProof)
 
+	// onMaintenanceTick is a MAINTENANCE-LOOP TEST SEAM: it fires after each
+	// completed tick, so a test can observe the CADENCE the loop actually runs
+	// at without a database behind it. nil in production.
+	onMaintenanceTick func()
+
 	version   string // build version, reported via Ping and ListHosts
 	dnsDomain string // DNS domain for VM record names (e.g. "litevirt.local")
 

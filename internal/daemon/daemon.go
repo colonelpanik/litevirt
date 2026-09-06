@@ -773,6 +773,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return fmt.Errorf("netbox client: %w", err)
 		}
 		svc.SetNetBoxClient(nbClient)
+		// Binding revalidation + the orphan sweep, on the configured cadence.
+		// Started ONLY here: a node with no NetBox configuration creates no
+		// goroutine and never enters the `netbox` leader-lease race. The sweep
+		// itself is leader-gated, so every configured node running this loop
+		// still means exactly one reclaiming node cluster-wide.
+		svc.StartNetBoxMaintenance(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
 	}
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.

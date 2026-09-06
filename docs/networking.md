@@ -298,6 +298,79 @@ Both commands are admin-only and both write an audit record (`netbox.rekey`,
 `netbox.resume`), so `lv audit verify` carries a trace of every identity rewrite
 and every lifted suspension.
 
+### Maintenance and reclamation
+
+Every node configured for NetBox runs a maintenance pass on the
+`netbox.sweep_interval_sec` cadence (900 seconds by default). One pass does two
+things, in this order:
+
+1. **Re-validate every binding** against NetBox, suspending any that has drifted
+   (the section above).
+2. **Reclaim orphans** — addresses NetBox still holds under this cluster's
+   identity that nothing claims any more.
+
+The order is the safety property. A binding suspended by step 1 is out of scope
+for step 2 in that same pass, and a revalidation that could not COMPLETE — an
+unreadable cluster database, a suspension that could not be recorded — skips the
+sweep entirely. A binding litevirt could not check is not one it will delete
+against.
+
+Reclamation is the only thing in litevirt that deletes an address from NetBox,
+so it happens only under a whole-cluster proof:
+
+- exactly one node sweeps, elected through a cluster-wide lease;
+- **every** eligible host must answer, and answer with a complete scan. One
+  unreachable host, one incomplete answer, or a membership change mid-proof and
+  the address is left alone;
+- an address any host still claims, or that a live local lease references, is
+  never touched;
+- an address younger than 30 minutes is never touched, so an in-flight create is
+  not swept out from under itself.
+
+Nothing here is best-effort. Leaking an address the next pass can reclaim is
+always preferable to freeing one a running guest is using, so every doubt leaves
+the address allocated. Expect reclamation to pause whenever the cluster is not
+whole — that is the design, not a fault.
+
+**After a permanent host loss the sweeper stays inert** until an operator
+attests the machine is off:
+
+```bash
+lv host fence-confirm <host>
+```
+
+Without that, the lost host is simply unreachable, every proof is incomplete,
+and nothing is ever reclaimed. The attestation counts for 24 hours — long enough
+that a confirmation does not expire between passes — and only for a host that is
+still unreachable: a host that comes back is never excluded from the proof set,
+whatever the fencing record says.
+
+Two things follow from that, and both are deliberate. During those 24 hours a
+host that is unreachable but alive is out of the proof set, so an address only it
+holds could be reclaimed — confirm a fence only for a machine you know is off.
+And the attestation cannot be revoked early; if it was given in error, the way
+back is to make the host reachable again.
+
+**During a rolling upgrade, reclamation pauses.** A peer running a build that
+does not implement the proof RPC counts as unreachable, so no proof is complete
+until every node has been upgraded. Nothing needs doing about it — the sweep
+resumes on its own once the upgrade finishes.
+
+### Stuck leases
+
+A **stuck lease** is an address a rolled-back create queued for release in NetBox
+while a live local allocation row still references it — what a compensating
+release that did not land leaves behind. It is not an orphan: something still
+holds the address locally, so nothing may delete the NetBox object.
+
+The sweeper reports it and never acts on it: the counter
+`litevirt_netbox_stuck_leases_total` rises and an error log names the address.
+It is deleted from neither system automatically, because a lease that disagrees
+with the workload record is exactly the case where an automatic deletion could
+free an address something is really using. Reconcile it by hand — confirm no
+guest holds the address, then delete the allocation and let the next pass
+reclaim the NetBox object.
+
 ## NAT
 
 By default, litevirt enables IP masquerading (NAT) for networks with a subnet defined. This gives VMs outbound internet access through the host.

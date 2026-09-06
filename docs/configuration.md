@@ -318,8 +318,16 @@ netbox:
                             # is read from this file at startup and is NEVER held
                             # inline in config.
   timeout_sec: 10           # per-request timeout.
-  sweep_interval_sec: 900   # how often the reconciler re-validates bindings and
-                            # sweeps orphans.
+  sweep_interval_sec: 900   # how often each configured node runs one maintenance
+                            # pass: re-validate every binding, then reclaim
+                            # NetBox addresses nothing claims. Unset (or <= 0)
+                            # means 15 minutes. The sweep's leader lease is
+                            # derived from this value, so exactly one node
+                            # reclaims however many run the loop. Reclamation
+                            # needs a complete whole-cluster proof, so a longer
+                            # interval only delays it — it never weakens it.
+                            # See docs/networking.md, "Maintenance and
+                            # reclamation".
   # Binding a network to a NetBox prefix requires the netbox_ipam_v1 latch, and the
   # prefix must belong to a VRF with enforce_unique set. Global-table prefixes are
   # refused, because NetBox does not expose the global uniqueness setting through a

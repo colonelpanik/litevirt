@@ -21,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
 )
@@ -288,6 +289,10 @@ type nicAttachRollback struct {
 	attached         bool // live AttachNIC succeeded
 	nicRowWritten    bool // vm_nics UpsertNIC succeeded
 	legacyRowWritten bool // vm_interfaces InsertInterface succeeded
+	// claims holds the external-IPAM address this attach took, if any. A NetBox
+	// claim is a synchronous REMOTE side effect and cannot join the local row
+	// writes, so — exactly as in CreateVM — compensation is explicit.
+	claims *claimSet
 }
 
 // ensureNICNetworkProvisioned resolves networkName's bridge and, if the network has
@@ -325,17 +330,22 @@ func (s *Server) ensureNICNetworkProvisioned(ctx context.Context, networkName st
 // authoritative write lands is forward progress the caller must compensate
 // precisely (via rb.nicRowWritten/legacyRowWritten), never a coarse all-or-nothing
 // commit that could leak one side.
-func (s *Server) writeNICAttachRows(ctx context.Context, rb *nicAttachRollback, vmName string, spec *pb.NetworkAttachment, model, mac, nicID, sgsJSON string, ordinal int) error {
+//
+// ip is the address the NIC actually holds — the request's own value on an
+// unbound network, the claimed one on a bound one. It is passed in rather than
+// read back off spec.Ip so the claim never has to mutate the request the
+// operation's request hash was computed from.
+func (s *Server) writeNICAttachRows(ctx context.Context, rb *nicAttachRollback, vmName string, spec *pb.NetworkAttachment, model, mac, nicID, sgsJSON, ip string, ordinal int) error {
 	if err := corrosion.UpsertNIC(ctx, s.db, corrosion.NICRecord{
 		VMName: vmName, ID: nicID, NetworkName: spec.Name, Model: model, MAC: mac,
-		Ordinal: ordinal, IP: spec.Ip, SecurityGroups: sgsJSON,
+		Ordinal: ordinal, IP: ip, SecurityGroups: sgsJSON,
 	}); err != nil {
 		return fmt.Errorf("record nic row: %w", err)
 	}
 	rb.nicRowWritten = true
 	if rb.dualWrite {
 		if err := corrosion.InsertInterface(ctx, s.db, corrosion.InterfaceRecord{
-			VMName: vmName, NetworkName: spec.Name, Ordinal: ordinal, MAC: mac, IP: spec.Ip,
+			VMName: vmName, NetworkName: spec.Name, Ordinal: ordinal, MAC: mac, IP: ip,
 		}); err != nil {
 			return fmt.Errorf("record legacy interface row: %w", err)
 		}
@@ -344,14 +354,88 @@ func (s *Server) writeNICAttachRows(ctx context.Context, rb *nicAttachRollback, 
 	return nil
 }
 
+// claimNICAddress claims the hot-attached NIC's address from whatever authority
+// owns its network, mirroring CreateVM's per-NIC claim exactly: the same
+// allocatorFor selection, the same identity (cluster fingerprint + the VM's
+// incarnation uuid + this NIC's mac), the same fail-closed refusal when the
+// external IPAM cannot answer, and the same claimSet so a later failure gives
+// the address back.
+//
+// It returns the address the NIC row must carry. On an UNBOUND network that is
+// whatever the request asked for — allocatorFor hands a VM no allocator there,
+// and VMs have never allocated on unbound networks, so a hotplugged NIC keeps
+// exactly today's behaviour.
+func (s *Server) claimNICAddress(ctx context.Context, vm *corrosion.VMRecord, spec *pb.NetworkAttachment, mac string, claims *claimSet) (string, codes.Code, error) {
+	alloc, binding, aerr := s.allocatorFor(ctx, "vm", spec.Name)
+	if aerr != nil {
+		return "", codes.FailedPrecondition, aerr
+	}
+	if alloc == nil {
+		return spec.Ip, codes.OK, nil
+	}
+	if binding == nil {
+		// allocatorFor pairs a VM allocator with the binding it claims from, and
+		// only ever hands a VM the NetBox one. An allocator with no binding would
+		// mean claiming from a prefix nothing reserved, so it fails closed here
+		// rather than being assumed impossible.
+		return "", codes.Internal, fmt.Errorf(
+			"network %q: an address allocator was selected for a VM with no NetBox binding", spec.Name)
+	}
+	fp, ferr := corrosion.ClusterFingerprint(ctx, s.db)
+	if ferr != nil {
+		return "", codes.Internal, fmt.Errorf("cluster fingerprint: %w", ferr)
+	}
+	vmUUID, uerr := vmSpecUUID(vm.Spec)
+	if uerr != nil {
+		return "", codes.Internal, uerr
+	}
+	identity := netbox.Identity(fp, vmUUID, mac)
+	subnet := ""
+	if def := lookupNetworkDef(ctx, s.db, spec.Name); def != nil {
+		subnet = def.Subnet
+	}
+	res, cerr := alloc.Claim(ctx, network.ClaimRequest{
+		Network:    spec.Name,
+		Subnet:     subnet,
+		MAC:        mac,
+		OwnerKind:  "vm",
+		OwnerHost:  "", // VM names are cluster-global
+		Name:       vm.Name,
+		Identity:   identity,
+		ExplicitIP: spec.Ip,
+		PrefixID:   binding.PrefixID,
+		PrefixCIDR: binding.ObservedCIDR,
+		VRFID:      binding.VRFID,
+	})
+	if cerr != nil {
+		// ErrClaimUnknown means we never learned whether NetBox committed. There
+		// may be an object out there carrying this identity and nothing
+		// referencing it, so name it for the sweep — releasing blind would risk
+		// freeing an address another incarnation holds.
+		if errors.Is(cerr, network.ErrClaimUnknown) {
+			if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
+				slog.Error("netbox: could not enqueue orphan check for an unknown claim",
+					"identity", identity, "error", eerr)
+			}
+		}
+		return "", codes.FailedPrecondition, fmt.Errorf("claim address from NetBox: %w", cerr)
+	}
+	claims.add(claimedAddr{
+		Network: spec.Name, IP: res.IP, MAC: mac,
+		OwnerKind: "vm", OwnerHost: "", Name: vm.Name,
+		Identity: identity, NetBoxID: res.NetBoxIPID,
+	})
+	return res.IP, codes.OK, nil
+}
+
 // executeNICAttach realizes the attach DAG under the lock: ensure the network is
-// provisioned → journal the plan → (running) live attach then commit rows, or
-// (stopped) commit rows then reconcile the inactive definition → verify
-// both-state membership → CompleteVMOperation. Any failure routes to
-// failNICAttach, which rolls back directionally.
+// provisioned → journal the plan → claim the NIC's address → (running) live
+// attach then commit rows, or (stopped) commit rows then reconcile the inactive
+// definition → verify both-state membership → CompleteVMOperation. Any failure
+// routes to failNICAttach, which rolls back directionally.
 func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, spec *pb.NetworkAttachment, mac, model, nicID, sgsJSON string, ordinal int, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
 	rb := &nicAttachRollback{vm: vm, opID: opID, epoch: epoch, newGen: newGen, mac: mac, nicID: nicID,
-		networkName: spec.Name, running: running, dualWrite: !latched}
+		networkName: spec.Name, running: running, dualWrite: !latched, claims: &claimSet{srv: s}}
 
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepReserved)
 
@@ -388,6 +472,16 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 			return s.failNICAttach(ctx, rb, codes.Unavailable, fmt.Errorf("journal attach plan: %w", err))
 		}
 	}
+	// Claim the address BEFORE the irreversible live attach, after the durable
+	// plan is journaled and while every failure from here on still routes
+	// through failNICAttach — which is what gives the claim back. A hotplugged
+	// NIC on a bound network must get its address from the same authority a
+	// created one does, and must never fall back to a local allocator when that
+	// authority cannot be reached.
+	nicIP, claimCode, claimErr := s.claimNICAddress(ctx, vm, spec, mac, rb.claims)
+	if claimErr != nil {
+		return s.failNICAttach(ctx, rb, claimCode, claimErr)
+	}
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceAttach, corrosion.OpStepClaimed)
 
 	if running {
@@ -395,11 +489,11 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 			return s.failNICAttach(ctx, rb, codes.Internal, fmt.Errorf("attach NIC: %w", err))
 		}
 		rb.attached = true
-		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, ordinal); err != nil {
+		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
 			return s.failNICAttach(ctx, rb, codes.Internal, err)
 		}
 	} else {
-		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, ordinal); err != nil {
+		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {
 			return s.failNICAttach(ctx, rb, codes.Internal, err)
 		}
 		if err := s.reconcileDomainDefinition(ctx, vm, nil); err != nil {
@@ -475,6 +569,16 @@ func (s *Server) failNICAttach(ctx context.Context, rb *nicAttachRollback, code 
 			slog.Error("nic attach rollback: re-reconcile to drop nic failed", "vm", rb.vm.Name, "error", err)
 			rolledBack = false
 		}
+	}
+
+	// Give the claimed address back — but ONLY once the rows that referenced it
+	// are really gone. Releasing it while a NIC row still names it would hand
+	// the address to another workload while litevirt still points a NIC at it,
+	// which is the one outcome the release ordering everywhere else exists to
+	// prevent. An incomplete rollback leaves the operation recoverable and the
+	// address held, which is the safe half of that trade.
+	if rolledBack && rb.claims != nil {
+		rb.claims.releaseAll(ctx)
 	}
 
 	if !rolledBack {
@@ -622,10 +726,14 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list NICs for %q: %v", vmName, err)
 	}
+	// The matched record travels with the operation: its (network, ip) pair is
+	// what names the ONE lease this detach releases, and it is only readable
+	// here — the rows are gone by the time the detach completes.
+	var target corrosion.NICRecord
 	found := false
 	for _, n := range existing {
 		if strings.EqualFold(n.MAC, req.NicMac) {
-			found = true
+			target, found = n, true
 			break
 		}
 	}
@@ -655,16 +763,17 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot detach a NIC from %q: an operation is in progress", vmName)
 	}
 	newGen := vm.SpecGeneration + 1
-	return s.executeNICDetach(ctx, vm, req.NicMac, opID, vm.OwnerEpoch, newGen, running, latched)
+	return s.executeNICDetach(ctx, vm, target, req.NicMac, opID, vm.OwnerEpoch, newGen, running, latched)
 }
 
 // executeNICDetach realizes the detach DAG under the lock: journal the plan →
-// (running) live detach then tombstone rows, or (stopped) tombstone rows then
-// reconcile → verify absence → CompleteVMOperation. Row writes are ordered
+// release this NIC's address → (running) live detach then tombstone rows, or
+// (stopped) tombstone rows then reconcile → verify absence →
+// CompleteVMOperation. Row writes are ordered
 // vm_nics-first (authoritative), then the pre-latch legacy dual-write — so a
 // legacy-write failure after the authoritative tombstone lands is forward progress
 // (left recoverable), never reported as a clean no-op failure.
-func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, mac, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
+func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, mac, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepReserved)
 
 	nicID := corrosion.DeterministicNICID(vm.Name, mac)
@@ -695,6 +804,16 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, m
 			return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac,
 				codes.Unavailable, fmt.Errorf("journal detach plan: %w", err))
 		}
+	}
+
+	// Give this NIC's address back BEFORE anything about the NIC is removed —
+	// while the row and the domain still reference it, so a failure here is a
+	// clean, retryable refusal rather than a NIC that is gone with its address
+	// still held by an external IPAM nothing points at any more. The release is
+	// idempotent, so the retry re-runs it.
+	if err := s.releaseNICAddress(ctx, vm, nic); err != nil {
+		return s.failNICDetachClean(ctx, vm, opID, epoch, newGen, mac, codes.Internal,
+			fmt.Errorf("detach %s: address release failed (retry is safe): %w", mac, err))
 	}
 
 	if running {
@@ -749,6 +868,95 @@ func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, m
 	s.recordVMEvent(ctx, vm.Name, "device.detached", "ok", "nic "+mac)
 	s.publish("device.detached", vm.Name, "nic:"+mac)
 	return s.vmToProto(ctx, vm.Name)
+}
+
+// releaseNICAddress gives back EXACTLY the detached NIC's address — DeleteVM's
+// per-NIC release loop applied to the one NIC that is going away.
+//
+// Keyed on the lease's own (network, ip) primary key, never on (network,
+// vm_name): a VM can hold several leases, and a bulk release would free the
+// addresses of the NICs that are staying. The LEASE decides whether there is
+// anything to release — read owner-scoped, so a foreign row sharing this
+// (network, ip) reads back as nil rather than as a row this VM may not retire.
+func (s *Server) releaseNICAddress(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord) error {
+	if nic.IP == "" {
+		return nil // never addressed — nothing to give back
+	}
+	lease, lerr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", vm.Name)
+	if lerr != nil {
+		return fmt.Errorf("read lease %s on %s: %w", nic.IP, nic.NetworkName, lerr)
+	}
+	if lease == nil {
+		return nil // never allocated, or already released; the detach is idempotent
+	}
+
+	alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
+	if aerr != nil {
+		// A suspended or misconfigured binding must not make a NIC undetachable,
+		// but skipping the release outright burns the address in BOTH systems:
+		// the NIC row goes away below while this lease stays LIVE under a NIC
+		// that no longer exists, and a live lease is exactly what the orphan
+		// sweep must never touch, while the guarded upsert in
+		// netboxAllocator.persist refuses to reuse a live row even after an
+		// operator frees the address in NetBox by hand.
+		//
+		// So tombstone the LOCAL half directly. The allocator is only needed for
+		// the remote half; the local half is a plain owner-scoped write, and
+		// owner-scoping still makes it fail loudly if ownership moved.
+		slog.Warn("nic detach: no allocator for network, releasing the lease locally",
+			"vm", vm.Name, "network", nic.NetworkName, "ip", nic.IP, "error", aerr)
+		if rerr := network.ReleaseLease(ctx, s.db, nic.NetworkName, nic.IP, nic.MAC, "vm", "", vm.Name); rerr != nil {
+			return fmt.Errorf("tombstone lease %s on %s: %w", nic.IP, nic.NetworkName, rerr)
+		}
+		if lease.NetBoxIPID == 0 {
+			return nil // a builtin lease: no remote object to hand over
+		}
+		// The remote object is now UNREFERENCED, which is precisely the case the
+		// orphan sweep already handles correctly. Name it so it does not wait for
+		// a full sweep to notice.
+		//
+		// A failure here is logged, not surfaced: the local tombstone already
+		// landed, so a retried detach would find no lease and could never reach
+		// this point again — reporting it as retryable would be a lie, and the
+		// full sweep remains the backstop either way.
+		fp, ferr := corrosion.ClusterFingerprint(ctx, s.db)
+		if ferr != nil {
+			slog.Error("netbox: could not read the cluster fingerprint for an orphan check — address may be stranded until the next full sweep",
+				"vm", vm.Name, "network", nic.NetworkName, "ip", nic.IP, "error", ferr)
+			return nil
+		}
+		vmUUID, uerr := vmSpecUUID(vm.Spec)
+		if uerr != nil {
+			slog.Error("netbox: could not build the identity for an orphan check — address may be stranded until the next full sweep",
+				"vm", vm.Name, "network", nic.NetworkName, "ip", nic.IP, "error", uerr)
+			return nil
+		}
+		identity := netbox.Identity(fp, vmUUID, nic.MAC)
+		if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
+			slog.Error("netbox: could not enqueue orphan check — address may be stranded until the next full sweep",
+				"identity", identity, "error", eerr)
+		}
+		return nil
+	}
+	if alloc == nil {
+		// An UNBOUND network. VMs have never allocated there, so the live lease
+		// read above cannot be one of ours to give back; leave it exactly as
+		// today's code does rather than newly tombstoning a row this path has
+		// never owned.
+		return nil
+	}
+
+	// The ordinary release: local tombstone then remote delete, in that order,
+	// inside the allocator.
+	return alloc.Release(ctx, network.ReleaseRequest{
+		Network:    nic.NetworkName,
+		IP:         nic.IP,
+		MAC:        nic.MAC,
+		OwnerKind:  "vm",
+		OwnerHost:  "", // VM names are cluster-global
+		Name:       vm.Name,
+		NetBoxIPID: lease.NetBoxIPID,
+	})
 }
 
 // retryNICRowTombstone retries the row bookkeeping a bounded number of times (the

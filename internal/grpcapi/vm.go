@@ -1874,19 +1874,11 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			}
 			clusterFP = fp
 		}
-		var sp struct {
-			Uuid string `json:"uuid"`
+		uuid, uerr := vmSpecUUID(vm.Spec)
+		if uerr != nil {
+			return "", uerr
 		}
-		if err := json.Unmarshal([]byte(vm.Spec), &sp); err != nil {
-			return "", fmt.Errorf("parse VM spec for its uuid: %w", err)
-		}
-		if sp.Uuid == "" {
-			// The uuid is what makes an identity incarnation-unique; without it
-			// the string names nothing, and enqueueing it would only send the
-			// sweeper after an object that does not exist.
-			return "", fmt.Errorf("VM record carries no uuid")
-		}
-		return netbox.Identity(clusterFP, sp.Uuid, mac), nil
+		return netbox.Identity(clusterFP, uuid, mac), nil
 	}
 
 	for _, nic := range nics {

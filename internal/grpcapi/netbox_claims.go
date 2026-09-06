@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -95,4 +96,24 @@ func (c *claimSet) releaseAll(ctx context.Context) {
 // object. The full sweep is what resolves it; this only shortens the latency.
 func (s *Server) enqueueOrphanCheck(ctx context.Context, identity string) error {
 	return corrosion.EnqueueSync(ctx, s.db, "orphan", identity, "check")
+}
+
+// vmSpecUUID reads the incarnation uuid out of a stored VM spec — the middle
+// component of every netbox.Identity this package builds.
+//
+// A missing uuid is an ERROR, not an empty string: the uuid is what makes an
+// identity incarnation-unique, and an identity built without one names nothing.
+// Claiming under it would tag a NetBox object no later lookup could find, and
+// enqueueing it would only send the sweeper after an object that does not exist.
+func vmSpecUUID(vmSpec string) (string, error) {
+	var sp struct {
+		Uuid string `json:"uuid"`
+	}
+	if err := json.Unmarshal([]byte(vmSpec), &sp); err != nil {
+		return "", fmt.Errorf("parse VM spec for its uuid: %w", err)
+	}
+	if sp.Uuid == "" {
+		return "", fmt.Errorf("VM record carries no uuid")
+	}
+	return sp.Uuid, nil
 }

@@ -305,3 +305,107 @@ func LeaseExistsByIP(ctx context.Context, c *Client, network, ip string) (bool, 
 	}
 	return len(rows) > 0, nil
 }
+
+// ObjectRef maps one litevirt object to its NetBox counterpart. It is what
+// makes the mirror idempotent: a retried create finds the existing NetBox id
+// here instead of POSTing a duplicate.
+//
+// LitevirtKey is the IDENTITY string in both cases — Identity(fp, uuid, "") for
+// kind "vm" and Identity(fp, uuid, mac) for kind "nic" — matching Action.Key so
+// the applier resolves them directly.
+//
+// Identity, not name: two clusters can hold same-named VMs in one NetBox, and a
+// reused name must not adopt a previous incarnation's object. The NIC component
+// is the MAC rather than DeterministicNICID, which RenameVM re-derives from the
+// VM name and which would therefore fork a duplicate vminterface on every
+// rename.
+type ObjectRef struct {
+	LitevirtKind string
+	LitevirtKey  string
+	NetBoxKind   string
+	NetBoxID     int
+}
+
+// PutObjectRef records or updates a mapping.
+//
+// Upsert on the PRIMARY KEY, clearing deleted_at: an object that is deleted and
+// re-created reuses its row rather than leaving a tombstone the conflict clause
+// would keep colliding with — the same reclaim shape as ClaimBinding, minus the
+// live-row guard, because the identity key already names exactly one object.
+func PutObjectRef(ctx context.Context, c *Client, r ObjectRef) error {
+	if err := c.Execute(ctx,
+		`INSERT INTO netbox_objects
+		   (litevirt_kind, litevirt_key, netbox_kind, netbox_id, synced_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(litevirt_kind, litevirt_key) DO UPDATE SET
+		   netbox_kind = excluded.netbox_kind,
+		   netbox_id = excluded.netbox_id,
+		   synced_at = excluded.synced_at,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`,
+		r.LitevirtKind, r.LitevirtKey, r.NetBoxKind, r.NetBoxID,
+		c.NowWall(), c.NowTS()); err != nil {
+		return fmt.Errorf("put object ref %s/%s: %w", r.LitevirtKind, r.LitevirtKey, err)
+	}
+	return nil
+}
+
+const objectRefCols = `litevirt_kind, litevirt_key, netbox_kind, netbox_id`
+
+func scanObjectRef(r Row) ObjectRef {
+	return ObjectRef{
+		LitevirtKind: r.String("litevirt_kind"),
+		LitevirtKey:  r.String("litevirt_key"),
+		NetBoxKind:   r.String("netbox_kind"),
+		NetBoxID:     r.Int("netbox_id"),
+	}
+}
+
+// GetObjectRef reads one mapping, or nil. A tombstoned mapping reads as absent,
+// so a re-created object is synced afresh rather than adopting the NetBox object
+// its predecessor owned.
+func GetObjectRef(ctx context.Context, c *Client, kind, key string) (*ObjectRef, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+objectRefCols+` FROM netbox_objects
+		 WHERE litevirt_kind = ? AND litevirt_key = ? AND deleted_at IS NULL`,
+		kind, key)
+	if err != nil {
+		return nil, fmt.Errorf("query object ref: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	o := scanObjectRef(rows[0])
+	return &o, nil
+}
+
+// DeleteObjectRef tombstones one mapping. It never hard-deletes: a hard DELETE
+// does not replicate as an LWW row, and the tombstone is what PutObjectRef
+// reclaims when the object comes back. Retiring an already-retired (or never
+// recorded) mapping is a no-op, so a compensating caller can retry it.
+func DeleteObjectRef(ctx context.Context, c *Client, kind, key string) error {
+	if err := c.Execute(ctx,
+		`UPDATE netbox_objects SET deleted_at = ?, updated_at = ?
+		 WHERE litevirt_kind = ? AND litevirt_key = ? AND deleted_at IS NULL`,
+		c.NowWall(), c.NowTS(), kind, key); err != nil {
+		return fmt.Errorf("delete object ref %s/%s: %w", kind, key, err)
+	}
+	return nil
+}
+
+// ListObjectRefs returns every live mapping of one kind — what the orphan sweep
+// diffs against NetBox. Scoped to the kind because "vm" and "nic" identities
+// share a key space (a VM identity is its NIC identity with an empty MAC).
+func ListObjectRefs(ctx context.Context, c *Client, kind string) ([]ObjectRef, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+objectRefCols+` FROM netbox_objects
+		 WHERE litevirt_kind = ? AND deleted_at IS NULL`, kind)
+	if err != nil {
+		return nil, fmt.Errorf("list object refs: %w", err)
+	}
+	out := make([]ObjectRef, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, scanObjectRef(r))
+	}
+	return out, nil
+}

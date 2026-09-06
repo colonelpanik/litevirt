@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -52,6 +53,14 @@ type Server struct {
 	images     *image.Store
 	events     *events.Bus
 	webhookURL string // optional; fired on every publish() call
+
+	// netbox is the NetBox IPAM REST client, wired by the daemon from config
+	// once netbox_ipam_v1 is configured on this node. nil by default (every
+	// bare test server, and any node with no NetBox binding) — a claimSet with
+	// a non-zero NetBoxID and a nil client is a programming error, and
+	// releaseAll treats it as a failed release (logged + enqueued for the
+	// orphan sweep) rather than dereferencing a nil pointer.
+	netbox *netbox.Client
 
 	version   string // build version, reported via Ping and ListHosts
 	dnsDomain string // DNS domain for VM record names (e.g. "litevirt.local")

@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"fmt"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // BindingRecord is one litevirt network bound to one NetBox prefix.
@@ -142,4 +144,49 @@ func ListBindings(ctx context.Context, c *Client) ([]BindingRecord, error) {
 		out = append(out, scanBinding(r))
 	}
 	return out, nil
+}
+
+// QueueItem is one pending sync/orphan-check unit.
+type QueueItem struct {
+	ID       string
+	Kind     string
+	Key      string
+	Op       string
+	Attempts int
+}
+
+// EnqueueSync records work for the reconciler. The queue is a LATENCY
+// optimisation only — the full sweep is what makes the mirror correct — so
+// callers log an enqueue failure and continue rather than failing the operation.
+func EnqueueSync(ctx context.Context, c *Client, kind, key, op string) error {
+	id := randid.New()
+	return c.Execute(ctx,
+		`INSERT INTO netbox_sync_queue (id, kind, key, op, attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
+		id, kind, key, op, c.NowWall(), c.NowTS())
+}
+
+// DrainSyncQueue reads up to limit pending items.
+func DrainSyncQueue(ctx context.Context, c *Client, limit int) ([]QueueItem, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, kind, key, op, COALESCE(attempts, 0) AS attempts
+		 FROM netbox_sync_queue WHERE deleted_at IS NULL ORDER BY created_at LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("drain sync queue: %w", err)
+	}
+	out := make([]QueueItem, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, QueueItem{
+			ID: r.String("id"), Kind: r.String("kind"),
+			Key: r.String("key"), Op: r.String("op"), Attempts: r.Int("attempts"),
+		})
+	}
+	return out, nil
+}
+
+// AckSyncItem tombstones a completed item.
+func AckSyncItem(ctx context.Context, c *Client, id string) error {
+	return c.Execute(ctx,
+		`UPDATE netbox_sync_queue SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+		c.NowWall(), c.NowTS(), id)
 }

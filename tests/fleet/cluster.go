@@ -744,6 +744,51 @@ func (n *Node) FailVMRowWrites(t *testing.T) func() {
 	return drop
 }
 
+// FailNICRowWrites aborts every INSERT into `vm_interfaces` on this node — the
+// pre-latch dual-write half of a NIC attach, which runs AFTER the live hotplug
+// and after the authoritative vm_nics row has landed. It is how a scenario
+// reaches an attach that has to be rolled back with real forward progress
+// already on the ground.
+func (n *Node) FailNICRowWrites(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_legacy_nic_insert BEFORE INSERT ON vm_interfaces
+		 BEGIN SELECT RAISE(ABORT, 'induced legacy interface persist failure'); END`); err != nil {
+		t.Fatalf("install legacy-interface-insert failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_legacy_nic_insert`); err != nil {
+			t.Fatalf("drop legacy-interface-insert failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// FailNICRowDelete aborts every vm_nics TOMBSTONE on this node (an UPDATE that
+// sets deleted_at on a live row). The attach path writes its row with INSERT OR
+// REPLACE, so that write is untouched and only the UNDO fails — which is how a
+// scenario reaches a rollback that could not put the rows back, and therefore
+// must NOT give the claimed address away.
+func (n *Node) FailNICRowDelete(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_nic_tombstone BEFORE UPDATE ON vm_nics
+		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
+		 BEGIN SELECT RAISE(ABORT, 'induced nic tombstone failure'); END`); err != nil {
+		t.Fatalf("install nic-tombstone failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_nic_tombstone`); err != nil {
+			t.Fatalf("drop nic-tombstone failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
 // FailLeaseTombstones aborts every ip_allocations TOMBSTONE on this node
 // (an UPDATE that sets deleted_at on a live row), leaving inserts and every
 // other update alone. It is how a scenario reaches a release whose LOCAL half

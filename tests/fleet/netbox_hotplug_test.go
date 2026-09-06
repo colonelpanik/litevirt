@@ -26,6 +26,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -151,6 +154,54 @@ func mustDetachNIC(t *testing.T, c *Cluster, n *Node, vmName, mac string) {
 func isNetBoxBand(ip string) bool {
 	v4 := net.ParseIP(ip).To4()
 	return v4 != nil && v4[3] >= 100
+}
+
+// liveNICs is the VM's LIVE NIC rows as the cluster records them, through the
+// same vm_nics/vm_interfaces overlay the daemon reads.
+func liveNICs(t *testing.T, n *Node, vmName string) []corrosion.NICRecord {
+	t.Helper()
+	nics, err := corrosion.MergedVMNICs(context.Background(), n.DB, vmName)
+	if err != nil {
+		t.Fatalf("MergedVMNICs(%s): %v", vmName, err)
+	}
+	return nics
+}
+
+// domainHasNIC reports whether the LIVE domain still carries the interface —
+// the guest's own view, which is the half a lease assertion cannot see.
+func domainHasNIC(t *testing.T, n *Node, vmName, mac string) bool {
+	t.Helper()
+	xml, err := n.Virt.DumpXML(vmName)
+	if err != nil {
+		t.Fatalf("DumpXML(%s): %v", vmName, err)
+	}
+	return strings.Contains(strings.ToLower(xml), strings.ToLower(mac))
+}
+
+// orphanChecksQueued drains the node's sync queue and reports which identities
+// were named for the orphan sweep.
+func orphanChecksQueued(t *testing.T, n *Node) []string {
+	t.Helper()
+	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, 50)
+	if err != nil {
+		t.Fatalf("DrainSyncQueue: %v", err)
+	}
+	var out []string
+	for _, it := range items {
+		if it.Kind == "orphan" && it.Op == "check" {
+			out = append(out, it.Key)
+		}
+	}
+	return out
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ── attach ──────────────────────────────────────────────────────────────────
@@ -403,5 +454,200 @@ func TestHotplugDetachTombstonesLeaseWhenBindingSuspended(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %+v", ids[0], items)
+	}
+}
+
+// TestHotplugAttachPartialRollbackEnqueuesOrphanCheck covers the OTHER half of
+// the compensation trade in failNICAttach.
+//
+// When the rollback cannot complete, the claimed address is deliberately NOT
+// given back: a NIC row that survived the rollback would still name it, and
+// freeing an address something still points at is worse than holding one nothing
+// does. But that decision on its own ends in a log line — the lease stays live
+// and the NetBox object stays held with nothing left to drive either forward,
+// and neither is visible to anything that reports stuck leases.
+//
+// The failure is built out of two seams, because the property needs BOTH halves
+// of a partial rollback to be real: the legacy dual-write aborts so the attach
+// fails with the live hotplug and the authoritative row already on the ground,
+// and the vm_nics tombstone aborts so the undo of that row genuinely cannot
+// land. The device rollback still succeeds, which is what makes this partial
+// rather than total.
+func TestHotplugAttachPartialRollbackEnqueuesOrphanCheck(t *testing.T) {
+	nb, c, _ := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	mustCreateNICLessVM(t, c, n, "vm-1")
+
+	n.FailNICRowWrites(t) // the attach fails AFTER the live hotplug + vm_nics row
+	n.FailNICRowDelete(t) // ...and the rollback of that row cannot land
+
+	if _, err := attachNIC(c, n, "vm-1", orphanNetwork); err == nil {
+		t.Fatal("an attach whose row write fails must not report success")
+	}
+
+	// The claim is RETAINED, in both systems: a live NIC row still names it.
+	nics := liveNICs(t, n, "vm-1")
+	if len(nics) != 1 {
+		t.Fatalf("test setup: the rollback should have been unable to remove the NIC row, got %+v", nics)
+	}
+	ids := nb.Identities()
+	if len(ids) != 1 {
+		t.Fatalf("an incomplete rollback must NOT release the claim, identities = %v", ids)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("an incomplete rollback must leave the local lease live, got %d", got)
+	}
+
+	// ...and it is SURFACED rather than left to a log line.
+	queued := orphanChecksQueued(t, n)
+	if !contains(queued, ids[0]) {
+		t.Fatalf("the retained claim %q must be named for the stuck-lease sweep, queue = %v", ids[0], queued)
+	}
+}
+
+// TestHotplugDetachReleasesAfterLiveDetach pins the detach ORDER, and it is the
+// exact mirror of the attach path's rolledBack guard.
+//
+// Give the address back BEFORE the live unplug and a detach that then fails
+// leaves the guest holding an address that litevirt and the external IPAM both
+// consider free — the collision every other ordering decision here exists to
+// prevent. Unplug first and the same failure can only ever leak, which a retry
+// or the sweep clears.
+//
+// The domain assertion is what makes this non-vacuous: both orderings return an
+// error here, and only one of them has already freed an address the guest is
+// still using.
+func TestHotplugDetachReleasesAfterLiveDetach(t *testing.T) {
+	nb, c, _ := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	mustCreateNICLessVM(t, c, n, "vm-1")
+
+	nic := mustAttachNIC(t, c, n, "vm-1", orphanNetwork)
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("want one live lease before the detach, got %d", got)
+	}
+
+	n.Virt.FailDetachNIC = func(_, _ string) error {
+		return fmt.Errorf("live detach refused by the hypervisor")
+	}
+
+	if err := detachNIC(c, n, "vm-1", nic.MAC); err == nil {
+		t.Fatal("a detach whose live unplug fails must not report success")
+	}
+
+	if !domainHasNIC(t, n, "vm-1", nic.MAC) {
+		t.Fatal("test setup: the failed unplug must have left the NIC in the live domain")
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the address was freed while the domain still has the NIC: %d leases live", got)
+	}
+	if ids := nb.Identities(); len(ids) != 1 {
+		t.Fatalf("the NetBox object was released while the domain still has the NIC: %v", ids)
+	}
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 1 {
+		t.Fatalf("a failed detach must leave the NIC row, got %+v", nics)
+	}
+}
+
+// TestHotplugDetachReleaseFailureKeepsRow is what the ordering above BUYS: the
+// leak it prefers has to be recoverable.
+//
+// The unplug lands and the release then fails on its local half, so litevirt
+// still holds the address with the NIC already gone from the guest. The NIC row
+// must survive that — it is the only thing that still names the address a retry
+// has to release — and the operation must be terminally failed rather than left
+// in flight, or the retry would be refused for an operation already in progress.
+func TestHotplugDetachReleaseFailureKeepsRow(t *testing.T) {
+	nb, c, _ := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	mustCreateNICLessVM(t, c, n, "vm-1")
+
+	nic := mustAttachNIC(t, c, n, "vm-1", orphanNetwork)
+
+	dropTombstoneFailure := n.FailLeaseTombstones(t)
+
+	err := detachNIC(c, n, "vm-1", nic.MAC)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("a failed release must surface as Internal, got %v", err)
+	}
+	if domainHasNIC(t, n, "vm-1", nic.MAC) {
+		t.Fatal("the live unplug runs first and must have landed")
+	}
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 1 {
+		t.Fatalf("the NIC row must be RETAINED so a retry can re-run the release, got %+v", nics)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the lease must still be live after a failed release, got %d", got)
+	}
+	if ids := nb.Identities(); len(ids) != 1 {
+		t.Fatalf("the NetBox object must still be held after a failed release, got %v", ids)
+	}
+
+	// The retry is the whole point of retaining the row.
+	dropTombstoneFailure()
+	mustDetachNIC(t, c, n, "vm-1", nic.MAC)
+
+	if got := leaseCount(t, n, orphanNetwork); got != 0 {
+		t.Fatalf("the retry must release the lease, %d still live", got)
+	}
+	if ids := nb.Identities(); len(ids) != 0 {
+		t.Fatalf("the retry must release the NetBox object, still held: %v", ids)
+	}
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 0 {
+		t.Fatalf("the retry must remove the NIC row, got %+v", nics)
+	}
+}
+
+// TestHotplugDetachRemoteReleaseFailureRetryRemovesRow is the OTHER release
+// failure, and the one where a retry cannot simply do it all again.
+//
+// The release tombstones the local lease first and only then deletes the remote
+// object, so a NetBox that is unreachable at that moment leaves the lease gone
+// and the object held. A retry finds no lease at all — there is nothing left to
+// prove ownership with, and re-running the remote delete blind would risk freeing
+// an address another incarnation now holds. So the retry must not stall on it:
+// it hands the object to the orphan sweep, which reclaims only under whole-
+// cluster proof, and finishes removing the NIC.
+func TestHotplugDetachRemoteReleaseFailureRetryRemovesRow(t *testing.T) {
+	nb, c, _ := hotplugCluster(t, 1)
+	n := c.Nodes[0]
+	mustCreateNICLessVM(t, c, n, "vm-1")
+
+	nic := mustAttachNIC(t, c, n, "vm-1", orphanNetwork)
+	ids := nb.Identities()
+	if len(ids) != 1 {
+		t.Fatalf("want one NetBox identity before the detach, got %v", ids)
+	}
+
+	nb.Down = true
+	err := detachNIC(c, n, "vm-1", nic.MAC)
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("a failed remote release must surface as Internal, got %v", err)
+	}
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 1 {
+		t.Fatalf("the NIC row must be RETAINED while the release is unfinished, got %+v", nics)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 0 {
+		t.Fatalf("test setup: the local half of the release lands first, so no lease should be live, got %d", got)
+	}
+	if got := nb.Identities(); len(got) != 1 {
+		t.Fatalf("the remote object must still be held after an unreachable NetBox, got %v", got)
+	}
+
+	nb.Down = false
+	mustDetachNIC(t, c, n, "vm-1", nic.MAC)
+
+	if nics := liveNICs(t, n, "vm-1"); len(nics) != 0 {
+		t.Fatalf("the retry must remove the NIC row, got %+v", nics)
+	}
+	// Deliberately NOT deleted inline: with the lease already gone there is no
+	// local proof of ownership left, so the sweep's whole-cluster proof is what
+	// reclaims it.
+	if got := nb.Identities(); len(got) != 1 {
+		t.Fatalf("the retry must leave the remote object to the sweep, got %v", got)
+	}
+	queued := orphanChecksQueued(t, n)
+	if !contains(queued, ids[0]) {
+		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %v", ids[0], queued)
 	}
 }

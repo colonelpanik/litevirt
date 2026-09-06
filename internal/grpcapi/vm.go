@@ -1862,111 +1862,19 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
 	}
-	// Identity for the orphan sweep, built at most once and ONLY if some lease
-	// actually has to be handed over (below): the cluster fingerprint is a DB
-	// read, and a delete whose bindings are all healthy must not gain one.
-	clusterFP := ""
-	identityFor := func(mac string) (string, error) {
-		if clusterFP == "" {
-			fp, ferr := corrosion.ClusterFingerprint(ctx, s.db)
-			if ferr != nil {
-				return "", ferr
-			}
-			clusterFP = fp
-		}
-		uuid, uerr := vmSpecUUID(vm.Spec)
-		if uerr != nil {
-			return "", uerr
-		}
-		return netbox.Identity(clusterFP, uuid, mac), nil
-	}
-
 	for _, nic := range nics {
-		// (1) The LEASE decides whether there is anything to release. Reading it
-		// first — owner-scoped, so a foreign row sharing this (network, ip) reads
-		// back as nil rather than as a row we may not retire — keeps the two
-		// branches below about HOW to release, never about whether to.
-		lease, lerr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", req.Name)
-		if lerr != nil {
-			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: read lease %s: %v", nic.NetworkName, nic.IP, lerr))
-			continue
-		}
-		if lease == nil {
-			continue // never allocated, or already released; the delete is idempotent
-		}
-
-		// (2) Resolve the allocator that owns the RELEASE of that lease.
-		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
-		if aerr != nil {
-			// A suspended or misconfigured binding must not block a delete — the
-			// workload is already gone, and a VM that cannot be deleted at all is
-			// strictly worse. But skipping the release outright burns the address
-			// in BOTH systems: the vms row is tombstoned below while this lease
-			// stays LIVE with an owner that no longer exists, and a live lease is
-			// exactly what the orphan sweep must never touch (that invariant is
-			// what protects a running guest's address), while the guarded upsert
-			// in netboxAllocator.persist refuses to reuse a live row even after an
-			// operator frees the address in NetBox by hand.
-			//
-			// So tombstone the LOCAL half directly. The allocator is only needed
-			// for the remote half; the local half is a plain owner-scoped write,
-			// and owner-scoping still makes it fail loudly if ownership moved.
-			slog.Warn("delete: no allocator for network, releasing the lease locally",
-				"vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", aerr)
-			if rerr := network.ReleaseLease(ctx, s.db, nic.NetworkName, nic.IP, nic.MAC, "vm", "", req.Name); rerr != nil {
-				// Same treatment as any other release failure: the lease is still
-				// live, so the operator has to know litevirt still holds the
-				// address. Nothing destructive has run, so a retry re-runs this.
-				releaseErrs = append(releaseErrs, fmt.Sprintf("%s: tombstone lease %s: %v", nic.NetworkName, nic.IP, rerr))
-				continue
-			}
-			if lease.NetBoxIPID == 0 {
-				continue // a builtin lease: no remote object to hand over
-			}
-			// The remote object is now UNREFERENCED, which is precisely the case
-			// the orphan sweep already handles correctly. Name it so it does not
-			// wait for a full sweep to notice.
-			//
-			// A failure here is logged, not surfaced: the local tombstone already
-			// landed, so a retried delete would find no lease and could never
-			// reach this point again — reporting it as retryable would be a lie,
-			// and the full sweep remains the backstop either way.
-			identity, ierr := identityFor(nic.MAC)
-			if ierr != nil {
-				slog.Error("netbox: could not build the identity for an orphan check — address may be stranded until the next full sweep",
-					"vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", ierr)
-				continue
-			}
-			if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
-				slog.Error("netbox: could not enqueue orphan check — address may be stranded until the next full sweep",
-					"identity", identity, "error", eerr)
-			}
-			continue
-		}
-		if alloc == nil {
-			// An UNBOUND network. VMs have never allocated there, so the live
-			// lease read above cannot be one of ours to give back; leave it
-			// exactly as today's code does rather than newly tombstoning rows
-			// this path has never owned.
-			continue
-		}
-
-		// (3) The ordinary release: local tombstone then remote delete, in that
-		// order, inside the allocator.
-		if err := alloc.Release(ctx, network.ReleaseRequest{
-			Network:    nic.NetworkName,
-			IP:         nic.IP,
-			MAC:        nic.MAC,
-			OwnerKind:  "vm",
-			OwnerHost:  "", // VM names are cluster-global
-			Name:       req.Name,
-			NetBoxIPID: lease.NetBoxIPID,
-		}); err != nil {
-			// SURFACED, not just logged. A release failure means either the
-			// lease is still live (so the external object must stay, and the
-			// operator has to know litevirt still holds the address) or
-			// ownership moved under us. The release is idempotent and runs
-			// before the tombstone, so a retry re-runs it.
+		// ONE implementation, shared verbatim with the hot-detach path
+		// (releaseOneNICLease): the lease — read owner-scoped, keyed on its own
+		// (network, ip) so a VM's other NICs keep theirs — decides whether there
+		// is anything to release; a suspended binding still tombstones the local
+		// half and hands the now-unreferenced remote object to the sweep; and an
+		// unbound network is left exactly as it has always been.
+		//
+		// A failure is SURFACED, not just logged. It means either the lease is
+		// still live (so the external object must stay, and the operator has to
+		// know litevirt still holds the address) or ownership moved under us. The
+		// release is idempotent and runs before the tombstone, so a retry re-runs it.
+		if err := s.releaseOneNICLease(ctx, vm, nic); err != nil {
 			slog.Error("release IP failed", "vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: %v", nic.NetworkName, err))
 		}

@@ -303,6 +303,28 @@ enforcement:
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
 
+# External NetBox IPAM integration. Disabled by default; when disabled no
+# NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).
+netbox:
+  enabled: false            # advertise netbox_ipam_v1 and allow prefix bindings
+                            # (`lv network create --netbox-prefix-id`). Must be
+                            # uniform cluster-wide for the latch to form — an older
+                            # binary does not parse the prefix-binding field at all
+                            # and would silently allocate from the builtin
+                            # allocator across the whole prefix, so replicated
+                            # state alone cannot make a bound prefix safe.
+  url: ""                  # NetBox base URL, e.g. "https://netbox.corp".
+  token_path: ""            # path to a file containing the API token. The token
+                            # is read from this file at startup and is NEVER held
+                            # inline in config.
+  timeout_sec: 10           # per-request timeout.
+  sweep_interval_sec: 900   # how often the reconciler re-validates bindings and
+                            # sweeps orphans.
+  # Binding a network to a NetBox prefix requires the netbox_ipam_v1 latch, and the
+  # prefix must belong to a VRF with enforce_unique set. Global-table prefixes are
+  # refused, because NetBox does not expose the global uniqueness setting through a
+  # supported API.
+
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
 # LDAP realms are loaded into a Registry at startup; `Login` dispatches

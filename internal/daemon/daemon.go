@@ -753,6 +753,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.VIPProofReclaim,
 		d.cfg.Enforcement.SharedStorageFence,
 	)
+	// netbox_ipam_v1 is advertised only while this node's config enables the
+	// NetBox integration, so the cluster-wide latch requires config uniformity,
+	// not just a uniform build (see capabilities.NetBoxIPAMV1).
+	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)

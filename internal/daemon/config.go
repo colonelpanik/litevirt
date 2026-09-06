@@ -199,8 +199,21 @@ type Config struct {
 	// PROVIDE_*/OTEL_* env vars override these fields.
 	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
 
+	// NetBox is the external IPAM integration. Absent or disabled means the
+	// client is never constructed: no HTTP, no goroutine, no behaviour change.
+	NetBox NetBoxConfig `yaml:"netbox"`
+
 	// Version is set at startup from build-time ldflags (not from config file).
 	Version string `yaml:"-"`
+}
+
+// NetBoxConfig configures the external NetBox IPAM integration. Default off.
+type NetBoxConfig struct {
+	Enabled          bool   `yaml:"enabled"`
+	URL              string `yaml:"url"`
+	TokenPath        string `yaml:"token_path"`
+	TimeoutSec       int    `yaml:"timeout_sec"`
+	SweepIntervalSec int    `yaml:"sweep_interval_sec"`
 }
 
 // TelemetryConfig maps litevirt's daemon config onto the provide-telemetry

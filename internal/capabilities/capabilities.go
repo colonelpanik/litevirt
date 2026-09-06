@@ -243,6 +243,14 @@ const (
 	// enabling on one node changes nothing until every node has opted in. Default-off,
 	// and the flag is the reversible kill switch (off → sign nothing, refuse nothing).
 	AuditSignatureV1 = "audit_signature_v1"
+	// NetBoxIPAMV1 gates binding a litevirt network to a NetBox prefix.
+	//
+	// The latch is required because an OLDER binary does not parse the
+	// NetBoxPrefixID field on a network definition at all, and would silently
+	// allocate from the builtin allocator across the whole prefix. Every node
+	// observing the same replicated binding is not the same thing as every node
+	// INTERPRETING it — which is why replicated state alone is not sufficient here.
+	NetBoxIPAMV1 = "netbox_ipam_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -333,6 +341,7 @@ var supported = []string{
 	HardwareV2,
 	ProjectAuthorityV1,
 	AuditSignatureV1,
+	NetBoxIPAMV1,
 	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
@@ -349,7 +358,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

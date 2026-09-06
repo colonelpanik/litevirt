@@ -48,3 +48,20 @@ func TestCapacityAdmissionV1Registered(t *testing.T) {
 		t.Fatalf("All() = %v, want it to contain %q", All(), CapacityAdmissionV1)
 	}
 }
+
+// TestNetBoxIPAMV1Registered pins the netbox_ipam_v1 token in both sets.
+// Supported() is what peers see via Ping, so the cluster can never latch a token
+// missing from it; All() is what health.SetActivationMarker walks to preload the
+// durable latch markers and what daemon rollback detection diffs against, so a
+// token absent there loses its latch across a restart.
+func TestNetBoxIPAMV1Registered(t *testing.T) {
+	if NetBoxIPAMV1 != "netbox_ipam_v1" {
+		t.Fatalf("NetBoxIPAMV1 = %q, want %q", NetBoxIPAMV1, "netbox_ipam_v1")
+	}
+	if !slices.Contains(Supported(), NetBoxIPAMV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), NetBoxIPAMV1)
+	}
+	if !slices.Contains(All(), NetBoxIPAMV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), NetBoxIPAMV1)
+	}
+}

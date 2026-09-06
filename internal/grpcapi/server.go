@@ -118,6 +118,15 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
+	// enfNetBoxIPAM gates ADVERTISEMENT of netbox_ipam_v1: the token is advertised
+	// only while this flag is set (like operation_protocol), so it can latch only
+	// once every node has opted in. An older binary does not parse the
+	// NetBoxPrefixID field on a network definition at all and would silently
+	// allocate from the builtin allocator across the whole prefix, so replicated
+	// state alone cannot make a bound prefix safe — the latch requires config
+	// uniformity, not just a uniform build. Default false; the flag is the
+	// reversible kill switch.
+	enfNetBoxIPAM bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -482,6 +491,15 @@ func (s *Server) advertisedCapabilities() []string {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
+	// netbox_ipam_v1 is likewise advertised CONDITIONALLY on its config flag. An
+	// older binary does not parse the NetBoxPrefixID field on a network
+	// definition at all, and would silently allocate from the builtin allocator
+	// across the whole prefix — every node observing the same replicated binding
+	// is not the same thing as every node INTERPRETING it, so the latch requires
+	// CONFIG uniformity, not just a uniform build.
+	if !s.enfNetBoxIPAM {
+		caps = withoutCapability(caps, capabilities.NetBoxIPAMV1)
+	}
 	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
 	// a peer outright, and a node that isn't enforcing would keep accepting the
 	// isolated node's state and re-inject it — so the latch requires CONFIG
@@ -599,6 +617,11 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
+// enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node
+// changes nothing until every node has opted in and the token has latched.
+func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
@@ -760,6 +783,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOwnerEpoch
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
+	case capabilities.NetBoxIPAMV1:
+		return s.enfNetBoxIPAM
 	default:
 		return false
 	}

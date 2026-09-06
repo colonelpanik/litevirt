@@ -16,6 +16,7 @@ package fleet
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -55,6 +56,36 @@ func mustRekey(t *testing.T, c *Cluster, n *Node, network string) {
 	if err := rekey(c, n, network); err != nil {
 		t.Fatalf("RekeyBinding(%s) on %s: %v", network, n.Name, err)
 	}
+}
+
+// resumeBinding drives the ResumeBinding RPC, returning the error unchanged so
+// the refusal scenarios can read the reason out of it.
+func resumeBinding(c *Cluster, n *Node, network string) error {
+	_, err := c.SelfClient(n).ResumeBinding(context.Background(),
+		&pb.ResumeBindingRequest{Network: network})
+	return err
+}
+
+func mustResume(t *testing.T, c *Cluster, n *Node, network string) {
+	t.Helper()
+	if err := resumeBinding(c, n, network); err != nil {
+		t.Fatalf("ResumeBinding(%s) on %s: %v", network, n.Name, err)
+	}
+}
+
+// inCIDR reports whether addr is inside cidr. Used to prove a resumed binding
+// allocates out of the range it PINNED, not whatever NetBox reports now.
+func inCIDR(t *testing.T, addr, cidr string) bool {
+	t.Helper()
+	_, netw, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatalf("parse %q: %v", cidr, err)
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		t.Fatalf("VM has no address to check against %s", cidr)
+	}
+	return netw.Contains(ip)
 }
 
 // bindingSuspended reports the binding's suspension flag as the cluster stores
@@ -368,4 +399,156 @@ func TestTwoClustersOneNetBoxDoNotCollide(t *testing.T) {
 		}
 	}
 	t.Fatalf("one cluster's sweeper reclaimed another cluster's address, left %v", nb.Identities())
+}
+
+// ── the resume ──────────────────────────────────────────────────────────────
+//
+// A re-key answers exactly one reason a binding suspends: the fingerprint pin.
+// Every other drift is repaired by an operator in NetBox, and `lv netbox resume`
+// is what re-checks the repair and lifts the flag. It is a re-VALIDATION, never
+// an adoption: the binding's pinned facts are written back unchanged, so a
+// prefix that is still drifted stays suspended however often it is run.
+
+// TestResumeRefusesWhileStillDrifted is the property that makes resume safe to
+// hand an operator: it is not a "clear the flag" switch. A binding whose drift
+// is still present comes back refused, with the reason, and still suspended.
+func TestResumeRefusesWhileStillDrifted(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+
+	nb.RecidrPrefix(orphanPrefixID, "10.0.6.0/24")
+	mustRevalidate(t, n)
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("setup: the re-CIDR must have suspended the binding")
+	}
+
+	err := resumeBinding(c, n, orphanNetwork)
+	if err == nil {
+		t.Fatal("resume must refuse while the drift that suspended the binding is still there")
+	}
+	// The reason, not a bare "refused": an operator reading this has to learn
+	// what to repair in NetBox.
+	if !strings.Contains(err.Error(), "re-CIDRed") {
+		t.Fatalf("refusal = %v, want it to name the CIDR drift", err)
+	}
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("a refused resume must leave the binding suspended")
+	}
+	if _, err := createVMOnNetwork(c, n, "vm-1", orphanNetwork); err == nil {
+		t.Fatal("the still-suspended binding must keep refusing creates")
+	}
+}
+
+// TestResumeClearsAfterDriftRepaired is the other half: once the prefix is what
+// the binding recorded again, resume actually lifts the suspension and the
+// network allocates — out of the ORIGINAL range, which is the range the
+// sweeper and lease repair enumerate.
+func TestResumeClearsAfterDriftRepaired(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+
+	nb.RecidrPrefix(orphanPrefixID, "10.0.6.0/24")
+	mustRevalidate(t, n)
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("setup: the re-CIDR must have suspended the binding")
+	}
+
+	nb.RecidrPrefix(orphanPrefixID, orphanSubnet) // the operator reverts it
+	mustResume(t, c, n, orphanNetwork)
+
+	if bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatalf("a repaired binding must resume, still suspended with %q",
+			bindingSuspendReason(t, n, orphanPrefixID))
+	}
+	if _, err := createVMOnNetwork(c, n, "vm-1", orphanNetwork); err != nil {
+		t.Fatalf("the resumed binding must allocate again, got %v", err)
+	}
+	if addr := vmNICIP(t, n, "vm-1"); !inCIDR(t, addr, orphanSubnet) {
+		t.Fatalf("address %q is outside the pinned range %s — a resumed binding must "+
+			"keep allocating where the reclaim proof looks", addr, orphanSubnet)
+	}
+}
+
+// TestResumeDoesNotAcceptNewCIDR pins the v1 limitation as a PROPERTY, not a
+// doc sentence: resume re-validates against the pinned CIDR and writes it back
+// unchanged. Adopting the new range instead would resume allocation into
+// addresses the sweeper and lease repair — both of which enumerate NetBox by
+// observed_cidr — could never see.
+func TestResumeDoesNotAcceptNewCIDR(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+
+	nb.RecidrPrefix(orphanPrefixID, "10.0.7.0/24")
+	mustRevalidate(t, n)
+
+	if err := resumeBinding(c, n, orphanNetwork); err == nil {
+		t.Fatal("resume must refuse a prefix whose CIDR is not the one the binding pinned")
+	}
+	if got := binding(t, n, orphanPrefixID).ObservedCIDR; got != orphanSubnet {
+		t.Fatalf("ObservedCIDR = %q after a refused resume, want the pinned %q — "+
+			"a resume that re-observed the prefix would strand every later claim",
+			got, orphanSubnet)
+	}
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("the binding must stay suspended against a re-CIDRed prefix")
+	}
+}
+
+// TestResumeIsIdempotentOnLiveBinding: resuming a binding that is already live
+// is the state the caller asked for, so it succeeds and changes nothing.
+func TestResumeIsIdempotentOnLiveBinding(t *testing.T) {
+	_, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustResume(t, c, n, orphanNetwork)
+	mustResume(t, c, n, orphanNetwork)
+
+	if bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("resuming a live binding must not suspend it")
+	}
+	if _, err := createVMOnNetwork(c, n, "vm-1", orphanNetwork); err != nil {
+		t.Fatalf("the binding must still allocate after a no-op resume, got %v", err)
+	}
+}
+
+// TestRekeyRefusesToResumeWhileDrifted is the re-key's half of the same rule.
+//
+// A re-key rewrites identities; it does not repair a prefix. Resuming on the
+// strength of a completed rewrite alone would lift a suspension the operation
+// did nothing about — and on a re-CIDRed prefix that is silently destructive,
+// because allocation restarts from the NEW NetBox range while the binding still
+// records the OLD observed_cidr that the reclaim proof enumerates by.
+func TestRekeyRefusesToResumeWhileDrifted(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	mustCreateVMOnNetwork(t, c, n, "vm-1", orphanNetwork)
+
+	c.ReplaceClusterCA()
+	newFP := clusterFP(t, n)
+	nb.RecidrPrefix(orphanPrefixID, "10.0.6.0/24") // a SECOND, unrelated drift
+	mustRevalidate(t, n)
+
+	err := rekey(c, n, orphanNetwork)
+	if err == nil {
+		t.Fatal("a re-key must not report success while the binding stays suspended")
+	}
+	if !strings.Contains(err.Error(), "re-CIDRed") {
+		t.Fatalf("the re-key error = %v, want it to name the drift it did not fix", err)
+	}
+
+	// The rewrite itself still happened — the two halves are independent, and a
+	// re-key that silently skipped its own work would also pass the assertions
+	// above.
+	if got := fingerprintCounts(t, nb); got[newFP] != 1 {
+		t.Fatalf("the re-key must still rewrite every identity, got %v", got)
+	}
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("a re-key must leave a still-drifted binding suspended")
+	}
+	if reason := bindingSuspendReason(t, n, orphanPrefixID); !strings.Contains(reason, "re-CIDRed") {
+		t.Fatalf("suspend reason = %q, want the drift the operator now has to repair", reason)
+	}
+	if _, err := createVMOnNetwork(c, n, "vm-2", orphanNetwork); err == nil {
+		t.Fatal("the still-suspended binding must refuse new creates")
+	}
 }

@@ -102,6 +102,7 @@ const (
 	LiteVirt_DeleteNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteNetwork"
 	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
 	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
+	LiteVirt_ResumeBinding_FullMethodName              = "/litevirt.v1.LiteVirt/ResumeBinding"
 	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
 	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
 	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
@@ -388,6 +389,11 @@ type LiteVirtClient interface {
 	// fingerprint and resumes allocation. Idempotent and resumable — a partial
 	// rewrite leaves the binding suspended for the next run to finish.
 	RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+	// It re-runs the bind-time checks against the binding's pinned prefix facts
+	// and refuses while any of them still disagree; it never accepts a changed
+	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
+	ResumeBinding(ctx context.Context, in *ResumeBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLBResponse, error)
 	InspectLoadBalancer(ctx context.Context, in *InspectLBRequest, opts ...grpc.CallOption) (*LoadBalancer, error)
@@ -1626,6 +1632,16 @@ func (c *liteVirtClient) RekeyBinding(ctx context.Context, in *RekeyBindingReque
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_RekeyBinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ResumeBinding(ctx context.Context, in *ResumeBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ResumeBinding_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3419,6 +3435,11 @@ type LiteVirtServer interface {
 	// fingerprint and resumes allocation. Idempotent and resumable — a partial
 	// rewrite leaves the binding suspended for the next run to finish.
 	RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error)
+	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+	// It re-runs the bind-time checks against the binding's pinned prefix facts
+	// and refuses while any of them still disagree; it never accepts a changed
+	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
+	ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error)
 	InspectLoadBalancer(context.Context, *InspectLBRequest) (*LoadBalancer, error)
@@ -3950,6 +3971,9 @@ func (UnimplementedLiteVirtServer) ListNetworks(context.Context, *emptypb.Empty)
 }
 func (UnimplementedLiteVirtServer) RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RekeyBinding not implemented")
+}
+func (UnimplementedLiteVirtServer) ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeBinding not implemented")
 }
 func (UnimplementedLiteVirtServer) ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListLoadBalancers not implemented")
@@ -5741,6 +5765,24 @@ func _LiteVirt_RekeyBinding_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RekeyBinding(ctx, req.(*RekeyBindingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ResumeBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ResumeBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ResumeBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ResumeBinding(ctx, req.(*ResumeBindingRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8679,6 +8721,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RekeyBinding",
 			Handler:    _LiteVirt_RekeyBinding_Handler,
+		},
+		{
+			MethodName: "ResumeBinding",
+			Handler:    _LiteVirt_ResumeBinding_Handler,
 		},
 		{
 			MethodName: "ListLoadBalancers",

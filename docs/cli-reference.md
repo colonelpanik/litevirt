@@ -321,15 +321,25 @@ for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 ## NetBox IPAM
 
 ```bash
-lv netbox rekey <network>                         # re-stamp identities, resume a suspended binding
+lv netbox rekey <network>                         # re-stamp identities after a cluster CA replacement
+lv netbox resume <network>                        # lift a suspension once the drift is repaired
 ```
 
 A bound network's binding is suspended when the NetBox prefix drifts out of what
 the bind validated, or when the cluster CA — and with it the fingerprint stamped
 on every NetBox object litevirt owns — is replaced. New allocations then refuse
-while running VMs continue untouched. `lv netbox rekey` rewrites those
-identities under the current fingerprint and resumes the binding; it is safe to
-re-run. See `docs/networking.md#recovering-from-a-ca-replacement`.
+while running VMs continue untouched.
+
+`lv netbox rekey` is the CA case: it rewrites those identities under the current
+fingerprint and resumes the binding, and is safe to re-run. It resumes nothing
+while another drift is still present.
+
+`lv netbox resume` is every other case: repair the prefix in NetBox, then run it
+to re-check the bind-time preconditions and clear the suspension. It refuses
+while the drift is still there, and it never accepts a changed CIDR — re-CIDRing
+a bound prefix is unsupported. See
+`docs/networking.md#resuming-a-suspended-binding` and
+`docs/networking.md#recovering-from-a-ca-replacement`.
 
 ## Storage pools
 

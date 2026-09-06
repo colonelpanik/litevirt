@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -119,10 +120,14 @@ func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, li
 // ── the CA re-key ───────────────────────────────────────────────────────────
 
 // RekeyBinding rewrites the identities a bound network owns in NetBox under the
-// cluster's CURRENT fingerprint, then resumes the binding.
+// cluster's CURRENT fingerprint, then resumes the binding IF nothing else is
+// wrong with it.
 //
 // A pinned fingerprint with no rotation path is an outage waiting for the first
-// CA replacement, so this is the operation that turns one into a chore.
+// CA replacement, so this is the operation that turns one into a chore. It
+// answers the fingerprint pin and only that: a binding that had also drifted in
+// NetBox stays suspended under the remaining reason, for `lv netbox resume`
+// once an operator has repaired it.
 func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -134,6 +139,10 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"this node has no netbox configuration; run the re-key on a node that does")
 	}
+	if s.db == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this node has no cluster database; run the re-key on a node that does")
+	}
 	b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.GetNetwork())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal,
@@ -143,14 +152,37 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 		return nil, status.Errorf(codes.NotFound,
 			"network %q is not bound to a NetBox prefix", req.GetNetwork())
 	}
-	if err := s.rekeyBinding(ctx, *b); err != nil {
+	rewritten, err := s.rekeyBinding(ctx, *b)
+	detail := fmt.Sprintf("prefix=%d rewritten=%d", b.PrefixID, rewritten)
+	if err != nil {
+		// Audited on BOTH outcomes: a re-key that failed partway has still
+		// rewritten objects in NetBox, so "nothing happened" is exactly the
+		// wrong thing for the audit trail to imply.
+		s.audit(ctx, "netbox.rekey", req.GetNetwork(), detail, "error")
+		var drifted stillDriftedError
+		if errors.As(err, &drifted) {
+			// Not an internal failure: the rewrite succeeded and the operator
+			// has a prefix to repair.
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"re-key network %q: %v", req.GetNetwork(), err)
+		}
 		return nil, status.Errorf(codes.Internal, "re-key network %q: %v", req.GetNetwork(), err)
 	}
+	s.audit(ctx, "netbox.rekey", req.GetNetwork(), detail, "ok")
 	return &emptypb.Empty{}, nil
 }
 
-// rekeyBinding is the re-key itself: rewrite, then resume — never the other way
-// round.
+// stillDriftedError is a re-key that rewrote every identity and then found the
+// binding still invalid for a reason a re-key does not address.
+type stillDriftedError struct{ reason string }
+
+func (e stillDriftedError) Error() string {
+	return fmt.Sprintf("identities re-keyed, but the binding remains suspended: %s"+
+		" — repair it in NetBox, then run `lv netbox resume`", e.reason)
+}
+
+// rekeyBinding is the re-key itself: rewrite, then re-validate, then resume —
+// never any other order.
 //
 // SCOPE: this rewrites identities on `ipam.ip-address` objects only. P2 extends
 // this function to `virtual_machine` and `vminterface` objects; until then, do
@@ -164,10 +196,10 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 // a SECOND CA replacement: objects stamped with an intermediate fingerprint
 // match neither the old pin nor the new one. Finish a re-key before rotating
 // again.
-func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) error {
+func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (int, error) {
 	newFP, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
-		return fmt.Errorf("derive cluster fingerprint: %w", err)
+		return 0, fmt.Errorf("derive cluster fingerprint: %w", err)
 	}
 
 	// Suspend FIRST when the pin is already stale. Every claim stamps the LIVE
@@ -178,7 +210,7 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) er
 	if b.ClusterFingerprint != newFP && !b.Suspended {
 		reason := fmt.Sprintf("cluster CA changed; re-key in progress for %s", b.Network)
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
-			return fmt.Errorf("suspend binding %d before re-key: %w", b.PrefixID, err)
+			return 0, fmt.Errorf("suspend binding %d before re-key: %w", b.PrefixID, err)
 		}
 	}
 
@@ -186,7 +218,7 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) er
 	if err != nil {
 		// A partial enumeration would resume the binding with objects still
 		// carrying the old fingerprint — invisible to this cluster ever after.
-		return fmt.Errorf("enumerate prefix %d: %w", b.PrefixID, err)
+		return 0, fmt.Errorf("enumerate prefix %d: %w", b.PrefixID, err)
 	}
 
 	rewritten := 0
@@ -199,21 +231,121 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) er
 		}
 		if err := s.netbox.SetIPIdentity(ctx, ip.ID, netbox.Identity(newFP, uuid, mac)); err != nil {
 			s.nbMetrics().IncAPIError(netbox.Classify(err))
-			return fmt.Errorf("rewrite identity on address %s (id %d) after %d rewrites; "+
+			return rewritten, fmt.Errorf("rewrite identity on address %s (id %d) after %d rewrites; "+
 				"the binding stays suspended, re-run to finish: %w",
 				ip.Address, ip.ID, rewritten, err)
 		}
 		rewritten++
 	}
 
+	// A re-key answers exactly ONE reason a binding suspends: the fingerprint
+	// pin. Resuming here on the strength of that alone would lift a suspension
+	// this operation did nothing about — and on a re-CIDRed prefix that is not
+	// merely premature, it is silently destructive. Allocation would resume from
+	// the NEW NetBox range while the row still records the OLD ObservedCIDR, and
+	// both the sweeper and lease repair enumerate by ObservedCIDR: every address
+	// claimed from the new range is invisible to the reclaim proof.
+	//
+	// So re-run the whole predicate with the new fingerprint as the pin. Only
+	// what a re-key fixed is fixed; anything else keeps the binding suspended,
+	// now under the reason an operator has to act on.
 	next := b
 	next.ClusterFingerprint = newFP
+	if reason := s.bindingDrift(ctx, next, newFP); reason != "" {
+		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
+			return rewritten, fmt.Errorf("suspend binding %d after re-key: %w", b.PrefixID, err)
+		}
+		slog.Warn("netbox binding re-keyed but still drifted", "network", b.Network,
+			"prefix", b.PrefixID, "addresses_rewritten", rewritten, "reason", reason)
+		return rewritten, stillDriftedError{reason: reason}
+	}
+
 	next.Suspended = false
 	next.SuspendReason = ""
 	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
-		return fmt.Errorf("resume binding for prefix %d: %w", b.PrefixID, err)
+		return rewritten, fmt.Errorf("resume binding for prefix %d: %w", b.PrefixID, err)
 	}
 	slog.Info("netbox binding re-keyed", "network", b.Network, "prefix", b.PrefixID,
 		"addresses_rewritten", rewritten, "fingerprint", newFP)
-	return nil
+	return rewritten, nil
+}
+
+// ── the resume ──────────────────────────────────────────────────────────────
+
+// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+//
+// Suspension is sticky by design, so every drift needs a way out. A re-key is
+// the way out of ONE of them (the fingerprint pin) and rewrites objects to get
+// there; the others — a re-CIDR, a move to the global table, a VRF that stopped
+// enforcing uniqueness — are repaired in NetBox by an operator, and all that is
+// left is to re-check and clear the flag. That is this call, and it re-runs the
+// full bind-time predicate rather than trusting the operator's word for it.
+//
+// RESUME NEVER ACCEPTS A CIDR CHANGE. It re-validates against the PINNED
+// ObservedCIDR and writes it back unchanged, so a prefix that NetBox now
+// reports under a different CIDR stays suspended. Re-CIDRing a bound prefix is
+// a v1 limitation: revert the CIDR in NetBox, or delete and recreate the
+// litevirt network (which releases the binding and re-claims it against the new
+// range).
+func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest) (*emptypb.Empty, error) {
+	if err := RequireRole(ctx, "admin"); err != nil {
+		return nil, err
+	}
+	if req.GetNetwork() == "" {
+		return nil, status.Error(codes.InvalidArgument, "network is required")
+	}
+	if s.netbox == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this node has no netbox configuration; run the resume on a node that does")
+	}
+	if s.db == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"this node has no cluster database; run the resume on a node that does")
+	}
+	b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.GetNetwork())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"read binding for network %q: %v", req.GetNetwork(), err)
+	}
+	if b == nil {
+		return nil, status.Errorf(codes.NotFound,
+			"network %q is not bound to a NetBox prefix", req.GetNetwork())
+	}
+	if !b.Suspended {
+		// Idempotent: resuming a live binding is the state the caller asked for.
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d already-live", b.PrefixID), "ok")
+		return &emptypb.Empty{}, nil
+	}
+
+	// The LIVE fingerprint, so a CA replacement is still caught here and routed
+	// to the re-key that actually fixes it — the reason string already names it.
+	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "derive cluster fingerprint: %v", err)
+	}
+	if reason := s.bindingDrift(ctx, *b, fp); reason != "" {
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d refused: %s", b.PrefixID, reason), "error")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"network %q stays suspended: %s", req.GetNetwork(), reason)
+	}
+
+	// Everything the pin records is written back UNCHANGED. Resume clears a
+	// flag; it never re-observes the prefix into the binding, because that would
+	// turn "the drift is gone" into "adopt whatever NetBox says now" — the very
+	// silent re-identification the pin exists to prevent.
+	next := *b
+	next.Suspended = false
+	next.SuspendReason = ""
+	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d", b.PrefixID), "error")
+		return nil, status.Errorf(codes.Internal,
+			"resume binding for network %q: %v", req.GetNetwork(), err)
+	}
+	slog.Info("netbox binding resumed", "network", b.Network, "prefix", b.PrefixID)
+	s.audit(ctx, "netbox.resume", req.GetNetwork(),
+		fmt.Sprintf("prefix=%d", b.PrefixID), "ok")
+	return &emptypb.Empty{}, nil
 }

@@ -329,6 +329,16 @@ message RekeyBindingRequest {
     string network = 1;
 }
 
+// ResumeBindingRequest lifts a suspension once the drift behind it has been
+// repaired in NetBox. Unlike a re-key it rewrites nothing: it re-runs every
+// bind-time check against the PINNED prefix facts and only clears the flag when
+// all of them agree again. A prefix whose CIDR now differs from the one the
+// binding recorded therefore stays suspended — re-CIDRing a bound prefix is not
+// supported.
+message ResumeBindingRequest {
+    string network = 1;
+}
+
 // CloneVM creates a new VM from a template or an existing VM (optionally a
 // snapshot of it). mode "" → storage-aware auto (linked on shared storage,
 // full on local); "linked" / "full" force a mode. The clone gets a fresh
@@ -2126,6 +2136,11 @@ service LiteVirt {
     // fingerprint and resumes allocation. Idempotent and resumable — a partial
     // rewrite leaves the binding suspended for the next run to finish.
     rpc RekeyBinding(RekeyBindingRequest)     returns (google.protobuf.Empty);
+    // ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+    // It re-runs the bind-time checks against the binding's pinned prefix facts
+    // and refuses while any of them still disagree; it never accepts a changed
+    // CIDR. A fingerprint mismatch is the re-key's job, not this one.
+    rpc ResumeBinding(ResumeBindingRequest)   returns (google.protobuf.Empty);
 
     // ── Load Balancers ──
     rpc ListLoadBalancers(google.protobuf.Empty) returns (ListLBResponse);

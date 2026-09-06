@@ -201,3 +201,130 @@ func TestRekeyBindingRefusesAnUnboundNetwork(t *testing.T) {
 		t.Fatalf("the refusal must name the network, got %v", err)
 	}
 }
+
+// TestRekeyBindingWritesAnAuditRow: a re-key rewrites the identity of every
+// NetBox object a network owns, fleet-wide, under an admin's hands. An
+// operation of that reach that leaves no trace in the audit log is one `lv
+// audit verify` can never account for afterwards.
+func TestRekeyBindingWritesAnAuditRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{Network: "bound"}); err != nil {
+		t.Fatalf("re-key: %v", err)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT target, detail, result FROM audit_log WHERE action = 'netbox.rekey'`)
+	if err != nil {
+		t.Fatalf("read the audit log: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one netbox.rekey audit row, got %d", len(rows))
+	}
+	if got := rows[0].String("target"); got != "bound" {
+		t.Errorf("audit target = %q, want the network the re-key names", got)
+	}
+	if got := rows[0].String("result"); got != "ok" {
+		t.Errorf("audit result = %q, want ok", got)
+	}
+	// The prefix is what the operation actually acted on, and the rewrite count
+	// is the only record of how much of NetBox it touched.
+	if got := rows[0].String("detail"); !strings.Contains(got, "prefix=7") ||
+		!strings.Contains(got, "rewritten=") {
+		t.Errorf("audit detail = %q, want the prefix and the rewrite count", got)
+	}
+}
+
+// TestResumeBindingRequiresAdmin pins the role gate on the resume, which lifts
+// a safety flag on a cluster-wide binding.
+func TestResumeBindingRequiresAdmin(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	if err := s.validateAndBindPrefix(context.Background(), "bound", 7); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	viewer := context.WithValue(context.WithValue(context.Background(),
+		ctxKeyUsername, "vera"), ctxKeyRole, "viewer")
+	_, err := s.ResumeBinding(viewer, &pb.ResumeBindingRequest{Network: "bound"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("viewer got %v, want PermissionDenied", err)
+	}
+
+	// The same call as admin gets past the gate — without this the test would
+	// also pass against a handler that refused everyone.
+	if _, err := s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "bound"}); err != nil {
+		t.Fatalf("admin resume: %v", err)
+	}
+}
+
+func TestResumeBindingRefusesAnUnboundNetwork(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	_, err := s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "unbound"})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("got %v, want NotFound", err)
+	}
+	if !strings.Contains(err.Error(), "unbound") {
+		t.Fatalf("the refusal must name the network, got %v", err)
+	}
+}
+
+// TestResumeBindingRefusesADriftedCIDRAndKeepsThePin covers the two halves of
+// the v1 re-CIDR limitation in one place: the refusal is a FailedPrecondition
+// naming the drift, and the binding's observed_cidr is left exactly as pinned.
+// A resume that adopted the new range would restart allocation into addresses
+// the sweeper and lease repair — which enumerate by observed_cidr — cannot see.
+func TestResumeBindingRefusesADriftedCIDRAndKeepsThePin(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	// The binding as a re-CIDR would leave it: suspended, still pinned to the
+	// range it validated, while NetBox reports the prefix under another one.
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil || b == nil {
+		t.Fatalf("read binding: %v %v", b, err)
+	}
+	pinned := *b
+	pinned.ObservedCIDR = "10.0.9.0/24"
+	pinned.Suspended = true
+	pinned.SuspendReason = "prefix re-CIDRed from 10.0.9.0/24 to 10.0.5.0/24"
+	if err := corrosion.UpsertBinding(ctx, s.db, pinned); err != nil {
+		t.Fatalf("seed the suspended binding: %v", err)
+	}
+
+	_, err = s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "bound"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "re-CIDRed") {
+		t.Fatalf("the refusal must name the drift, got %v", err)
+	}
+
+	after, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil || after == nil {
+		t.Fatalf("re-read binding: %v %v", after, err)
+	}
+	if !after.Suspended {
+		t.Fatal("a refused resume must leave the binding suspended")
+	}
+	if after.ObservedCIDR != "10.0.9.0/24" {
+		t.Fatalf("ObservedCIDR = %q, want the pinned 10.0.9.0/24 — resume must never "+
+			"re-observe the prefix", after.ObservedCIDR)
+	}
+}

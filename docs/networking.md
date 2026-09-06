@@ -234,15 +234,43 @@ the prefix no longer satisfies what the bind checked, the binding is
 An unreachable NetBox is *not* drift and never suspends a binding — silence is
 not a change.
 
-Suspension is deliberately sticky: nothing lifts it automatically. Repair the
-prefix in NetBox, then resume the binding with the same command a CA replacement
-needs:
+Suspension is deliberately sticky: nothing lifts it automatically. Which command
+lifts it depends on what drifted — see the two sections below.
+
+### Resuming a suspended binding
+
+Repair the prefix in NetBox, then:
 
 ```bash
-lv netbox rekey <network>
+lv netbox resume <network>
 ```
 
-If the drift is still present, the next revalidation suspends the binding again.
+Resume rewrites nothing. It re-runs every bind-time check against the facts the
+binding pinned and clears the suspension only when all of them agree again; while
+the drift is still present the command is refused, naming the reason, and the
+binding stays suspended.
+
+Repairable in place, by fixing NetBox and running `lv netbox resume`:
+
+| Drift | Repair |
+|---|---|
+| the prefix's VRF stopped enforcing uniqueness | set `enforce_unique` on the VRF again |
+| the prefix was moved to the global table | move it back into a VRF with `enforce_unique` |
+| the prefix was re-CIDRed | revert the CIDR to the one the binding recorded |
+
+A suspension caused by a **cluster CA replacement** is not repaired in NetBox and
+`lv netbox resume` will not lift it — the identities have to be rewritten first
+with `lv netbox rekey` (below). The refusal message says so.
+
+**Re-CIDRing a bound prefix is not supported in v1.** Resume validates against the
+CIDR the binding recorded and writes it back unchanged, so a prefix NetBox now
+reports under a different CIDR stays suspended however many times the command is
+run. That is deliberate: the addresses already handed out do not move with the
+prefix, and both the orphan sweeper and lease repair enumerate NetBox by the
+recorded CIDR — adopting a new range would make every address claimed from it
+invisible to the reclaim proof. Either revert the CIDR in NetBox, or delete and
+recreate the litevirt network, which releases the binding and re-claims it
+against the new range.
 
 ### Recovering from a CA replacement
 
@@ -260,6 +288,15 @@ on every address the binding owns and then resumes the binding — in that order
 so a run that fails partway leaves the binding suspended rather than live with
 half its objects unrecognisable. Re-running finishes the job; objects already
 rewritten are skipped. Complete a re-key before replacing the CA again.
+
+A re-key answers the fingerprint pin and nothing else. If the prefix had ALSO
+drifted — re-CIDRed, say — the rewrite still happens, but the binding is left
+suspended under the remaining reason and the command reports it. Repair that in
+NetBox and run `lv netbox rekey` again.
+
+Both commands are admin-only and both write an audit record (`netbox.rekey`,
+`netbox.resume`), so `lv audit verify` carries a trace of every identity rewrite
+and every lifted suspension.
 
 ## NAT
 

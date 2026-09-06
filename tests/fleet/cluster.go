@@ -25,6 +25,7 @@ import (
 
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -60,6 +62,11 @@ type Options struct {
 	SharedCRDT bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
+	// NetBoxURL points every node's NetBox client at an external IPAM — in
+	// practice a *NetBoxFake started by the scenario. Empty (the default)
+	// leaves the client nil and netbox_ipam_v1 unadvertised, so every existing
+	// scenario is untouched.
+	NetBoxURL string
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -70,6 +77,9 @@ type Cluster struct {
 	caCert  string
 	caKey   string
 	tmpRoot string
+	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
+	// read options the harness applies after the nodes exist.
+	opts Options
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -122,7 +132,7 @@ func New(t *testing.T, opts Options) *Cluster {
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
-	c := &Cluster{t: t, tmpRoot: t.TempDir()}
+	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts}
 	c.mintCA()
 
 	// Step 1 — mint pki for every node and pre-allocate ports so the
@@ -414,6 +424,15 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	n.Server.SetHostNetworkEnv(n.HostNet, "127.0.0.1")
 
+	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
+	// scenario's fake server, plus the config kill-switch that lets this node
+	// ADVERTISE netbox_ipam_v1. Both together are what the daemon does from
+	// config, so a scenario exercises the same wiring production uses rather
+	// than reaching past it.
+	if c.opts.NetBoxURL != "" {
+		c.wireNetBox(n)
+	}
+
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it
 	// discovers peers via memberlist (corrosion.Client.Members()), and the
@@ -566,3 +585,60 @@ func regionFor(by []string, i int) string {
 // HLCClock returns a node's HLC. Used by scenarios that need to
 // fabricate mutation entries with deterministic timestamps.
 func (n *Node) HLCClock() *hlc.Clock { return n.DB.Clock() }
+
+// ── external IPAM wiring ────────────────────────────────────────────────────
+
+// NewClusterWithNetBox brings up a fleet whose every node talks to nb. It is the
+// entry point for scenarios that assert on NetBox-backed addressing: the fake
+// hands out addresses from a band the builtin allocator never produces, so an
+// assertion on the address genuinely distinguishes "NetBox supplied it" from
+// "the wiring is missing and the builtin allocator answered".
+func NewClusterWithNetBox(t *testing.T, nodes int, nb *NetBoxFake) *Cluster {
+	t.Helper()
+	return New(t, Options{Nodes: nodes, NetBoxURL: nb.URL()})
+}
+
+// wireNetBox gives one node the two things the daemon derives from
+// config.netbox: a real *netbox.Client built from a token FILE (the production
+// constructor, not a hand-assembled struct) and the advertise kill-switch.
+//
+// It also seeds the `cluster` row every node needs to derive a cluster
+// fingerprint. Binding pins that fingerprint onto the binding row, so without
+// it every bind in the fleet fails with "cluster row not found" — a harness
+// gap, not a behaviour under test. Every node gets the SAME ca_cert (the
+// fleet's one CA), so every node derives the SAME fingerprint, which is the
+// property a real cluster has.
+func (c *Cluster) wireNetBox(n *Node) {
+	c.t.Helper()
+
+	caPEM, err := os.ReadFile(c.caCert)
+	if err != nil {
+		c.t.Fatalf("read fleet CA for %s: %v", n.Name, err)
+	}
+	if err := n.DB.Execute(context.Background(),
+		`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
+		 VALUES ('default', 'fleet', 'fleet.local', ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET ca_cert = excluded.ca_cert, updated_at = excluded.updated_at`,
+		string(caPEM), n.DB.NowWall(), n.DB.NowWall()); err != nil {
+		c.t.Fatalf("seed cluster row for %s: %v", n.Name, err)
+	}
+
+	tokenDir := filepath.Join(c.tmpRoot, n.Name, "netbox")
+	if err := mkdirAll(tokenDir); err != nil {
+		c.t.Fatalf("mkdir netbox dir for %s: %v", n.Name, err)
+	}
+	tokenPath := filepath.Join(tokenDir, "token")
+	if err := os.WriteFile(tokenPath, []byte("fleet-netbox-token\n"), 0o600); err != nil {
+		c.t.Fatalf("write netbox token for %s: %v", n.Name, err)
+	}
+	client, err := netbox.New(netbox.Config{
+		BaseURL:   c.opts.NetBoxURL,
+		TokenPath: tokenPath,
+		Timeout:   5 * time.Second,
+	})
+	if err != nil {
+		c.t.Fatalf("netbox client for %s: %v", n.Name, err)
+	}
+	n.Server.SetNetBoxClient(client)
+	n.Server.SetNetBoxIPAM(true)
+}

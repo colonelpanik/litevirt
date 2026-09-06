@@ -667,9 +667,9 @@ func (c *Cluster) wireNetBox(n *Node) {
 // through, and each also registers that drop with t.Cleanup so a trigger can
 // never leak into another test sharing the process.
 
-// FailNextVMRowWrite aborts every INSERT into `vms` on this node. It is how a
+// FailVMRowWrites aborts every INSERT into `vms` on this node. It is how a
 // scenario reaches the window between a started domain and its durable row.
-func (n *Node) FailNextVMRowWrite(t *testing.T) func() {
+func (n *Node) FailVMRowWrites(t *testing.T) func() {
 	t.Helper()
 	if err := n.DB.Execute(context.Background(),
 		`CREATE TRIGGER test_fail_vm_insert BEFORE INSERT ON vms
@@ -686,11 +686,11 @@ func (n *Node) FailNextVMRowWrite(t *testing.T) func() {
 	return drop
 }
 
-// FailNextLeaseTombstone aborts every ip_allocations TOMBSTONE on this node
+// FailLeaseTombstones aborts every ip_allocations TOMBSTONE on this node
 // (an UPDATE that sets deleted_at on a live row), leaving inserts and every
 // other update alone. It is how a scenario reaches a release whose LOCAL half
 // failed while the remote IPAM object still exists.
-func (n *Node) FailNextLeaseTombstone(t *testing.T) func() {
+func (n *Node) FailLeaseTombstones(t *testing.T) func() {
 	t.Helper()
 	if err := n.DB.Execute(context.Background(),
 		`CREATE TRIGGER test_fail_lease_tombstone BEFORE UPDATE ON ip_allocations

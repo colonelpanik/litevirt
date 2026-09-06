@@ -234,20 +234,29 @@ type LeaseRecord struct {
 	NetBoxPrefix int
 }
 
-// GetLeaseByIP reads one lease by its (network, ip) PRIMARY KEY, or nil.
+// GetLeaseByIPForOwner reads one lease by its (network, ip) PRIMARY KEY, scoped
+// to the owner that must hold it, or nil.
 //
-// Keyed on the ADDRESS, not on the owner: a release has to name the exact row
-// it is retiring, and an owner-keyed read cannot distinguish two NICs of one
-// workload. The NetBox columns are nullable — every pre-v51 lease has them
-// empty — so they are COALESCEd, and a builtin lease reads back as id 0, which
-// is what tells a release there is no remote object to delete.
-func GetLeaseByIP(ctx context.Context, c *Client, network, ip string) (*LeaseRecord, error) {
+// Keyed on the ADDRESS, because a release has to name the exact row it is
+// retiring and an owner-keyed read cannot distinguish two NICs of one workload.
+// The owner triple is a PREDICATE on top of that key, matching ReleaseLease's:
+// a read that returned a FOREIGN lease sharing (network, ip) would hand the
+// caller a row it may not retire, and the owner-scoped release would then refuse
+// it — turning someone else's address into a workload that cannot be deleted.
+// Returning nil instead lets the caller treat it as "not ours, nothing to do".
+//
+// The NetBox columns are nullable — every pre-v51 lease has them empty — so they
+// are COALESCEd, and a builtin lease reads back as id 0, which is what tells a
+// release there is no remote object to delete.
+func GetLeaseByIPForOwner(ctx context.Context, c *Client, network, ip, ownerKind, ownerHost, name string) (*LeaseRecord, error) {
 	rows, err := c.Query(ctx,
 		`SELECT network, ip, mac,
 		        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
 		        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id
-		 FROM ip_allocations WHERE network = ? AND ip = ? AND deleted_at IS NULL`,
-		network, ip)
+		 FROM ip_allocations
+		 WHERE network = ? AND ip = ? AND vm_name = ?
+		   AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
+		network, ip, name, ownerKind, ownerHost)
 	if err != nil {
 		return nil, fmt.Errorf("query lease: %w", err)
 	}

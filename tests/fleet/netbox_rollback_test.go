@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // createVMWithNICs creates a VM pinned to n with one NIC per entry in nets,
@@ -65,7 +66,7 @@ func TestCreateAbortsWhenRowPersistFailsAfterClaim(t *testing.T) {
 
 	n := c.Nodes[0]
 	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
-	n.FailNextVMRowWrite(t)
+	n.FailVMRowWrites(t)
 
 	if _, err := createVMOnNetwork(c, n, "vm-1", "bound"); err == nil {
 		t.Fatal("create must abort when the VM row cannot be persisted after a claim")
@@ -102,7 +103,7 @@ func TestUnboundCreateKeepsLogAndContinue(t *testing.T) {
 	seedClusterRow(t, c)
 	seedContainerNetwork(t, c)
 
-	n.FailNextVMRowWrite(t)
+	n.FailVMRowWrites(t)
 
 	_, err := createVMOnNetwork(c, n, "vm-1", ctNetName)
 	if err != nil && strings.Contains(err.Error(), "persist VM state") {
@@ -132,7 +133,7 @@ func TestNetBoxDeleteSkippedWhenTombstoneFails(t *testing.T) {
 	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
 	mustCreateVMOnNetwork(t, c, n, "vm-1", "bound")
 
-	n.FailNextLeaseTombstone(t)
+	n.FailLeaseTombstones(t)
 
 	// The error must be SURFACED, not swallowed — discarding it here would make
 	// this test unable to enforce the requirement it claims to check, and would
@@ -223,5 +224,80 @@ func TestTwoNICsOnOneNetworkAbortsAndReleasesBoth(t *testing.T) {
 	}
 	if got := leaseCount(t, n, "bound"); got != 0 {
 		t.Fatalf("both local leases must be tombstoned, %d still live", got)
+	}
+}
+
+// TestDeleteVMTombstonesLeaseWhenBindingSuspended pins that an UNUSABLE binding
+// cannot strand the address it leased.
+//
+// A suspended binding (or a def naming a prefix no binding row backs) makes
+// allocatorFor fail, and the release loop cannot go through the allocator. The
+// old handling warned and moved on, which tombstoned the vms row while leaving
+// the ip_allocations row LIVE under an owner that no longer exists — and that
+// burns the address in BOTH systems at once: the orphan sweep must never touch
+// a live lease, and the guarded upsert refuses to reuse a live row even after
+// an operator frees the address in NetBox by hand. Nothing surfaced it.
+//
+// The delete must still succeed (a suspended binding is not a reason a VM
+// becomes undeletable) while doing both halves it still can: tombstone the
+// local lease directly, and hand the now-unreferenced remote object to the
+// sweeper, whose unreferenced-object case is exactly right for it.
+//
+// The three assertions are one property each, and the last two are what make it
+// non-vacuous: without the queue item the NetBox object is simply abandoned,
+// and without the surviving identity the test would pass against a release that
+// wrongly went through NetBox with a suspended binding.
+func TestDeleteVMTombstonesLeaseWhenBindingSuspended(t *testing.T) {
+	ctx := context.Background()
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(7, "10.0.5.0/24", 3, true)
+
+	c := NewClusterWithNetBox(t, 1, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	mustCreateBoundNetwork(t, c, n, "bound", "10.0.5.0/24", 7)
+	mustCreateVMOnNetwork(t, c, n, "vm-1", "bound")
+
+	// The claim has to have really happened, or every assertion below passes for
+	// the wrong reason.
+	if got := leaseCount(t, n, "bound"); got != 1 {
+		t.Fatalf("want one live lease before the delete, got %d", got)
+	}
+	ids := nb.Identities()
+	if len(ids) != 1 {
+		t.Fatalf("want one NetBox identity before the delete, got %v", ids)
+	}
+
+	if err := corrosion.SuspendBinding(ctx, n.DB, 7, "test"); err != nil {
+		t.Fatalf("SuspendBinding: %v", err)
+	}
+
+	if err := deleteVM(c, n, "vm-1"); err != nil {
+		t.Fatalf("a suspended binding must not make the VM undeletable: %v", err)
+	}
+	if got := leaseCount(t, n, "bound"); got != 0 {
+		t.Fatalf("the local lease must be tombstoned anyway, %d still live", got)
+	}
+	// The REMOTE half is deliberately deferred: releasing through a suspended
+	// binding is what the suspension exists to prevent.
+	if got := nb.Identities(); len(got) != 1 {
+		t.Fatalf("the NetBox object must be left for the sweeper, identities = %v", got)
+	}
+
+	items, err := corrosion.DrainSyncQueue(ctx, n.DB, 10)
+	if err != nil {
+		t.Fatalf("DrainSyncQueue: %v", err)
+	}
+	var found bool
+	for _, it := range items {
+		if it.Kind == "orphan" && it.Op == "check" && it.Key == ids[0] {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the deferred NetBox object must be queued as an orphan check for %q, queue = %+v", ids[0], items)
 	}
 }

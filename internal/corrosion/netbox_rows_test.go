@@ -242,3 +242,56 @@ func TestDeleteBindingIsIdempotent(t *testing.T) {
 		t.Fatalf("want no live bindings after release, got %d", len(all))
 	}
 }
+
+// TestGetLeaseByIPForOwnerIgnoresAForeignLease pins the owner predicate on the
+// READ, not just on the release.
+//
+// (network, ip) is the primary key, so a lease held by someone else is still a
+// single row this read could hand back. A caller that then released it would be
+// refused by the owner-scoped ReleaseLease — turning another owner's address
+// into a workload that can never be deleted. Reading nil is what lets the caller
+// treat it as "not ours, nothing to do".
+func TestGetLeaseByIPForOwnerIgnoresAForeignLease(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	if err := c.Execute(ctx,
+		`INSERT INTO ip_allocations
+		   (network, ip, mac, vm_name, owner_kind, owner_host,
+		    netbox_ip_id, netbox_prefix_id, allocated_at, updated_at)
+		 VALUES ('net-a', '10.0.5.100', 'aa:bb:cc:dd:ee:ff', 'other-vm', 'vm', '', 42, 7, ?, ?)`,
+		c.NowWall(), c.NowWall()); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	// The row exists and is readable for the owner that holds it — without this
+	// the miss below could be a typo in the seed rather than the predicate.
+	got, err := GetLeaseByIPForOwner(ctx, c, "net-a", "10.0.5.100", "vm", "", "other-vm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("the holder's own read must find the lease")
+	}
+	if got.NetBoxIPID != 42 || got.NetBoxPrefix != 7 {
+		t.Fatalf("NetBox join keys = (%d, %d), want (42, 7)", got.NetBoxIPID, got.NetBoxPrefix)
+	}
+
+	// Every component of the triple is load-bearing, so each is missed alone.
+	for _, tc := range []struct {
+		what                       string
+		ownerKind, ownerHost, name string
+	}{
+		{"a different name", "vm", "", "my-vm"},
+		{"a different owner kind", "ct", "", "other-vm"},
+		{"a different owner host", "vm", "node-2", "other-vm"},
+	} {
+		got, err := GetLeaseByIPForOwner(ctx, c, "net-a", "10.0.5.100", tc.ownerKind, tc.ownerHost, tc.name)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.what, err)
+		}
+		if got != nil {
+			t.Fatalf("%s must not read back a foreign lease, got %+v", tc.what, got)
+		}
+	}
+}

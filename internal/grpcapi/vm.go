@@ -1862,30 +1862,105 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		return nil, status.Errorf(codes.Internal,
 			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
 	}
+	// Identity for the orphan sweep, built at most once and ONLY if some lease
+	// actually has to be handed over (below): the cluster fingerprint is a DB
+	// read, and a delete whose bindings are all healthy must not gain one.
+	clusterFP := ""
+	identityFor := func(mac string) (string, error) {
+		if clusterFP == "" {
+			fp, ferr := corrosion.ClusterFingerprint(ctx, s.db)
+			if ferr != nil {
+				return "", ferr
+			}
+			clusterFP = fp
+		}
+		var sp struct {
+			Uuid string `json:"uuid"`
+		}
+		if err := json.Unmarshal([]byte(vm.Spec), &sp); err != nil {
+			return "", fmt.Errorf("parse VM spec for its uuid: %w", err)
+		}
+		if sp.Uuid == "" {
+			// The uuid is what makes an identity incarnation-unique; without it
+			// the string names nothing, and enqueueing it would only send the
+			// sweeper after an object that does not exist.
+			return "", fmt.Errorf("VM record carries no uuid")
+		}
+		return netbox.Identity(clusterFP, sp.Uuid, mac), nil
+	}
+
 	for _, nic := range nics {
-		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
-		if aerr != nil {
-			// A suspended or misconfigured binding must not block a delete —
-			// the workload is already gone and the address is reclaimable by
-			// the orphan sweep, which is strictly better than a VM that cannot
-			// be deleted at all.
-			slog.Warn("delete: no allocator for network, skipping address release",
-				"vm", req.Name, "network", nic.NetworkName, "error", aerr)
-			continue
-		}
-		if alloc == nil {
-			// An UNBOUND network: VMs have never held a lease there, so there
-			// is nothing to release and nothing to report.
-			continue
-		}
-		lease, lerr := corrosion.GetLeaseByIP(ctx, s.db, nic.NetworkName, nic.IP)
+		// (1) The LEASE decides whether there is anything to release. Reading it
+		// first — owner-scoped, so a foreign row sharing this (network, ip) reads
+		// back as nil rather than as a row we may not retire — keeps the two
+		// branches below about HOW to release, never about whether to.
+		lease, lerr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", req.Name)
 		if lerr != nil {
 			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: read lease %s: %v", nic.NetworkName, nic.IP, lerr))
 			continue
 		}
 		if lease == nil {
-			continue // already released; the delete is idempotent
+			continue // never allocated, or already released; the delete is idempotent
 		}
+
+		// (2) Resolve the allocator that owns the RELEASE of that lease.
+		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
+		if aerr != nil {
+			// A suspended or misconfigured binding must not block a delete — the
+			// workload is already gone, and a VM that cannot be deleted at all is
+			// strictly worse. But skipping the release outright burns the address
+			// in BOTH systems: the vms row is tombstoned below while this lease
+			// stays LIVE with an owner that no longer exists, and a live lease is
+			// exactly what the orphan sweep must never touch (that invariant is
+			// what protects a running guest's address), while the guarded upsert
+			// in netboxAllocator.persist refuses to reuse a live row even after an
+			// operator frees the address in NetBox by hand.
+			//
+			// So tombstone the LOCAL half directly. The allocator is only needed
+			// for the remote half; the local half is a plain owner-scoped write,
+			// and owner-scoping still makes it fail loudly if ownership moved.
+			slog.Warn("delete: no allocator for network, releasing the lease locally",
+				"vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", aerr)
+			if rerr := network.ReleaseLease(ctx, s.db, nic.NetworkName, nic.IP, nic.MAC, "vm", "", req.Name); rerr != nil {
+				// Same treatment as any other release failure: the lease is still
+				// live, so the operator has to know litevirt still holds the
+				// address. Nothing destructive has run, so a retry re-runs this.
+				releaseErrs = append(releaseErrs, fmt.Sprintf("%s: tombstone lease %s: %v", nic.NetworkName, nic.IP, rerr))
+				continue
+			}
+			if lease.NetBoxIPID == 0 {
+				continue // a builtin lease: no remote object to hand over
+			}
+			// The remote object is now UNREFERENCED, which is precisely the case
+			// the orphan sweep already handles correctly. Name it so it does not
+			// wait for a full sweep to notice.
+			//
+			// A failure here is logged, not surfaced: the local tombstone already
+			// landed, so a retried delete would find no lease and could never
+			// reach this point again — reporting it as retryable would be a lie,
+			// and the full sweep remains the backstop either way.
+			identity, ierr := identityFor(nic.MAC)
+			if ierr != nil {
+				slog.Error("netbox: could not build the identity for an orphan check — address may be stranded until the next full sweep",
+					"vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", ierr)
+				continue
+			}
+			if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
+				slog.Error("netbox: could not enqueue orphan check — address may be stranded until the next full sweep",
+					"identity", identity, "error", eerr)
+			}
+			continue
+		}
+		if alloc == nil {
+			// An UNBOUND network. VMs have never allocated there, so the live
+			// lease read above cannot be one of ours to give back; leave it
+			// exactly as today's code does rather than newly tombstoning rows
+			// this path has never owned.
+			continue
+		}
+
+		// (3) The ordinary release: local tombstone then remote delete, in that
+		// order, inside the allocator.
 		if err := alloc.Release(ctx, network.ReleaseRequest{
 			Network:    nic.NetworkName,
 			IP:         nic.IP,

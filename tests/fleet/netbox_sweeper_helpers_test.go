@@ -133,6 +133,7 @@ type sweepMetrics struct {
 	reclaimed   int
 	stuckLeases int
 	suspended   int
+	ambiguous   int
 }
 
 func newSweepMetrics() *sweepMetrics { return &sweepMetrics{} }
@@ -171,4 +172,10 @@ func (m *sweepMetrics) IncBindingSuspended() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.suspended++
+}
+
+func (m *sweepMetrics) IncAmbiguousClaim() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ambiguous++
 }

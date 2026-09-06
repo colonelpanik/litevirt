@@ -67,6 +67,16 @@ type Server struct {
 	// claim or a sweep behaves differently.
 	nbMetricsSink netboxMetrics
 
+	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
+	// consecutive-blocked-pass state for the NetBox health evaluator, which
+	// cannot read a Prometheus counter in-process. Written only by the sweep,
+	// which runs under the `netbox` leader lease; the mutex is for the -race
+	// detector, since a test may drive a pass from another goroutine.
+	// See netbox_health.go for why the streak is deliberately per-process.
+	nbSweepMu           sync.Mutex
+	nbSweepUnreachable  bool
+	nbUnreachableStreak int
+
 	// onProofCollected and onProofsGathered are ORPHAN-SWEEPER TEST SEAMS,
 	// documented at their setters. Both are nil in production and are the only
 	// way a test can reach the two windows the sweeper's safety rests on: a
@@ -1470,18 +1480,27 @@ type netboxMetrics interface {
 	// error, no deletion, and no change a running workload can feel — the first
 	// symptom is a create refusing, long after the fact.
 	IncBindingSuspended()
+	// IncAmbiguousClaim counts one claim resolved by lookup because the POST's
+	// outcome could not be read off the response. Emitted by the allocator, not
+	// by this package — it is declared here because the whole sink is passed to
+	// it (network.apiErrorCounter is the narrower structural view).
+	IncAmbiguousClaim()
 }
 
-// noopNetBoxMetrics satisfies the sink until the real counters exist.
+// noopNetBoxMetrics is what an UNWIRED sink resolves to — every bare test
+// server, and any node with no NetBox configuration. The real sink is
+// metrics.NewNetBoxMetrics(), wired by the daemon.
+//
 // Classification is used for metrics ONLY — never to decide whether a remote
 // write happened — so discarding it changes no outcome.
-type noopNetBoxMetrics struct{} // TODO(task 14): real metrics
+type noopNetBoxMetrics struct{}
 
 func (noopNetBoxMetrics) IncAPIError(netbox.ErrClass) {}
 func (noopNetBoxMetrics) IncSweepSkipped(string)      {}
 func (noopNetBoxMetrics) IncOrphansReclaimed()        {}
 func (noopNetBoxMetrics) IncStuckLease()              {}
 func (noopNetBoxMetrics) IncBindingSuspended()        {}
+func (noopNetBoxMetrics) IncAmbiguousClaim()          {}
 
 // SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
 func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }

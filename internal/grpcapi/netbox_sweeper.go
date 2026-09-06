@@ -135,6 +135,10 @@ func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error
 		return nil
 	}
 
+	// Arms this pass's skip record, which the health evaluator below folds into
+	// the consecutive-blocked-pass streak.
+	s.beginSweepPass()
+
 	// The queue is a latency optimisation over the full pass below, and it is
 	// also where a failed compensation reports a STUCK lease. Drained first so
 	// an operator learns about a stuck lease on the same pass.
@@ -142,15 +146,20 @@ func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error
 
 	candidates, err := s.orphanCandidates(ctx, orphanGrace)
 	if err != nil {
+		// The pass never ran, so it is neither a blocked pass nor a clean one:
+		// closing the streak here would let a failing candidate read silently
+		// clear a standing "the sweep is stuck" finding.
 		return fmt.Errorf("list orphan candidates: %w", err)
 	}
 	for _, cand := range candidates {
 		if err := s.reclaimIfProven(ctx, cand); err != nil {
 			slog.Warn("netbox sweep: reclamation aborted",
 				"address", cand.Address, "identity", cand.Identity, "reason", err)
-			s.nbMetrics().IncSweepSkipped(skipReason(err))
+			s.noteSweepSkip(skipReason(err))
 		}
 	}
+	// Findings last: they describe the pass that just finished.
+	s.evaluateNetBoxHealth(ctx, s.closeSweepPass())
 	return nil
 }
 
@@ -720,7 +729,7 @@ func (s *Server) handleOrphanCheck(ctx context.Context, it corrosion.QueueItem, 
 	if !ok || cf != fp {
 		slog.Warn("netbox sweep: dropping an orphan check with an unusable identity",
 			"identity", it.Key)
-		s.nbMetrics().IncSweepSkipped(skipIdentityUnresolvable)
+		s.noteSweepSkip(skipIdentityUnresolvable)
 		return true // nothing this cluster can ever resolve
 	}
 
@@ -820,7 +829,7 @@ func (s *Server) resolveQueuedAddress(ctx context.Context, b corrosion.BindingRe
 	if err := s.reclaimIfProven(ctx, cand); err != nil {
 		slog.Warn("netbox sweep: queued reclamation aborted",
 			"address", cand.Address, "identity", identity, "reason", err)
-		s.nbMetrics().IncSweepSkipped(skipReason(err))
+		s.noteSweepSkip(skipReason(err))
 	}
 	return queueDone
 }

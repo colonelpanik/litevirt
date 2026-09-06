@@ -49,10 +49,20 @@ type netboxAllocator struct {
 	metrics apiErrorCounter
 }
 
-// apiErrorCounter records NetBox error classes for metrics. Classification is
-// used ONLY here — never to decide whether a write happened.
+// apiErrorCounter records NetBox outcomes for metrics. Classification is used
+// ONLY here — never to decide whether a write happened.
+//
+// It is a narrower view of the same sink grpcapi passes down (its netboxMetrics
+// interface), so a type satisfying that one satisfies this one structurally and
+// this package imports nothing from grpcapi or internal/metrics.
 type apiErrorCounter interface {
 	IncAPIError(class netbox.ErrClass)
+	// IncAmbiguousClaim counts one claim whose outcome litevirt could not read
+	// off the response and had to resolve by lookup. It is invisible to the
+	// caller — a recovered claim returns an address like any other — so this
+	// counter is the only place a cluster losing NetBox responses shows up
+	// before an orphan does.
+	IncAmbiguousClaim()
 }
 
 // NewNetBoxAllocator claims addresses from NetBox. There is no local fallback:
@@ -107,6 +117,11 @@ func (a *netboxAllocator) Claim(ctx context.Context, req ClaimRequest) (ClaimRes
 // from a status code, and it never treats a zero-result lookup as proof the
 // POST will not commit — the original request may still be executing.
 func (a *netboxAllocator) recover(ctx context.Context, req ClaimRequest) (netbox.IPAddress, error) {
+	// Counted at ENTRY, not on success: an ambiguous claim is ambiguous whether
+	// or not the lookup manages to resolve it, and the unresolved ones are the
+	// ones that leave an orphan behind.
+	a.metrics.IncAmbiguousClaim()
+
 	byIdentity, err := a.nb.LookupByIdentity(ctx, req.Identity, req.VRFID, req.PrefixCIDR)
 	if err != nil {
 		return netbox.IPAddress{}, fmt.Errorf("%w: identity lookup failed: %v", ErrClaimUnknown, err)

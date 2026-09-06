@@ -141,6 +141,17 @@ var errForbidden = &netbox.APIError{Status: 403, Body: `{"detail":"permission de
 type noopMetrics struct{}
 
 func (noopMetrics) IncAPIError(netbox.ErrClass) {}
+func (noopMetrics) IncAmbiguousClaim()          {}
+
+// countingMetrics records what the allocator emitted, so a test can assert on
+// the ONE signal an ambiguous claim produces that nothing else does.
+type countingMetrics struct {
+	apiErrors []netbox.ErrClass
+	ambiguous int
+}
+
+func (m *countingMetrics) IncAPIError(c netbox.ErrClass) { m.apiErrors = append(m.apiErrors, c) }
+func (m *countingMetrics) IncAmbiguousClaim()            { m.ambiguous++ }
 
 // ── db helpers ──────────────────────────────────────────────────────────────
 
@@ -745,5 +756,47 @@ func TestReleaseSkipsNetBoxWhenTheLocalTombstoneFails(t *testing.T) {
 	}
 	if len(nb.released) != 0 {
 		t.Fatalf("NetBox must not be touched when the local tombstone failed, released %v", nb.released)
+	}
+}
+
+// ── ambiguous-claim accounting ──────────────────────────────────────────────
+
+// TestAmbiguousClaimIsCounted pins litevirt_netbox_ambiguous_claims_total's only
+// increment site. A recovery lookup is the moment litevirt could not tell
+// whether its own POST committed; that is invisible to a caller who gets an
+// address back, and it is the signal that NetBox (or the path to it) is losing
+// responses. Counted once per recovery, whatever the recovery decides.
+func TestAmbiguousClaimIsCounted(t *testing.T) {
+	ctx := context.Background()
+	m := &countingMetrics{}
+	nb := &stubNetBox{
+		claimErr:   errDuplicate,
+		byIdentity: []stubIP{{ID: 41, Address: "10.0.5.100/24", VRFID: 3}},
+	}
+	a := NewNetBoxAllocator(newTestDB(t), nb, m)
+	if _, err := a.Claim(ctx, boundReq()); err != nil {
+		t.Fatalf("recovery should have adopted our own object: %v", err)
+	}
+	if m.ambiguous != 1 {
+		t.Fatalf("ambiguous claims counted %d times, want 1", m.ambiguous)
+	}
+	if len(m.apiErrors) != 1 {
+		t.Fatalf("api errors counted %d times, want 1", len(m.apiErrors))
+	}
+}
+
+// TestCleanClaimCountsNothing is the other half: a POST that answered 2xx never
+// entered recovery, so neither counter moves. Without this the counter could be
+// wired to every claim and still pass the test above.
+func TestCleanClaimCountsNothing(t *testing.T) {
+	ctx := context.Background()
+	m := &countingMetrics{}
+	nb := &stubNetBox{claimed: stubIP{ID: 41, Address: "10.0.5.100/24", VRFID: 3}}
+	a := NewNetBoxAllocator(newTestDB(t), nb, m)
+	if _, err := a.Claim(ctx, boundReq()); err != nil {
+		t.Fatalf("clean claim: %v", err)
+	}
+	if m.ambiguous != 0 || len(m.apiErrors) != 0 {
+		t.Fatalf("a clean claim counted ambiguous=%d apiErrors=%d, want 0/0", m.ambiguous, len(m.apiErrors))
 	}
 }

@@ -639,3 +639,39 @@ fleet runtime coverage, a current-epoch authoritative holder, a strictly older
 conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
+
+## NetBox IPAM: metrics and health findings
+
+Every counter below is registered on the same `/metrics` endpoint as the rest,
+on every node whose config enables the NetBox integration.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `litevirt_netbox_api_errors_total` | `class` = `transport` / `client` / `server` | NetBox API failures by class. `transport` is no answer at all, `client` is a 4xx (NetBox answered and said no), `server` is a 5xx — the last two are the AMBIGUOUS ones, where a write may have committed before the response was lost. |
+| `litevirt_netbox_ambiguous_claims_total` | — | Address claims whose outcome could not be read off the response and had to be resolved by a lookup. Invisible to the caller (a recovered claim returns an address like any other), so this is the first sign that responses are being lost between litevirt and NetBox. |
+| `litevirt_netbox_orphans_reclaimed_total` | — | NetBox IP objects deleted by the orphan sweep under a whole-cluster negative proof. |
+| `litevirt_netbox_sweeps_skipped_total` | `reason` (closed set: `hosts_read`, `no_eligible_hosts`, `host_unreachable`, `host_returned_no_proof`, `incomplete_proof`, `host_still_claims`, `proof_count_mismatch`, `membership_changed`, `leader_lease_lost`, `netbox_reread_failed`, `netbox_object_changed`, `release_failed`, `identity_unresolvable`, `error`) | Reclamations the sweep declined. Every skip leaves the address allocated, which is always the safe direction; the full reason (which names an address and a host) goes to the log, never to the label. |
+| `litevirt_netbox_stuck_leases_total` | — | Addresses whose NetBox object was queued for release while a live local allocation row still names them. Never resolved automatically — see [Stuck leases](networking.md#stuck-leases). |
+| `litevirt_netbox_bindings_suspended_total` | — | Cumulative bindings taken out of service by revalidation drift. |
+| `litevirt_netbox_bindings_suspended` | — | **Gauge:** bindings suspended *right now*. Use this one for alerting — the counter above keeps rising after an operator has repaired a binding. |
+| `litevirt_netbox_duplicate_objects_total` | — | NetBox objects found duplicated for one litevirt identity by the inventory mirror. |
+| `litevirt_netbox_sync_queue_depth` | — | **Gauge:** pending items in the inventory mirror's work queue. The queue is a latency optimisation — the periodic sweep is the correctness mechanism — but a depth that never returns to 0 means the mirror is not draining. |
+
+### Health findings
+
+Two NetBox failures are silent to everything else litevirt reports, so they are
+also durable `health_conditions` rows and appear in `lv health` (see
+[Cluster health](#cluster-health-durable-conditions-and-the-admission-gate-v50)).
+Both are raised by the orphan sweep, which runs under the `netbox` leader lease,
+so the cluster has exactly one writer. Both are **warning** severity, so they
+show as DEGRADED and never as CRITICAL, and neither gates admission.
+
+| Code | Subject | Raised when | Clears when |
+|---|---|---|---|
+| `netbox_binding_suspended` | the network | A `netbox_bindings` row is suspended. The evidence names the network, the prefix, and the drift reason. New allocations on that network refuse until an operator runs `lv netbox resume` (or `lv netbox rekey` for a CA change); running workloads are untouched. | Two consecutive sweeps see the binding un-suspended. |
+| `netbox_sweep_blocked` | `netbox` (cluster) | Three consecutive sweeps declined every reclamation because a host would not answer the absence proof. One unreachable host is ordinary — a reboot, a restart — but while it is away NOT ONE address can be reclaimed, and the pool fills with orphans in silence. | Two consecutive sweeps complete without a `host_unreachable` skip. |
+
+The three-pass threshold is deliberately per-process state held by the lease
+holder: a daemon restart or a lease handover re-arms it, and three fresh passes
+re-raise the finding. Forgetting is the safe direction for a warning whose whole
+claim is "this has been stuck for a while".

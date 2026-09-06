@@ -773,6 +773,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return fmt.Errorf("netbox client: %w", err)
 		}
 		svc.SetNetBoxClient(nbClient)
+		// The real counter sink, replacing the noop. Registered on the default
+		// registry, so it is served wherever /metrics is.
+		svc.SetNetBoxMetrics(metrics.NewNetBoxMetrics())
 		// Binding revalidation + the orphan sweep, on the configured cadence.
 		// Started ONLY here: a node with no NetBox configuration creates no
 		// goroutine and never enters the `netbox` leader-lease race. The sweep

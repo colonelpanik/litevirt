@@ -43,14 +43,7 @@ var assignRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 // Empty is the goal state: an allowlisted identifier is a doc promising
 // something the code does not do. litevirt_audit_chain_last_verified_ok was the
 // last entry and shipped with v45 audit signing.
-var knownAbsentIdentifiers = map[string]string{
-	// The orphan sweeper already counts stuck leases through the NetBox metrics
-	// sink (Server.nbMetrics().IncStuckLease) and logs the address at ERROR, but
-	// nothing registers the Prometheus counter yet. Documented ahead of that
-	// because a stuck lease is never resolved automatically — an operator who
-	// meets one needs the name to alert on.
-	"litevirt_netbox_stuck_leases_total": "documented ahead of registration; Task 14 registers it — delete this entry then",
-}
+var knownAbsentIdentifiers = map[string]string{}
 
 // TestDocsReferenceRealCLICommands fails if README/docs show an `lv` or
 // `litevirt` command whose path doesn't resolve in the real cobra tree.

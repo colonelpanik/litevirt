@@ -40,6 +40,7 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -757,6 +758,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// NetBox integration, so the cluster-wide latch requires config uniformity,
 	// not just a uniform build (see capabilities.NetBoxIPAMV1).
 	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
+	// The client itself. A node whose config ENABLES the integration but whose
+	// client cannot be built (missing/empty token file, no URL) must not start:
+	// it would advertise netbox_ipam_v1 — helping the cluster latch — while
+	// every bind and claim on it refused for want of a client. Failing startup
+	// keeps the "config uniformity" the latch depends on honest.
+	if d.cfg.NetBox.Enabled {
+		nbClient, err := netbox.New(netbox.Config{
+			BaseURL:   d.cfg.NetBox.URL,
+			TokenPath: d.cfg.NetBox.TokenPath,
+			Timeout:   time.Duration(d.cfg.NetBox.TimeoutSec) * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("netbox client: %w", err)
+		}
+		svc.SetNetBoxClient(nbClient)
+	}
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)

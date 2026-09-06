@@ -640,6 +640,13 @@ func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 // changes nothing until every node has opted in and the token has latched.
 func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
 
+// SetNetBoxClient wires the NetBox REST client the daemon builds from config.
+// nil (the default) means every NetBox-dependent path refuses: binding a
+// network to a prefix, and claiming from a bound one. The kill-switch above and
+// this client are set together — a node whose config enables the integration
+// but whose client failed to construct must not advertise the token.
+func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
+
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
 // `flag && Enforced` model as the rest of the family.

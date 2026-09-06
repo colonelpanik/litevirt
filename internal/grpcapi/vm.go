@@ -609,7 +609,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			identity := netbox.Identity(fp, spec.Uuid, mac)
 			subnet := ""
-			if def := lookupNetworkDef(ctx, s.db, n.Name); def != nil {
+			if def, _ := lookupNetworkDef(ctx, s.db, n.Name); def != nil {
 				subnet = def.Subnet
 			}
 			res, cerr := alloc.Claim(ctx, network.ClaimRequest{
@@ -681,7 +681,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var staticNetCfg string
 	var staticIfaces []isolatedIface
 	for i, n := range spec.Network {
-		netDef := lookupNetworkDef(ctx, s.db, n.Name)
+		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
 		ip := n.Ip
 		if ip == "" && i < len(ifaceRecords) {
 			ip = ifaceRecords[i].IP
@@ -1728,6 +1728,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
 			return nil, err
 		}
+		// Give the addresses back BEFORE the row goes. The lease outlives the VM
+		// row, and once the row is gone the sweeper's live-lease veto — correct,
+		// and what protects a running guest — refuses to reclaim that lease
+		// forever. Best-effort, unlike the main delete path below: this cleanup
+		// runs because the domain no longer exists anywhere, and refusing to
+		// remove the ghost row over a release failure would leave a row every
+		// node keeps scheduling around. A failure is logged and every NIC named
+		// for the orphan sweep, never swallowed.
+		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -2319,7 +2328,11 @@ func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkNam
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {
-	def := lookupNetworkDef(ctx, db, networkName)
+	// An unreadable record resolves exactly like a missing one here: this is a
+	// device-name resolution with a documented flat-bridge fallback, and it has
+	// no fail-closed answer to give. The admission decisions that DO need one
+	// (allocatorFor) read the record themselves and surface the error.
+	def, _ := lookupNetworkDef(ctx, db, networkName)
 	if def == nil {
 		return networkName
 	}
@@ -2346,20 +2359,32 @@ func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string
 }
 
 // lookupNetworkDef fetches a network definition from Corrosion.
-// Returns nil if the network is not found (flat bridge mode).
-func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName string) *compose.NetworkDef {
+//
+// (nil, nil) means the network is not there — flat bridge mode, which most
+// callers treat as "no managed definition" and carry on from. A non-nil ERROR
+// means we could not find out, which is a different thing entirely and is why
+// the two are now distinguishable: allocatorFor's "config names a prefix but no
+// binding exists" guard is a read of exactly this record, and swallowing the DB
+// error turned that fail-closed guard into a fail-OPEN one — a transient read
+// failure read as "no prefix named" and the create sailed past it. A config
+// parse failure stays a nil def with no error: the row EXISTS and is simply not
+// one this build understands, which is the flat-bridge case, not an unknown.
+func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName string) (*compose.NetworkDef, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
 		networkName)
-	if err != nil || len(rows) == 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("read network %q: %w", networkName, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
 	}
 	var def compose.NetworkDef
 	if err := json.Unmarshal([]byte(rows[0].String("config")), &def); err != nil {
-		return nil
+		return nil, nil
 	}
 	def.Type = rows[0].String("type")
-	return &def
+	return &def, nil
 }
 
 // buildIsolatedNetworkConfig generates a cloud-init V1 network-config YAML
@@ -2565,6 +2590,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// BEFORE anything destructive: a VM holding an address on a NetBox-bound
+	// network cannot be rebuilt at all. The recreate below mints a fresh spec
+	// uuid, so the claim for the address this rebuild carries forward would be
+	// refused under the new identity — with the disks and firmware already gone.
+	if err := s.refuseRebuildIfBound(ctx, req.Name); err != nil {
+		return nil, err
+	}
+
 	// Parse the stored spec.
 	spec := &pb.VMSpec{}
 	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
@@ -2610,6 +2643,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// makes the CreateVM below fail AlreadyExists — surfacing the real cause
 	// here beats erroring one step later with a misleading message. The rebuild
 	// is retryable: everything before this point is idempotent teardown.
+	//
+	// The addresses go back first, for the same reason as every other row
+	// removal: a lease that outlives its row can never be reclaimed. On a
+	// NetBox-bound network this rebuild was already refused above, so in
+	// practice this only ever retires builtin leases — but the ordering rule is
+	// the row-deleting path's, not the binding's, and a rebuild must not be the
+	// one place it is missing.
+	s.releaseNICLeasesBestEffort(ctx, vm, "rebuild")
 	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
@@ -2701,6 +2742,14 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		// would leave the replaced VM's row live (a duplicate identity) while
 		// its disks and firmware are already gone. Everything up to here is
 		// idempotent teardown, so the cutover can simply be retried.
+		//
+		// The replaced VM's addresses go back BEFORE its row does: the lease
+		// survives the row otherwise, and the sweeper's live-lease veto then
+		// makes it unreclaimable for good. Best-effort — the -next VM is about
+		// to take this name, and a cutover halted between the two would leave
+		// two rows claiming one identity — but a failure is logged at ERROR and
+		// every NIC handed to the orphan sweep rather than passing silently.
+		s.releaseNICLeasesBestEffort(ctx, oldVM, "cutover")
 		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
 			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
 		}

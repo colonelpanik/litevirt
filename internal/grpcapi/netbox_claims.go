@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
@@ -80,6 +84,13 @@ func (c *claimSet) releaseAll(ctx context.Context) {
 			releaseErr = fmt.Errorf("netbox client not wired")
 		} else {
 			releaseErr = c.srv.netbox.ReleaseIP(ctx, a.NetBoxID)
+			if releaseErr != nil {
+				// Counted where the API call is, not where the rollback ends: a
+				// compensating release is a NetBox request like any other, and
+				// leaving it out made a cluster whose rollbacks were all failing
+				// read as zero API errors.
+				c.srv.nbMetrics().IncAPIError(netbox.Classify(releaseErr))
+			}
 		}
 		if releaseErr != nil {
 			slog.Warn("netbox: compensating release failed; enqueueing orphan check",
@@ -281,4 +292,177 @@ func (s *Server) releaseOneNICLease(ctx context.Context, vm *corrosion.VMRecord,
 		Name:       vm.Name,
 		NetBoxIPID: lease.NetBoxIPID,
 	})
+}
+
+// releaseAllNICLeases gives back EVERY address a VM holds, and is what a path
+// that is about to tombstone the VM's row calls first.
+//
+// DeleteVM has always done this inline and SURFACES a failure, because a delete
+// can simply be retried. The other three row-deleting paths cannot: a cutover
+// has already renamed the replacement into place, and the stale-record cleanup
+// runs precisely because the VM no longer exists anywhere. Blocking those on a
+// release failure would leave a duplicate identity or an undeletable ghost row.
+//
+// So this returns the per-NIC failures rather than deciding for the caller, and
+// the callers that must complete anyway log them and hand each NIC to the
+// orphan sweep. What none of them may do is stay SILENT: the lease survives the
+// row, the sweeper's live-lease veto then refuses to reclaim it forever (that
+// veto is what protects a running guest's address), and the result is an
+// address stuck in both systems with no metric, no finding and no log line.
+func (s *Server) releaseAllNICLeases(ctx context.Context, vm *corrosion.VMRecord) []string {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm.Name)
+	if err != nil {
+		return []string{fmt.Sprintf("read NICs: %v", err)}
+	}
+	var failures []string
+	for _, nic := range nics {
+		if rerr := s.releaseOneNICLease(ctx, vm, nic); rerr != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", nic.NetworkName, rerr))
+		}
+	}
+	return failures
+}
+
+// releaseNICLeasesBestEffort is releaseAllNICLeases for the callers that MUST
+// complete regardless: it logs at ERROR and names every NIC for the orphan
+// sweep, so a stuck lease is surfaced by the stuck-lease detector instead of
+// disappearing.
+//
+// Deliberately returns nothing. A caller that could act on the failure should
+// be using releaseAllNICLeases and surfacing it.
+func (s *Server) releaseNICLeasesBestEffort(ctx context.Context, vm *corrosion.VMRecord, op string) {
+	failures := s.releaseAllNICLeases(ctx, vm)
+	if len(failures) == 0 {
+		return
+	}
+	slog.Error("netbox: address release failed before a VM row was removed — the lease may be stuck",
+		"op", op, "vm", vm.Name, "failures", failures)
+	// Name every NIC, not only the ones that failed: the failure list is keyed
+	// by network and a VM can hold several leases on one, and a check the sweep
+	// finds nothing for costs one lookup.
+	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, vm.Name)
+	if nerr != nil {
+		slog.Error("netbox: could not read NICs to name them for the orphan sweep — an address may be stranded",
+			"op", op, "vm", vm.Name, "error", nerr)
+		return
+	}
+	for _, nic := range nics {
+		if nic.IP == "" {
+			continue
+		}
+		s.enqueueNICOrphanCheck(ctx, vm, nic)
+	}
+}
+
+// ── refusals for the paths that mint a VM without claiming ──────────────────
+
+// refuseIfBound refuses an operation that would put a VM on a NetBox-bound
+// network WITHOUT claiming its addresses.
+//
+// CreateVM is the only create path that claims. Every other way a VM row comes
+// into existence — clone, live-restore, import, a renamed promote — builds NIC
+// records and persists them with InsertVMWithHardware directly, so on a bound
+// network each would hand a guest an address litevirt never reserved: a clone
+// and a restore copy the SOURCE's address onto a second VM (a guaranteed
+// duplicate, invisible to NetBox), an import carries one in from a foreign
+// hypervisor, and a renamed promote writes a second row holding the original's.
+// The external IPAM is the authority for that prefix, and none of it asked.
+//
+// Making those paths claim-aware is a much larger change than the shape of a
+// refusal — a clone would have to claim per NIC and compensate across a
+// half-built disk set; a restore would have to reconcile a claim against a spec
+// that already names an address. Refusing is the fail-closed half, and it is
+// what ships: never let a guest hold an address litevirt did not reserve.
+//
+// Resolution runs through allocatorFor rather than reading the binding row
+// directly, so every refusal the selector already makes is INHERITED and cannot
+// drift: a config that names a prefix with no binding behind it, a suspended
+// binding, a bound network on a node carrying no NetBox client. A nil allocator
+// with a nil error is an unbound network — nothing to refuse, and the ordinary
+// case must not gain one.
+//
+// op names the operation in the message ("clone", "restore", …) so the operator
+// is told which of several paths declined, and what to do instead.
+func (s *Server) refuseIfBound(ctx context.Context, op string, networks []string) error {
+	seen := make(map[string]bool, len(networks))
+	for _, netName := range networks {
+		if netName == "" || seen[netName] {
+			continue
+		}
+		seen[netName] = true
+		alloc, _, err := s.allocatorFor(ctx, "vm", netName)
+		if err != nil {
+			// Not "assume unbound and carry on": an unresolvable network is
+			// exactly the state in which allocating around an external authority
+			// does the damage. Surfaced verbatim — the selector's messages are
+			// already operator-actionable.
+			return status.Errorf(codes.FailedPrecondition, "%s: %v", op, err)
+		}
+		if alloc != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"%s is not supported onto the NetBox-bound network %q; create the VM with `lv vm create` instead",
+				op, netName)
+		}
+	}
+	return nil
+}
+
+// specNetworkNames is the network list refuseIfBound takes, read off a VM spec.
+func specNetworkNames(networks []*pb.NetworkAttachment) []string {
+	out := make([]string, 0, len(networks))
+	for _, n := range networks {
+		if n != nil {
+			out = append(out, n.Name)
+		}
+	}
+	return out
+}
+
+// refuseRebuildIfBound refuses a rebuild of a VM that holds an address on a
+// bound network.
+//
+// A rebuild is not a create with extra steps. It copies the VM's CURRENT
+// address out of vm_interfaces into the new spec as an EXPLICIT one, destroys
+// the disks, the firmware state and the row, and only then calls CreateVM —
+// which mints a FRESH spec uuid. A NetBox claim is keyed on the identity
+// (fingerprint, uuid, mac), so the recreate asks for the old address under a NEW
+// identity: the specific-claim is refused as held by another system, and the
+// recovery lookup finds the object under the OLD identity. That refusal lands
+// AFTER the disks and firmware are gone — the VM is destroyed and cannot be
+// recreated.
+//
+// So the refusal comes FIRST, before anything destructive, the same shape as the
+// container refusal in resolveContainerNICs. Making rebuild claim-aware (release
+// under the old identity, re-claim under the new, compensate if the recreate then
+// fails) is a materially larger change.
+//
+// The NIC list comes from MergedVMNICs, not from the stored spec: a hot-attached
+// NIC exists as a row long before any spec names it, and it is the ROWS a rebuild
+// copies its addresses from.
+func (s *Server) refuseRebuildIfBound(ctx context.Context, vmName string) error {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		// Fail closed: an unreadable NIC list means we do not know whether this
+		// VM holds an external address, and the next step destroys its disks.
+		// Retryable — nothing has run yet.
+		return status.Errorf(codes.Internal,
+			"rebuild %s: could not read its NICs to check for a NetBox-bound network (retry is safe): %v", vmName, err)
+	}
+	seen := make(map[string]bool, len(nics))
+	for _, nic := range nics {
+		if nic.NetworkName == "" || seen[nic.NetworkName] {
+			continue
+		}
+		seen[nic.NetworkName] = true
+		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
+		if aerr != nil {
+			return status.Errorf(codes.FailedPrecondition, "rebuild %s: %v", vmName, aerr)
+		}
+		if alloc != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"rebuild is not supported for a VM on the NetBox-bound network %q; delete and recreate the VM instead",
+				nic.NetworkName)
+		}
+	}
+	return nil
 }

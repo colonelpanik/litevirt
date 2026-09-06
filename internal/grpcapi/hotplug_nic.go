@@ -391,7 +391,7 @@ func (s *Server) claimNICAddress(ctx context.Context, vm *corrosion.VMRecord, sp
 	}
 	identity := netbox.Identity(fp, vmUUID, mac)
 	subnet := ""
-	if def := lookupNetworkDef(ctx, s.db, spec.Name); def != nil {
+	if def, _ := lookupNetworkDef(ctx, s.db, spec.Name); def != nil {
 		subnet = def.Subnet
 	}
 	res, cerr := alloc.Claim(ctx, network.ClaimRequest{
@@ -792,8 +792,12 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 // leaves the guest using an address both litevirt and the external IPAM consider
 // free — a collision, and the very outcome failNICAttach's rolledBack guard
 // exists to prevent on the way in. In this order the same failure can only ever
-// leak: the address stays held with the NIC already gone, which a retry or the
-// orphan sweep clears.
+// leak: the address stays held with the NIC already gone, and the NIC row is
+// kept precisely so a RETRY can find the address and release it. Note what the
+// sweep can and cannot do here — if the release failed at its LOCAL half the
+// lease is still live, and a live lease is one the sweep must never reclaim, so
+// it can only SURFACE it as a stuck lease. The retry is the fix; the sweep is
+// the alarm.
 //
 // STOPPED: the NIC ROW is. There is no live device, but the row is not
 // bookkeeping trailing behind an applied state — for a stopped VM it IS the
@@ -804,8 +808,14 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 // address NetBox has already handed to someone else — the same collision, merely
 // deferred to the next start. So the row goes first here too: the running order
 // minus the unplug. A release that then fails is a pure leak — the row is gone,
-// the lease and the NetBox object linger, the VM starts without that NIC, and the
-// sweep reclaims.
+// the lease and the NetBox object linger, and the VM starts without that NIC.
+// What the sweep can then do depends on WHERE the release failed: with the local
+// tombstone landed and only the remote delete failed, the NetBox object is
+// unreferenced and the sweep reclaims it; with the LOCAL tombstone failed the
+// lease is still LIVE, the sweep's live-lease veto keeps it — correctly, that
+// veto is what protects a running guest's address — and all it can do is surface
+// a stuck lease for an operator. Which is why the failure path NAMES the identity
+// for the sweep rather than assuming reclamation.
 func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, mac, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepReserved)
 

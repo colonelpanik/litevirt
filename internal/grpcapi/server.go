@@ -1543,7 +1543,17 @@ func (s *Server) allocatorFor(ctx context.Context, ownerKind, netName string) (n
 		// exists to prevent, so it is loud. (Reachable through a compose file
 		// written before the refusal in provisionComposeNetworks, or a binding
 		// released while its network survived.)
-		if def := lookupNetworkDef(ctx, s.db, netName); def != nil && def.NetBoxPrefixID != 0 {
+		// The read itself must fail CLOSED. This guard is the only thing standing
+		// between a network whose config names a prefix and the builtin allocator
+		// handing out addresses across it, and a swallowed read error made it a
+		// fail-OPEN guard: "could not read the record" became "the record names
+		// no prefix" and the allocation went ahead.
+		def, derr := lookupNetworkDef(ctx, s.db, netName)
+		if derr != nil {
+			return nil, nil, fmt.Errorf(
+				"cannot determine whether network %q names a NetBox prefix: %w", netName, derr)
+		}
+		if def != nil && def.NetBoxPrefixID != 0 {
 			return nil, nil, fmt.Errorf(
 				"network %q config names NetBox prefix %d but no binding exists; rebind with `lv network create --netbox-prefix-id`",
 				netName, def.NetBoxPrefixID)

@@ -85,6 +85,15 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
 
+	// A clone does not claim. It rebuilds the source's NIC list with fresh MACs
+	// and persists it directly, so on a NetBox-bound network it would either
+	// copy the source's address onto a second VM or leave the clone addressless
+	// on a network where nothing hands out addresses but NetBox. Refused before
+	// admission, so nothing is reserved and no disk is written.
+	if err := s.refuseIfBound(ctx, "clone", specNetworkNames(srcSpec.Network)); err != nil {
+		return nil, err
+	}
+
 	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
 	// memory, its own disks — so it consumes exactly what CreateVM would, and
 	// skipping this let a clone walk past both the host's capacity and the

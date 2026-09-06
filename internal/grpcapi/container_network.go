@@ -99,13 +99,26 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		var def *compose.NetworkDef
 		switch {
 		case netName != "":
-			if def = lookupNetworkDef(ctx, s.db, netName); def == nil {
+			var derr error
+			if def, derr = lookupNetworkDef(ctx, s.db, netName); derr != nil {
+				// Fail closed on a read failure rather than report the network
+				// missing: "not found" is a definite answer this read did not
+				// give, and the def is what decides raw-bridge admission and the
+				// bound-network refusal below.
+				return nil, status.Errorf(codes.Internal, "read network %q: %v", netName, derr)
+			} else if def == nil {
 				return nil, status.Errorf(codes.InvalidArgument, "network %q not found", netName)
 			}
 		case n.Bridge != "":
 			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
 				netName = name
-				def = lookupNetworkDef(ctx, s.db, name)
+				var derr error
+				// Same reason: a bridge that RESOLVES to a managed network must
+				// not degrade to the legacy raw-bridge path (no isolation check,
+				// no bound-network refusal) because its record could not be read.
+				if def, derr = lookupNetworkDef(ctx, s.db, name); derr != nil {
+					return nil, status.Errorf(codes.Internal, "read network %q: %v", name, derr)
+				}
 			}
 		}
 

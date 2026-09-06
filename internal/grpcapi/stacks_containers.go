@@ -96,7 +96,7 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 		if n.IP != "" {
 			if addr, _, hasPrefix := strings.Cut(n.IP, "/"); hasPrefix {
 				bareIP = addr // caller already supplied a CIDR
-			} else if def := lookupNetworkDef(ctx, s.db, scoped); def != nil {
+			} else if def, _ := lookupNetworkDef(ctx, s.db, scoped); def != nil {
 				// lxc.net.*.ipv4.address needs addr/prefix; compose NICs carry a
 				// bare IP, so borrow the prefix from the network's subnet.
 				if _, bits, ok := strings.Cut(def.Subnet, "/"); ok && bits != "" {

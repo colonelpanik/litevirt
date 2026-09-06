@@ -100,6 +100,20 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return s.sendImportInspect(stream, fv, project)
 	}
 
+	// An import does not claim. importRecords builds the NIC rows straight from
+	// the foreign hypervisor's NICs, so importing onto a NetBox-bound network
+	// would bring in an address the external IPAM never issued to this cluster.
+	// Run AFTER --inspect (which writes nothing and should still describe what
+	// the source contains) and before the disk conversion, the quota admission
+	// and the define, so a refusal leaves no converted disk and no reservation.
+	names := make([]string, 0, len(fv.NICs))
+	for _, n := range fv.NICs {
+		names = append(names, n.Network)
+	}
+	if err := s.refuseIfBound(ctx, "import", names); err != nil {
+		return err
+	}
+
 	// Resolve disk files (Proxmox .conf disks need --disk-map) + safety checks.
 	if err := s.applyImportDiskMap(ctx, fv, first); err != nil {
 		return err

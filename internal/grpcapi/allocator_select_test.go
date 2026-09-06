@@ -205,3 +205,39 @@ func TestAllocatorForBoundVMGetsNetBoxAllocator(t *testing.T) {
 		t.Fatalf("binding must be handed back for the claim request, got %+v", binding)
 	}
 }
+
+// TestAllocatorForFailsClosedOnAnUnreadableNetworkRecord pins the one accidental
+// fail-OPEN in the selector.
+//
+// The "config names a prefix but no binding exists" guard is a READ of the
+// networks row. lookupNetworkDef used to swallow its DB error and answer nil, so
+// a read failure was indistinguishable from "this network names no prefix" — and
+// the builtin allocator then handed out addresses across a prefix somebody
+// believes is externally managed. A read that did not happen must refuse.
+func TestAllocatorForFailsClosedOnAnUnreadableNetworkRecord(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	seedNetworkDef(t, s, "plain", compose.NetworkDef{Type: "bridge", Subnet: "10.0.5.0/24"})
+
+	// A container on an unbound network is the case that PREVIOUSLY sailed
+	// through: it gets the builtin allocator, so nothing else would have failed.
+	if _, _, err := s.allocatorFor(ctx, "ct", "plain"); err != nil {
+		t.Fatalf("control: an unbound network must resolve cleanly, got %v", err)
+	}
+
+	// Make every read of `networks` fail. Renaming is the only way to produce a
+	// read error — SQLite has no BEFORE SELECT trigger — and is the same seam
+	// hideLeaseTable uses for ip_allocations.
+	if err := s.db.Execute(ctx, `ALTER TABLE networks RENAME TO networks_hidden`); err != nil {
+		t.Fatalf("hide the networks table: %v", err)
+	}
+
+	_, _, err := s.allocatorFor(ctx, "ct", "plain")
+	if err == nil {
+		t.Fatal("an unreadable networks table must refuse — a read that did not happen " +
+			"cannot prove the network names no NetBox prefix")
+	}
+	if !strings.Contains(err.Error(), "NetBox prefix") {
+		t.Fatalf("the refusal must say what could not be determined, got: %v", err)
+	}
+}

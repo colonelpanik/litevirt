@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -1404,3 +1405,10 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 // SetContainersRoot tells the runtime-inventory collector where per-container
 // owner-epoch markers live (the same root the container checker converges).
 func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }
+
+// allocatorFor picks the allocator for one network. Containers ALWAYS get the
+// builtin allocator: a container on a bound network is refused before this point
+// (see refuseContainerOnBoundNetwork), so there is no container/NetBox path.
+func (s *Server) allocatorFor(ctx context.Context, netName string) network.Allocator {
+	return network.NewBuiltinAllocator(s.db)
+}

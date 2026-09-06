@@ -235,3 +235,32 @@ func GetAllocationFor(ctx context.Context, db *corrosion.Client, network, ownerK
 func GetAllocation(ctx context.Context, db *corrosion.Client, network, vmName string) (*IPAllocation, error) {
 	return GetAllocationFor(ctx, db, network, "vm", "", vmName)
 }
+
+// ReleaseLease tombstones EXACTLY ONE lease by its (network, ip) primary key.
+//
+// ReleaseIPFor above is a bulk update keyed (network, vm_name, owner). When a
+// workload has two NICs on one network, releasing "the lease for this owner on
+// this network" matches BOTH rows, so the first release tombstones both. That
+// is latent today because VMs never allocate; it becomes live the moment they
+// do. Release by the actual PK instead.
+func ReleaseLease(ctx context.Context, db *corrosion.Client, network, ip, mac, ownerKind, ownerHost, name string) error {
+	// Owner-scoped, not just (network, ip). A stale detach arriving after the
+	// address was reassigned would otherwise tombstone the NEW holder's lease.
+	//
+	// ExecuteRows, not Execute: its contract is that a guarded WHERE matching
+	// zero rows means the write did NOT happen, and the caller must not treat
+	// that as success.
+	n, err := db.ExecuteRows(ctx,
+		`UPDATE ip_allocations SET deleted_at = ?, updated_at = ?
+		 WHERE network = ? AND ip = ? AND mac = ? AND vm_name = ?
+		   AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
+		db.NowWall(), db.NowTS(), network, ip, mac, name, ownerKind, ownerHost)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("lease %s on %s is not held by %s/%s/%s — refusing to release it",
+			ip, network, ownerKind, ownerHost, name)
+	}
+	return nil
+}

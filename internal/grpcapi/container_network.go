@@ -186,11 +186,18 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			}
 			ip = n.Ip
 		case def.Subnet != "":
-			cand, aerr := network.AllocateIPFor(ctx, s.db, netName, def.Subnet, mac, "ct", s.hostName, ctName)
+			cand, aerr := s.allocatorFor(ctx, netName).Claim(ctx, network.ClaimRequest{
+				Network:   netName,
+				Subnet:    def.Subnet,
+				MAC:       mac,
+				OwnerKind: "ct",
+				OwnerHost: s.hostName,
+				Name:      ctName,
+			})
 			if aerr != nil {
 				return nil, status.Errorf(codes.ResourceExhausted, "allocate IP on network %q: %v", netName, aerr)
 			}
-			ip = cand
+			ip = cand.IP
 		}
 		p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: bridge, IP: ip, MAC: mac, Veth: veth})
 		p.ifaces = append(p.ifaces, corrosion.ContainerInterfaceRecord{

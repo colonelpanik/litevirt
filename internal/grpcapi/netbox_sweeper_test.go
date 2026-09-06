@@ -1,10 +1,18 @@
 package grpcapi
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
 )
 
@@ -127,5 +135,201 @@ func TestSweeperSkipReasonIsBounded(t *testing.T) {
 	}
 	if got := skipReason(errors.New("something else")); got != "error" {
 		t.Fatalf("skipReason of a plain error = %q, want \"error\"", got)
+	}
+}
+
+// ── the orphan-check queue ──────────────────────────────────────────────────
+
+// The queue fixture. The identity is built from the test cluster's REAL
+// fingerprint, because handleOrphanCheck drops anything stamped with another
+// cluster's — an identity hardcoded here would make every scenario vacuous.
+const (
+	queuePrefixID = 7
+	queueVRF      = 3
+	queueSubnet   = "10.0.5.0/24"
+	queueNetwork  = "bound"
+	queueCIDR     = "10.0.5.150/24"
+	queueNetBoxID = 41
+	queueUUID     = "6f1b0c2e-0000-4000-8000-0000000000aa"
+	queueMAC      = "52:54:00:0a:0b:0c"
+)
+
+// fakeNetBoxQueue answers the identity lookup drainOrphanChecks makes, and
+// records every DELETE. Deletes are RECORDED rather than refused so a test can
+// tell "nothing was deleted" apart from "the delete was attempted and failed" —
+// only the first is the property these scenarios assert.
+type fakeNetBoxQueue struct {
+	mu       sync.Mutex
+	identity string
+	deleted  []int
+}
+
+func (f *fakeNetBoxQueue) Deleted() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.deleted...)
+}
+
+func (f *fakeNetBoxQueue) handler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if r.URL.Query().Get("cf_"+netbox.IdentityField) != f.identity {
+			_, _ = w.Write([]byte(`{"results":[]}`))
+			return
+		}
+		_, _ = fmt.Fprintf(w,
+			`{"results":[{"id":%d,"address":%q,"vrf":{"id":%d},"custom_fields":{%q:%q}}]}`,
+			queueNetBoxID, queueCIDR, queueVRF, netbox.IdentityField, f.identity)
+	case http.MethodDelete:
+		f.mu.Lock()
+		f.deleted = append(f.deleted, queueNetBoxID)
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "fakeNetBoxQueue: unsupported method "+r.Method, http.StatusMethodNotAllowed)
+	}
+}
+
+// newOrphanQueueServer builds a server whose sync queue holds exactly ONE
+// orphan check — the item a failed create-compensation leaves behind —
+// resolvable against a real binding through the real *netbox.Client.
+func newOrphanQueueServer(t *testing.T) (*Server, *fakeNetBoxQueue) {
+	t.Helper()
+	ctx := context.Background()
+
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	// ClusterFingerprint derives the scope from the CA cert, so there has to be
+	// a cluster row before an identity means anything at all.
+	if err := db.Execute(ctx,
+		`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
+		 VALUES ('default', 'test', 'test.local', 'test-ca-cert', ?, ?)`,
+		db.NowWall(), db.NowTS()); err != nil {
+		t.Fatalf("seed cluster row: %v", err)
+	}
+	fp, err := corrosion.ClusterFingerprint(ctx, db)
+	if err != nil {
+		t.Fatalf("ClusterFingerprint: %v", err)
+	}
+
+	nb := &fakeNetBoxQueue{identity: netbox.Identity(fp, queueUUID, queueMAC)}
+	httpSrv := httptest.NewServer(http.HandlerFunc(nb.handler))
+	t.Cleanup(httpSrv.Close)
+
+	tokenPath := filepath.Join(t.TempDir(), "netbox-token")
+	if err := os.WriteFile(tokenPath, []byte("test-token\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	client, err := netbox.New(netbox.Config{
+		BaseURL:   httpSrv.URL,
+		TokenPath: tokenPath,
+		Timeout:   2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("netbox.New: %v", err)
+	}
+
+	if ok, err := corrosion.ClaimBinding(ctx, db, corrosion.BindingRecord{
+		PrefixID:           queuePrefixID,
+		Network:            queueNetwork,
+		ObservedCIDR:       queueSubnet,
+		VRFID:              queueVRF,
+		ClusterFingerprint: fp,
+	}); err != nil || !ok {
+		t.Fatalf("ClaimBinding: ok=%v err=%v", ok, err)
+	}
+	if err := corrosion.EnqueueSync(ctx, db, "orphan", nb.identity, "check"); err != nil {
+		t.Fatalf("EnqueueSync: %v", err)
+	}
+	return &Server{hostName: "test-host", db: db, netbox: client}, nb
+}
+
+// hideLeaseTable makes every read of ip_allocations fail.
+//
+// It RENAMES the table: SQLite has no BEFORE SELECT trigger, so a read cannot be
+// intercepted, and a missing table is the only way to produce the error a
+// corrupt or unavailable ip_allocations yields. Same seam the fleet harness uses
+// for fencing_log.
+func hideLeaseTable(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.db.Execute(ctx,
+		`ALTER TABLE ip_allocations RENAME TO ip_allocations_hidden_by_test`); err != nil {
+		t.Fatalf("hide ip_allocations: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.db.Execute(ctx,
+			`ALTER TABLE ip_allocations_hidden_by_test RENAME TO ip_allocations`); err != nil {
+			t.Logf("restore ip_allocations: %v", err)
+		}
+	})
+}
+
+func queueItems(t *testing.T, s *Server) []corrosion.QueueItem {
+	t.Helper()
+	items, err := corrosion.DrainSyncQueue(context.Background(), s.db, 10)
+	if err != nil {
+		t.Fatalf("DrainSyncQueue: %v", err)
+	}
+	return items
+}
+
+// TestOrphanCheckKeptQueuedWhenLeaseReadFails pins that a FAILED lease read
+// leaves the item queued.
+//
+// The stuck-lease check is the whole reason this queue exists: it is the only
+// place the cluster ever learns that a compensating release never finished
+// locally. Acking on a transient DB error discards that signal permanently —
+// the periodic candidate pass skips any address a live lease references, so
+// nothing else ever looks at it again — and the address stays leaked in both
+// systems with no counter, no log line, and no way back.
+func TestOrphanCheckKeptQueuedWhenLeaseReadFails(t *testing.T) {
+	s, nb := newOrphanQueueServer(t)
+	hideLeaseTable(t, s)
+
+	s.drainOrphanChecks(context.Background())
+
+	items := queueItems(t, s)
+	if len(items) != 1 {
+		t.Fatalf("an unreadable lease table must leave the orphan check queued, %d items remain", len(items))
+	}
+	if items[0].Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 — an item retried without being counted can never be retired",
+			items[0].Attempts)
+	}
+	if got := nb.Deleted(); len(got) != 0 {
+		t.Fatalf("nothing may be deleted when the lease read failed, deleted %v", got)
+	}
+}
+
+// TestOrphanCheckGivesUpAfterTenAttempts pins the other end of that retry: an
+// item nothing can ever resolve is retired rather than re-attempted on every
+// pass for the life of the cluster. It is retired LOUDLY (an ERROR naming the
+// identity), because the address behind it is then reachable only by hand.
+func TestOrphanCheckGivesUpAfterTenAttempts(t *testing.T) {
+	s, nb := newOrphanQueueServer(t)
+	ctx := context.Background()
+	hideLeaseTable(t, s)
+
+	// One attempt short of the cap, so THIS pass is the one that gives up.
+	if err := s.db.Execute(ctx,
+		`UPDATE netbox_sync_queue SET attempts = ?, updated_at = ?`,
+		orphanCheckMaxAttempts-1, s.db.NowTS()); err != nil {
+		t.Fatalf("seed attempts: %v", err)
+	}
+
+	s.drainOrphanChecks(ctx)
+
+	if items := queueItems(t, s); len(items) != 0 {
+		t.Fatalf("an item that has failed %d times must be retired, %d still queued",
+			orphanCheckMaxAttempts, len(items))
+	}
+	if got := nb.Deleted(); len(got) != 0 {
+		t.Fatalf("giving up must delete nothing, deleted %v", got)
 	}
 }

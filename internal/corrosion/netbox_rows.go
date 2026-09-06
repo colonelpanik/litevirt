@@ -218,6 +218,19 @@ func DrainSyncQueue(ctx context.Context, c *Client, limit int) ([]QueueItem, err
 	return out, nil
 }
 
+// BumpSyncAttempts counts ONE failed resolution of a queued item, so a lookup
+// that can never succeed is bounded instead of retried on every pass forever.
+//
+// The increment is an SQL expression, not a value the caller computed: a
+// read-modify-write in Go would lose one of two concurrent attempts, and the
+// count is exactly what decides when an item is retired.
+func BumpSyncAttempts(ctx context.Context, c *Client, id string) error {
+	return c.Execute(ctx,
+		`UPDATE netbox_sync_queue SET attempts = attempts + 1, updated_at = ?
+		 WHERE id = ?`,
+		c.NowTS(), id)
+}
+
 // AckSyncItem tombstones a completed item.
 func AckSyncItem(ctx context.Context, c *Client, id string) error {
 	return c.Execute(ctx,

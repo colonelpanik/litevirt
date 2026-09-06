@@ -110,6 +110,37 @@ func TestSweeperIgnoresFenceProofAfterRejoin(t *testing.T) {
 	}
 }
 
+// TestSweeperHonoursFenceConfirmOlderThanVIPWindow pins the sweeper's OWN fence
+// window.
+//
+// The VIP release proof expires an operator's `lv host fence-confirm` after five
+// minutes, which is right for a failover decision made seconds after a host
+// drops. A sweep runs on a ten-minute lease cadence, so borrowing that window
+// would expire every confirmation before the next pass could ever read it: after
+// a permanent host loss the sweeper would be inert forever, and no amount of
+// re-confirming would help — the operator has no way to land a confirmation
+// inside a window narrower than the cadence.
+//
+// The attestation is safe to honour for far longer here because reachability is
+// checked FIRST and independently: a host that comes back is never excluded,
+// however fresh its fence record (TestSweeperIgnoresFenceProofAfterRejoin). The
+// window only bounds an UNREACHABLE host's attestation.
+func TestSweeperHonoursFenceConfirmOlderThanVIPWindow(t *testing.T) {
+	nb, c := boundClusterWithOrphan(t, 2)
+
+	// Permanently gone: off the network, and attested down ten minutes ago —
+	// older than the VIP window, well inside the sweeper's.
+	c.Nodes[1].Stop()
+	fenceConfirmAged(t, c.Nodes[0], c.Nodes[1].Name, 10*time.Minute)
+
+	mustSweep(t, c.Nodes[0])
+
+	if len(nb.Identities()) != 0 {
+		t.Fatalf("a confirmation older than the VIP window must still exclude an unreachable host, still held: %v",
+			nb.Identities())
+	}
+}
+
 func TestSweeperBlockedByFenceLogReadFailure(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 2)
 
@@ -277,6 +308,25 @@ func mustForceRemoveHost(t *testing.T, n *Node, name string) {
 	if _, err := n.cluster.SelfClient(n).RemoveHost(context.Background(),
 		&pb.RemoveHostRequest{Name: name, Force: true}); err != nil {
 		t.Fatalf("RemoveHost(%s, force) on %s: %v", name, n.Name, err)
+	}
+}
+
+// fenceConfirmAged writes the fencing_log row `lv host fence-confirm` leaves
+// behind, with an explicit AGE.
+//
+// The RPC stamps its own `now` and ignores any timestamp handed to it, so a
+// scenario about an attestation that has been sitting there for a while has to
+// write the row directly. Same columns and same result value the handler writes
+// — only the timestamp differs.
+func fenceConfirmAged(t *testing.T, n *Node, name string, age time.Duration) {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail)
+		 VALUES (?, ?, 'manual', 'manual-confirmed', ?, ?)`,
+		"fence-confirm-"+name, name,
+		time.Now().UTC().Add(-age).Format(time.RFC3339),
+		"operator attestation, aged by the test"); err != nil {
+		t.Fatalf("write an aged fence confirmation for %s on %s: %v", name, n.Name, err)
 	}
 }
 

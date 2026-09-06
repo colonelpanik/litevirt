@@ -42,6 +42,27 @@ const orphanProofWorkers = 4
 // orphanQueueBatch is how many sync-queue items one pass drains.
 const orphanQueueBatch = 100
 
+// orphanCheckMaxAttempts bounds how many passes ONE queued orphan check may
+// fail before the sweeper gives up on it. Without a bound, an item whose lookup
+// can never succeed — an identity whose prefix is no longer bound, a NetBox that
+// answers 500 for it forever — is retried on every pass for the life of the
+// cluster and the queue never drains. Giving up is logged at ERROR, never
+// silently: the address it names becomes an operator's problem.
+const orphanCheckMaxAttempts = 10
+
+// netboxFenceWindow bounds how long an operator's `lv host fence-confirm`
+// attestation counts as power-off evidence FOR THIS SWEEPER.
+//
+// It is deliberately NOT vipManualFenceWindow (5 minutes). Reachability is the
+// PRIMARY safety here: hasFreshPowerOffProof consults the live signal first, so
+// a host that has rejoined is never excluded from a proof, whatever the fencing
+// log says. The window therefore only bounds how long an UNREACHABLE host's
+// attestation keeps counting — and it must EXCEED the sweep cadence
+// (netBoxLeaseInterval), or an operator's confirmation expires before the next
+// sweep can honour it: after a permanent host loss the sweeper would then be
+// inert forever, with no practical escape.
+const netboxFenceWindow = 24 * time.Hour
+
 // ── skip reasons ────────────────────────────────────────────────────────────
 
 // skipError carries a BOUNDED metric label alongside the full human-readable
@@ -70,19 +91,19 @@ func skipReason(err error) string {
 
 // The bounded set of skip labels.
 const (
-	skipHostsRead       = "hosts_read"
-	skipNoHosts         = "no_eligible_hosts"
-	skipUnreachable     = "host_unreachable"
-	skipNoProof         = "host_returned_no_proof"
-	skipIncomplete      = "incomplete_proof"
-	skipHostHolds       = "host_still_claims"
-	skipProofCount      = "proof_count_mismatch"
-	skipMembership      = "membership_changed"
-	skipLeaseLost       = "leader_lease_lost"
-	skipRemoteReread    = "netbox_reread_failed"
-	skipObjectChanged   = "netbox_object_changed"
-	skipReleaseFailed   = "release_failed"
-	skipUnknownBindings = "identity_unresolvable"
+	skipHostsRead            = "hosts_read"
+	skipNoHosts              = "no_eligible_hosts"
+	skipUnreachable          = "host_unreachable"
+	skipNoProof              = "host_returned_no_proof"
+	skipIncomplete           = "incomplete_proof"
+	skipHostHolds            = "host_still_claims"
+	skipProofCount           = "proof_count_mismatch"
+	skipMembership           = "membership_changed"
+	skipLeaseLost            = "leader_lease_lost"
+	skipRemoteReread         = "netbox_reread_failed"
+	skipObjectChanged        = "netbox_object_changed"
+	skipReleaseFailed        = "release_failed"
+	skipIdentityUnresolvable = "identity_unresolvable"
 )
 
 // ── the sweep ───────────────────────────────────────────────────────────────
@@ -317,15 +338,16 @@ func (s *Server) hostIsReachable(ctx context.Context, host string) bool {
 }
 
 // freshFenceConfirmation reads the operator's `lv host fence-confirm`
-// attestation, within the same window the VIP release proof uses. An error is
-// RETURNED, never folded into false: "I could not read the fencing log" and
-// "this host was never fenced" lead to opposite decisions here, and only one of
-// them is safe.
+// attestation, within netboxFenceWindow — the sweeper's OWN window, not the VIP
+// one, because a sweep pass runs on a far longer cadence than a VIP failover.
+// An error is RETURNED, never folded into false: "I could not read the fencing
+// log" and "this host was never fenced" lead to opposite decisions here, and
+// only one of them is safe.
 func (s *Server) freshFenceConfirmation(ctx context.Context, host string) (bool, error) {
 	if s.db == nil {
 		return false, fmt.Errorf("no local database")
 	}
-	return corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), vipManualFenceWindow)
+	return corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), netboxFenceWindow)
 }
 
 func sameHostSet(a, b []string) bool {
@@ -406,7 +428,13 @@ func (s *Server) gatherOrphanProofs(ctx context.Context, hosts []string, cand or
 	sem := make(chan struct{}, orphanProofWorkers)
 	for i, h := range hosts {
 		if h == s.hostName {
-			p, err := s.collectOrphanProof(ctx, cand.VMUUID, cand.MAC, cand.Address)
+			// Bounded exactly like a peer's. A local libvirt that hangs would
+			// otherwise stretch the pass past the lease TTL — the failure
+			// orphanProofTimeout exists to prevent — and the self proof is the
+			// one probe that never crosses a network timeout of its own.
+			pctx, cancel := context.WithTimeout(ctx, orphanProofTimeout)
+			p, err := s.collectOrphanProof(pctx, cand.VMUUID, cand.MAC, cand.Address)
+			cancel()
 			results[i] = result{host: h, proof: p, err: err}
 			continue
 		}
@@ -645,13 +673,40 @@ func (s *Server) drainOrphanChecks(ctx context.Context) {
 			if err := corrosion.AckSyncItem(ctx, s.db, it.ID); err != nil {
 				slog.Warn("netbox sweep: ack orphan check", "id", it.ID, "error", err)
 			}
+			continue
 		}
+		s.countFailedOrphanCheck(ctx, it)
+	}
+}
+
+// countFailedOrphanCheck records ONE failed resolution and retires an item that
+// has failed too many times.
+//
+// The counter is what makes "keep it queued and retry" bounded: an item nothing
+// can ever resolve would otherwise be re-attempted on every pass forever,
+// crowding out the items a sweep can actually finish. Retiring it is loud —
+// ERROR, naming the identity — because the address behind it is then reachable
+// only by hand.
+func (s *Server) countFailedOrphanCheck(ctx context.Context, it corrosion.QueueItem) {
+	if err := corrosion.BumpSyncAttempts(ctx, s.db, it.ID); err != nil {
+		// The count did not land, so this attempt is not held against the item.
+		// Retrying forever is the lesser failure: nothing is deleted either way.
+		slog.Warn("netbox sweep: count an orphan-check attempt", "id", it.ID, "error", err)
+		return
+	}
+	if it.Attempts+1 < orphanCheckMaxAttempts {
+		return
+	}
+	slog.Error(fmt.Sprintf("netbox sweep: giving up after %d attempts; address may need manual review",
+		orphanCheckMaxAttempts), "identity", it.Key, "id", it.ID, "attempts", it.Attempts+1)
+	if err := corrosion.AckSyncItem(ctx, s.db, it.ID); err != nil {
+		slog.Warn("netbox sweep: ack an exhausted orphan check", "id", it.ID, "error", err)
 	}
 }
 
 // handleOrphanCheck resolves one queued identity. It reports whether the item is
 // FINISHED and may be acked; an item whose lookup failed stays queued so the
-// next pass retries it.
+// next pass retries it, bounded by orphanCheckMaxAttempts.
 //
 // An identity carries no prefix, so it is resolved against every non-suspended
 // binding of this cluster. That is the only scoping available, and NetBox's
@@ -664,7 +719,7 @@ func (s *Server) handleOrphanCheck(ctx context.Context, it corrosion.QueueItem, 
 	if !ok || cf != fp {
 		slog.Warn("netbox sweep: dropping an orphan check with an unusable identity",
 			"identity", it.Key)
-		s.nbMetrics().IncSweepSkipped(skipUnknownBindings)
+		s.nbMetrics().IncSweepSkipped(skipIdentityUnresolvable)
 		return true // nothing this cluster can ever resolve
 	}
 
@@ -681,8 +736,11 @@ func (s *Server) handleOrphanCheck(ctx context.Context, it corrosion.QueueItem, 
 		}
 		for _, ip := range found {
 			resolvedAny = true
-			if !s.resolveQueuedAddress(ctx, b, it.Key, uuid, mac, ip) {
+			switch s.resolveQueuedAddress(ctx, b, it.Key, uuid, mac, ip) {
+			case queueStuck:
 				return true // stuck lease: surfaced, acked, nothing deleted
+			case queueRetry:
+				return false // undecidable this pass; keep the item queued
 			}
 		}
 	}
@@ -694,31 +752,56 @@ func (s *Server) handleOrphanCheck(ctx context.Context, it corrosion.QueueItem, 
 	return true
 }
 
-// resolveQueuedAddress handles one address a queued identity resolved to. It
-// returns false when the address is a STUCK lease — a live lease still names it,
-// so the compensation that enqueued this item never finished locally, and
-// deleting the remote object would free an address litevirt still holds.
+// queueOutcome is what ONE resolved address tells the queue to do with its item.
+//
+// Three outcomes, not two: "finished" and "a stuck lease" both retire the item,
+// but "I could not tell" must not — and a single bool cannot say that. The stuck
+// lease is the whole reason the queue exists, so an item dropped before its lease
+// check ran takes the only signal that address will ever produce with it.
+type queueOutcome int
+
+const (
+	// queueDone: handled. Reclaimed, refused by the whole-cluster proof, or not
+	// interpretable at all — nothing further will change by asking again.
+	queueDone queueOutcome = iota
+	// queueStuck: a live lease still names the address. Surfaced for an operator
+	// and retired, because re-firing the same alarm every sweep buries it.
+	queueStuck
+	// queueRetry: the decision could not be made — a read failed. The item stays
+	// queued for the next pass.
+	queueRetry
+)
+
+// resolveQueuedAddress handles one address a queued identity resolved to.
+//
+// It reports queueStuck when the address is a STUCK lease — a live lease still
+// names it, so the compensation that enqueued this item never finished locally,
+// and deleting the remote object would free an address litevirt still holds.
 func (s *Server) resolveQueuedAddress(ctx context.Context, b corrosion.BindingRecord,
-	identity, uuid, mac string, ip netbox.IPAddress) bool {
+	identity, uuid, mac string, ip netbox.IPAddress) queueOutcome {
 
 	bare, ok := bareAddress(ip.Address)
 	if !ok {
 		slog.Warn("netbox sweep: orphan check resolved an uninterpretable address",
 			"address", ip.Address, "identity", identity)
-		return true
+		return queueDone
 	}
 	held, err := corrosion.LeaseExistsByIP(ctx, s.db, b.Network, bare)
 	if err != nil {
-		slog.Warn("netbox sweep: orphan check could not read the lease table",
-			"address", bare, "error", err)
-		return true // a read we cannot do is not permission to delete
+		// A read we cannot do is not permission to delete — and it is not
+		// permission to FORGET either. Acking here would drop the item on a
+		// transient DB error, and with it the stuck-lease check that is the only
+		// thing standing between this address and a later, unwitnessed delete.
+		slog.Warn("netbox sweep: orphan check could not read the lease table; keeping the item queued",
+			"address", bare, "network", b.Network, "identity", identity, "error", err)
+		return queueRetry
 	}
 	if held {
 		slog.Error("netbox sweep: STUCK LEASE — a live ip_allocations row still references an address whose NetBox object was queued for release; "+
 			"the address is leaked in both systems until an operator retires the lease. Nothing has been deleted.",
 			"address", bare, "network", b.Network, "identity", identity, "netbox_id", ip.ID)
 		s.nbMetrics().IncStuckLease()
-		return false
+		return queueStuck
 	}
 	cand := orphanCandidate{
 		PrefixID:         b.PrefixID,
@@ -738,7 +821,7 @@ func (s *Server) resolveQueuedAddress(ctx context.Context, b corrosion.BindingRe
 			"address", cand.Address, "identity", identity, "reason", err)
 		s.nbMetrics().IncSweepSkipped(skipReason(err))
 	}
-	return true
+	return queueDone
 }
 
 // ── test seams ──────────────────────────────────────────────────────────────

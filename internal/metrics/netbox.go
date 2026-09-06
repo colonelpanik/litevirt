@@ -130,3 +130,7 @@ func (*NetBoxMetrics) IncStuckLease() { netboxStuckLeases.Inc() }
 
 // IncBindingSuspended counts one binding taken out of service by drift.
 func (*NetBoxMetrics) IncBindingSuspended() { netboxBindingsSuspended.Inc() }
+
+// IncDuplicateObject counts one NetBox object found duplicated for a single
+// litevirt identity by the inventory mirror, and deleted by the sweep.
+func (*NetBoxMetrics) IncDuplicateObject() { netboxDuplicateObjects.Inc() }

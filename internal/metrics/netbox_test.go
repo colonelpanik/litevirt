@@ -192,3 +192,24 @@ func TestCollectNetBoxGauges(t *testing.T) {
 		t.Errorf("litevirt_netbox_bindings_suspended = %v (present=%v), want 2", got, ok)
 	}
 }
+
+// TestNetBoxMetricsSatisfiesTheMirrorSink pins the STRUCTURAL contract with
+// internal/netboxsync, whose sink interface is unexported for the same reason
+// grpcapi's is. Without this check a renamed method there would silently leave
+// the inventory mirror counting duplicates into a noop.
+func TestNetBoxMetricsSatisfiesTheMirrorSink(t *testing.T) {
+	// Mirrors netboxsync.mirrorMetrics exactly.
+	type mirrorSink interface {
+		IncDuplicateObject()
+	}
+	var s mirrorSink = NewNetBoxMetrics()
+	s.IncDuplicateObject()
+
+	fam := netboxFamilies(t)["litevirt_netbox_duplicate_objects_total"]
+	if fam == nil || len(fam.GetMetric()) == 0 {
+		t.Fatal("litevirt_netbox_duplicate_objects_total is not registered")
+	}
+	if got := fam.GetMetric()[0].GetCounter().GetValue(); got < 1 {
+		t.Fatalf("litevirt_netbox_duplicate_objects_total = %v, want at least 1", got)
+	}
+}

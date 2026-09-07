@@ -292,6 +292,14 @@ run that fails partway leaves the binding suspended rather than live with half
 its objects unrecognisable. Re-running finishes the job; objects already
 rewritten are skipped. Complete a re-key before replacing the CA again.
 
+Both forms of the command run under the same cluster-wide leader lease as the
+orphan sweeper and the inventory mirror, because all three write the objects the
+others read. A re-key that cannot take the lease **rewrites nothing** and refuses,
+naming the node that holds it — wait for that node's sweep to finish and run it
+again. If the lease is lost while a re-key is running, it stops where it is: the
+binding stays suspended and re-running finishes what was left. Taking the lease
+also stops a mirror sweep that is already in flight, at its next write batch.
+
 Three sets of objects are re-stamped, in this order:
 
 1. the `ipam.ip-address` objects the bound prefix holds;

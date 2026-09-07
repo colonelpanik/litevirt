@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -170,14 +171,7 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 		// rewritten objects in NetBox, so "nothing happened" is exactly the
 		// wrong thing for the audit trail to imply.
 		s.audit(ctx, "netbox.rekey", req.GetNetwork(), detail, "error")
-		var drifted stillDriftedError
-		if errors.As(err, &drifted) {
-			// Not an internal failure: the rewrite succeeded and the operator
-			// has a prefix to repair.
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"re-key network %q: %v", req.GetNetwork(), err)
-		}
-		return nil, status.Errorf(codes.Internal, "re-key network %q: %v", req.GetNetwork(), err)
+		return nil, status.Errorf(rekeyCode(err), "re-key network %q: %v", req.GetNetwork(), err)
 	}
 	s.audit(ctx, "netbox.rekey", req.GetNetwork(), detail, "ok")
 	return &emptypb.Empty{}, nil
@@ -197,6 +191,53 @@ func (e stillDriftedError) Error() string {
 		" — repair it in NetBox, then run `lv netbox rekey` again once the drift is repaired", e.reason)
 }
 
+// leaseRefusedError is a re-key that could not take the `netbox` leader lease
+// and therefore rewrote NOTHING. It is the fail-closed refusal, and it costs
+// the operator a retry.
+type leaseRefusedError struct{ holder string }
+
+func (e leaseRefusedError) Error() string {
+	if e.holder == "" {
+		// The row is absent, unreadable, or already expired but not yet taken
+		// by anyone. Naming a holder we cannot prove would be worse than
+		// naming none.
+		return "could not take the netbox leader lease, so nothing was rewritten;" +
+			" retry in a few minutes"
+	}
+	return fmt.Sprintf("the netbox leader lease is held by %q, so nothing was rewritten;"+
+		" that node may be mid-sweep — retry in a few minutes", e.holder)
+}
+
+// leaseLostError is a re-key that HELD the lease and lost it partway, and so
+// stopped rather than write on without it.
+type leaseLostError struct{ holder string }
+
+func (e leaseLostError) Error() string {
+	if e.holder == "" {
+		return "the netbox leader lease was lost mid-re-key"
+	}
+	return fmt.Sprintf("the netbox leader lease was lost mid-re-key and is now held by %q", e.holder)
+}
+
+// rekeyCode is the gRPC code a re-key failure deserves.
+//
+// FailedPrecondition for everything an OPERATOR can act on — a rewrite that
+// finished and left the binding drifted for a reason a re-key does not address,
+// and a lease this node could not take or did not keep. None of those is a bug
+// in the daemon and all of them are answered by a retry, so reporting them as
+// Internal would send an operator looking for one.
+func rekeyCode(err error) codes.Code {
+	var (
+		drifted stillDriftedError
+		refused leaseRefusedError
+		lost    leaseLostError
+	)
+	if errors.As(err, &drifted) || errors.As(err, &refused) || errors.As(err, &lost) {
+		return codes.FailedPrecondition
+	}
+	return codes.Internal
+}
+
 // rekeyCounts is what one re-key touched, for the audit trail. A re-key that
 // failed partway has still rewritten some of it, so the numbers are recorded on
 // both outcomes.
@@ -205,6 +246,106 @@ type rekeyCounts struct {
 	vms        int // virtualization.virtual_machine objects
 	interfaces int // virtualization.vminterface objects
 	refs       int // local netbox_objects index rows
+}
+
+// ── the leader lease ────────────────────────────────────────────────────────
+
+// A re-key is the THIRD writer under the `netbox` leader_election key, and it
+// has to be, because it rewrites the very objects the other two act on.
+//
+// The orphan sweeper and the inventory mirror already share that one key so
+// that neither can reclaim an address while the other rewrites the inventory
+// naming it. The re-key rewrites both sets of identities at once, and a mirror
+// sweep running alongside it sees a half-rewritten cluster: BuildActual filters
+// actual state on the LIVE fingerprint, so a not-yet-rewritten VM is invisible,
+// Diff emits a create for it, and NetBox's cluster-scoped VM-name uniqueness
+// refuses that create — taking the whole sweep down. Nothing is corrupted (the
+// failed create never reaches recordRef) and the next sweep converges once the
+// re-key finishes, but a failed sweep is a false alarm an operator has to read.
+//
+// Taking the lease is also what makes the re-key STOP a sweep already in
+// flight: the mirror re-validates the lease before every write batch, so an
+// outgoing writer halts at its next boundary instead of racing on.
+
+// rekeyLeaseInterval sizes the lease ONE re-key holds. acquireNetBoxLease
+// writes an expiry of 2x whatever it is handed, so the re-key holds the lease
+// for two minutes at a time and renews once half of that has gone.
+//
+// Deliberately NOT the sweep cadence, and deliberately renewed rather than
+// sized to cover the operation: how long a re-key runs is a function of how
+// much inventory NetBox holds, which nothing knows at acquire time, so any TTL
+// "large enough" is a guess that fails in exactly the case that motivates it. A
+// SHORT TTL is what keeps the other direction safe — the conditional upsert in
+// acquireNetBoxLease refuses to steal an UNEXPIRED lease, so a re-key whose
+// node dies mid-operation locks the mirror out for one TTL and no longer.
+const rekeyLeaseInterval = time.Minute
+
+// rekeyLease is the `netbox` leader lease held for the duration of one re-key.
+type rekeyLease struct {
+	s       *Server
+	renewAt time.Time
+}
+
+// takeRekeyLease acquires the lease, or refuses having written nothing.
+//
+// acquireNetBoxLease is a conditional upsert plus a read-back: a losing acquire
+// writes nothing at all and the read-back is what makes the loss observable
+// rather than assumed. So a refusal here is proof this node does not lead, not
+// an inference from one.
+func (s *Server) takeRekeyLease(ctx context.Context) (*rekeyLease, error) {
+	if !s.acquireNetBoxLease(ctx, rekeyLeaseInterval) {
+		return nil, leaseRefusedError{holder: s.netBoxLeaseHolder(ctx)}
+	}
+	return &rekeyLease{s: s, renewAt: time.Now().Add(rekeyLeaseInterval)}, nil
+}
+
+// check re-proves the lease immediately before one more object is rewritten,
+// renewing it when the TTL is half gone.
+//
+// The renewal cannot paper over a steal: it goes through the same conditional
+// upsert, which writes nothing when a peer holds an unexpired lease, and the
+// read-back then reports the loss. Between renewals the check is the READ
+// alone, so a lease lost for any reason — a peer that took an expired row, a
+// hand-edited row, a clock that moved — stops the rewrite at the very next
+// object rather than at the next renewal.
+//
+// A local query per rewritten object is not a cost worth optimising: every one
+// of those objects is an HTTP round trip to NetBox.
+func (l *rekeyLease) check(ctx context.Context) error {
+	if time.Now().Before(l.renewAt) {
+		if l.s.holdsLeaderLease(ctx) {
+			return nil
+		}
+		return leaseLostError{holder: l.s.netBoxLeaseHolder(ctx)}
+	}
+	if !l.s.acquireNetBoxLease(ctx, rekeyLeaseInterval) {
+		return leaseLostError{holder: l.s.netBoxLeaseHolder(ctx)}
+	}
+	l.renewAt = time.Now().Add(rekeyLeaseInterval)
+	return nil
+}
+
+// netBoxLeaseHolder names the node the `netbox` lease row records, for an
+// operator-facing message and nothing else — never as a decision input, which
+// is holdsLeaderLease's job.
+//
+// An EXPIRED row names nobody: it records who led last, not who leads, and
+// putting that name in a refusal would send an operator to a node that has
+// nothing to do with it. Same for an absent or unreadable row.
+func (s *Server) netBoxLeaseHolder(ctx context.Context) string {
+	if s.db == nil {
+		return ""
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, netBoxLeaseKey)
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
+	if err != nil || !time.Now().UTC().Before(expiresAt) {
+		return ""
+	}
+	return rows[0].String("holder")
 }
 
 // rekeyBinding is the re-key itself: rewrite, then re-validate, then resume —
@@ -240,6 +381,15 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 		return counts, fmt.Errorf("derive cluster fingerprint: %w", err)
 	}
 
+	// The lease before ANY write, the suspend below included. A re-key that
+	// cannot prove it leads the cluster must leave the binding exactly as it
+	// found it — suspending a binding it is then not going to repair would take
+	// a network out of service for nothing.
+	lease, err := s.takeRekeyLease(ctx)
+	if err != nil {
+		return counts, err
+	}
+
 	// Suspend FIRST when the pin is already stale. Every claim stamps the LIVE
 	// fingerprint, so a binding left allocating during a partial rewrite would
 	// keep minting objects under a fingerprint its own pin does not cover. This
@@ -266,6 +416,11 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 			// run of this same re-key. The pin is what says which are ours.
 			continue
 		}
+		if err := lease.check(ctx); err != nil {
+			return counts, fmt.Errorf("re-key address %s (id %d) after %d rewrites; "+
+				"the binding stays suspended, re-run to finish: %w",
+				ip.Address, ip.ID, counts.addresses, err)
+		}
 		if err := s.netbox.SetIPIdentity(ctx, ip.ID, netbox.Identity(newFP, uuid, mac)); err != nil {
 			s.nbMetrics().IncAPIError(netbox.Classify(err))
 			return counts, fmt.Errorf("rewrite identity on address %s (id %d) after %d rewrites; "+
@@ -279,11 +434,22 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// order, and both BEFORE the resume below. See the ordering note on this
 	// function: a binding resumed over a half-rewritten inventory is live with
 	// objects it can no longer name.
-	if err := s.rekeyInventory(ctx, b.ClusterFingerprint, newFP, &counts); err != nil {
+	if err := s.rekeyInventory(ctx, lease, b.ClusterFingerprint, newFP, &counts); err != nil {
 		return counts, err
 	}
-	if err := s.rekeyObjectIndex(ctx, b.ClusterFingerprint, newFP, &counts); err != nil {
+	if err := s.rekeyObjectIndex(ctx, lease, b.ClusterFingerprint, newFP, &counts); err != nil {
 		return counts, err
+	}
+
+	// One last proof, before the tail below writes the binding row. Everything
+	// after this point is the RESUME, and resuming is the one step that makes a
+	// half-rewritten cluster live again — it may not rest on a lease this node
+	// stopped holding somewhere in the rewrite above. Returning here leaves the
+	// binding suspended and the operation re-runnable, which is the contract
+	// every error in this function already promises.
+	if err := lease.check(ctx); err != nil {
+		return counts, fmt.Errorf("re-validate before resuming the binding for prefix %d; "+
+			"it stays suspended, re-run to finish: %w", b.PrefixID, err)
 	}
 
 	// A re-key answers exactly ONE reason a binding suspends: the fingerprint
@@ -332,6 +498,14 @@ const (
 	rekeyRefKindVM  = "vm"
 	rekeyRefKindNIC = "nic"
 )
+
+// rekeyInventoryDetail is the audit detail every outcome of the cluster-scoped
+// re-key records — refusal, no-op, partial failure and success alike — so the
+// shape an operator greps for is written in one place rather than three.
+func rekeyInventoryDetail(pins, rows int, counts rekeyCounts) string {
+	return fmt.Sprintf("inventory pins=%d rows=%d vms=%d interfaces=%d refs=%d",
+		pins, rows, counts.vms, counts.interfaces, counts.refs)
+}
 
 // rekeyInventoryTarget is what the audit trail names for the cluster-scoped
 // form. Parenthesised because a network name never can be, so it can never be
@@ -388,8 +562,8 @@ func (s *Server) rekeyInventoryOnly(ctx context.Context) (*emptypb.Empty, error)
 		// there is nothing to derive a pin from — and reporting success would be
 		// worse than refusing: an operator whose index was lost while NetBox
 		// still holds stranded inventory would be told the re-key worked.
-		detail := "inventory pins=0 rows=0 vms=0 interfaces=0 refs=0"
-		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "error")
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget,
+			rekeyInventoryDetail(0, 0, rekeyCounts{}), "error")
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"the local identity index holds no rows, so nothing records the fingerprint this "+
 				"cluster's NetBox objects carry; re-stamping everything that is not the current "+
@@ -402,11 +576,23 @@ func (s *Server) rekeyInventoryOnly(ctx context.Context) (*emptypb.Empty, error)
 		// fingerprint. Nothing to rewrite, and — deliberately — no other rule to
 		// fall back on. This is also what makes a second run of a completed
 		// re-key a no-op.
-		detail := fmt.Sprintf("inventory pins=0 rows=%d vms=0 interfaces=0 refs=0", rows)
 		slog.Info("netbox re-key: every local index row already carries the live fingerprint",
 			"rows", rows, "fingerprint", newFP)
-		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "ok")
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget,
+			rekeyInventoryDetail(0, rows, rekeyCounts{}), "ok")
 		return &emptypb.Empty{}, nil
+	}
+
+	// The lease, and only now: neither answer above writes anything, and taking
+	// the lease to refuse or to no-op would lock the inventory mirror out of a
+	// sweep for nothing. Everything below this line rewrites.
+	lease, err := s.takeRekeyLease(ctx)
+	if err != nil {
+		// Audited like every other outcome, because an operator has to be able
+		// to see that the command ran and declined.
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget,
+			rekeyInventoryDetail(len(pins), rows, rekeyCounts{}), "error")
+		return nil, status.Errorf(rekeyCode(err), "re-key inventory: %v", err)
 	}
 
 	// One pass per stale fingerprint. More than one means a rotation was
@@ -417,22 +603,21 @@ func (s *Server) rekeyInventoryOnly(ctx context.Context) (*emptypb.Empty, error)
 	for _, oldFP := range pins {
 		// NetBox first, the local index second — the same order and the same
 		// reason as the per-network form. Leak over collision, every time.
-		if failed = s.rekeyInventory(ctx, oldFP, newFP, &counts); failed != nil {
+		if failed = s.rekeyInventory(ctx, lease, oldFP, newFP, &counts); failed != nil {
 			break
 		}
-		if failed = s.rekeyObjectIndex(ctx, oldFP, newFP, &counts); failed != nil {
+		if failed = s.rekeyObjectIndex(ctx, lease, oldFP, newFP, &counts); failed != nil {
 			break
 		}
 	}
 
-	detail := fmt.Sprintf("inventory pins=%d rows=%d vms=%d interfaces=%d refs=%d",
-		len(pins), rows, counts.vms, counts.interfaces, counts.refs)
+	detail := rekeyInventoryDetail(len(pins), rows, counts)
 	if failed != nil {
 		// Audited on BOTH outcomes, as the per-network form is: a re-key that
 		// failed partway has still rewritten objects, so "nothing happened" is
 		// the wrong thing for the audit trail to imply.
 		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "error")
-		return nil, status.Errorf(codes.Internal, "re-key inventory: %v", failed)
+		return nil, status.Errorf(rekeyCode(failed), "re-key inventory: %v", failed)
 	}
 	slog.Info("netbox inventory re-keyed", "pins", len(pins), "index_rows", rows,
 		"vms_rewritten", counts.vms, "interfaces_rewritten", counts.interfaces,
@@ -493,7 +678,7 @@ func (s *Server) inventoryPins(ctx context.Context, liveFP string) (pins []strin
 // share one NetBox and, mirroring under the same cluster name, one NetBox
 // cluster object — so this enumeration hands one cluster's re-key the OTHER
 // cluster's inventory, and only the fingerprint says which rows are ours.
-func (s *Server) rekeyInventory(ctx context.Context, oldFP, newFP string, counts *rekeyCounts) error {
+func (s *Server) rekeyInventory(ctx context.Context, lease *rekeyLease, oldFP, newFP string, counts *rekeyCounts) error {
 	if oldFP == newFP {
 		// Nothing to match. Without this a redundant re-key would PATCH every
 		// object in the cluster to the value it already holds.
@@ -533,6 +718,10 @@ func (s *Server) rekeyInventory(ctx context.Context, oldFP, newFP string, counts
 		// The VM form of an identity carries NO MAC. Rebuilding it with the one
 		// splitIdentity returned would work only because it is empty; passing ""
 		// says so.
+		if err := lease.check(ctx); err != nil {
+			return fmt.Errorf("re-key VM %d after %d addresses and %d VMs; the binding stays "+
+				"suspended, re-run to finish: %w", vm.ID, counts.addresses, counts.vms, err)
+		}
 		if err := s.netbox.SetVMIdentity(ctx, vm.ID, netbox.Identity(newFP, uuid, "")); err != nil {
 			s.nbMetrics().IncAPIError(netbox.Classify(err))
 			return fmt.Errorf("rewrite identity on VM %d after %d addresses and %d VMs; "+
@@ -552,6 +741,10 @@ func (s *Server) rekeyInventory(ctx context.Context, oldFP, newFP string, counts
 		cf, uuid, mac, ok := splitIdentity(i.Identity)
 		if !ok || cf != oldFP {
 			continue
+		}
+		if err := lease.check(ctx); err != nil {
+			return fmt.Errorf("re-key interface %d after %d VMs and %d interfaces; the binding "+
+				"stays suspended, re-run to finish: %w", i.ID, counts.vms, counts.interfaces, err)
 		}
 		if err := s.netbox.SetInterfaceIdentity(ctx, i.ID, netbox.Identity(newFP, uuid, mac)); err != nil {
 			s.nbMetrics().IncAPIError(netbox.Classify(err))
@@ -602,7 +795,7 @@ func (s *Server) netboxClusterID(ctx context.Context) (int, error) {
 // Both writes are the same replicated statements the mirror already uses — the
 // key is part of the primary key, so this is an insert and a tombstone, never an
 // update of it.
-func (s *Server) rekeyObjectIndex(ctx context.Context, oldFP, newFP string, counts *rekeyCounts) error {
+func (s *Server) rekeyObjectIndex(ctx context.Context, lease *rekeyLease, oldFP, newFP string, counts *rekeyCounts) error {
 	if oldFP == newFP {
 		return nil
 	}
@@ -620,6 +813,10 @@ func (s *Server) rekeyObjectIndex(ctx context.Context, oldFP, newFP string, coun
 				// interrupted by a second CA replacement, and guessing at it
 				// would orphan the object it names.
 				continue
+			}
+			if err := lease.check(ctx); err != nil {
+				return fmt.Errorf("re-key %s index row after %d rows; the binding stays "+
+					"suspended, re-run to finish: %w", kind, counts.refs, err)
 			}
 			next := ref
 			next.LitevirtKey = netbox.Identity(newFP, uuid, mac)

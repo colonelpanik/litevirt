@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -470,5 +471,160 @@ func TestResumeBindingRefusesADriftedCIDRAndKeepsThePin(t *testing.T) {
 	if after.ObservedCIDR != "10.0.9.0/24" {
 		t.Fatalf("ObservedCIDR = %q, want the pinned 10.0.9.0/24 — resume must never "+
 			"re-observe the prefix", after.ObservedCIDR)
+	}
+}
+
+// ── the re-key's leader lease ───────────────────────────────────────────────
+
+// leaseFingerprint is the stale fingerprint seedObjectRefs stamps the local
+// index with, so a cluster-scoped re-key has a pin to derive and real work to
+// do. Sixteen hex characters, the shape corrosion.ClusterFingerprint produces.
+const leaseFingerprint = "0000000000000000"
+
+// indexFingerprints groups every live netbox_objects row by the cluster
+// component of its key — the local half of "was anything rewritten".
+func indexFingerprints(t *testing.T, s *Server) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, kind := range []string{rekeyRefKindVM, rekeyRefKindNIC} {
+		refs, err := corrosion.ListObjectRefs(context.Background(), s.db, kind)
+		if err != nil {
+			t.Fatalf("ListObjectRefs(%s): %v", kind, err)
+		}
+		for _, r := range refs {
+			cf, _, _, ok := splitIdentity(r.LitevirtKey)
+			if !ok {
+				t.Fatalf("index key %q is not an identity string", r.LitevirtKey)
+			}
+			out[cf]++
+		}
+	}
+	return out
+}
+
+// TestRekeyRefusedWithoutTheLease is the fail-closed half of putting the re-key
+// under the `netbox` leader lease.
+//
+// The re-key rewrites the very objects the inventory mirror reconciles, so the
+// two may not run at once: BuildActual filters actual state on the LIVE
+// fingerprint, a not-yet-rewritten VM is therefore invisible to it, Diff emits a
+// create, and NetBox's cluster-scoped VM-name uniqueness refuses that create —
+// failing the whole sweep. A re-key that cannot prove it leads the cluster must
+// therefore rewrite NOTHING and say so.
+//
+// The binding assertion is the sharp one: the pin here is deliberately stale, so
+// a re-key that took the lease anywhere AFTER its own suspend-first step would
+// leave a network refusing allocations that this command is not going to repair.
+func TestRekeyRefusedWithoutTheLease(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	seedObjectRefs(t, s, leaseFingerprint)
+	// The CA is replaced under the binding's feet, so the pin is stale and the
+	// re-key has a reason to suspend before it rewrites.
+	if err := s.db.Execute(ctx, `UPDATE cluster SET ca_cert = ? WHERE id = 'default'`,
+		"a-different-ca-cert"); err != nil {
+		t.Fatalf("replace ca_cert: %v", err)
+	}
+	// A peer holds the lease, and it has not expired.
+	seedLease(t, s, "another-node", time.Now().Add(time.Hour))
+
+	_, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{Network: "bound"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition — a lease this node does not hold is an "+
+			"operator's retry, not an internal failure", err)
+	}
+	if !strings.Contains(err.Error(), "another-node") {
+		t.Fatalf("the refusal must name the holder, got %v", err)
+	}
+
+	if got := indexFingerprints(t, s); got[leaseFingerprint] != 2 {
+		t.Fatalf("local index rows by fingerprint = %v, want both still under %q — a refused "+
+			"re-key must rewrite nothing", got, leaseFingerprint)
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil || b == nil {
+		t.Fatalf("read binding: %v %v", b, err)
+	}
+	if b.Suspended {
+		t.Fatal("a re-key refused for want of the lease must leave the binding as it found it — " +
+			"the lease has to be taken before the suspend, not after")
+	}
+	if s.holdsLeaderLease(ctx) {
+		t.Fatal("a refused re-key must not have taken the lease")
+	}
+
+	// The other side: once the peer's lease has lapsed the SAME call goes
+	// through. Without this the test would also pass against a re-key that
+	// refused unconditionally.
+	seedLease(t, s, "another-node", time.Now().Add(-time.Minute))
+	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{Network: "bound"}); err != nil {
+		t.Fatalf("re-key with the lease free: %v", err)
+	}
+	if !s.holdsLeaderLease(ctx) {
+		t.Fatal("a completed re-key must hold the lease it rewrote under")
+	}
+}
+
+// TestRekeyInventoryOnlyTakesTheLeaseToo covers the CLUSTER-SCOPED form, which
+// is a separate entry point with its own writes.
+//
+// It is the form a mirror-only cluster runs, and it rewrites exactly the objects
+// the mirror reconciles — no addresses, no binding, nothing else. A lease taken
+// in the per-network path alone would leave the only re-key such a cluster HAS
+// racing the sweep it exists to keep working.
+func TestRekeyInventoryOnlyTakesTheLeaseToo(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	seedObjectRefs(t, s, leaseFingerprint)
+	seedLease(t, s, "another-node", time.Now().Add(time.Hour))
+
+	_, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "another-node") {
+		t.Fatalf("the refusal must name the holder, got %v", err)
+	}
+	if got := indexFingerprints(t, s); got[leaseFingerprint] != 2 {
+		t.Fatalf("local index rows by fingerprint = %v, want both still under %q", got, leaseFingerprint)
+	}
+	if s.holdsLeaderLease(ctx) {
+		t.Fatal("a refused inventory re-key must not have taken the lease")
+	}
+	// Audited, like every other outcome of this command: an operator has to be
+	// able to see that it ran and declined.
+	rows, err := s.db.Query(ctx,
+		`SELECT result FROM audit_log WHERE action = 'netbox.rekey'`)
+	if err != nil {
+		t.Fatalf("read the audit log: %v", err)
+	}
+	if len(rows) != 1 || rows[0].String("result") != "error" {
+		t.Fatalf("want one netbox.rekey audit row recording the refusal, got %d rows", len(rows))
+	}
+
+	// Once the peer's lease has lapsed the same call completes, and this node
+	// ends up holding the lease it rewrote under.
+	seedLease(t, s, "another-node", time.Now().Add(-time.Minute))
+	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{}); err != nil {
+		t.Fatalf("inventory re-key with the lease free: %v", err)
+	}
+	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+	if err != nil {
+		t.Fatalf("ClusterFingerprint: %v", err)
+	}
+	if got := indexFingerprints(t, s); got[fp] != 2 || got[leaseFingerprint] != 0 {
+		t.Fatalf("local index rows by fingerprint = %v, want both under the live %q", got, fp)
+	}
+	if !s.holdsLeaderLease(ctx) {
+		t.Fatal("a completed inventory re-key must hold the lease it rewrote under")
 	}
 }

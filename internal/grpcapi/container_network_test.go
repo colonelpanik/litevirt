@@ -149,10 +149,19 @@ func TestDeleteContainer_ReleasesThroughTheOldLeaseShape(t *testing.T) {
 	// ReleaseContainerLeases: bulk, owner-scoped, a shape the previous release
 	// already accepts. Errorf, not Fatalf, so one wrong wiring reports against
 	// both halves of the rule rather than only the first.
-	if !strings.Contains(wal, "owner_kind = 'ct' AND owner_host = ?") {
+	//
+	// THE WHOLE STATEMENT, not the WHERE clause on its own.
+	// TransferContainerLeases keys on the identical `owner_kind = 'ct' AND
+	// owner_host = ? AND vm_name = ? AND deleted_at IS NULL`, so a fragment
+	// assertion is satisfied by a migrate's re-home as readily as by a delete's
+	// tombstone — and would go on passing if the cascade stopped tombstoning at
+	// all. `SET deleted_at` is what makes this statement a release.
+	const releaseShape = "UPDATE ip_allocations SET deleted_at = ?, updated_at = ? " +
+		"WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL"
+	if !strings.Contains(wal, releaseShape) {
 		t.Errorf("the container delete cascade must tombstone leases through the bulk "+
-			"owner-scoped shape the previous release accepts; the ip_allocations statements it "+
-			"replicated were:\n%s", wal)
+			"owner-scoped shape the previous release accepts (%s); the ip_allocations statements "+
+			"it replicated were:\n%s", releaseShape, wal)
 	}
 	// ReleaseLease: PK-keyed, and NEW at this release.
 	if strings.Contains(wal, "AND ip = ? AND mac = ?") {
@@ -164,9 +173,13 @@ func TestDeleteContainer_ReleasesThroughTheOldLeaseShape(t *testing.T) {
 }
 
 // replicatedStatementsFor is every statement this server logged for replication
-// that names table, with the WAL's JSON escaping undone so an assertion can read
-// like the SQL does. Scoped to one table so a failure names the writes in
-// question instead of the whole log.
+// that names table, with the WAL's JSON escaping undone and every run of
+// whitespace collapsed to one space, so an assertion can name a WHOLE statement
+// on one line however the builder wrapped it. Scoped to one table so a failure
+// names the writes in question instead of the whole log.
+//
+// Whole statements are the point: several ip_allocations builders share a WHERE
+// clause, so a fragment cannot tell a tombstone from a re-home.
 func replicatedStatementsFor(t *testing.T, s *Server, table string) string {
 	t.Helper()
 	rows, err := s.db.Query(context.Background(), `SELECT stmts FROM mutation_log ORDER BY seq`)
@@ -175,7 +188,10 @@ func replicatedStatementsFor(t *testing.T, s *Server, table string) string {
 	}
 	var matched []string
 	for _, r := range rows {
-		stmts := strings.ReplaceAll(r.String("stmts"), `\n`, "\n")
+		stmts := r.String("stmts")
+		stmts = strings.ReplaceAll(stmts, `\n`, " ")
+		stmts = strings.ReplaceAll(stmts, `\t`, " ")
+		stmts = strings.Join(strings.Fields(stmts), " ")
 		if strings.Contains(stmts, table) {
 			matched = append(matched, stmts)
 		}

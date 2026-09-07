@@ -17,6 +17,8 @@ package fleet
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -282,5 +284,85 @@ func seedOldMirrorQueueItems(t *testing.T, n *Node, count int) {
 		`UPDATE netbox_sync_queue SET created_at = '2000-01-01T00:00:00Z' WHERE kind = ?`,
 		netboxsync.QueueKind); err != nil {
 		t.Fatalf("backdate mirror queue items on %s: %v", n.Name, err)
+	}
+}
+
+// TestMirrorNICNameCollisionIsSuffixed drives netboxsync's interface-name collision
+// suffix against a NetBox that enforces the constraint the suffix exists for.
+//
+// NetBox requires an interface name to be unique WITHIN a virtual machine, and
+// the mirror derives that name POSITIONALLY — "eth" + the NIC's ordinal. Two
+// NICs of one VM can genuinely share an ordinal: the legacy `vm_interfaces`
+// table is keyed by (vm_name, network_name) and its `ordinal` column defaults
+// to 0, so a row written by a peer that never set one — an older build, a
+// restore, any writer that filled the record positionally for a single NIC —
+// lands on ordinal 0 next to the NIC CreateVM already wrote there. Both derive
+// "eth0", and the second POST is a 400 that aborts the whole sweep, leaving
+// every later phase — deletes included — unrun.
+//
+// The fixture is that exact shape: one NIC through CreateVM, and a second
+// legacy row on another network with the SAME ordinal and a distinct MAC. The
+// two assertions are separate properties. DISTINCT names prove the suffix ran;
+// a converged second sweep proves the suffixed name is also STABLE — a suffix
+// derived from anything per-sweep would satisfy the first check and then PATCH
+// the interface on every pass forever.
+func TestMirrorNICNameCollisionIsSuffixed(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	// The colliding NIC: ordinal 0, same as the one CreateVM wrote.
+	insertLegacyNIC(t, n, "vm-1", "second-net", 0, "52:54:00:cc:dd:ee")
+
+	if nics, err := corrosion.MergedVMNICs(context.Background(), n.DB, "vm-1"); err != nil {
+		t.Fatalf("MergedVMNICs: %v", err)
+	} else if len(nics) != 2 {
+		t.Fatalf("precondition: the VM must carry 2 NICs for the names to collide, got %d", len(nics))
+	}
+
+	mustSyncAllNodes(t, c)
+
+	names := nb.InterfaceNames()
+	if len(names) != 2 {
+		t.Fatalf("both NICs must be mirrored, NetBox holds %d interfaces %v "+
+			"(a 400 on the second create aborts the sweep)", len(names), names)
+	}
+	if names[0] == names[1] {
+		t.Fatalf("two interfaces of one VM share the name %q — "+
+			"NetBox does not allow that and neither may the mirror", names[0])
+	}
+	// Both must still be the ordinal-0 name plus a suffix, not two arbitrary
+	// strings: a derivation that renamed one NIC to "eth1" would be unique and
+	// WRONG, since nothing in the guest ever called it that.
+	for _, name := range names {
+		if !strings.HasPrefix(name, "eth0") {
+			t.Fatalf("interface named %q, want the ordinal-0 name with a collision suffix; got %v",
+				name, names)
+		}
+	}
+
+	before := nb.PatchCount()
+	mustSyncAllNodes(t, c)
+	if got := nb.PatchCount() - before; got != 0 {
+		t.Fatalf("a second sweep over the same colliding NICs issued %d PATCHes, want 0 — "+
+			"the collision suffix is not stable across sweeps", got)
+	}
+	if names2 := nb.InterfaceNames(); !reflect.DeepEqual(names2, names) {
+		t.Fatalf("the second sweep changed the interface names: %v -> %v", names, names2)
+	}
+}
+
+// insertLegacyNIC writes one `vm_interfaces` row directly — the pre-v42 shape a
+// peer that knows nothing of `vm_nics` still writes, and the only way to
+// produce a duplicate ordinal, which no RPC on the create path will do.
+func insertLegacyNIC(t *testing.T, n *Node, vmName, network string, ordinal int, mac string) {
+	t.Helper()
+	if err := corrosion.InsertInterface(context.Background(), n.DB, corrosion.InterfaceRecord{
+		VMName:      vmName,
+		NetworkName: network,
+		Ordinal:     ordinal,
+		MAC:         mac,
+	}); err != nil {
+		t.Fatalf("insert legacy NIC row for %s: %v", vmName, err)
 	}
 }

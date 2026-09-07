@@ -17,6 +17,13 @@
 //     those interfaces held are UNASSIGNED rather than deleted. That is what
 //     makes a VM delete a single request instead of a cascade the mirror has to
 //     drive itself.
+//   - The two UNIQUENESS constraints are enforced: a VM name is unique within
+//     its cluster, and an interface name is unique within its virtual machine.
+//     Both are 400s, and both are constraints the mirror has code to avoid —
+//     nicName's collision suffix exists for exactly the second one. A fake that
+//     accepted duplicates would let that code be deleted with every fleet
+//     scenario still green, and the sweep would abort on a 400 the first time a
+//     real VM carried two NICs on the same ordinal.
 
 package fleet
 
@@ -195,8 +202,15 @@ func (f *NetBoxFake) createVM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
-	vm := &fakeVM{ID: f.nextVMID()}
+	// Built WITHOUT an id first, so a rejected create does not consume one.
+	vm := &fakeVM{}
 	applyVMBody(vm, body)
+	if f.vmNameTakenLocked(vm.Name, vm.ClusterID, 0) {
+		f.mu.Unlock()
+		writeValidationErr(w, "name", vmNameClashMsg)
+		return
+	}
+	vm.ID = f.nextVMID()
 	f.vms[vm.ID] = vm
 	out := vmJSONOf(*vm)
 	f.mu.Unlock()
@@ -215,13 +229,24 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		f.mu.Lock()
 		vm, known := f.vms[id]
 		var out vmView
+		var clash bool
 		if known {
-			applyVMBody(vm, body)
-			out = vmJSONOf(*vm)
+			// Applied to a COPY: a PATCH that would violate the constraint must
+			// leave the stored object untouched, exactly as a rejected write does.
+			next := *vm
+			applyVMBody(&next, body)
+			if clash = f.vmNameTakenLocked(next.Name, next.ClusterID, id); !clash {
+				*vm = next
+				out = vmJSONOf(*vm)
+			}
 		}
 		f.mu.Unlock()
 		if !known {
 			writeErr(w, http.StatusNotFound, "no virtual-machine %d", id)
+			return
+		}
+		if clash {
+			writeValidationErr(w, "name", vmNameClashMsg)
 			return
 		}
 		writeJSON(w, out)
@@ -410,8 +435,14 @@ func (f *NetBoxFake) createIface(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, `{"virtual_machine":["Invalid pk %d - object does not exist."]}`, *body.VirtualMachine)
 		return
 	}
-	iface := &fakeIface{ID: f.nextIfaceID()}
+	iface := &fakeIface{}
 	applyIfaceBody(iface, body)
+	if f.ifaceNameTakenLocked(iface.VMID, iface.Name, 0) {
+		f.mu.Unlock()
+		writeValidationErr(w, "non_field_errors", ifaceNameClashMsg)
+		return
+	}
+	iface.ID = f.nextIfaceID()
 	f.ifaces[iface.ID] = iface
 	out := ifaceJSONOf(*iface)
 	f.mu.Unlock()
@@ -430,13 +461,24 @@ func (f *NetBoxFake) ifaceObject(w http.ResponseWriter, r *http.Request, id int)
 		f.mu.Lock()
 		iface, known := f.ifaces[id]
 		var out ifaceView
+		var clash bool
 		if known {
-			applyIfaceBody(iface, body)
-			out = ifaceJSONOf(*iface)
+			next := *iface
+			applyIfaceBody(&next, body)
+			// UpdateInterface never sends virtual_machine, so the parent that
+			// scopes the constraint is the STORED one — which the copy carries.
+			if clash = f.ifaceNameTakenLocked(next.VMID, next.Name, id); !clash {
+				*iface = next
+				out = ifaceJSONOf(*iface)
+			}
 		}
 		f.mu.Unlock()
 		if !known {
 			writeErr(w, http.StatusNotFound, "no interface %d", id)
+			return
+		}
+		if clash {
+			writeValidationErr(w, "non_field_errors", ifaceNameClashMsg)
 			return
 		}
 		writeJSON(w, out)
@@ -504,6 +546,40 @@ func applyIfaceBody(iface *fakeIface, b ifaceBody) {
 	}
 }
 
+// ── uniqueness, as NetBox enforces it ───────────────────────────────────────
+
+// The two messages NetBox itself returns. VirtualMachine.clean() raises a
+// field-scoped error on `name`; VMInterface's (virtual_machine, name)
+// unique_together surfaces through DRF as a non_field_errors entry.
+const (
+	vmNameClashMsg    = "A virtual machine with this name already exists in this cluster."
+	ifaceNameClashMsg = "The fields virtual_machine, name must make a unique set."
+)
+
+// vmNameTakenLocked reports whether some OTHER virtual machine in clusterID
+// already carries name. exclude is the id being written, so a PATCH that leaves
+// the name alone does not collide with itself. Caller holds f.mu.
+func (f *NetBoxFake) vmNameTakenLocked(name string, clusterID, exclude int) bool {
+	for id, vm := range f.vms {
+		if id != exclude && vm.Name == name && vm.ClusterID == clusterID {
+			return true
+		}
+	}
+	return false
+}
+
+// ifaceNameTakenLocked is the same predicate for an interface name within one
+// virtual machine — the constraint netboxsync's nicName suffix exists to dodge.
+// Caller holds f.mu.
+func (f *NetBoxFake) ifaceNameTakenLocked(vmID int, name string, exclude int) bool {
+	for id, iface := range f.ifaces {
+		if id != exclude && iface.VMID == vmID && iface.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // unassignFromLocked detaches every address pointing at ifaceID. Caller holds
 // f.mu.
 func (f *NetBoxFake) unassignFromLocked(ifaceID int) {
@@ -543,6 +619,23 @@ func (f *NetBoxFake) InterfaceCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.ifaces)
+}
+
+// InterfaceNames returns every interface's name, sorted.
+//
+// The names, not just the count: NetBox rejects two interfaces sharing a name
+// on one VM, so a scenario that only counted objects could not tell "both were
+// created under distinct names" from "the second create was refused and the
+// sweep swallowed it".
+func (f *NetBoxFake) InterfaceNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for _, iface := range f.ifaces {
+		out = append(out, iface.Name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // InterfaceMACs returns every interface's MAC as NetBox holds it, sorted.

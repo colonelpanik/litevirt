@@ -407,16 +407,35 @@ func (s *Server) acquireNetBoxLease(ctx context.Context, interval time.Duration)
 // holdsLeaderLease is the read-back alone — no write, no renewal — so it can be
 // called immediately before each destructive step without extending a lease
 // this node may have already lost. A read failure reads as "not ours".
+//
+// BOTH halves of the lease are checked. The holder alone catches a lease that
+// was STOLEN — a peer wrote its own name — but not one that merely EXPIRED,
+// and expiry is the case this is named for: nothing obliges a peer to write the
+// moment our TTL runs out, so a holder-only predicate keeps returning true for
+// a lease no other node would honour, and the sweeper's destructive steps go on
+// resting on it. expires_at is parsed exactly as acquireNetBoxLease formats it
+// (RFC3339, UTC).
+//
+// Fail-closed at every branch: no row, an unreadable row, a missing or
+// unparseable expires_at, and an expiry already in the past all read as "not
+// ours". A lease we cannot prove we hold is one we do not hold.
 func (s *Server) holdsLeaderLease(ctx context.Context) bool {
 	if s.db == nil {
 		return false
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT holder FROM leader_election WHERE key = ?`, netBoxLeaseKey)
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, netBoxLeaseKey)
 	if err != nil || len(rows) == 0 {
 		return false
 	}
-	return rows[0].String("holder") == s.hostName
+	if rows[0].String("holder") != s.hostName {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
+	if err != nil {
+		return false
+	}
+	return time.Now().UTC().Before(expiresAt)
 }
 
 // ── the proof fan-out ───────────────────────────────────────────────────────

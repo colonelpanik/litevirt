@@ -380,3 +380,128 @@ func TestOrphanCheckGivesUpAfterTenAttempts(t *testing.T) {
 		t.Fatalf("giving up must delete nothing, deleted %v", got)
 	}
 }
+
+// ── the leader lease ────────────────────────────────────────────────────────
+
+// leaseServer is a Server with an initialised schema and nothing else — the
+// lease predicate reads one table and needs no NetBox, no cluster row and no
+// fingerprint.
+func leaseServer(t *testing.T) *Server {
+	t.Helper()
+	db, err := corrosion.NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := corrosion.InitSchema(context.Background(), db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	return &Server{db: db, hostName: "lease-host"}
+}
+
+// seedLease writes the `netbox` leader_election row verbatim, so a test can
+// place an expiry the acquire path would never produce.
+func seedLease(t *testing.T, s *Server, holder string, expires time.Time) {
+	t.Helper()
+	if err := s.db.Execute(context.Background(),
+		`INSERT OR REPLACE INTO leader_election (key, holder, expires_at, updated_at)
+		 VALUES (?, ?, ?, ?)`,
+		netBoxLeaseKey, holder,
+		expires.UTC().Format(time.RFC3339), s.db.NowTS()); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+}
+
+// TestHoldsLeaderLeaseFalseWhenExpired is the reason this predicate reads
+// expires_at at all.
+//
+// A lease is not ours because our name is still in the row — it is ours until
+// the TTL runs out. Nothing obliges a peer to overwrite the row the instant we
+// expire (it may be busy, unreachable, or simply not yet at its tick), so the
+// stale row keeps naming us for as long as no one else writes. A holder-only
+// predicate reads that as "still leader" forever, and the sweeper's per-batch
+// re-validation — and the five-step orphan proof's re-check before a
+// destructive delete — go on resting on a lease no other node would honour.
+func TestHoldsLeaderLeaseFalseWhenExpired(t *testing.T) {
+	s := leaseServer(t)
+	seedLease(t, s, s.hostName, time.Now().Add(-time.Minute))
+
+	if s.holdsLeaderLease(context.Background()) {
+		t.Fatal("an EXPIRED lease still naming this host must not read as held — " +
+			"the holder is checked but the TTL is not")
+	}
+}
+
+// TestHoldsLeaderLeaseTrueWhenHeldAndFresh is the other side: the expiry check
+// must not make the predicate say no to a lease this node genuinely holds, or
+// every sweep would abort at its first batch boundary.
+func TestHoldsLeaderLeaseTrueWhenHeldAndFresh(t *testing.T) {
+	s := leaseServer(t)
+	seedLease(t, s, s.hostName, time.Now().Add(2*time.Minute))
+
+	if !s.holdsLeaderLease(context.Background()) {
+		t.Fatal("a lease held by this host with a future expiry must read as held")
+	}
+}
+
+// TestHoldsLeaderLeaseFailsClosed pins the fail-closed branches. Each is a
+// state a real cluster can produce — a peer took the lease, the row is absent
+// before any node has acquired, a mixed-version or hand-edited row carries an
+// empty or malformed expires_at — and every one of them must read as "not
+// ours", because a lease we cannot PROVE we hold is one we do not hold.
+func TestHoldsLeaderLeaseFailsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no row at all", func(t *testing.T) {
+		s := leaseServer(t)
+		if s.holdsLeaderLease(ctx) {
+			t.Fatal("an absent lease row must not read as held")
+		}
+	})
+
+	t.Run("held by a peer", func(t *testing.T) {
+		s := leaseServer(t)
+		seedLease(t, s, "other-host", time.Now().Add(2*time.Minute))
+		if s.holdsLeaderLease(ctx) {
+			t.Fatal("a lease held by a peer must not read as held")
+		}
+	})
+
+	t.Run("unparseable expiry", func(t *testing.T) {
+		s := leaseServer(t)
+		seedLease(t, s, s.hostName, time.Now().Add(2*time.Minute))
+		if err := s.db.Execute(ctx,
+			`UPDATE leader_election SET expires_at = 'not-a-timestamp' WHERE key = ?`,
+			netBoxLeaseKey); err != nil {
+			t.Fatalf("corrupt expiry: %v", err)
+		}
+		if s.holdsLeaderLease(ctx) {
+			t.Fatal("an unparseable expires_at must not read as held")
+		}
+	})
+
+	t.Run("empty expiry", func(t *testing.T) {
+		s := leaseServer(t)
+		seedLease(t, s, s.hostName, time.Now().Add(2*time.Minute))
+		if err := s.db.Execute(ctx,
+			`UPDATE leader_election SET expires_at = '' WHERE key = ?`,
+			netBoxLeaseKey); err != nil {
+			t.Fatalf("blank expiry: %v", err)
+		}
+		if s.holdsLeaderLease(ctx) {
+			t.Fatal("a missing expires_at must not read as held")
+		}
+	})
+}
+
+// TestAcquireNetBoxLeaseStillSucceeds guards the interaction between the new
+// predicate and the acquire path: acquireNetBoxLease returns holdsLeaderLease,
+// so an expiry format the writer produces and the reader cannot parse would
+// make the sweeper unable to ever take its own lease.
+func TestAcquireNetBoxLeaseStillSucceeds(t *testing.T) {
+	s := leaseServer(t)
+	if !s.acquireNetBoxLease(context.Background(), time.Minute) {
+		t.Fatal("a node acquiring an unheld lease must read it back as held — " +
+			"the acquire path's expires_at format and the read-back's parse disagree")
+	}
+}

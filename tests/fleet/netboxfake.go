@@ -978,3 +978,15 @@ func writeErr(w http.ResponseWriter, code int, format string, args ...any) {
 	w.WriteHeader(code)
 	_, _ = fmt.Fprintf(w, `{"detail":%q}`, fmt.Sprintf(format, args...))
 }
+
+// writeValidationErr is the OTHER error shape NetBox produces: a 400 whose body
+// maps a field name to a list of messages, which is what DRF returns when a
+// write violates a model constraint. writeErr's {"detail": …} is the routing
+// and method shape and never carries a field, so a fake that reported a
+// rejected write through it would be teaching the client the wrong thing to
+// parse.
+func writeValidationErr(w http.ResponseWriter, field, msg string) {
+	w.WriteHeader(http.StatusBadRequest)
+	body, _ := json.Marshal(map[string][]string{field: {msg}})
+	_, _ = w.Write(body)
+}

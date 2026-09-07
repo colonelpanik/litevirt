@@ -331,3 +331,62 @@ func breakSyncQueue(t *testing.T, n *Node) {
 		t.Fatalf("drop netbox_sync_queue on %s: %v", n.Name, err)
 	}
 }
+
+// TestCutoverQueuesTheSurvivingName pins WHICH name a cutover hands the mirror.
+//
+// A cutover promotes the `-next` twin onto the original name, so the moment the
+// rename lands, nothing answers to the `-next` name any more. Queueing it would
+// name a VM that does not exist — one replicated write, per cutover, saying
+// nothing an operator reading the table could act on.
+//
+// One row is also SUFFICIENT. The queue is a trigger, not a work list: the sweep
+// it wakes reconciles the whole cluster, and the replaced incarnation and the
+// promoted one carry distinct identities, so the same pass retires one object
+// and mirrors the other whichever name woke it.
+//
+// The fixture has no VM under the original name, which is the case the cutover
+// path completes: with a replaced row present the rename collides with its own
+// tombstone on the `vms.name` unique constraint and the RPC returns before it
+// reaches any enqueue at all — a pre-existing cutover defect, noted on
+// TestCutoverReleasesTheReplacedVMsLease and out of scope here.
+func TestCutoverQueuesTheSurvivingName(t *testing.T) {
+	_, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "app-next", orphanNetwork)
+	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 0 {
+		t.Fatalf("precondition: %d mirror items queued before the cutover, want 0", got)
+	}
+
+	if _, err := c.SelfClient(n).CutoverVM(context.Background(),
+		&pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("CutoverVM: %v", err)
+	}
+
+	keys := queuedKeys(t, n, netboxsync.QueueKind)
+	if len(keys) != 1 {
+		t.Fatalf("a cutover queued %d mirror items %v, want exactly 1 — the sweep one item "+
+			"triggers already covers both incarnations", len(keys), keys)
+	}
+	if keys[0] != "app" {
+		t.Fatalf("the cutover queued %q; only the SURVIVING name means anything after the "+
+			"rename — nothing answers to %q any more", keys[0], "app-next")
+	}
+	if vm, err := corrosion.GetVM(context.Background(), n.DB, "app"); err != nil || vm == nil {
+		t.Fatalf("the cutover must leave a VM under the surviving name: vm=%v err=%v", vm, err)
+	}
+}
+
+// queuedKeys is the un-acked keys of one queue kind, oldest first.
+func queuedKeys(t *testing.T, n *Node, kind string) []string {
+	t.Helper()
+	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, kind, 200)
+	if err != nil {
+		t.Fatalf("DrainSyncQueue on %s: %v", n.Name, err)
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.Key)
+	}
+	return out
+}

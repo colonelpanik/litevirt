@@ -2765,11 +2765,13 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if err := corrosion.RenameVM(ctx, s.db, nextName, req.VmName); err != nil {
 		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
 	}
-	// BOTH names go to the mirror. The replaced VM was tombstoned above and its
-	// object has to go; the surviving one now carries a name NetBox has never
-	// seen. They are separate incarnations with separate identities, so naming
-	// only one leaves the other stale until the next full sweep.
-	s.enqueueMirrorSync(ctx, nextName, mirrorOpUpsert)
+	// The SURVIVING name, once. A cutover leaves NetBox two things to do — retire
+	// the replaced incarnation's object and mirror the promoted one — but the
+	// queue names a trigger, not a work item: the sweep it wakes resolves both,
+	// because the two incarnations carry distinct identities and the diff sees
+	// one desired and one no longer desired. Naming `nextName` as well would
+	// enqueue a name that answers to nothing — the rename above just moved it —
+	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
 	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here

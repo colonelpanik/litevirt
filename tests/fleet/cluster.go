@@ -484,9 +484,12 @@ func (c *Cluster) buildServer(n *Node) {
 	n.netboxMaintenance = n.Server.StartNetBoxMaintenance(c.ctx, 0)
 	// The inventory mirror, started exactly as the daemon starts it and on every
 	// node, so a scenario exercises the server's own "is this node configured"
-	// guard rather than a harness branch. Same production default interval:
-	// nothing ticks under a test, and scenarios drive a pass explicitly through
-	// SyncNetBoxMirror.
+	// guard rather than a harness branch. Same production default cadences, and
+	// scenarios drive a pass explicitly through SyncNetBoxMirror. The 15-minute
+	// sweep tick cannot fire under a test; the mirror's faster QUEUE POLL can, at
+	// one minute — two orders of magnitude beyond the slowest scenario here, but
+	// the reason a scenario that both queues work and counts NetBox writes must
+	// not be made to run for minutes.
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify

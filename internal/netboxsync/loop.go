@@ -35,6 +35,17 @@ const queueBatch = 100
 // sized for one cadence must not be handed away between the other's passes.
 const defaultInterval = 15 * time.Minute
 
+// defaultPollInterval is how often the node that ALREADY holds the lease looks
+// for queued work between sweeps.
+//
+// It is not a second sweep cadence: a poll is one local read, and it reaches the
+// sweep only when the queue is non-empty, so an idle cluster pays one SELECT per
+// node per minute and writes nothing. What it buys is latency — without it a
+// delete waits out a whole defaultInterval before NetBox stops advertising a VM
+// that no longer exists, and every enqueue a lifecycle path makes is a
+// replicated write that changes nothing.
+const defaultPollInterval = 60 * time.Second
+
 // clusterTypeName is the NetBox cluster-type every litevirt cluster registers
 // under. A constant, not a config key: it names the SOFTWARE, so an operator
 // choosing it per-cluster would fragment the type list for no gain.
@@ -58,6 +69,11 @@ type Options struct {
 	Metrics mirrorMetrics
 	// Interval is the sweep cadence; <= 0 means defaultInterval.
 	Interval time.Duration
+	// PollInterval is how often the node holding the lease checks the queue
+	// between sweeps; <= 0 means defaultPollInterval. Anything LARGER than
+	// Interval is clamped to it — a poll slower than the sweep it exists to
+	// anticipate would never be the thing that noticed a change.
+	PollInterval time.Duration
 	// AcquireLease and HoldsLease gate the sweep on the cluster's `netbox`
 	// leader lease. Leaving either nil makes this reconciler write NOTHING —
 	// the fail-closed direction, so an incomplete wiring is inert rather than
@@ -72,11 +88,19 @@ func New(o Options) *Reconciler {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
+	poll := o.PollInterval
+	if poll <= 0 {
+		poll = defaultPollInterval
+	}
+	if poll > interval {
+		poll = interval
+	}
 	return &Reconciler{
 		nb:           o.NetBox,
 		db:           o.DB,
 		metrics:      o.Metrics,
 		interval:     interval,
+		pollInterval: poll,
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
 	}
@@ -84,23 +108,84 @@ func New(o Options) *Reconciler {
 
 // Run drives the reconciler until ctx ends.
 //
+// TWO cadences, and only one of them can change who leads. The sweep tick is the
+// authority — it acquires the lease and reconciles everything, queue or no queue
+// — and the poll tick only accelerates the node ALREADY holding that lease. So
+// leadership handover happens at exactly the cadence it did before the poll
+// existed, and a queue that is empty, lost or unreadable costs the mirror
+// nothing but latency.
+//
 // There is deliberately no pass at startup, matching the orphan sweeper: the
 // first pass lands one interval in, so a node that has just restarted — or a
 // cluster mid-rolling-upgrade — is not writing inventory while its own view of
-// the fleet is still assembling.
+// the fleet is still assembling. The poll cannot pull that forward either: it
+// takes no lease, so before the first sweep tick there is none to hold.
 func (r *Reconciler) Run(ctx context.Context) {
-	t := time.NewTicker(r.interval)
-	defer t.Stop()
+	sweep := time.NewTicker(r.interval)
+	defer sweep.Stop()
+	poll := time.NewTicker(r.pollInterval)
+	defer poll.Stop()
+	r.run(ctx, sweep.C, poll.C)
+}
+
+// run is Run over its two tick sources.
+//
+// Split out so a test can fire exactly ONE tick of either kind and know when it
+// has been processed, instead of sleeping on a real minute. Driving the loop
+// itself matters: calling pollQueue directly would leave the wiring — which tick
+// runs which pass — asserted by nothing.
+func (r *Reconciler) run(ctx context.Context, sweepTick, pollTick <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-sweepTick:
 			if err := r.SyncOnce(ctx); err != nil {
 				slog.Warn("netbox mirror: sync failed", "error", err)
 			}
+		case <-pollTick:
+			if err := r.pollQueue(ctx); err != nil {
+				slog.Warn("netbox mirror: queued sync failed", "error", err)
+			}
 		}
 	}
+}
+
+// pollQueue sweeps early IF this node leads and something is waiting.
+//
+// The order of the three questions is the whole design, and each one stops the
+// pass:
+//
+//  1. Do we hold the lease? A READ (holdsLeader), never an acquire. A non-leader
+//     has to reach the end of this having written NOTHING — not a lease renewal,
+//     not a queue ack — or every configured node would be contending for
+//     leadership on the fast cadence instead of the sweep's.
+//  2. Is anything queued? A peek, not a drain: corrosion.DrainSyncQueue is a
+//     plain SELECT and acking is a separate call, so this observes the queue
+//     without consuming it. Nothing is acked here — Sync does that, and only
+//     once its sweep has succeeded.
+//  3. Only then, the full sweep — Sync, NOT SyncOnce. The lease is already held;
+//     re-acquiring it on every poll is precisely the replicated-write
+//     amplification this path exists to avoid.
+//
+// A queue this node cannot read is not an error: the sweep tick covers
+// everything the queue could have named, so a failed peek is logged and the poll
+// simply does nothing this minute.
+func (r *Reconciler) pollQueue(ctx context.Context) error {
+	if !r.holdsLeader(ctx) {
+		return nil
+	}
+	// Limit 1: the poll only needs to know whether the queue is EMPTY. Sync
+	// re-reads it in full to decide what to ack.
+	items, err := corrosion.DrainSyncQueue(ctx, r.db, QueueKind, 1)
+	if err != nil {
+		slog.Warn("netbox mirror: queue poll failed; the next full sweep still covers it", "error", err)
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return r.Sync(ctx)
 }
 
 // SyncOnce is ONE leader-gated pass.
@@ -133,13 +218,27 @@ func (r *Reconciler) holdsLeader(ctx context.Context) bool {
 
 // Sync reconciles litevirt state into NetBox.
 //
-// The queue drain is a latency optimisation; the full diff below runs
-// regardless of what the queue held, because a node that died mid-create never
-// enqueued anything and a peer that drained an item may have died before acting
-// on it. Nothing in this function branches on what the drain returned.
+// The queue is a latency optimisation; the full diff below runs regardless of
+// what the queue held, because a node that died mid-create never enqueued
+// anything and a peer that drained an item may have died before acting on it.
+// Nothing in the sweep branches on what the peek returned.
+//
+// Read first, ack LAST. The items are only tombstoned once the sweep they were
+// read before has succeeded, so a sweep that fails partway leaves its triggers
+// in place and the next poll retries immediately. Acking first would throw the
+// trigger away on exactly the passes that did not do the work, and the change
+// would then wait out a full sweep interval.
 func (r *Reconciler) Sync(ctx context.Context) error {
-	r.drainQueue(ctx)
+	queued := r.peekQueue(ctx)
+	if err := r.sweep(ctx); err != nil {
+		return err
+	}
+	r.ackQueued(ctx, queued)
+	return nil
+}
 
+// sweep is the reconciliation itself: read both sides, diff, apply in phases.
+func (r *Reconciler) sweep(ctx context.Context) error {
 	fp, err := corrosion.ClusterFingerprint(ctx, r.db)
 	if err != nil {
 		return fmt.Errorf("cluster fingerprint: %w", err)
@@ -164,19 +263,32 @@ func (r *Reconciler) Sync(ctx context.Context) error {
 	return r.applyPhases(ctx, Diff(desired, actual, fp), indexDesired(desired, fp), fp)
 }
 
-// drainQueue acks this mirror's own queued items.
+// peekQueue reads this mirror's own queued items WITHOUT consuming them.
 //
-// It resolves nothing from them: the full diff below covers every object the
-// queue could name, so the drain exists only to keep the table from growing.
-// Every failure is logged and swallowed for the same reason — a queue this
-// component cannot read is not a reason to skip a sweep that does not depend on
-// it.
-func (r *Reconciler) drainQueue(ctx context.Context) {
+// DrainSyncQueue is a plain SELECT — acking is AckSyncItem, a separate call — so
+// this is side-effect free and safe to run before a sweep that may fail.
+//
+// It resolves nothing from what it read: the full diff covers every object the
+// queue could name, so the read exists only to decide which rows the sweep has
+// earned the right to tombstone. A failure is logged and swallowed for the same
+// reason — a queue this component cannot read is not a reason to skip a sweep
+// that does not depend on it.
+func (r *Reconciler) peekQueue(ctx context.Context) []corrosion.QueueItem {
 	items, err := corrosion.DrainSyncQueue(ctx, r.db, QueueKind, queueBatch)
 	if err != nil {
-		slog.Warn("netbox mirror: queue drain failed; the full sweep still runs", "error", err)
-		return
+		slog.Warn("netbox mirror: queue read failed; the full sweep still runs", "error", err)
+		return nil
 	}
+	return items
+}
+
+// ackQueued tombstones the items a SUCCEEDED sweep has covered.
+//
+// Called only after Sync's sweep returned nil, so an item is never thrown away
+// by a pass that did not do its work. Every ack failure is logged and swallowed:
+// the row is a trigger, not state, and the worst a surviving one costs is one
+// redundant sweep on the next poll.
+func (r *Reconciler) ackQueued(ctx context.Context, items []corrosion.QueueItem) {
 	for _, it := range items {
 		if err := corrosion.AckSyncItem(ctx, r.db, it.ID); err != nil {
 			slog.Warn("netbox mirror: ack queue item", "id", it.ID, "error", err)

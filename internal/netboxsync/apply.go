@@ -94,8 +94,11 @@ type Reconciler struct {
 	// action in a sweep shares it.
 	clusterID int
 
-	// interval is the sweep cadence Run ticks on.
-	interval time.Duration
+	// interval is the sweep cadence Run ticks on; pollInterval is the faster
+	// cadence on which the node already holding the lease looks for queued work.
+	// Only the sweep acquires — see Run.
+	interval     time.Duration
+	pollInterval time.Duration
 
 	// acquireLease takes or renews the leader lease; holdsLease is the READ
 	// alone, re-run before every write batch.

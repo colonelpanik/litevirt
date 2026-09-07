@@ -529,6 +529,18 @@ func TestApplyReportsAFailedActionWithoutSkippingTheRest(t *testing.T) {
 // every identity mapping goes through the production SQL rather than a map.
 func newTestReconciler(t *testing.T, nb netboxWriter) *Reconciler {
 	t.Helper()
+	return &Reconciler{
+		nb: nb, db: newMirrorDB(t), clusterID: 5, metrics: &countingMetrics{},
+		// Supplied EXPLICITLY. An unwired lease reads as "not the leader" (the
+		// fail-closed direction), so applyPhases would write nothing at all and
+		// every ordering assertion would pass vacuously.
+		holdsLease: func(context.Context) bool { return true },
+	}
+}
+
+// newMirrorDB is a schema-initialised corrosion handle scoped to one test.
+func newMirrorDB(t *testing.T) *corrosion.Client {
+	t.Helper()
 	db, err := corrosion.NewTestClient()
 	if err != nil {
 		t.Fatalf("NewTestClient: %v", err)
@@ -537,13 +549,7 @@ func newTestReconciler(t *testing.T, nb netboxWriter) *Reconciler {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Reconciler{
-		nb: nb, db: db, clusterID: 5, metrics: &countingMetrics{},
-		// Supplied EXPLICITLY. An unwired lease reads as "not the leader" (the
-		// fail-closed direction), so applyPhases would write nothing at all and
-		// every ordering assertion would pass vacuously.
-		holdsLease: func(context.Context) bool { return true },
-	}
+	return db
 }
 
 // vmWireBody returns the body the PRODUCTION client puts on the wire for the VM
@@ -640,6 +646,10 @@ type stubVirt struct {
 
 	createErr map[string]error
 	deleteErr error
+
+	// sweeps counts EnsureCluster calls — one per sweep, whether or not the
+	// sweep goes on to write anything. See Sweeps.
+	sweeps int
 
 	createCalls       int
 	created           []netbox.VirtualMachine
@@ -787,4 +797,22 @@ func (s *stubVirt) ListOwnedIPsForInterfaces(context.Context, []int) ([]netbox.I
 // exercises that against a real NetBox surface.
 func (s *stubVirt) EnsureClusterType(context.Context, string) (int, error) { return 1, nil }
 
-func (s *stubVirt) EnsureCluster(context.Context, string, int) (int, error) { return 5, nil }
+func (s *stubVirt) EnsureCluster(context.Context, string, int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweeps++
+	return 5, nil
+}
+
+// Sweeps is how many times a sweep got as far as resolving its cluster.
+//
+// Every sweep resolves the cluster before it reads either side of the diff, and
+// nothing else does, so this counts SWEEPS — including the ones that go on to
+// find no work and write nothing. A scenario asserting "no sweep ran" cannot use
+// the write counters for that: a sweep over converged state issues no writes
+// either, and the two would be indistinguishable.
+func (s *stubVirt) Sweeps() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sweeps
+}

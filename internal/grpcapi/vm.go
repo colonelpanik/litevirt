@@ -2541,13 +2541,23 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 	// mirror keeps assigned. The same refusal the container path already makes
 	// on this question.
 	//
-	// FAIL CLOSED on the read. The container guard was fail-open once: a
-	// swallowed error turned "could not read the record" into "this network
-	// names no prefix", and the write went ahead.
-	binding, err := corrosion.GetBindingByNetwork(ctx, s.db, networkName)
+	// Asked through allocatorFor, like every other address decision in this
+	// server, rather than by reading the binding row directly. The row is not
+	// the whole question: a network whose CONFIG names a prefix while no binding
+	// exists is a disagreement allocatorFor refuses loudly, and a direct read
+	// answers "nil, so unbound" and lets the write through — recording an
+	// operator-chosen address across a space someone believes is externally
+	// managed. A suspended binding and a bound network on a node with no NetBox
+	// client are refused there too, and both mean the addresses are still
+	// NetBox's.
+	//
+	// FAIL CLOSED on the read, which allocatorFor also does. The container guard
+	// was fail-open once: a swallowed error turned "could not read the record"
+	// into "this network names no prefix", and the write went ahead.
+	_, binding, err := s.allocatorFor(ctx, "vm", networkName)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal,
-			"cannot determine whether network %q is bound to a NetBox prefix: %v", networkName, err)
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot record an IP on network %q: %v", networkName, err)
 	}
 	if binding != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,

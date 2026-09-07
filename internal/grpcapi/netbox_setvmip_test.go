@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -104,5 +105,39 @@ func TestSetVMIPRefusedWhenTheBindingReadFails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a binding read that failed must refuse the edit, not allow it")
+	}
+}
+
+// TestSetVMIPRefusedWhenTheDefNamesAPrefixWithNoBinding is the state a direct
+// binding read cannot see.
+//
+// A network whose CONFIG names a NetBox prefix while no binding row exists was
+// never validated against NetBox and holds no claim on that prefix — the
+// disagreement allocatorFor refuses loudly for every other address decision in
+// this server. Read the binding row directly and the answer is "nil, therefore
+// unbound", and an operator-chosen address is recorded across a space somebody
+// believes is externally managed. Reachable from a compose file written before
+// the refusal existed, or a binding released while its network survived.
+func TestSetVMIPRefusedWhenTheDefNamesAPrefixWithNoBinding(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	insertTestVMR2(t, ctx, s.db, "vm-1", "test-host", "running")
+	// The def names prefix 7; no ClaimBinding call, so there is no binding row.
+	seedNetworkDef(t, s, "half-bound", compose.NetworkDef{
+		Type: "bridge", Subnet: "10.0.5.0/24", NetBoxPrefixID: 7,
+	})
+
+	_, err := s.SetVMIP(ctx, &pb.SetVMIPRequest{
+		Name: "vm-1", NetworkName: "half-bound", Ip: "10.0.5.200",
+	})
+	if err == nil {
+		t.Fatal("a network whose config names a NetBox prefix with no binding row must be " +
+			"refused, not treated as unbound")
+	}
+	if c := status.Code(err); c != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition (%v)", c, err)
+	}
+	if !strings.Contains(err.Error(), "no binding exists") {
+		t.Fatalf("the refusal must name the missing binding, got %v", err)
 	}
 }

@@ -62,6 +62,28 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// bridges (infrastructure bridges like br0) should not get DHCP/NAT
 		// added unless the user explicitly enables them.
 		bridgePreExisted := BridgeExists(bridge)
+
+		// REFUSE BEFORE CREATING ANYTHING, and this ordering is the whole of
+		// whether the refusal survives a retry.
+		//
+		// The check used to live inside startDHCPFor, below EnsureBridge. So the
+		// first attempt CREATED the bridge and then refused — and the second read
+		// a pre-existing bridge, which is the one input that turns DHCPWouldServe
+		// off for this shape, and provisioned successfully with no DHCP server on
+		// a subnet-ful network. Guests with no addresses and no explanation,
+		// which is the outcome startDHCPFor's own comment says it refuses in
+		// order to avoid. Hoisted here, the refusal reads the same host state
+		// every time and a retry refuses identically.
+		//
+		// startDHCPFor still asks the same question, for the other two dnsmasq
+		// sites (isolated, vxlan) which do not create a bridge this way; it is
+		// one exported predicate, not two copies.
+		if err := BoundNetworkDHCPRefusal(def,
+			DHCPHostFacts{BridgePreExisted: bridgePreExisted}, networkName, bridge,
+			hostName); err != nil {
+			return "", err
+		}
+
 		if err := EnsureBridge(bridge); err != nil {
 			return "", err
 		}
@@ -96,7 +118,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			// because the NetBox bind-time refusal decides from the same
 			// predicate, and two copies of it would drift.
 			if err := startDHCPFor(def, DHCPHostFacts{BridgePreExisted: bridgePreExisted},
-				networkName, bridge, dnsmasqPidFile(bridge)); err != nil {
+				networkName, bridge, hostName, dnsmasqPidFile(bridge)); err != nil {
 				return "", err
 			}
 			// Record NAT (masquerade) intent whenever this managed subnet-network
@@ -181,7 +203,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 				}
 				if err := startDHCPFor(def,
 					DHCPHostFacts{IsGatewayHost: isGatewayHost(ctx, db, networkName, hostName)},
-					networkName, bridge, dnsmasqPidFileVNI(vni)); err != nil {
+					networkName, bridge, hostName, dnsmasqPidFileVNI(vni)); err != nil {
 					return "", err
 				}
 			}
@@ -233,7 +255,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			// is why a bind over an isolated network's subnet is refused
 			// cluster-wide rather than on the binding node's own evidence.
 			if err := startDHCPFor(def, DHCPHostFacts{},
-				networkName, bridge, dnsmasqPidFile(bridge)); err != nil {
+				networkName, bridge, hostName, dnsmasqPidFile(bridge)); err != nil {
 				return "", err
 			}
 			if def.Subnet != "" {

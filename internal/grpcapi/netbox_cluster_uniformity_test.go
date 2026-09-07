@@ -247,14 +247,155 @@ func TestUniformityFailsClosedOnAnUnreadableHostTable(t *testing.T) {
 	if err := s.db.Execute(ctx, `DROP TABLE hosts`); err != nil {
 		t.Fatalf("drop hosts: %v", err)
 	}
-	_, bad, err := s.declareAndCompareNetBoxCluster(ctx)
+	d, err := s.compareNetBoxClusterName(ctx)
 	if err == nil {
 		t.Fatal("an unreadable host table must be reported as an error, not as an empty live set")
 	}
-	if bad {
-		t.Fatal("a read that failed is not a disagreement — the caller must tell them apart")
+	if d.bad() {
+		t.Fatal("a read that failed is not a finding — the caller must tell them apart")
 	}
 	if s.netboxClusterUniformityAgrees(ctx) {
 		t.Fatal("the mirror gate must decline a pass whose live set it could not establish")
+	}
+}
+
+// ── the publish/compare split, and the pass before every peer has spoken ────
+//
+// The gate used to PUBLISH inside the same function that COMPARED, and read the
+// absence of a peer's row as "that node has not run this gate, so it cannot be
+// mirroring". That reasoning holds for the peer and not for THIS node: on its
+// own first pass a node publishes, compares against a set that does not yet
+// include a peer with no pass of its own, and mirrors — one bounded pass under
+// a disagreement it could not see. Fail closed for that pass instead.
+
+// TestTheCompareDoesNotPublish is the split itself.
+//
+// A predicate with a write inside it cannot be reasoned about at its call sites,
+// and this one is called from two (the mirror's gate and the health evaluator).
+// The publication is now its own step, so the comparison is a pure read.
+func TestTheCompareDoesNotPublish(t *testing.T) {
+	s := uniformityServer(t, "site-a")
+	ctx := context.Background()
+
+	if _, err := s.compareNetBoxClusterName(ctx); err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	got, err := corrosion.ListNetBoxHostConfig(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, published := got[s.hostName]; published {
+		t.Fatal("the comparison must not write; publication is its own step")
+	}
+}
+
+// TestALiveHostThatHasNotPublishedBlocksThePass.
+//
+// The window: a live peer exists, this node has published, that peer has not.
+// Mirroring there would be mirroring against an incomplete set while believing
+// it was complete — and the value that peer is about to publish may disagree.
+// One pass is bounded, but it is one pass in which the inventory can be written
+// under the wrong cluster, and the whole enforcement exists to stop exactly
+// that.
+func TestALiveHostThatHasNotPublishedBlocksThePass(t *testing.T) {
+	s := uniformityServer(t, "site-a")
+	ctx := context.Background()
+
+	// A live peer with a host row and NO publication.
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "peer-1", Address: "192.0.2.10", State: "active", CertSerial: "serial-peer-1",
+	}); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+
+	if s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("the mirror must decline a pass in which a live host has published nothing")
+	}
+}
+
+// TestTheUnpublishedPeerIsNamedInTheCondition: fail-closed silence is the worst
+// of both. A mirror that has stopped and says only "declining" leaves an
+// operator with nothing; the row has to name the hosts whose value is missing,
+// because the remedy is about them.
+func TestTheUnpublishedPeerIsNamedInTheCondition(t *testing.T) {
+	s := uniformityServer(t, "site-a")
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "peer-1", Address: "192.0.2.10", State: "active", CertSerial: "serial-peer-1",
+	}); err != nil {
+		t.Fatalf("insert host: %v", err)
+	}
+
+	s.evaluateNetBoxClusterUniformity(ctx)
+
+	h, ok := netboxCondition(t, s, condNetBoxClusterNameUnpublished, s.hostName)
+	if !ok {
+		t.Fatal("a pass blocked on an unpublished peer must say so in lv health")
+	}
+	if !strings.Contains(h.Evidence, "peer-1") {
+		t.Fatalf("the evidence must name the host that has published nothing, got %q", h.Evidence)
+	}
+	if !strings.Contains(h.Evidence, "DECLINES every pass") {
+		t.Fatalf("the evidence must state that mirroring is stopped, got %q", h.Evidence)
+	}
+}
+
+// TestOnceThePeerPublishesThePassProceeds is what keeps the block bounded rather
+// than permanent: every configured node publishes on its own first pass, so the
+// window closes on its own.
+func TestOnceThePeerPublishesThePassProceeds(t *testing.T) {
+	s := uniformityServer(t, "site-a")
+	ctx := context.Background()
+	publishAs(t, s, "peer-1", "active", "site-a")
+
+	if !s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a peer that has published an agreeing value must not block the pass")
+	}
+	// …and the condition resolves.
+	for i := 0; i < netboxCleanPasses; i++ {
+		s.evaluateNetBoxClusterUniformity(ctx)
+	}
+	if h, ok := netboxCondition(t, s, condNetBoxClusterNameUnpublished, s.hostName); ok &&
+		h.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("the finding must not stand once every live host has published, got %+v", h)
+	}
+}
+
+// TestADownHostThatHasNotPublishedDoesNotBlockThePass keeps the same rule the
+// disagreement check already follows. A host that is offline, fenced or
+// decommissioned will never publish, and a fail-closed gate that waited for it
+// would stop mirroring permanently over a node that has left.
+func TestADownHostThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
+	ctx := context.Background()
+	for _, state := range []string{"offline", "maintenance", "fenced"} {
+		t.Run(state, func(t *testing.T) {
+			s := uniformityServer(t, "site-a")
+			if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+				Name: "peer-1", Address: "192.0.2.10", State: state, CertSerial: "serial-peer-1",
+			}); err != nil {
+				t.Fatalf("insert host: %v", err)
+			}
+			if !s.netboxMirrorPassAuthorized(ctx) {
+				t.Fatalf("a %s host that never publishes must not block mirroring forever", state)
+			}
+		})
+	}
+}
+
+// TestAPublicationFailureStillStopsTheGate. Publishing is what makes this node's
+// opinion visible to its peers, and a node whose opinion nobody can see is
+// exactly the node that must not go on to mirror on the strength of a comparison
+// that therefore excludes it. Splitting publish from compare must not lose that.
+func TestAPublicationFailureStillStopsTheGate(t *testing.T) {
+	s := uniformityServer(t, "site-a")
+	ctx := context.Background()
+	if err := s.db.Execute(ctx,
+		`CREATE TRIGGER test_fail_nb_host_config BEFORE INSERT ON netbox_host_config
+		 BEGIN SELECT RAISE(ABORT, 'induced publish failure'); END`); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+
+	if s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a node that could not publish its own value must not mirror")
 	}
 }

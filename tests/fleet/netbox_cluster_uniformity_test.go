@@ -215,3 +215,70 @@ func TestMirrorOnlyClusterAgreeingNodesMirrorNormally(t *testing.T) {
 // the two ever diverge, the loop above simply runs more passes than it needs,
 // which cannot make a resolution assertion pass falsely.
 const netboxFleetCleanPasses = 3
+
+// TestMirrorWaitsForALiveHostThatHasNotPublished is the window the gate used to
+// mirror straight through.
+//
+// The publication used to happen INSIDE the comparison, and an absent peer row
+// was passed over on the argument that a node which has not published has not
+// run the gate and so cannot be flapping anything. True of the peer; beside the
+// point for the node doing the comparing, which went on to mirror against a set
+// it knew was incomplete — and the value that peer is about to publish may
+// disagree.
+//
+// Two real nodes are what make this observable: only one of them runs a pass,
+// so the other's row genuinely does not exist yet, which no single-process
+// fixture reproduces honestly.
+func TestMirrorWaitsForALiveHostThatHasNotPublished(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+
+	c := New(t, Options{
+		Nodes: 2, NetBoxURL: nb.URL(), SharedCRDT: true,
+		NetBoxClusterName: pinnedClusterName,
+	})
+	latchNetBoxBoth(t, c, gateAll(t, c))
+
+	first, quiet := c.Nodes[0], c.Nodes[1]
+	mustCreateUnboundNetwork(t, c, first, mirrorOnlyNetwork, "")
+	mustCreateVM(t, first, "vm-1", mirrorOnlyNetwork)
+	assertNoBindings(t, first)
+
+	ctx := context.Background()
+	// ONLY the first node runs. The second is live — it has a host row and it is
+	// voting-eligible — and it has published nothing.
+	stealNetBoxLease(t, first, first.Name)
+	if err := first.Server.RunNetBoxMaintenanceOnce(ctx); err != nil {
+		t.Fatalf("maintenance on %s: %v", first.Name, err)
+	}
+	if err := first.SyncNetBoxMirror(); err != nil {
+		t.Fatalf("a pass that cannot establish uniformity must decline quietly: %v", err)
+	}
+	if got := nb.VMCountAll(); got != 0 {
+		t.Fatalf("%d virtual_machine object(s) mirrored while a live host had published no "+
+			"NetBox cluster name — the comparison cannot be complete", got)
+	}
+	// …and it says so, naming the host it is waiting for. A mirror that stopped
+	// in silence would be the worst of both.
+	h, ok := fleetNetBoxCondition(t, first, "netbox_cluster_name_unpublished", first.Name)
+	if !ok {
+		t.Fatal("a pass blocked on an unpublished peer must raise a health condition")
+	}
+	if !strings.Contains(h.Evidence, quiet.Name) {
+		t.Fatalf("the evidence must name the host that has not published, got %q", h.Evidence)
+	}
+
+	// THE WINDOW CLOSES ON ITS OWN: the quiet node runs its own pass, publishes
+	// the same name, and mirroring resumes. That is what keeps the fail-closed
+	// wait bounded rather than a permanent stop.
+	if err := quiet.Server.RunNetBoxMaintenanceOnce(ctx); err != nil {
+		t.Fatalf("maintenance on %s: %v", quiet.Name, err)
+	}
+	stealNetBoxLease(t, first, first.Name)
+	if err := first.SyncNetBoxMirror(); err != nil {
+		t.Fatalf("mirror on %s: %v", first.Name, err)
+	}
+	if got := nb.VMCount("vm-1"); got != 1 {
+		t.Fatalf("once every live host has published, mirroring must resume; got %d object(s)", got)
+	}
+}

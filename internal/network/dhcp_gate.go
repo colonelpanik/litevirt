@@ -209,6 +209,38 @@ func overlapReason(subnetCIDR, prefixCIDR string) (string, bool) {
 	return "", false
 }
 
+// BoundNetworkDHCPRefusal is the PROVISION-TIME refusal, exported so the one
+// predicate serves both consumers that need it: Provision, which enforces it,
+// and the health evaluator that makes it discoverable before a placement hits
+// it. Two copies would drift, which is the mistake this file already exists to
+// avoid.
+//
+// It returns nil unless def is bound to a NetBox prefix AND litevirt's own DHCP
+// server would serve it on a host observing f.
+//
+// hostName IS IN THE MESSAGE, and that is the point of the parameter. This
+// refusal surfaces as a VM placement failure on whichever node the scheduler
+// picked, and the remedy — "make sure the bridge exists there, or define the
+// network so litevirt serves no DHCP on it" — is not actionable without knowing
+// which node is missing the bridge. A message that said "this host" left the
+// operator to work that out from a log line on a node they had not been looking
+// at.
+func BoundNetworkDHCPRefusal(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, hostName string) error {
+	if def.NetBoxPrefixID == 0 || !DHCPWouldServe(def, f) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: network %q is bound to NetBox prefix %d, and provisioning it on host %s would start "+
+			"a DHCP server for subnet %s on bridge %s — dnsmasq would assign the gateway and "+
+			"lease a pool across that subnet with no row NetBox can see, so the two would hand "+
+			"the same addresses to different guests. Either create %s on %s (an infrastructure "+
+			"bridge litevirt did not make gets no DHCP server), or define the network so litevirt "+
+			"serves no DHCP on it at all: set a VLAN for a tagged physical network, use type "+
+			"direct, or drop the subnet. Until then no VM can be placed on %s",
+		ErrDHCPWouldRaceNetBox, networkName, def.NetBoxPrefixID, hostName, def.Subnet, bridge,
+		bridge, hostName, hostName)
+}
+
 // startDHCPFor is the ONLY place Provision starts a DHCP server, and the second
 // half of the refusal: the half that covers the hosts a bind could not speak
 // for.
@@ -222,19 +254,12 @@ func overlapReason(subnetCIDR, prefixCIDR string) (string, bool) {
 // works on hosts which already have the bridge is a definition an operator has
 // to fix, and silently omitting the DHCP server on one host would leave guests
 // there with no addresses and no explanation.
-func startDHCPFor(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, pidFile string) error {
+func startDHCPFor(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, hostName, pidFile string) error {
+	if err := BoundNetworkDHCPRefusal(def, f, networkName, bridge, hostName); err != nil {
+		return err
+	}
 	if !DHCPWouldServe(def, f) {
 		return nil
-	}
-	if def.NetBoxPrefixID != 0 {
-		return fmt.Errorf(
-			"%w: network %q is bound to NetBox prefix %d, and provisioning it on this host would "+
-				"start a DHCP server for subnet %s on bridge %s — dnsmasq would assign the gateway "+
-				"and lease a pool across that subnet with no row NetBox can see, so the two would "+
-				"hand the same addresses to different guests. Define the network so litevirt serves "+
-				"no DHCP on it (set a VLAN for a tagged physical network, use type direct, or drop "+
-				"the subnet), or ensure %s already exists on every host",
-			ErrDHCPWouldRaceNetBox, networkName, def.NetBoxPrefixID, def.Subnet, bridge, bridge)
 	}
 	gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
 	if err != nil {

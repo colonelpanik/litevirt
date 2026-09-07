@@ -2,14 +2,17 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netboxsync"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // NetBox health findings.
@@ -61,6 +64,19 @@ const (
 	// the only check a mirror-only cluster has. Subject is the HOST, for the
 	// reason above, and the evidence carries the peers holding the other value.
 	condNetBoxClusterNameDisagreement = "netbox_cluster_name_disagreement"
+	// condNetBoxClusterNameUnpublished: a LIVE host has published no resolved
+	// `netbox.cluster_name` at all, so this node cannot establish that the
+	// setting is uniform and declines to mirror.
+	//
+	// A separate code from the disagreement above because it is a different
+	// fault with a different remedy: that one names a value to correct, this one
+	// names a node that has not spoken. It is normally transient — every node
+	// configured for NetBox publishes on its first maintenance pass — and the
+	// one shape that does not clear itself is a live host running with
+	// `netbox.enabled` off, which is only diagnosable from the host name the
+	// evidence carries. Without the row, that state would be a mirror that had
+	// silently stopped.
+	condNetBoxClusterNameUnpublished = "netbox_cluster_name_unpublished"
 	// condNetBoxDiscoveryUnclaimable: a guest on THIS host is using an address
 	// on a bound network that NetBox will not grant it, so litevirt refused to
 	// record it.
@@ -77,6 +93,20 @@ const (
 	// answering where — and no peer can make it or contradict it. The VMs and
 	// addresses are named in the evidence, which is what an operator acts on.
 	condNetBoxDiscoveryUnclaimable = "netbox_discovery_unclaimable"
+	// condNetBoxDHCPWouldRace: provisioning a bound network on THIS host would
+	// start litevirt's own DHCP server over the bound prefix, so this host
+	// refuses to provision it — and no VM can be placed on that network here.
+	//
+	// The provision-time refusal is what closes the host-local half of the
+	// hazard, and it has to stay: a bind is a cluster-wide decision and
+	// "did litevirt have to create this bridge" is host-local runtime state no
+	// row records. But the refusal only speaks once somebody has hit it, as a
+	// placement failure on whichever node the scheduler picked. This finding is
+	// the same fact stated in advance, on the node it is about.
+	//
+	// Subject is the HOST, for the same reason as its two neighbours: the input
+	// is this node's own bridge state, which no peer can read.
+	condNetBoxDHCPWouldRace = "netbox_dhcp_would_race"
 )
 
 // netboxSweepSubject is the single subject of condNetBoxSweepBlocked. The
@@ -250,6 +280,80 @@ func (s *Server) evaluateNetBoxDiscoveryRefusals(ctx context.Context) {
 			len(names), strings.Join(details, "; "))
 	}
 	s.applyNetBoxConditionsScoped(ctx, condNetBoxDiscoveryUnclaimable, "host", positive,
+		func(subject string) bool { return subject == s.hostName })
+}
+
+// evaluateNetBoxDHCPConflicts advances condNetBoxDHCPWouldRace for THIS host,
+// over the bound networks the caller has already read.
+//
+// It answers "would this host refuse to provision that network right now" by
+// asking the SAME predicate provisioning asks — network.BoundNetworkDHCPRefusal
+// — with this host's own bridge state. Not a model of the refusal: the refusal.
+// A second copy of the rule is exactly what this file's neighbours in
+// internal/network exist to avoid, and it is the mistake this branch has already
+// shipped twice.
+//
+// IT IS DERIVABLE IN ADVANCE only because the refusal is idempotent: a refused
+// provision creates no bridge, so the state read here is the state the provision
+// would read. Before that fix the first attempt created the bridge and the
+// second read it as pre-existing, so any evaluator would have reported the
+// opposite of what the next provision did.
+//
+// Its blind spot, stated: it evaluates the OTHER host-local input
+// (IsGatewayHost) as false, because a bound network for which that input matters
+// — vxlan with a subnet — cannot exist. The bind refuses those cluster-wide, on
+// the certain assignment, before any binding row is written. A binding row that
+// predates that refusal would be missed here; a re-key or a resume of it hits
+// the same check at the bind's own predicate.
+//
+// Per-node and scoped to this host's own subject, like its two neighbours: a
+// host that CAN provision must not clean-count a subject belonging to one that
+// cannot.
+func (s *Server) evaluateNetBoxDHCPConflicts(ctx context.Context, bindings []corrosion.BindingRecord) {
+	positive := map[string]string{}
+	var reasons []string
+	for _, b := range bindings {
+		nr, err := corrosion.GetNetwork(ctx, s.db, b.Network)
+		if err != nil {
+			// Not evidence of anything. Skipping the binding is right in both
+			// directions: it is not a positive finding, and it is not a clean
+			// pass for one either — a pass that could not read is silence, and
+			// the map below simply does not carry it.
+			slog.Warn("netbox health: read network for the DHCP conflict check",
+				"network", b.Network, "error", err)
+			return
+		}
+		if nr == nil {
+			// A binding whose network is gone. DeleteNetwork releases the
+			// binding, so this is a transient the next pass resolves; nothing on
+			// this host can provision a network that does not exist.
+			continue
+		}
+		var def compose.NetworkDef
+		if err := json.Unmarshal([]byte(nr.Config), &def); err != nil {
+			slog.Warn("netbox health: decode network config for the DHCP conflict check",
+				"network", b.Network, "error", err)
+			return
+		}
+		// The binding row is the authority on what is bound, not the config
+		// blob: the two are written together, but the refusal is about the
+		// PREFIX and the row is what holds it.
+		def.NetBoxPrefixID = b.PrefixID
+		bridge := def.Interface
+		if bridge == "" {
+			bridge = b.Network
+		}
+		if rerr := network.BoundNetworkDHCPRefusal(def,
+			network.DHCPHostFacts{BridgePreExisted: s.bridgeExistsHere(bridge)},
+			b.Network, bridge, s.hostName); rerr != nil {
+			reasons = append(reasons, rerr.Error())
+		}
+	}
+	if len(reasons) > 0 {
+		sort.Strings(reasons)
+		positive[s.hostName] = strings.Join(reasons, " | ")
+	}
+	s.applyNetBoxConditionsScoped(ctx, condNetBoxDHCPWouldRace, "host", positive,
 		func(subject string) bool { return subject == s.hostName })
 }
 

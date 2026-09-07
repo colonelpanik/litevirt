@@ -66,6 +66,12 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 	// pass whatever the drift check goes on to decide.
 	s.evaluateNetBoxClusterPin(ctx, bindings)
 
+	// Whether THIS host could provision each bound network at all. Same
+	// placement: this pass runs on every configured node, and the fact is
+	// host-local bridge state — so the node that cannot place a VM on a bound
+	// network is the node that has to say so, and it may never lead.
+	s.evaluateNetBoxDHCPConflicts(ctx, bindings)
+
 	// The other half of the same enforcement: what this node's LIVE PEERS
 	// published, which is the only uniformity evidence a cluster with no bound
 	// network has. Also where this node PUBLISHES its own resolved name, so a

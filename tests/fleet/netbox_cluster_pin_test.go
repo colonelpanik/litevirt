@@ -56,6 +56,17 @@ func TestMisconfiguredNodeMirrorsNothingAndTheClusterStaysWhole(t *testing.T) {
 
 	good, bad := c.Nodes[0], c.Nodes[1]
 	mustCreateBoundNetwork(t, c, good, orphanNetwork, orphanSubnet, orphanPrefixID)
+	// Both nodes declare the name they resolve, which at this point is the same
+	// one — the state a converged cluster is in before anybody's config is
+	// touched, and the state the mirror now requires before it will run at all.
+	//
+	// It also sets the WINDOW this scenario is about. `bad`'s configuration
+	// changes below, but its published row still carries the agreeing value
+	// until `bad` runs a pass of its own; until then the PIN is the only check
+	// that can see the disagreement, which is exactly the case the pin exists
+	// for. Once `bad` republishes, the per-host check sees it too and stops BOTH
+	// nodes — that is netbox_cluster_uniformity_test.go's scenario, not this one.
+	publishClusterNamesEverywhere(t, c)
 
 	// The pin, recorded by the bind above.
 	b, err := corrosion.GetBindingByPrefix(context.Background(), good.DB, orphanPrefixID)

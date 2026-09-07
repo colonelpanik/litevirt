@@ -224,7 +224,31 @@ func boundMirrorClusterGated(t *testing.T, nodes int) (*NetBoxFake, *Cluster, ma
 	// cluster never forms.
 	latchNetBoxBoth(t, c, gates)
 	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
+	publishClusterNamesEverywhere(t, c)
 	return nb, c, gates
+}
+
+// publishClusterNamesEverywhere brings the fixture to the state a real cluster
+// reaches on its own: every configured node has declared the NetBox cluster name
+// it resolves.
+//
+// Required because the mirror now DECLINES a pass in which a live host has
+// published nothing — it cannot prove `netbox.cluster_name` is uniform against a
+// set it knows to be incomplete. In production every node publishes on its own
+// first maintenance pass, so the window is one interval; in a fixture, a
+// scenario that drives a pass on ONE node would sit in that window forever and
+// be testing the wait rather than whatever it meant to test.
+//
+// It uses the production publisher (the revalidation pass), not a hand-written
+// row, so a scenario cannot be made to pass by a fixture that publishes
+// something the daemon would not.
+func publishClusterNamesEverywhere(t *testing.T, c *Cluster) {
+	t.Helper()
+	for _, n := range c.Nodes {
+		if err := n.Server.RevalidateBindingsOnce(context.Background()); err != nil {
+			t.Fatalf("publish pass on %s: %v", n.Name, err)
+		}
+	}
 }
 
 // mustCreateVM creates a one-NIC VM pinned to n.

@@ -276,12 +276,26 @@ speak for the rest. Two things follow:
   the two it was.
 - **Provisioning refuses as well.** A host that would start `dnsmasq` for a
   network bound to a NetBox prefix fails the provision instead, with a message
-  naming the bridge. That is where the host-local fact is finally known, and it
-  is what stops a node added later — or a node that never had the bridge — from
-  standing up a second allocator over a prefix NetBox believes it owns. The
-  consequence is that a VM cannot be placed on such a host until the definition
-  is corrected; that is deliberate, and better than two DHCP authorities on one
-  subnet.
+  naming **that host**, the network, the prefix and the bridge. That is where the
+  host-local fact is finally known, and it is what stops a node added later — or
+  a node that never had the bridge — from standing up a second allocator over a
+  prefix NetBox believes it owns. The consequence is that a VM cannot be placed
+  on such a host until the definition is corrected; that is deliberate, and
+  better than two DHCP authorities on one subnet.
+
+  The refusal happens **before** the bridge is created, so it is idempotent: a
+  retry reads the same host state and refuses identically. (It used to create the
+  bridge and then refuse, so the second attempt read a pre-existing bridge,
+  concluded litevirt was not the DHCP authority, and provisioned with no DHCP
+  server at all — guests with no addresses and no explanation.)
+
+  It is also **discoverable before anybody hits it**. Every configured node
+  checks its own bridge state against every bound network on each maintenance
+  pass and raises `netbox_dhcp_would_race` in `lv health` when it would refuse,
+  naming the network and both remedies: create the bridge on that host, or define
+  the network so litevirt serves no DHCP on it. The two remedies are
+  interchangeable — an infrastructure bridge litevirt did not create gets no DHCP
+  server, so making the bridge exist is enough.
 
 ##### What this does NOT cover
 
@@ -581,8 +595,18 @@ Only live hosts count. A host that is offline, in maintenance, fenced or
 decommissioned keeps its published row but is not compared, so it cannot stop
 mirroring forever by holding a stale value.
 
-Both refusals are mirror-only: address allocation, binds and the orphan sweep
-are unaffected. `lv health` shows the condition; the fix is to correct
+**A live host that has published nothing yet also stops the mirror**, under
+`netbox_cluster_name_unpublished`, naming the hosts it is waiting for. Uniformity
+cannot be established against a set litevirt knows to be incomplete — a peer that
+has not spoken may be about to publish a different name, and one pass is enough
+to write the whole inventory under the wrong cluster. Every node configured for
+NetBox publishes on its first maintenance pass, so this normally clears within
+one interval. The one shape that does not clear itself is a live host running
+with `netbox.enabled` off: it never publishes, because it runs no NetBox pass at
+all. Enable NetBox there, or remove the host.
+
+All of these refusals are mirror-only: address allocation, binds and the orphan
+sweep are unaffected. `lv health` shows the condition; the fix is to correct
 `netbox.cluster_name` on the node that is wrong and restart it.
 
 ### The inventory mirror

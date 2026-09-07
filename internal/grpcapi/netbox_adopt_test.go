@@ -629,14 +629,17 @@ func bindAndCaptureLogs(t *testing.T, s *Server) string {
 // corrosion.ListVMs answers ([], nil) for a node that is hydrating after a
 // database loss or a fresh join exactly as it does for a cluster that genuinely
 // holds no VMs — and on the first of those, every address the cluster's guests
-// hold inside the prefix is invisible to this bind, which then goes LIVE
-// un-suspended over all of them.
+// hold inside the prefix is invisible to this bind.
 //
-// It cannot be refused: `vms` empty with no tombstones is also the state of
-// every cluster that has not created a VM yet, which is the first bind on every
-// installation (see reportUncorroboratedVMRead). What it must not be is silent.
+// It is neither refused nor allowed to go live: the binding is created SUSPENDED
+// and a revalidation pass resumes it (netbox_unhydrated_test.go covers the
+// decision and the convergence). What it must not be is SILENT, so the log line
+// stays pinned here.
 func TestBindReportsAnUncorroboratedEmptyVMRead(t *testing.T) {
 	s := newAdoptTestServer(t)
+	// A peer is what makes the empty read uncorroborated: with no peer, this
+	// node's database IS the cluster's and the read is its own answer.
+	seedPeerHost(t, s, "peer-b")
 
 	logs := bindAndCaptureLogs(t, s)
 
@@ -646,11 +649,22 @@ func TestBindReportsAnUncorroboratedEmptyVMRead(t *testing.T) {
 	if !strings.Contains(logs, "level=WARN") {
 		t.Fatalf("the report must be a WARN, not a debug aside: %q", logs)
 	}
-	// The bind still went through — this is a report, not a refusal, and a
-	// cluster with no VMs must be bindable.
+	// …and it must say WHICH host left the read unproven and what it did. "could
+	// not be proven" with nothing attached is the line nobody can act on, and
+	// the two negative answers have different remedies: a host that cannot be
+	// reached needs reaching, a host that holds rows needs replicating from.
+	if !strings.Contains(logs, "peer-b") || !strings.Contains(logs, "could not be asked") {
+		t.Fatalf("the report must name the host that could not answer and say so: %q", logs)
+	}
+	// The bind still went THROUGH — it is not a refusal, which would refuse the
+	// first bind on a young cluster with no override — but the binding serves no
+	// claims until adoption can be re-run.
 	b, err := corrosion.GetBindingByPrefix(context.Background(), s.db, adoptTestPrefix)
-	if err != nil || b == nil || b.Suspended {
-		t.Fatalf("the bind must still succeed and go live, got %+v (err %v)", b, err)
+	if err != nil || b == nil {
+		t.Fatalf("the bind must still record a binding row, got %+v (err %v)", b, err)
+	}
+	if !b.Suspended {
+		t.Fatal("a binding made over an uncorroborated empty read must not go live")
 	}
 }
 

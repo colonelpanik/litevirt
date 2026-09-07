@@ -78,6 +78,12 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 	}
 	for _, b := range bindings {
 		if b.Suspended {
+			// The ONE suspension this pass may lift by itself. Everything else
+			// records a repair an operator has to make, and lifting one of those
+			// would declare a repair the pass never performed.
+			if isUnhydratedSuspension(b.SuspendReason) {
+				s.resumeUnhydratedBinding(ctx, b, fp)
+			}
 			continue
 		}
 		reason := s.bindingDrift(ctx, b, fp)
@@ -92,6 +98,97 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 		s.nbMetrics().IncBindingSuspended()
 	}
 	return nil
+}
+
+// resumeUnhydratedBinding re-runs the adoption a bind could not, and resumes the
+// binding once it completes.
+//
+// THIS IS THE CONVERGENT HALF of the uncorroborated-empty-read decision
+// (corroborateEmptyVMRead). A bind that could not tell "this cluster has no VMs"
+// from "this node has not replicated yet" left the binding SUSPENDED rather than
+// live, which serves no claim; without this it would stay that way until an
+// operator noticed. A refusal never converges; a pass does.
+//
+// ORDER: drift first, then adoption, then the resume — the same order the re-key's
+// tail and ResumeBinding both use, and for the same reason. A binding waiting for
+// its inventory can ALSO have been re-CIDRed or moved out of its VRF while it
+// waited, and resuming on the strength of the adoption alone would lift a
+// suspension over a prefix that no longer validates. A drift REPLACES the reason,
+// which is what takes the binding out of the self-lifting class and puts it in
+// front of an operator.
+//
+// NO LEADER LEASE, and no nbPassMu of its own. Both follow the rule
+// adoptExistingAddresses already states: adoption's exclusion is nbPassMu, which
+// netboxMaintenanceTick holds for the whole of this pass, and adoption may not
+// require cluster leadership. The cross-node consequence is that every configured
+// node can run this for the same binding, which is safe rather than merely
+// tolerated: the claim path recovers its own object by identity, so a second
+// node's POST resolves to the first node's object and persists the same lease.
+//
+// IT COSTS NOTHING ON THE PASSES THAT CANNOT ACT. The corroboration is one local
+// read, and the 2N+3-query enumeration behind adoptExistingAddresses only runs
+// once it succeeds — so a binding waiting on a hydrating node does not re-scan
+// the whole cluster's NICs every fifteen minutes.
+//
+// It returns nothing. Every outcome is either a state change on the row or a log
+// line: a pass that cannot resume this binding has no bearing on the rest of
+// revalidation, and returning an error would skip the orphan sweep behind it.
+func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.BindingRecord, fp string) {
+	if reason := s.bindingDrift(ctx, b, fp); reason != "" {
+		slog.Warn("netbox binding suspended", "network", b.Network,
+			"prefix", b.PrefixID, "reason", reason)
+		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
+			slog.Error("netbox: could not re-state why a binding stays suspended",
+				"network", b.Network, "prefix", b.PrefixID, "error", err)
+			return
+		}
+		s.nbMetrics().IncBindingSuspended()
+		return
+	}
+
+	adopted, aerr := s.adoptExistingAddresses(ctx, b, nil)
+	if errors.Is(aerr, errAdoptionUncorroborated) {
+		// Still no standing to enumerate. Nothing changes — not the row, not the
+		// reason — so the next pass asks again. INFO rather than WARN: the bind
+		// already warned, the row already says so, and this repeats every
+		// fifteen minutes for as long as the node is catching up.
+		slog.Info("netbox: binding stays suspended — this node still cannot corroborate its VM "+
+			"inventory", "network", b.Network, "prefix", b.PrefixID)
+		return
+	}
+	if aerr != nil {
+		// A real adoption failure. Re-state the reason with what is actually
+		// outstanding, which also takes the binding out of the self-lifting
+		// class: this one needs an operator.
+		reason := fmt.Sprintf(
+			"adoption of existing addresses on network %s is incomplete after adopting %d: %v",
+			b.Network, adopted, aerr)
+		slog.Warn("netbox: could not finish the adoption a bind left owed",
+			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", aerr)
+		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
+			slog.Error("netbox: could not record why an adoption stopped; the binding stays "+
+				"suspended under its previous reason",
+				"network", b.Network, "prefix", b.PrefixID, "error", err)
+			return
+		}
+		s.nbMetrics().IncBindingSuspended()
+		return
+	}
+
+	next := b
+	next.Suspended = false
+	next.SuspendReason = ""
+	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
+		slog.Error("netbox: adopted every existing address but could not resume the binding; "+
+			"the next pass retries", "network", b.Network, "prefix", b.PrefixID,
+			"adopted", adopted, "error", err)
+		return
+	}
+	s.audit(ctx, "netbox.adopt", b.Network,
+		fmt.Sprintf("prefix=%d adopted=%d revalidation-resume", b.PrefixID, adopted), "ok")
+	slog.Info("netbox binding resumed after a revalidation pass corroborated this node's "+
+		"inventory and adopted what it found",
+		"network", b.Network, "prefix", b.PrefixID, "adopted", adopted)
 }
 
 // bindingDrift returns a non-empty reason when a binding is no longer valid.

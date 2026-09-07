@@ -363,21 +363,45 @@ being explicit about the rest matters more than the happy path:
   out of `/available-ips/`. If you have raw-bridge containers or external hosts
   sharing a bound prefix, record them in NetBox.
 
-#### Bind from a node that has finished replicating
+#### Binding from a node that is still replicating
 
 Adoption reads **this node's** copy of the replicated database, and an empty
 answer is not proof: a node that has just joined, or one rebuilt after a database
 loss, reports no VMs in exactly the same way as a cluster that genuinely has
-none. Bind from a node that has been up and replicating.
-
-litevirt cannot tell those two apart locally — a deleted VM leaves a tombstone
+none. No local table separates those two — a deleted VM leaves a tombstone
 behind, so a database with *no VM record of any kind* is suspicious, but that is
 also the state of every cluster before its first VM, which is when most prefixes
-get bound. So the bind proceeds and logs a `WARN` naming the situation
-(`uncorroborated empty VM inventory`) rather than refusing an ordinary first
-bind. If you see that line on a node that should have inventory, treat the
-binding as unverified: the addresses its guests hold were not adopted, and
-nothing adopts them later.
+get bound.
+
+So when the local VM list is empty **and** holds no tombstone, litevirt asks the
+cluster: every host reports how many `vms` rows it holds, and only a complete
+answer of zeroes corroborates the read. That costs one small request per peer,
+and only on a cluster that has never had a VM — on any other, the local
+tombstone answers it.
+
+If the read **cannot** be corroborated — a host that could not be reached, or a
+host that reports rows this node has not received — the bind still succeeds, but
+the binding is created **suspended**:
+
+```
+$ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
+Error: network "prod-a" was created and its NetBox binding for prefix 12 is
+SUSPENDED, so it serves no address claims yet: ... this node could not
+corroborate its VM inventory when NetBox prefix was bound ...
+```
+
+Nothing is broken and there is no cause to repair. A suspended binding refuses
+every allocation, so no address can be handed out into a prefix whose existing
+occupants are unknown, and the periodic NetBox maintenance pass (15 minutes by
+default) **re-runs the adoption and resumes the binding by itself** once the read
+can be corroborated. To finish it immediately, run `lv netbox resume <network>`
+from a node that has been up and replicating. `lv health` shows the suspension as
+`netbox_binding_suspended` while it lasts.
+
+The suspension is the one thing a bind can do here that is neither wrong: going
+live would make NetBox the authority over addresses running guests already hold,
+and refusing outright would refuse the first bind on any cluster with a peer that
+happens to be down, with no way forward.
 
 Some states refuse the bind rather than being adopted around, and every refusal
 names the object so it can be dealt with:

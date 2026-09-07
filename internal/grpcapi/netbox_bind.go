@@ -157,7 +157,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	//    NOTHING, exactly like checks 1-6. The adoption itself runs after the
 	//    network row lands (see CreateNetwork), because a refusal there has to
 	//    leave a binding an operator can resume.
-	pending, err := s.planAdoption(ctx, rec)
+	plan, err := s.planAdoption(ctx, rec)
 	if err != nil {
 		return err
 	}
@@ -170,10 +170,26 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		// Another bind won the race between our check above and this insert.
 		return fmt.Errorf("NetBox prefix %d was bound to another network concurrently", prefixID)
 	}
-	if len(pending) == 0 {
-		// Nothing to adopt: the binding is live immediately, which is both the
-		// pre-adoption behaviour and the common case. No NetBox address request
-		// is made at all.
+	pending := plan.candidates
+	// WHY THE BINDING MIGHT NOT GO LIVE, in the two cases that exist. They are
+	// mutually exclusive by construction (see adoptionPlan).
+	suspendReason := ""
+	switch {
+	case len(pending) > 0:
+		suspendReason = adoptionSuspendReason(netName, len(pending))
+	case plan.uncorroborated:
+		// The VM list was empty and nothing corroborates that the cluster is
+		// genuinely empty, so there is no list of existing addresses to adopt —
+		// only an inability to produce one. Live would be a binding allocating
+		// across a prefix whose occupants are unknown; a REFUSAL would refuse the
+		// first bind on a young multi-node cluster with no way out. Suspended is
+		// neither: no claim is served, and the revalidation pass re-runs adoption
+		// and resumes it with no operator action. See corroborateEmptyVMRead.
+		suspendReason = unhydratedSuspendReason(netName)
+	default:
+		// Nothing to adopt and the empty read stands up: the binding is live
+		// immediately, which is both the pre-adoption behaviour and the common
+		// case. No NetBox address request is made at all.
 		return nil
 	}
 
@@ -188,23 +204,22 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	// the network to a host device before it ever asks for an allocator. There is
 	// no VM that can be created on this network until CreateNetwork persists it,
 	// below.
-	if serr := corrosion.SuspendBinding(ctx, s.db, prefixID,
-		adoptionSuspendReason(netName, len(pending))); serr != nil {
+	if serr := corrosion.SuspendBinding(ctx, s.db, prefixID, suspendReason); serr != nil {
 		// The binding is LIVE and un-adopted, which is the one state that must
 		// not survive. Release the prefix so nothing can allocate from it, and
 		// say so if even that fails — a prefix left bound refuses every future
 		// bind of it.
 		if rerr := corrosion.DeleteBinding(ctx, s.db, prefixID); rerr != nil {
 			return fmt.Errorf(
-				"could not suspend the binding for prefix %d while %d existing address(es) are "+
-					"adopted (%v), and releasing it also failed (%v); prefix %d STAYS BOUND and "+
-					"must be released by hand before it can be bound again",
-				prefixID, len(pending), serr, rerr, prefixID)
+				"could not suspend the binding for prefix %d (%s) (%v), and releasing it also "+
+					"failed (%v); prefix %d STAYS BOUND and must be released by hand before it "+
+					"can be bound again",
+				prefixID, suspendReason, serr, rerr, prefixID)
 		}
 		return fmt.Errorf(
-			"could not suspend the binding for prefix %d while %d existing address(es) are "+
-				"adopted, so the prefix was released and nothing was bound: %w",
-			prefixID, len(pending), serr)
+			"could not suspend the binding for prefix %d (%s), so the prefix was released and "+
+				"nothing was bound: %w",
+			prefixID, suspendReason, serr)
 	}
 	// Deliberately NOT counted on litevirt_netbox_bindings_suspended_total. This
 	// suspension is TRANSIENT by design — the adoption below lifts it within the

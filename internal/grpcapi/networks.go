@@ -133,6 +133,19 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 	// so the message has to say so.
 	if def.NetBoxPrefixID != 0 {
 		if aerr := s.finishAdoptionAndResume(ctx, req.Name, def.NetBoxPrefixID); aerr != nil {
+			if errors.Is(aerr, errAdoptionUncorroborated) {
+				// The one suspension with NO cause to repair: this node simply
+				// could not establish what its guests already hold, and a
+				// revalidation pass lifts it by itself. Reported rather than
+				// swallowed — a network that serves no claims is not a silent
+				// success — but without the "repair the cause" the other
+				// branch's message ends on, which would send an operator
+				// looking for a fault that does not exist.
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"network %q was created and its NetBox binding for prefix %d is SUSPENDED, so "+
+						"it serves no address claims yet: %v",
+					req.Name, def.NetBoxPrefixID, aerr)
+			}
 			code := codes.Internal
 			if adoptionRefused(aerr) {
 				code = codes.FailedPrecondition

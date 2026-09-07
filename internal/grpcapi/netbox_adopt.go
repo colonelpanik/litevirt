@@ -9,6 +9,10 @@ import (
 	"net"
 	"slices"
 	"sort"
+	"strings"
+	"sync"
+
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -101,12 +105,26 @@ const adoptionCap = 256
 // container off, delete a foreign object in NetBox, retire a stale lease) and
 // none of them is a bug in the daemon. Reporting them as Internal would send
 // someone looking for one.
-type adoptionRefusedError struct{ msg string }
+// cause, when set, is a sentinel a caller matches with errors.Is — the refusals
+// that a background pass has to TELL APART rather than merely report. Most
+// refusals carry none: they are read by an operator, not branched on.
+type adoptionRefusedError struct {
+	msg   string
+	cause error
+}
 
 func (e adoptionRefusedError) Error() string { return e.msg }
+func (e adoptionRefusedError) Unwrap() error { return e.cause }
 
 func adoptRefusef(format string, args ...any) error {
 	return adoptionRefusedError{msg: fmt.Sprintf(format, args...)}
+}
+
+// adoptRefuseCausef is adoptRefusef for a refusal a caller branches on. The
+// message is written out in full rather than assembled from cause, so the
+// operator-facing sentence stays one readable string.
+func adoptRefuseCausef(cause error, format string, args ...any) error {
+	return adoptionRefusedError{msg: fmt.Sprintf(format, args...), cause: cause}
 }
 
 // adoptionRefused reports whether an adoption failure is one an OPERATOR
@@ -120,6 +138,36 @@ func adoptRefusef(format string, args ...any) error {
 func adoptionRefused(err error) bool {
 	var refused adoptionRefusedError
 	return errors.As(err, &refused) || errors.Is(err, network.ErrAddressNotOurs)
+}
+
+// errAdoptionUncorroborated is the sentinel for the one adoption that cannot be
+// performed because litevirt cannot ENUMERATE what needs performing: the local
+// VM list came back empty and nothing corroborates that the cluster is genuinely
+// empty (see corroborateEmptyVMRead).
+//
+// It lives on adoptExistingAddresses rather than on each of the three resume
+// doors, because that function's contract is "adopt EVERY address a guest already
+// holds", and every door that resumes a binding goes through it. One branch there
+// makes the bind's own finisher, `lv netbox resume` and the re-key's tail all fail
+// closed; a check per door would be three places to forget it.
+//
+// Wrapped in an adoptionRefusedError so the RPCs report FailedPrecondition: this
+// is a state of the cluster, not a fault in the daemon.
+var errAdoptionUncorroborated = errors.New(
+	"this node's VM inventory could not be corroborated, so the addresses guests already hold " +
+		"inside the prefix cannot be enumerated")
+
+// adoptionPlan is what planAdoption decided from local rows alone.
+type adoptionPlan struct {
+	// candidates is every address that still has to be adopted, in a stable
+	// order.
+	candidates []adoptCandidate
+	// uncorroborated records that the VM list was EMPTY and nothing corroborated
+	// that the cluster genuinely holds no VMs. It is mutually exclusive with a
+	// non-empty candidates by construction — the flag is only set when ListVMs
+	// returned nothing, and nothing is what candidates are built from — so a
+	// caller never has to reconcile the two.
+	uncorroborated bool
 }
 
 // adoptCandidate is one address a guest already holds that NetBox has to be
@@ -161,10 +209,22 @@ type adoptCandidate struct {
 // refused because some other node leads would be unusable. Their exclusion is
 // nbPassMu, taken by each of those doors.
 func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.BindingRecord, lease *rekeyLease) (int, error) {
-	cands, err := s.planAdoption(ctx, b)
+	plan, err := s.planAdoption(ctx, b)
 	if err != nil {
 		return 0, err
 	}
+	if plan.uncorroborated {
+		// Nothing to adopt AND no standing to say so. Every caller of this
+		// function goes on to resume the binding, and a resume on the strength
+		// of an empty read this node cannot corroborate is exactly the live,
+		// un-adopted binding the suspension exists to prevent.
+		return 0, adoptRefuseCausef(errAdoptionUncorroborated,
+			"network %q: %v; the binding for prefix %d stays suspended and a NetBox "+
+				"revalidation pass resumes it automatically once this node's inventory can be "+
+				"corroborated",
+			b.Network, errAdoptionUncorroborated, b.PrefixID)
+	}
+	cands := plan.candidates
 	if len(cands) == 0 {
 		return 0, nil
 	}
@@ -252,17 +312,17 @@ func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.Binding
 // allocatorFor refuses outright. A refusal that left a suspended binding behind
 // would therefore be a deadlock — the resume waiting for an address discovery
 // was no longer permitted to write.
-func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([]adoptCandidate, error) {
+func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (adoptionPlan, error) {
 	if b.ClusterFingerprint == "" {
 		// Every identity is built from it, and an identity without one names
 		// nothing: the object would be unfindable by the recovery lookup and
 		// unreclaimable by the sweep.
-		return nil, adoptRefusef(
+		return adoptionPlan{}, adoptRefusef(
 			"network %q: no cluster identity fingerprint, so no NetBox identity can be minted", b.Network)
 	}
 	_, prefix, perr := net.ParseCIDR(b.ObservedCIDR)
 	if perr != nil {
-		return nil, adoptRefusef("network %q: bound prefix %q is unparseable: %v",
+		return adoptionPlan{}, adoptRefusef("network %q: bound prefix %q is unparseable: %v",
 			b.Network, b.ObservedCIDR, perr)
 	}
 	ones, _ := prefix.Mask.Size()
@@ -271,7 +331,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	// class of lease that refuses the bind outright.
 	leases, err := corrosion.ListLeasesByNetwork(ctx, s.db, b.Network)
 	if err != nil {
-		return nil, fmt.Errorf("read existing address leases on network %q: %w", b.Network, err)
+		return adoptionPlan{}, fmt.Errorf("read existing address leases on network %q: %w", b.Network, err)
 	}
 	byIP := make(map[string]corrosion.LeaseRecord, len(leases))
 	var containers []string
@@ -318,7 +378,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	//     would make this refusal a race against that tick.
 	ctNICs, cerr := corrosion.ListContainerInterfacesByNetwork(ctx, s.db, b.Network)
 	if cerr != nil {
-		return nil, fmt.Errorf("read container NICs on network %q: %w", b.Network, cerr)
+		return adoptionPlan{}, fmt.Errorf("read container NICs on network %q: %w", b.Network, cerr)
 	}
 	for _, nic := range ctNICs {
 		held := nic.IP
@@ -334,7 +394,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 		// twice would read as two containers to move.
 		sort.Strings(containers)
 		containers = slices.Compact(containers)
-		return nil, adoptRefusef(
+		return adoptionPlan{}, adoptRefusef(
 			"network %q holds %d container NIC(s)/address lease(s) — %v — and containers are not "+
 				"supported on a network bound to NetBox; move them to another network (or delete "+
 				"them) before binding prefix %d",
@@ -343,10 +403,15 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
-		return nil, fmt.Errorf("list VMs to find existing addresses on network %q: %w", b.Network, err)
+		return adoptionPlan{}, fmt.Errorf("list VMs to find existing addresses on network %q: %w", b.Network, err)
 	}
+	// The ONE empty read this function cannot fail closed on from the read
+	// itself. Recorded on the plan rather than acted on here, because what it
+	// costs is decided by the caller: a bind SUSPENDS, and an adoption that is
+	// meant to finish a suspension REFUSES. See corroborateEmptyVMRead.
+	plan := adoptionPlan{}
 	if len(vms) == 0 {
-		s.reportUncorroboratedVMRead(ctx, b)
+		plan.uncorroborated = !s.corroborateEmptyVMRead(ctx, b)
 	}
 
 	var cands []adoptCandidate
@@ -354,7 +419,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	for _, vm := range vms {
 		nics, nerr := corrosion.MergedVMNICs(ctx, s.db, vm.Name)
 		if nerr != nil {
-			return nil, fmt.Errorf("read NICs of VM %s: %w", vm.Name, nerr)
+			return adoptionPlan{}, fmt.Errorf("read NICs of VM %s: %w", vm.Name, nerr)
 		}
 		for _, nic := range nics {
 			if nic.NetworkName != b.Network {
@@ -391,7 +456,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 				if vm.State == "stopped" {
 					continue
 				}
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: VM %s (state %q) has a NIC (%s) on this network with no address "+
 						"recorded, so litevirt cannot tell NetBox what that guest is using — and "+
 						"NetBox would offer the same address to the next VM created here. Let the "+
@@ -404,7 +469,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 				// Fail closed. An address we cannot parse is one we cannot test
 				// for containment, so we cannot say whether NetBox is about to
 				// hand it out again.
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: VM %s records an unparseable address %q; correct or clear it before binding",
 					b.Network, vm.Name, nic.IP)
 			}
@@ -423,7 +488,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 				// convert a bound-network VM into a template. Manufacturing it
 				// here through the back door would be the same trap with no
 				// command to undo it.
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: template %s holds %s inside NetBox prefix %d; a template is "+
 						"invisible to the inventory mirror, so its address would be held by nothing "+
 						"and reclaimable by neither the mirror nor the sweep. Detach that NIC, or "+
@@ -439,20 +504,20 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 					// leave the address unknown to the prefix being bound now.
 					continue
 				}
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: %s is held by VM %s and already carries a lease litevirt cannot "+
 						"account for (netbox object %d in prefix %d, binding prefix %d); retire that "+
 						"lease before binding",
 					b.Network, bare, vm.Name, lease.NetBoxIPID, lease.NetBoxPrefix, b.PrefixID)
 			}
 			if nic.MAC == "" {
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: VM %s holds %s on a NIC with no MAC, so no NetBox identity can "+
 						"be minted for it", b.Network, vm.Name, bare)
 			}
 			uuid, uerr := vmSpecUUID(vm.Spec)
 			if uerr != nil {
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: VM %s holds %s but %v, so no NetBox identity can be minted for it",
 					b.Network, vm.Name, bare, uerr)
 			}
@@ -461,7 +526,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 				// has, locally. `ip_allocations` is keyed (network, ip) so only
 				// one of them could ever hold the lease, and adopting one would
 				// silently pick a winner and tell NetBox it is the owner.
-				return nil, adoptRefusef(
+				return adoptionPlan{}, adoptRefusef(
 					"network %q: %s is recorded on two NICs (VMs %s and %s); resolve the duplicate "+
 						"before binding prefix %d", b.Network, bare, other, vm.Name, b.PrefixID)
 			}
@@ -476,7 +541,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 		}
 	}
 	if len(cands) > adoptionCap {
-		return nil, adoptRefusef(
+		return adoptionPlan{}, adoptRefusef(
 			"network %q has %d existing addresses to adopt into NetBox prefix %d, over the "+
 				"per-bind limit of %d; a bind adopts each one with a separate NetBox request, so "+
 				"this one would run for minutes. Move workloads off the network, or bind a smaller "+
@@ -490,55 +555,253 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	sort.Slice(cands, func(i, j int) bool {
 		return bytes.Compare(net.ParseIP(cands[i].IP), net.ParseIP(cands[j].IP)) < 0
 	})
-	return cands, nil
+	plan.candidates = cands
+	return plan, nil
 }
 
-// reportUncorroboratedVMRead names the ONE empty read this function cannot fail
-// closed on.
+// corroborateEmptyVMRead decides the ONE empty read planAdoption cannot fail
+// closed on from the read alone, and reports whether it is CORROBORATED.
 //
 // corrosion.ListVMs answers ([], nil) for a node hydrating after a database loss
-// or a fresh join exactly as it does for a cluster that genuinely holds no VMs,
-// and the inventory mirror documents that shape as forbidden — it corroborates
-// its own empty read with corrosion.HasVMRecords, which counts TOMBSTONES too,
-// because a VM that was deleted leaves one behind and a row that never
-// replicated leaves nothing.
+// or a fresh join exactly as it does for a cluster that genuinely holds no VMs.
+// The inventory mirror separates those two with corrosion.HasVMRecords, which
+// counts TOMBSTONES too — but only because the mirror asks the question when
+// NetBox still holds objects for this cluster, which is INDEPENDENT proof the
+// cluster once had VMs. A bind has no such precondition, so on its own
+// HasVMRecords distinguishes exactly one thing here: "only tombstones"
+// (corroborated) from "nothing at all" — and "nothing at all" is equally a node
+// that has not replicated AND every cluster before its first VM, which is the
+// documented order of operations and the state of the first bind on every
+// installation.
 //
-// THAT CORROBORATION DOES NOT TRANSFER TO A REFUSAL HERE, and the reason is the
-// mirror's own precondition rather than anything about the helper: the mirror
-// only asks when NetBox still holds objects for this cluster, which is
-// INDEPENDENT proof the cluster once had VMs — so "no VM row of any kind" is
-// proof that node has not hydrated. A bind has no such precondition. `vms` empty
-// with no tombstones is the state of every cluster that has not created a VM
-// yet, which is the documented order of operations (build the cluster, create
-// the networks, then the VMs) and the state of the FIRST bind on every
-// installation. Refusing it would refuse exactly that bind, with no override,
-// and there is no second local signal that separates the two states: a
-// rebuilt node's `hosts` rows are re-seeded by the operator, and "wait a while"
-// is not a proof — the same argument the mirror makes about grace periods.
+// THE SECOND SIGNAL IS THE CLUSTER ITSELF, ASKED. No local table can separate
+// the two states — the receive path records no position anywhere in the schema —
+// so the question goes to the other nodes: does ANY host hold a `vms` row of any
+// kind? Every host answers, or nothing is corroborated. That is the orphan
+// sweeper's negative-proof discipline applied to a different absence, and it
+// reuses the sweeper's own machinery rather than inventing a second one:
+// eligibleProofHosts for the participant universe (which deliberately keeps
+// offline, fenced and tombstoned hosts in — a host that cannot be reached still
+// HOLDS its rows), dialPeer for the transport, and one bounded timeout each.
 //
-// So it is REPORTED rather than refused, at WARN with both counts, and the
-// residual is documented (docs/networking.md, "Binding from a node that is
-// still replicating"). The convergent fix — re-running adoption from the
-// periodic revalidation pass, so rows that arrive after the bind are adopted
-// then — is a change to a background pass's blast radius and is deliberately
-// not made here.
+// The peer's answer is its `vms` ROW COUNT from GetStateDigest — an RPC that
+// already exists for anti-entropy, so nothing new goes on the wire. The count is
+// over the whole table, TOMBSTONES INCLUDED, which is the same evidence
+// HasVMRecords reads locally: a cluster where no host has a row of any kind has
+// never had a VM.
 //
-// The read itself still fails closed in the direction it can: an unreadable
-// answer is logged as unreadable rather than as an empty cluster.
-func (s *Server) reportUncorroboratedVMRead(ctx context.Context, b corrosion.BindingRecord) {
+// FAIL CLOSED at every branch. An unreachable host, a peer that answers without
+// a `vms` entry, an unreadable host table — none of them is "the cluster is
+// empty", and each leaves the read uncorroborated. What that costs is a
+// suspension that lifts itself on the next pass; what fail-open would cost is a
+// live binding over addresses running guests hold.
+//
+// THE COST IS ONLY PAID WHERE IT BUYS SOMETHING. Everything below runs only when
+// the local `vms` table is empty AND holds no tombstone, which on any cluster
+// that has ever created a VM is never. A single-node cluster short-circuits
+// before the fan-out, because there is no peer to ask.
+//
+// WHAT IT STILL CANNOT SEE: a NIC row whose `vms` row is absent everywhere.
+// Adoption enumerates VMs and then their NICs, so such a NIC is invisible to the
+// adoption this corroborates for — the proof covers exactly the table the
+// consumer reads, and no more.
+func (s *Server) corroborateEmptyVMRead(ctx context.Context, b corrosion.BindingRecord) bool {
 	seen, err := corrosion.HasVMRecords(ctx, s.db)
-	switch {
-	case err != nil:
+	if err != nil {
 		slog.Warn("netbox: could not corroborate an empty VM list while binding a prefix; "+
-			"if this node is still replicating, addresses its guests hold may be invisible to this bind",
+			"treating it as uncorroborated",
 			"network", b.Network, "prefix", b.PrefixID, "error", err)
-	case !seen:
-		slog.Warn("netbox: binding a prefix on an uncorroborated empty VM inventory — this "+
-			"node's local database holds no VM record of any kind, which a node that has not "+
-			"finished replicating looks exactly like; bind from a node that has been up and "+
-			"replicating, or re-check the prefix once this one has caught up",
-			"network", b.Network, "prefix", b.PrefixID)
+		return false
 	}
+	if seen {
+		// A tombstone is positive evidence this database has been told about
+		// VMs, so the empty LIVE read is its own answer and no peer need be
+		// asked.
+		return true
+	}
+	proven, why, perr := s.proveClusterHoldsNoVMRecord(ctx)
+	if perr != nil {
+		slog.Warn("netbox: could not establish whether any peer holds a VM record while binding "+
+			"a prefix over an empty VM list; treating it as uncorroborated",
+			"network", b.Network, "prefix", b.PrefixID, "error", perr)
+		return false
+	}
+	if proven {
+		return true
+	}
+	slog.Warn("netbox: uncorroborated empty VM inventory — this node's local database holds no "+
+		"VM record of any kind and the cluster could not confirm that it holds none either, "+
+		"which a node that has not finished replicating looks exactly like; a binding made now "+
+		"is created SUSPENDED and a revalidation pass resumes it once the read can be "+
+		"corroborated",
+		"network", b.Network, "prefix", b.PrefixID, "reason", why)
+	return false
+}
+
+// proveClusterHoldsNoVMRecord asks every host in the sweeper's participant
+// universe for its `vms` row count and reports whether ALL of them answered zero.
+//
+// The second return is the operator-facing reason a negative answer is negative
+// — which host, and what it said — because "we could not prove it" with nothing
+// attached is the log line nobody can act on.
+//
+// Errors are RETURNED only for the failures that are about this node (no
+// database, an unreadable host table). A peer that cannot be reached is part of
+// the ANSWER, not an error: it is a host whose inventory could not be read, and
+// the proof simply does not hold.
+func (s *Server) proveClusterHoldsNoVMRecord(ctx context.Context) (bool, string, error) {
+	if s.db == nil {
+		return false, "", fmt.Errorf("no cluster database")
+	}
+	hosts, err := s.vmInventoryProofHosts(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	var peers []string
+	for _, h := range hosts {
+		if h != s.hostName {
+			peers = append(peers, h)
+		}
+	}
+	if len(peers) == 0 {
+		// This node stands alone, so its local database IS the cluster's. Not a
+		// vacuous proof: the local read that got us here already answered for
+		// this host.
+		return true, "", nil
+	}
+
+	type answer struct {
+		host  string
+		count int32
+		found bool
+		err   error
+	}
+	answers := make([]answer, len(peers))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, orphanProofWorkers)
+	for i, h := range peers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, h string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			answers[i] = answer{host: h}
+			pctx, cancel := context.WithTimeout(ctx, orphanProofTimeout)
+			defer cancel()
+			client, closeConn, derr := s.dialPeer(pctx, h)
+			if derr != nil {
+				answers[i].err = derr
+				return
+			}
+			resp, rerr := client.GetStateDigest(pctx, &emptypb.Empty{})
+			closeConn()
+			if rerr != nil {
+				answers[i].err = rerr
+				return
+			}
+			for _, td := range resp.GetTables() {
+				if td.GetName() == vmsTableName {
+					answers[i].count = td.GetCount()
+					answers[i].found = true
+					break
+				}
+			}
+		}(i, h)
+	}
+	wg.Wait()
+
+	for _, a := range answers {
+		switch {
+		case a.err != nil:
+			return false, fmt.Sprintf("host %s could not be asked (%v)", a.host, a.err), nil
+		case !a.found:
+			// An older peer, or one whose digest set does not carry the table.
+			// Silence about `vms` is not a statement that it is empty.
+			return false, fmt.Sprintf("host %s reported no %s digest", a.host, vmsTableName), nil
+		case a.count != 0:
+			return false, fmt.Sprintf("host %s holds %d %s row(s) this node has not received",
+				a.host, a.count, vmsTableName), nil
+		}
+	}
+	return true, "", nil
+}
+
+// vmsTableName is the table whose row count corroborates an empty VM read. A
+// literal rather than an import: it is matched against a name a PEER put on the
+// wire, and on a mixed-version cluster the two sides are different builds.
+const vmsTableName = "vms"
+
+// vmInventoryProofHosts is the participant universe for that proof: the
+// sweeper's eligible-proof set, plus any GOSSIP member it does not already name.
+//
+// The union matters in exactly the direction this proof needs. eligibleProofHosts
+// reads the replicated `hosts` table, so a node that has not received that table
+// either would see only itself and corroborate by standing alone — the fail-open
+// this whole function exists to remove. Gossip membership is not CRDT state:
+// memberlist converges in seconds, independently of every table, so a peer it
+// names is a peer that exists whatever the database says. corrosion's peer
+// resolver already falls back to the membership address for a host whose row has
+// not replicated, so a gossip-only peer is dialable.
+func (s *Server) vmInventoryProofHosts(ctx context.Context) ([]string, error) {
+	hosts, err := s.eligibleProofHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the host set that would have to answer for the cluster: %w", err)
+	}
+	seen := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		seen[h] = true
+	}
+	for _, m := range s.db.Members() {
+		if m.Name == "" || seen[m.Name] {
+			continue
+		}
+		seen[m.Name] = true
+		hosts = append(hosts, m.Name)
+	}
+	return hosts, nil
+}
+
+// unhydratedSuspendPrefix is the head of the reason a bind writes when it could
+// not corroborate an empty VM inventory, and the whole of how the revalidation
+// pass RECOGNISES that suspension later.
+//
+// A prefix match on a sentence rather than a column, because `netbox_bindings`
+// is a replicated table and a new column on it is a mixed-version cost with
+// nothing to buy here: the reason string already replicates, already reaches the
+// operator through `lv health`, and this is the only consumer that has to branch
+// on it. The sentence therefore has to stay the literal head of what
+// unhydratedSuspendReason produces — pinned by
+// TestUnhydratedSuspensionIsToldFromEveryOtherSuspension, which asserts the
+// predicate matches its own writer's output and no other suspension's.
+const unhydratedSuspendPrefix = "this node could not corroborate its VM inventory when NetBox " +
+	"prefix was bound"
+
+// unhydratedSuspendReason is the suspension a bind writes over an empty VM read
+// it cannot corroborate.
+//
+// It states the automatic resume, because this is the ONE suspension an operator
+// must not go looking for a repair for: nothing is broken, and the pass lifts it
+// on its own. It also names the manual finisher, because the pass is 15 minutes
+// away by default and `lv netbox resume` is the same re-run every other adoption
+// suspension advises.
+func unhydratedSuspendReason(network string) string {
+	return fmt.Sprintf(
+		"%s, so the addresses guests already hold inside it could not be enumerated; the "+
+			"binding serves no claims until a NetBox revalidation pass re-runs adoption, which "+
+			"happens automatically once this node's inventory can be corroborated. To finish it "+
+			"now, run `lv netbox resume %s` from a node that has been up and replicating",
+		unhydratedSuspendPrefix, network)
+}
+
+// isUnhydratedSuspension reports whether a suspension is the one the periodic
+// revalidation pass may lift by itself.
+//
+// Exactly one class, deliberately. Every other suspension records something an
+// operator has to change — a re-CIDRed prefix, a VRF that stopped enforcing
+// uniqueness, a moved fingerprint, an adoption that failed against NetBox — and
+// a pass that lifted one of those would be declaring a repair it never made.
+func isUnhydratedSuspension(reason string) bool {
+	return strings.HasPrefix(reason, unhydratedSuspendPrefix)
 }
 
 // adoptionSuspendReason is the reason a binding carries while adoption is owed.
@@ -575,6 +838,20 @@ func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, pr
 	}
 	if !b.Suspended {
 		return nil
+	}
+	if isUnhydratedSuspension(b.SuspendReason) {
+		// The bind decided, from the same reads this call would repeat, that it
+		// cannot enumerate what needs adopting. Nothing has changed since —
+		// this runs in the same RPC — so there is no point taking nbPassMu or
+		// reaching NetBox, and no point rewriting the reason: the revalidation
+		// pass recognises exactly this one, and a reason restated as "adoption
+		// is incomplete" would take the binding out of the only class of
+		// suspension that lifts itself.
+		return adoptRefuseCausef(errAdoptionUncorroborated,
+			"the binding for prefix %d is suspended because %s. It resumes automatically once "+
+				"this node's inventory can be corroborated; `lv netbox resume %s` from a node "+
+				"that has been up and replicating finishes it now",
+			prefixID, unhydratedSuspendPrefix, netName)
 	}
 
 	// THE INTRA-NODE EXCLUSION, and only now that there is provably something

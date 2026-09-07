@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -59,6 +61,22 @@ const (
 	// the only check a mirror-only cluster has. Subject is the HOST, for the
 	// reason above, and the evidence carries the peers holding the other value.
 	condNetBoxClusterNameDisagreement = "netbox_cluster_name_disagreement"
+	// condNetBoxDiscoveryUnclaimable: a guest on THIS host is using an address
+	// on a bound network that NetBox will not grant it, so litevirt refused to
+	// record it.
+	//
+	// The most serious of the five, and the one that had no `lv health` surface
+	// at all — only an ERROR log and a counter, both of which have to be watched
+	// or scraped to exist. reason=not_ours means NetBox holds that address for
+	// something else, which is two things using one address: the collision the
+	// whole feature exists to prevent, arriving from the one direction litevirt
+	// cannot stop (a DHCP server it does not run).
+	//
+	// Subject is the HOST, like the two cluster-name findings and for the same
+	// reason: the observation is this node's own runtime — which MAC is
+	// answering where — and no peer can make it or contradict it. The VMs and
+	// addresses are named in the evidence, which is what an operator acts on.
+	condNetBoxDiscoveryUnclaimable = "netbox_discovery_unclaimable"
 )
 
 // netboxSweepSubject is the single subject of condNetBoxSweepBlocked. The
@@ -189,6 +207,49 @@ func (s *Server) evaluateNetBoxClusterPin(ctx context.Context, bindings []corros
 		positive[s.hostName] = m.String()
 	}
 	s.applyNetBoxConditionsScoped(ctx, condNetBoxClusterNameMismatch, "host", positive,
+		func(subject string) bool { return subject == s.hostName })
+}
+
+// evaluateNetBoxDiscoveryRefusals advances condNetBoxDiscoveryUnclaimable for
+// THIS host from what the IP scanner has been refused since the last pass.
+//
+// Per-node and scoped to this host's own subject, for the reason the finding is
+// host-subjected at all: the refusal is a statement about a guest running HERE,
+// derived from this host's ARP cache and dnsmasq leases. A node that has
+// refused nothing must not clean-count another node's subject — it has observed
+// nothing about it, and silence is not a clean pass.
+//
+// The evidence lists EVERY refused VM in one row rather than one row per VM.
+// The row is keyed on the host, so a per-VM subject would need a per-VM key and
+// a per-VM clean-count, and the state it would clean-count from is per-process:
+// a restart would leave rows for VMs nothing is observing any more. One row that
+// names them all resolves as a unit, which matches the lifetime of the state
+// behind it.
+func (s *Server) evaluateNetBoxDiscoveryRefusals(ctx context.Context) {
+	refused := s.discoveryRefusals()
+	positive := map[string]string{}
+	if len(refused) > 0 {
+		names := make([]string, 0, len(refused))
+		for vm := range refused {
+			names = append(names, vm)
+		}
+		// Sorted, so the evidence of an unchanged fault is byte-identical from
+		// pass to pass and does not restamp the row's LWW timestamp with a
+		// reordering.
+		sort.Strings(names)
+		details := make([]string, 0, len(names))
+		for _, vm := range names {
+			details = append(details, refused[vm])
+		}
+		positive[s.hostName] = fmt.Sprintf(
+			"%d guest(s) on this host are using addresses NetBox will not grant them, so "+
+				"litevirt has not recorded those addresses: %s. reason=not_ours is the serious "+
+				"one — NetBox holds that address for something else, which means two things are "+
+				"using it. Nothing repairs this automatically: find what else holds the address "+
+				"(in NetBox, or an external DHCP server on that subnet) and move one of them off",
+			len(names), strings.Join(details, "; "))
+	}
+	s.applyNetBoxConditionsScoped(ctx, condNetBoxDiscoveryUnclaimable, "host", positive,
 		func(subject string) bool { return subject == s.hostName })
 }
 

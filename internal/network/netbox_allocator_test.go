@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -46,7 +47,19 @@ type stubNetBox struct {
 
 	// addressIdentity overrides the identity stamped on byAddress results. Empty
 	// means "the identity this claim used", i.e. the object is ours.
+	//
+	// THAT DEFAULT IS A VALUE FOR THE HAZARD INPUT, which is why the flag below
+	// exists rather than a second sentinel string. An object with NO litevirt
+	// identity is a distinct, refused case (ErrAddressNotOurs), and it is not
+	// reachable by leaving this empty — so a test that wants it has to say so.
+	// Had the default been "" instead, the identity-less branch would have
+	// silently captured TestExplicitClaimCrossChecksAndRefusesDisagreement and
+	// changed its outcome.
 	addressIdentity string
+	// addressNoIdentity makes byAddress results carry NO identity at all: an
+	// operator-created object or a reservation, which litevirt refuses to stamp
+	// itself onto.
+	addressNoIdentity bool
 
 	// lastIdentityVRF / lastIdentityPrefix record the scope the recovery lookup
 	// was given, so a test can prove the scope is actually forwarded.
@@ -97,7 +110,11 @@ func (s *stubNetBox) LookupByAddress(_ context.Context, _ string, _ int) ([]netb
 	}
 	// An address lookup has no identity parameter. By default the object is
 	// ours (stamped with the identity this call used); addressIdentity models
-	// an address that belongs to another system.
+	// an address that belongs to another system, and addressNoIdentity models
+	// one that belongs to no litevirt at all.
+	if s.addressNoIdentity {
+		return s.toIPs(s.byAddress, ""), nil
+	}
 	identity := s.addressIdentity
 	if identity == "" {
 		identity = s.lastIdentity
@@ -347,6 +364,95 @@ func TestExplicitClaimRefusesAnotherSystemsAddress(t *testing.T) {
 	}
 	if errors.Is(err, ErrClaimUnknown) {
 		t.Fatalf("an address definitively held by another system is not an unknown outcome: %v", err)
+	}
+	if !errors.Is(err, ErrAddressNotOurs) {
+		t.Fatalf("want ErrAddressNotOurs, got %v", err)
+	}
+	// The FOREIGN IDENTITY has to be in the message. Without it the operator is
+	// told an address is taken and given nothing to look up: which installation
+	// holds it — a co-tenant cluster, or this one before a fingerprint move — is
+	// the whole of what decides what to do next.
+	if !strings.Contains(err.Error(), "lv:someone:else:aa:bb") {
+		t.Fatalf("the refusal must name the identity holding the address, got %v", err)
+	}
+	if len(nb.released) != 0 {
+		t.Fatalf("another system's object must not be released, got %v", nb.released)
+	}
+}
+
+// TestExplicitClaimRefusesAnIdentityLessAddress is the other half of the same
+// switch, and until now nothing produced it: an object at the requested address
+// carrying NO litevirt identity.
+//
+// It is refused rather than ADOPTED, and that is the judgement worth pinning.
+// Adopting it would mean stamping litevirt's identity onto a record litevirt did
+// not create — and that identity is exactly what later authorizes the orphan
+// sweep to DELETE the object. An operator's reservation would become something
+// litevirt reclaims on its own.
+//
+// Named separately from the foreign-identity case above because the remedy is
+// different and specific: remove the object in NetBox and let litevirt create
+// the address itself.
+func TestExplicitClaimRefusesAnIdentityLessAddress(t *testing.T) {
+	ctx := context.Background()
+	nb := &stubNetBox{
+		claimErr:   errDuplicate,
+		byIdentity: nil, // nothing carries OUR identity
+		byAddress:  []stubIP{{ID: 41, Address: "10.0.5.50/24", VRFID: 3}},
+		// The hazard input, spelled out. Leaving addressIdentity empty would
+		// make the object OURS, which is a different case entirely.
+		addressNoIdentity: true,
+	}
+	a := NewNetBoxAllocator(newTestDB(t), nb, noopMetrics{})
+	req := boundReq()
+	req.ExplicitIP = "10.0.5.50/24"
+	_, err := a.Claim(ctx, req)
+	if err == nil {
+		t.Fatal("an object with no litevirt identity must be refused, not adopted")
+	}
+	if !errors.Is(err, ErrAddressNotOurs) {
+		t.Fatalf("want ErrAddressNotOurs — this is a definite answer, not an unknown one; got %v", err)
+	}
+	if errors.Is(err, ErrClaimUnknown) {
+		t.Fatalf("an identity-less object is not an unknown outcome: %v", err)
+	}
+	// The remedy has to be in the message, and it is not the same remedy as the
+	// foreign-identity case: there is nobody to go and ask.
+	if !strings.Contains(err.Error(), "no litevirt identity") {
+		t.Fatalf("the refusal must say the object carries no litevirt identity, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "41") {
+		t.Fatalf("the refusal must name the NetBox object so it can be found, got %v", err)
+	}
+	// And nothing was deleted. This object is somebody else's row; a claim that
+	// tidied it away would be the exact failure the refusal exists to prevent.
+	if len(nb.released) != 0 {
+		t.Fatalf("an identity-less object must not be released, got %v", nb.released)
+	}
+}
+
+// TestTheAddressLookupDefaultIsNotTheIdentityLessCase is the control the
+// previous test needs.
+//
+// TestExplicitClaimCrossChecksAndRefusesDisagreement passes only because the
+// stub stamps byAddress results with the identity the call used. Had it defaulted
+// to "", the identity-less branch would have captured that test and changed its
+// outcome from ErrClaimUnknown to ErrAddressNotOurs — a real refusal replaced by
+// a differently-shaped one, with nothing failing. This asserts the default is
+// still "ours", so that test keeps testing the cross-check.
+func TestTheAddressLookupDefaultIsNotTheIdentityLessCase(t *testing.T) {
+	ctx := context.Background()
+	nb := &stubNetBox{
+		claimErr:   errTimeout,
+		byAddress:  []stubIP{{ID: 41, Address: "10.0.5.50/24", VRFID: 3}},
+		byIdentity: []stubIP{{ID: 99, Address: "10.0.5.50/24", VRFID: 3}},
+	}
+	a := NewNetBoxAllocator(newTestDB(t), nb, noopMetrics{})
+	req := boundReq()
+	req.ExplicitIP = "10.0.5.50/24"
+	if _, err := a.Claim(ctx, req); errors.Is(err, ErrAddressNotOurs) {
+		t.Fatalf("the stub's default byAddress identity must be OURS, or the cross-check test "+
+			"is really testing the identity-less branch: %v", err)
 	}
 }
 

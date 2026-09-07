@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -140,7 +142,14 @@ Examples:
 					NetboxPrefixId: int32(netboxID),
 				})
 				if err != nil {
-					return fmt.Errorf("create network: %w", err)
+					// The server's own message, not a wrapped rpc error. This
+					// RPC reports PARTIAL SUCCESS — "network X was created and
+					// its NetBox binding is SUSPENDED" — and `%w` prefixed that
+					// with "create network:" plus grpc's "rpc error: code = ...
+					// desc =", so the line said failure while the sentence
+					// inside said the network exists. status.Convert gives the
+					// server's sentence verbatim.
+					return errors.New(status.Convert(err).Message())
 				}
 
 				owner := ni.Project

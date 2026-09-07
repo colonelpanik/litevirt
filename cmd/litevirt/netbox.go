@@ -96,13 +96,25 @@ func newNetboxResumeCmd() *cobra.Command {
 		Short: "Lift a NetBox binding's suspension once the drift is repaired",
 		Long: `Resume a suspended NetBox binding.
 
-A binding suspends when its prefix stops satisfying what the bind validated: it
-was re-CIDRed, moved to the global table, or its VRF stopped enforcing
-uniqueness. New allocations refuse while it is suspended; running VMs are
-untouched. Repair the prefix in NetBox, then run this.
+A binding suspends for one of three kinds of reason:
 
-The suspension is lifted only when every bind-time check passes again, so a
-binding whose drift is still present is refused with the reason.
+  * DRIFT -- the prefix stopped satisfying what the bind validated: it was
+    re-CIDRed, moved to the global table, or its VRF stopped enforcing
+    uniqueness. Repair the prefix in NetBox, then run this.
+  * AN UNFINISHED ADOPTION -- the bind found addresses this network's guests
+    already hold and could not record all of them in NetBox (NetBox became
+    unreachable, or one address is held by something else). This command
+    FINISHES that adoption: it claims the remaining addresses and only then
+    lifts the suspension.
+  * AN UNCORROBORATED INVENTORY -- the binding was made on a node that could not
+    establish what its guests hold. That one lifts itself on the next NetBox
+    maintenance pass; running this finishes it immediately instead.
+
+New allocations refuse while a binding is suspended; running VMs are untouched.
+
+The suspension is lifted only when every bind-time check passes again AND every
+owed address is adopted, so a binding whose drift is still present, or whose
+adoption still cannot complete, is refused with the reason.
 
 Resume does NOT accept a changed CIDR. Re-CIDRing a bound prefix is unsupported:
 revert the CIDR in NetBox, or delete and recreate the network to bind against

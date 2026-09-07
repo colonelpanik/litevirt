@@ -72,6 +72,12 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 	// configured node contributes its opinion whether or not it ever mirrors.
 	s.evaluateNetBoxClusterUniformity(ctx)
 
+	// The IP scanner's refusals, from this node's own runtime. Reported here for
+	// the same reason the two above are: this pass runs on every configured
+	// node, and the observation is host-local — the scanner that made it runs on
+	// whichever host the guest is on, which is not necessarily the leader.
+	s.evaluateNetBoxDiscoveryRefusals(ctx)
+
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("derive cluster fingerprint: %w", err)
@@ -670,8 +676,15 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// a handover; leaving it unproven would also separate the resume below from
 	// its last proof by all of them.
 	//
-	// Costs a few local reads on a binding with nothing owed, which is every
-	// re-key that is only answering a fingerprint move.
+	// NOT "a few local reads" on a binding with nothing owed, which is what this
+	// used to claim. It re-plans the adoption unconditionally, which is 2N+3
+	// local queries for a cluster of N VMs — every VM's two NIC tables, before
+	// anything can be known to be owed (planAdoption states the figure). A
+	// re-key that is only answering a fingerprint move pays all of it. That is
+	// accepted here rather than optimised: a re-key is an operator command, it
+	// already spends one NetBox round trip per object it rewrites, and the scan
+	// is what makes the resume below unable to be a second door around the
+	// adoption gate.
 	adopted, aerr := s.adoptExistingAddresses(ctx, next, lease)
 	if aerr != nil {
 		reason := fmt.Sprintf(
@@ -1157,8 +1170,14 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 	// address to the next VM. It is also what makes "re-run to finish" true:
 	// the resume is the operator's re-run.
 	//
-	// Cheap when there is nothing owed — no NetBox request — so an ordinary
-	// resume of a drift suspension is unchanged.
+	// It makes no NetBox request when nothing is owed, so an ordinary resume of
+	// a drift suspension writes nothing remote — but it is NOT cheap, which is
+	// what this used to say. Establishing that nothing is owed means re-planning
+	// the adoption: 2N+3 local queries for a cluster of N VMs, every VM's two
+	// NIC tables, on every `lv netbox resume` whatever the suspension was for
+	// (planAdoption states the figure and why it is not bounded). Accepted for
+	// the same reason as the re-key's: this is an operator command, not a
+	// periodic pass.
 	//
 	// No leader lease: a resume must not require cluster leadership, so this
 	// door's exclusion is the nbPassMu above and nothing else. See

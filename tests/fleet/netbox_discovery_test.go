@@ -336,3 +336,89 @@ func TestFleetDiscoveryStillRecordsOnAnUnboundNetwork(t *testing.T) {
 		t.Fatalf("an unbound discovery wrote %d leases, want 0 — VMs allocate nothing there", got)
 	}
 }
+
+// TestFleetUnclaimableDiscoverySurfacesInHealth is the operator surface the
+// refusal did not have.
+//
+// This is the most serious NetBox finding there is — reason=not_ours means
+// NetBox holds that address for something else, so two things are using one
+// address — and its only two signals were an ERROR log and a counter. Both are
+// opt-in: the log has to be watched, the counter has to be scraped. `lv health`
+// is what somebody actually reads during an incident, and it said nothing.
+//
+// The whole cycle: refuse, report, then clear once the address is claimable.
+func TestFleetUnclaimableDiscoverySurfacesInHealth(t *testing.T) {
+	_, c, n := adoptCluster(t)
+	ctx := context.Background()
+
+	mac := aStoppedGuestOnABoundNetwork(t, c, n)
+
+	// Another VM holds the fake's first address for real, which is what makes
+	// the discovery below a collision rather than an ordinary claim.
+	mustCreateVMOnNetwork(t, c, n, "newcomer", adoptNetName)
+	if got := vmNICIP(t, n, "newcomer"); got != adoptFirstIP {
+		t.Fatalf("precondition: the newcomer holds %q, want %s", got, adoptFirstIP)
+	}
+
+	// Nothing yet — the finding must be produced by the refusal, not by the
+	// evaluator running at all.
+	if err := n.Server.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if h, ok := fleetNetBoxCondition(t, n, "netbox_discovery_unclaimable", n.Name); ok && h.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("a node that has refused nothing must raise nothing, got %+v", h)
+	}
+
+	// The stopped guest wakes up on the newcomer's address.
+	stubDiscovery(n, mac, adoptFirstIP)
+	grpcapi.NewIPScanner(n.Server).ScanOnce(ctx)
+	if got := vmNICIP(t, n, "cold-guest"); got != "" {
+		t.Fatalf("precondition: the refused address must not be recorded, got %q", got)
+	}
+
+	if err := n.Server.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h, ok := fleetNetBoxCondition(t, n, "netbox_discovery_unclaimable", n.Name)
+	if !ok {
+		t.Fatal("a guest using an address NetBox will not grant must raise a health condition")
+	}
+	if h.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("the finding must be live while the collision stands, got %+v", h)
+	}
+	if h.Severity != corrosion.SeverityWarning {
+		t.Fatalf("severity = %q, want warning", h.Severity)
+	}
+	// The evidence has to name the guest and the address, or the operator has a
+	// row and nowhere to go.
+	if !strings.Contains(h.Evidence, "cold-guest") || !strings.Contains(h.Evidence, adoptFirstIP) {
+		t.Fatalf("the evidence must name the VM and the address, got %q", h.Evidence)
+	}
+	// …and the reason, because reason=not_ours is the one that means two things
+	// are using one address and the others do not.
+	if !strings.Contains(h.Evidence, "not_ours") {
+		t.Fatalf("the evidence must carry the bounded reason, got %q", h.Evidence)
+	}
+
+	// NOW THE COLLISION GOES AWAY: the guest is seen on a free address instead,
+	// the claim succeeds, and two clean passes resolve the finding. A finding
+	// that could not clear would be worse than none — an operator learns to
+	// ignore a row that never goes away.
+	stubDiscovery(n, mac, discoveryFreeIP)
+	grpcapi.NewIPScanner(n.Server).ScanOnce(ctx)
+	if got := vmNICIP(t, n, "cold-guest"); got != discoveryFreeIP {
+		t.Fatalf("the claimable address must now be recorded, got %q", got)
+	}
+	for i := 0; i < 2; i++ {
+		if err := n.Server.RevalidateBindingsOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h, ok = fleetNetBoxCondition(t, n, "netbox_discovery_unclaimable", n.Name)
+	if !ok {
+		t.Fatal("the row must still exist, resolved")
+	}
+	if h.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("two clean passes must resolve the finding, got %+v", h)
+	}
+}

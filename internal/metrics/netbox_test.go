@@ -138,6 +138,46 @@ func TestNetBoxAPIErrorClassLabelIsBounded(t *testing.T) {
 	}
 }
 
+// TestUnclaimableDiscoveryReasonsAreMaterialisedAtZero pins the series an
+// operator alerts on into existence before anything has gone wrong.
+//
+// A CounterVec emits NO series for a label value nothing has incremented, so a
+// dashboard or an alert built on reason=not_ours reads empty until the first
+// occurrence — and depending on the alerting stack, an expression over a
+// non-existent series either never fires or fires only after the incident is
+// already underway. reason=not_ours means two things are using one address, so
+// it is precisely the series that must be there in advance.
+//
+// Constructed here WITHOUT incrementing anything, which is the whole assertion:
+// every reason must already have a series at zero.
+func TestUnclaimableDiscoveryReasonsAreMaterialisedAtZero(t *testing.T) {
+	NewNetBoxMetrics()
+
+	fam := netboxFamilies(t)["litevirt_netbox_unclaimable_discoveries_total"]
+	if fam == nil {
+		t.Fatal("litevirt_netbox_unclaimable_discoveries_total is not registered")
+	}
+	seen := map[string]bool{}
+	for _, series := range fam.GetMetric() {
+		for _, l := range series.GetLabel() {
+			if l.GetName() != "reason" {
+				t.Errorf("unexpected label %q on the discovery counter", l.GetName())
+				continue
+			}
+			seen[l.GetValue()] = true
+		}
+	}
+	for _, reason := range NetBoxDiscoveryReasons {
+		if !seen[reason] {
+			t.Errorf("reason=%q has no series — a dashboard on it reads empty until the "+
+				"first occurrence", reason)
+		}
+	}
+	if len(NetBoxDiscoveryReasons) == 0 {
+		t.Fatal("the reason vocabulary is empty, so this test asserts nothing")
+	}
+}
+
 // TestCollectNetBoxGauges pins the two DB-backed gauges. Both answer questions
 // a counter cannot: how much mirror work is queued RIGHT NOW, and how many
 // bindings are refusing allocations RIGHT NOW. A counter of suspensions keeps

@@ -342,15 +342,23 @@ func (f *NetBoxFake) Identities() []string {
 	return out
 }
 
-// IDForAddress is the id of the object currently at one address ("ip/len"), or
-// 0 if none. It is what an assertion needs when the point is that a lease names
-// an object that EXISTS — an id compared against a remembered number cannot say
-// that, and the fake reuses ids from a free pool where real NetBox would not.
-func (f *NetBoxFake) IDForAddress(address string) int {
+// IDForAddress is the id of the object currently at one address ("ip/len") in
+// one VRF, or 0 if none. It is what an assertion needs when the point is that a
+// lease names an object that EXISTS — an id compared against a remembered number
+// cannot say that, and the fake reuses ids from a free pool where real NetBox
+// would not.
+//
+// THE VRF IS PART OF THE KEY, and it was not. `enforce_unique` is per-VRF, which
+// is the whole reason a bind requires one, so the same address legitimately
+// exists in two VRFs — and this walked a MAP and returned the first match, so
+// with a co-tenant VRF present it answered a different id on different runs. A
+// non-deterministic helper under an equality assertion is a test that fails one
+// time in two for no reason anybody can reproduce.
+func (f *NetBoxFake) IDForAddress(address string, vrfID int) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for id, ip := range f.byID {
-		if ip.Address == address {
+		if ip.Address == address && ip.VRFID == vrfID {
 			return id
 		}
 	}

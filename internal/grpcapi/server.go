@@ -92,6 +92,21 @@ type Server struct {
 	nbSweepUnreachable  bool
 	nbUnreachableStreak int
 
+	// nbDiscRefused is the set of VMs on THIS host whose discovered address
+	// NetBox would not grant, keyed by VM name, valued by the operator-facing
+	// detail. Written by the IP scanner's 30-second tick (refuseDiscovery) and
+	// cleared the moment the same address is claimed successfully; read by the
+	// revalidation pass, which folds it into a health condition.
+	//
+	// Per-process and in-memory for the reason the sweeper's streak is: the
+	// observation is a HOST-LOCAL runtime fact about a guest on this host, so no
+	// other node can make it and no row could be merged from one that tried. A
+	// restart forgets it, and the next scanner tick re-derives it within 30
+	// seconds — which is the safe direction for a warning, and much shorter than
+	// the pass that reports it.
+	nbDiscMu      sync.Mutex
+	nbDiscRefused map[string]string
+
 	// nbPassMu admits ONE NetBox write pass at a time on this node: a
 	// maintenance pass (revalidate + orphan sweep), an inventory mirror pass, or
 	// a CA re-key.

@@ -323,7 +323,7 @@ for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 ```bash
 lv netbox rekey <network>                         # re-stamp a bound network's identities under the current fingerprint
 lv netbox rekey                                   # re-stamp the mirrored inventory, cluster-wide
-lv netbox resume <network>                        # lift a suspension once the drift is repaired
+lv netbox resume <network>                        # finish an owed adoption and lift a suspension
 ```
 
 A bound network's binding is suspended when the NetBox prefix drifts out of what
@@ -348,11 +348,22 @@ fingerprint recorded anywhere it refuses rather than re-stamping by any other
 rule. See `docs/networking.md#recovering-from-a-moved-cluster-fingerprint` for what the
 order buys and why the refusal matters.
 
-`lv netbox resume` is every other case: repair the prefix in NetBox, then run it
-to re-check the bind-time preconditions and clear the suspension. It refuses
-while the drift is still there, and it never accepts a changed CIDR — re-CIDRing
-a bound prefix is unsupported. See
-`docs/networking.md#resuming-a-suspended-binding` and
+`lv netbox resume` is every other case, and it does two things rather than one:
+
+- it re-checks the bind-time preconditions and clears the suspension, refusing
+  while the drift is still there and never accepting a changed CIDR (re-CIDRing
+  a bound prefix is unsupported);
+- it **finishes any adoption the bind left owed** — the addresses this network's
+  guests already hold that NetBox has not been told about — and lifts the
+  suspension only once every one of them is recorded. That is what makes "re-run
+  to finish" true for a bind whose adoption stopped partway, and it is why a
+  resume is a NetBox *write* pass: it refuses while another pass or a re-key is
+  running on the same node.
+
+A binding suspended because the node could not corroborate its VM inventory
+lifts itself on the next NetBox maintenance pass; running this finishes it
+immediately instead. See `docs/networking.md#resuming-a-suspended-binding`,
+`docs/networking.md#adopting-the-addresses-guests-already-hold` and
 `docs/networking.md#recovering-from-a-moved-cluster-fingerprint`.
 
 ## Storage pools

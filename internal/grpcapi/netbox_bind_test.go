@@ -39,6 +39,48 @@ type netboxPrefix struct {
 	VRFID  int // 0 = global table, no VRF
 }
 
+// requestCounter records what a fake NetBox was ASKED, so a test can pin that a
+// refusal happened BEFORE anything reached the API rather than only that it
+// happened. Shared by pointer, because the handler is a value receiver.
+//
+// It exists because "refused before any NetBox request is made" was a claim
+// several refusal tests made in a comment and none of them asserted: every one
+// of them would have passed against a bind that enumerated the whole prefix
+// first and then refused.
+type requestCounter struct {
+	mu        sync.Mutex
+	addresses int
+	total     int
+}
+
+func (c *requestCounter) record(path string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.total++
+	if strings.HasPrefix(path, "/api/ipam/ip-addresses") ||
+		strings.Contains(path, "/available-ips") {
+		c.addresses++
+	}
+}
+
+// AddressRequests is every request to the ipam ADDRESS surface — reads included,
+// because enumerating a prefix is exactly the cost these controls forbid.
+func (c *requestCounter) AddressRequests() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.addresses
+}
+
+// Requests is every request of any kind.
+func (c *requestCounter) Requests() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.total
+}
+
 // fakeNetBox configures a fake NetBox server serving exactly the two endpoints
 // validateAndBindPrefix needs: the prefix lookup and its VRF's enforce_unique
 // flag. Unlike fakeNetBoxDeletes (netbox_claims_test.go), which serves the IP
@@ -46,9 +88,13 @@ type netboxPrefix struct {
 type fakeNetBox struct {
 	prefix        netboxPrefix
 	enforceUnique bool
+	// counter, when set, records every request. Optional so the fixtures that do
+	// not care keep their one-line literals.
+	counter *requestCounter
 }
 
 func (f fakeNetBox) handler(w http.ResponseWriter, r *http.Request) {
+	f.counter.record(r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.URL.Path == "/api/ipam/ip-addresses/" && r.Method == http.MethodGet:

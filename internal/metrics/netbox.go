@@ -36,6 +36,18 @@ var (
 	netboxMirrorLastSuccess      prometheus.Gauge
 )
 
+// NetBoxDiscoveryReasons is the BOUNDED reason vocabulary of
+// litevirt_netbox_unclaimable_discoveries_total, materialised at zero by
+// netboxInit so a dashboard shows every series before the first occurrence.
+//
+// Literals rather than an import: the values are produced in internal/grpcapi,
+// which imports THIS package, so the dependency cannot go the other way. The two
+// lists are kept in step by a test on the grpcapi side
+// (TestDiscoveryReasonLabelsAreMaterialisedAtZero), which compares its own
+// constants against this slice — the same shape as the sink's structural
+// interface check, and for the same reason.
+var NetBoxDiscoveryReasons = []string{"not_ours", "unknown", "no_allocator", "no_identity"}
+
 func netboxInit() {
 	netboxOnce.Do(func() {
 		netboxAPIErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -113,6 +125,14 @@ func netboxInit() {
 		// failed gives the alert nothing to compare against.
 		for _, result := range []string{"ok", "error"} {
 			netboxMirrorSweeps.WithLabelValues(result)
+		}
+		// …and for every discovery-refusal reason. This is the counter that
+		// matters most to have at zero: reason=not_ours means two things are
+		// using one address, so it is the series an operator builds an alert on
+		// — and an alert on a series that does not exist until the first
+		// occurrence fires late or not at all, depending on the alerting stack.
+		for _, reason := range NetBoxDiscoveryReasons {
+			netboxUnclaimableDiscoveries.WithLabelValues(reason)
 		}
 	})
 }

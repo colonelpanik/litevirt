@@ -312,6 +312,27 @@ func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.Binding
 // allocatorFor refuses outright. A refusal that left a suspended binding behind
 // would therefore be a deadlock — the resume waiting for an address discovery
 // was no longer permitted to write.
+//
+// WHAT IT COSTS, stated in numbers because three comments elsewhere used to
+// describe it as "a few local reads". It is 2N+3 local queries for a cluster of
+// N VMs, all synchronous and all BEFORE the cap is evaluated:
+// ListLeasesByNetwork, ListContainerInterfacesByNetwork and ListVMs, then
+// MergedVMNICs per VM — and MergedVMNICs is TWO queries, one per NIC table
+// (internal/corrosion/hardware.go). On a 500-VM cluster that is a little over a
+// thousand queries. It scans EVERY VM in the cluster, not only the ones on this
+// network, because the NIC tables are keyed by VM and the merge that decides
+// what a NIC actually IS is per-VM; a network-scoped read would have to
+// reimplement that resolution.
+//
+// IT IS DELIBERATELY NOT BOUNDED, and the cap is not what would bound it — the
+// cap counts adoption CANDIDATES, so it is evaluated after the scan and cannot
+// shorten it. The reason is that every caller is either interactive and rare or
+// once-per-binding: a bind (one `lv network create`), `lv netbox resume`, a
+// re-key, and the revalidation pass's re-adoption, which runs only for a binding
+// suspended on an uncorroborated inventory and only on the pass that can finally
+// act — after which the binding is live and never scanned again. A thousand
+// local SQLite reads is tens of milliseconds; a periodic per-binding scan of the
+// whole fleet's NICs would not be, and that is the shape this avoids.
 func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (adoptionPlan, error) {
 	if b.ClusterFingerprint == "" {
 		// Every identity is built from it, and an identity without one names
@@ -816,10 +837,16 @@ func adoptionSuspendReason(network string, pending int) string {
 // finishAdoptionAndResume adopts what a bind left owed and resumes the binding.
 //
 // It is a NO-OP on a binding that is not suspended, which is the common case: a
-// bind of a network with no existing guests leaves the binding live and this
-// costs one local read and nothing else. That is deliberate — the ordinary bind
-// must not become a slow path, and in particular must not reach NetBox's address
-// endpoints at all.
+// bind of a network with no existing guests leaves the binding live, and this
+// then costs the one GetBindingByPrefix below and nothing else. That is
+// deliberate — the ordinary bind must not become a slow path, and in particular
+// must not reach NetBox's address endpoints at all.
+//
+// On a binding that IS suspended it costs 2N+3 more local queries for a cluster
+// of N VMs, because it re-plans the adoption (see planAdoption, which states the
+// figure and why it is not bounded). That is the same scan the bind itself just
+// performed; it is repeated rather than carried across, because the plan is only
+// valid against the rows as they are now and the binding is persisted in between.
 //
 // RESUME LAST, and only on a pass that adopted everything. Everything before the
 // resume is safe to interrupt: the binding stays suspended, no claim is served,

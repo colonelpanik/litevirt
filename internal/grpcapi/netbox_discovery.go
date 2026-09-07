@@ -226,6 +226,11 @@ func (s *Server) recordDiscoveredVMIP(ctx context.Context, vm *corrosion.VMRecor
 			cerr)
 		return false
 	}
+	// The claim was GRANTED, so whatever this VM was refused for is over. Cleared
+	// before the row write rather than after it: the finding is about NetBox
+	// declining the address, and a failed local write is a different fault with
+	// its own log line, which the next tick retries.
+	s.clearDiscoveryRefusal(vm.Name)
 	return s.persistDiscoveredVMIP(ctx, vm.Name, netName, ip)
 }
 
@@ -246,16 +251,64 @@ func (s *Server) persistDiscoveredVMIP(ctx context.Context, vmName, netName, ip 
 
 // refuseDiscovery is the disposition of every address discovery litevirt
 // declines to record: one ERROR log carrying the unbounded detail, one counter
-// carrying the bounded reason.
+// carrying the bounded reason, and one durable health finding.
 //
 // ERROR rather than WARN because nothing repairs it automatically and the
 // operator-visible consequence is real: a guest is using an address the cluster
 // will not record, so it is missing from cloud-init, from the inventory mirror,
 // and from every "is this address free" answer.
+//
+// THE HEALTH FINDING is why a log line and a counter were not enough. This is
+// the one NetBox failure that means two things are probably using one address,
+// and both of its existing surfaces are opt-in: the log has to be watched, and
+// the counter has to be scraped. `lv health` is what an operator actually reads
+// during an incident, and it said nothing at all. See
+// evaluateNetBoxDiscoveryRefusals.
 func (s *Server) refuseDiscovery(reason, vmName, netName, ip, what string, err error) {
 	slog.Error("netbox: refusing to record a discovered address — "+what,
 		"reason", reason, "vm", vmName, "network", netName, "ip", ip, "error", err)
 	s.nbMetrics().IncUnclaimableDiscovery(reason)
+	s.noteDiscoveryRefusal(vmName, fmt.Sprintf(
+		"%s on network %s is using %s, which NetBox will not grant it (%s): %s. The address is "+
+			"NOT recorded, so it is missing from cloud-init, from the inventory mirror and from "+
+			"every \"is this address free\" answer — and something else may be using it",
+		vmName, netName, ip, reason, what))
+}
+
+// noteDiscoveryRefusal records one refused discovery for the health evaluator.
+func (s *Server) noteDiscoveryRefusal(vmName, detail string) {
+	if vmName == "" {
+		return
+	}
+	s.nbDiscMu.Lock()
+	defer s.nbDiscMu.Unlock()
+	if s.nbDiscRefused == nil {
+		s.nbDiscRefused = map[string]string{}
+	}
+	s.nbDiscRefused[vmName] = detail
+}
+
+// clearDiscoveryRefusal forgets a VM whose address litevirt has now recorded.
+//
+// Called on the SUCCESS of the same write the refusal blocked, not on a timer:
+// the scanner re-attempts every 30 seconds, so a refusal that has resolved
+// clears itself on the next tick, and one that has not stays until it does. A
+// time-based expiry would clear a live collision while it was still live.
+func (s *Server) clearDiscoveryRefusal(vmName string) {
+	s.nbDiscMu.Lock()
+	defer s.nbDiscMu.Unlock()
+	delete(s.nbDiscRefused, vmName)
+}
+
+// discoveryRefusals is a copy of the current set, for the evaluator.
+func (s *Server) discoveryRefusals() map[string]string {
+	s.nbDiscMu.Lock()
+	defer s.nbDiscMu.Unlock()
+	out := make(map[string]string, len(s.nbDiscRefused))
+	for k, v := range s.nbDiscRefused {
+		out[k] = v
+	}
+	return out
 }
 
 // addressInPrefix reports whether a bare address falls inside a CIDR.

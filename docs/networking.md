@@ -457,12 +457,21 @@ uses — because the NIC record is what cloud-init, the inventory mirror and eve
 address describes something that is not true.
 
 If NetBox will not grant it, **nothing is recorded**: no NIC address, no DNS
-record. An `ERROR` is logged and
-`litevirt_netbox_unclaimable_discoveries_total{reason="not_ours"}` is
-incremented. That combination means what it says — a guest is using an address
-NetBox holds for something else, which is what an external DHCP server does when
-it re-offers a lease it remembers. litevirt cannot resolve that from here; move
-the guest off the address, or reconcile the NetBox object.
+record. Three things surface it:
+
+- an `ERROR` log line naming the VM, the network, the address and the reason;
+- `litevirt_netbox_unclaimable_discoveries_total{reason="not_ours"}`, whose
+  reason labels are materialised at zero so an alert on them has a series to
+  read before the first occurrence;
+- a durable `netbox_discovery_unclaimable` health condition on **that host**, so
+  `lv health` says so without anyone having to watch a log or scrape a counter.
+  It names every affected guest and clears two revalidation passes after the
+  address becomes claimable (the scanner re-attempts every 30 seconds).
+
+`reason=not_ours` means what it says — a guest is using an address NetBox holds
+for something else, which is what an external DHCP server does when it re-offers
+a lease it remembers. litevirt cannot resolve that from here; move the guest off
+the address, or reconcile the NetBox object.
 
 The two **read** RPCs that also discover (`lv ls` and `lv inspect`, i.e. ListVMs
 and GetVM) still *report* the address — the guest is using it, and hiding it helps
@@ -934,6 +943,13 @@ and every lifted suspension. A cluster-scoped re-key is audited under the target
 `(inventory)` rather than a network name, and — like the per-network form — is
 recorded on failure as well as success, because a run that stopped partway has
 still rewritten objects.
+
+**`netbox.adopt`** is the third action, and it is written by the paths that
+record addresses guests already hold: the tail of a bind, and the revalidation
+pass that finishes a bind it could not complete. Its detail carries
+`prefix=<id> adopted=<n>`, and — like the re-key — it is recorded on failure as
+well as success, because a pass that stopped partway has still created objects in
+NetBox and "nothing happened" is the wrong thing for the trail to imply.
 
 ### Maintenance and reclamation
 

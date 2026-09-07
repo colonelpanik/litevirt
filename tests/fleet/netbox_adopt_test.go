@@ -530,7 +530,7 @@ func TestFleetBindDoesNotSkipAnAddressOnAStaleTombstonedLease(t *testing.T) {
 	// against staleID: the fake hands ids out of a free pool, so a re-created
 	// object can legitimately land on the released id — real NetBox would not,
 	// and an inequality assertion would be testing the fake.)
-	if live := nb.IDForAddress(adoptFirstIP + "/24"); lease.NetBoxIPID != live {
+	if live := nb.IDForAddress(adoptFirstIP+"/24", adoptVRF); lease.NetBoxIPID != live {
 		t.Fatalf("lease names object %d but NetBox holds %d at %s",
 			lease.NetBoxIPID, live, adoptFirstIP)
 	}

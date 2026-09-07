@@ -181,3 +181,38 @@ func TestRecidrPrefixMovesTheBoundCIDR(t *testing.T) {
 		t.Fatalf("Addresses() = %v, want the pre-re-CIDR address to stay put", got)
 	}
 }
+
+// TestNetBoxFakeIDForAddressIsScopedToTheVRF pins the fake's own determinism.
+//
+// `enforce_unique` is per-VRF — which is the whole reason a bind requires a VRF
+// — so the same address legitimately exists in two of them. IDForAddress walks a
+// MAP, so an address-only match returned whichever of the two Go's iteration
+// order reached first: a helper that answers differently on different runs,
+// under an equality assertion. That is a test that fails one time in two for no
+// reason anybody can reproduce.
+func TestNetBoxFakeIDForAddressIsScopedToTheVRF(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+
+	// One address, two VRFs — a co-tenant installation sharing the NetBox
+	// instance, which is a shape this branch supports and tests elsewhere.
+	ours := nb.SeedIP("10.0.5.100/24", 3, "lv:ours:uuid:aa:bb", time.Now().UTC())
+	theirs := nb.SeedIP("10.0.5.100/24", 9, "lv:theirs:uuid:cc:dd", time.Now().UTC())
+	if ours == theirs {
+		t.Fatal("precondition: the two objects must be distinct")
+	}
+
+	// Repeated, because the failure is a map-iteration coin flip: one pass could
+	// pass by luck.
+	for i := 0; i < 20; i++ {
+		if got := nb.IDForAddress("10.0.5.100/24", 3); got != ours {
+			t.Fatalf("IDForAddress in VRF 3 = %d, want %d (ours)", got, ours)
+		}
+		if got := nb.IDForAddress("10.0.5.100/24", 9); got != theirs {
+			t.Fatalf("IDForAddress in VRF 9 = %d, want %d (theirs)", got, theirs)
+		}
+	}
+	if got := nb.IDForAddress("10.0.5.100/24", 42); got != 0 {
+		t.Fatalf("IDForAddress in an unrelated VRF = %d, want 0", got)
+	}
+}

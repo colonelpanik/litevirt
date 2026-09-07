@@ -121,9 +121,9 @@ func TestBindRefusesWhenATemplateHoldsAnAddressInThePrefix(t *testing.T) {
 
 	seedVMHoldingIP(t, s, "golden", "shared", "aa:bb:cc:00:00:01", "10.0.5.20",
 		"11111111-1111-1111-1111-111111111111")
-	if err := s.db.Execute(ctx,
-		`UPDATE vms SET is_template = 1, updated_at = ? WHERE name = 'golden'`,
-		s.db.NowTS()); err != nil {
+	// The production writer, not a hand-rolled UPDATE: a fixture that set the
+	// column itself would keep passing if the column ever moved.
+	if err := corrosion.SetVMTemplate(ctx, s.db, "golden", true); err != nil {
 		t.Fatalf("mark template: %v", err)
 	}
 
@@ -154,6 +154,12 @@ func TestBindRefusesALeaseNamingAnotherPrefix(t *testing.T) {
 		"22222222-2222-2222-2222-222222222222")
 	// A live lease naming an object in prefix 99 — the shape a network that was
 	// bound elsewhere, released, and is now being bound here leaves behind.
+	//
+	// Raw SQL because no production writer produces it in one step: the NetBox
+	// allocator writes these join keys, but only as the tail of a claim against
+	// the prefix currently bound, so reaching "a lease naming ANOTHER prefix"
+	// through it would mean binding, claiming, releasing and rebinding. The row
+	// is the subject here, not the path that made it.
 	if err := s.db.Execute(ctx,
 		`INSERT INTO ip_allocations
 		   (network, ip, mac, vm_name, owner_kind, owner_host,
@@ -176,23 +182,21 @@ func TestBindRefusesALeaseNamingAnotherPrefix(t *testing.T) {
 	assertNothingBound(t, s)
 }
 
-// TestBindRefusesOverTheAdoptionCap: one bind adopts each address with its own
-// NetBox request, so a prefix holding thousands of guests must refuse with the
-// numbers in the message rather than run for minutes.
+// capTestServer seeds `count` VMs each holding a distinct address inside a /22,
+// and returns the server plus the request counter its fake NetBox records on.
 //
-// Seeded one over the cap, so it also pins that the cap is the boundary and not
-// an approximation, and refused before any NetBox address request is made.
-func TestBindRefusesOverTheAdoptionCap(t *testing.T) {
-	// A /22, so the prefix genuinely CONTAINS every seeded address: on a /24 the
-	// containment skip would drop most of them and the cap would never be
-	// reached, and this would pass for the wrong reason.
+// A /22 rather than a /24, so the prefix genuinely CONTAINS every seeded
+// address: on a /24 the containment skip would drop most of them, the cap would
+// never be reached, and the refusal test would pass for the wrong reason.
+func capTestServer(t *testing.T, count int) (*Server, *requestCounter) {
+	t.Helper()
+	rc := &requestCounter{}
 	s := newTestServerWithNetBox(t, fakeNetBox{
 		prefix:        netboxPrefix{ID: adoptTestPrefix, Prefix: "10.0.4.0/22", VRFID: 3},
 		enforceUnique: true,
+		counter:       rc,
 	})
-	ctx := context.Background()
-
-	for i := 0; i <= adoptionCap; i++ {
+	for i := 0; i < count; i++ {
 		host := i + 2 // skip the network address
 		seedVMHoldingIP(t, s,
 			fmt.Sprintf("vm-%d", i), "shared",
@@ -200,6 +204,20 @@ func TestBindRefusesOverTheAdoptionCap(t *testing.T) {
 			fmt.Sprintf("10.0.%d.%d", 4+host/256, host%256),
 			fmt.Sprintf("33333333-3333-3333-3333-%012d", i))
 	}
+	return s, rc
+}
+
+// TestBindRefusesOverTheAdoptionCap: one bind adopts each address with its own
+// NetBox request, so a prefix holding thousands of guests must refuse with the
+// numbers in the message rather than run for minutes.
+//
+// Seeded ONE over the cap. That alone does not pin the boundary — a `>=`
+// off-by-one would refuse here too — so the acceptance side is
+// TestBindAcceptsExactlyTheAdoptionCap below, and the two together are what make
+// 256 the boundary rather than an approximation.
+func TestBindRefusesOverTheAdoptionCap(t *testing.T) {
+	s, rc := capTestServer(t, adoptionCap+1)
+	ctx := context.Background()
 
 	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
@@ -213,6 +231,40 @@ func TestBindRefusesOverTheAdoptionCap(t *testing.T) {
 		t.Fatalf("the refusal must name the cap (%d), got: %v", adoptionCap, err)
 	}
 	assertNothingBound(t, s)
+	// ASSERTED, not asserted in a comment. The point of a cap is that the
+	// refusal is cheap; a bind that walked the prefix in NetBox and then refused
+	// would satisfy every check above.
+	if got := rc.AddressRequests(); got != 0 {
+		t.Fatalf("the cap must refuse before any NetBox address request, got %d", got)
+	}
+}
+
+// TestBindAcceptsExactlyTheAdoptionCap is the acceptance side of the same
+// boundary.
+//
+// Without it the cap could be `>=` and every existing test would still pass: a
+// bind of exactly 256 addresses would be refused, and nothing would say so. It
+// asserts the PLAN rather than driving the whole adoption, because this file's
+// fake NetBox serves no address surface — what is under test is the count, not
+// 256 claims.
+func TestBindAcceptsExactlyTheAdoptionCap(t *testing.T) {
+	s, _ := capTestServer(t, adoptionCap)
+	ctx := context.Background()
+
+	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, perr := s.planAdoption(ctx, corrosion.BindingRecord{
+		Network: "shared", PrefixID: adoptTestPrefix, ObservedCIDR: "10.0.4.0/22",
+		VRFID: 3, ClusterFingerprint: fp,
+	})
+	if perr != nil {
+		t.Fatalf("exactly %d addresses is AT the cap and must be accepted: %v", adoptionCap, perr)
+	}
+	if len(plan.candidates) != adoptionCap {
+		t.Fatalf("planned %d candidates, want exactly %d", len(plan.candidates), adoptionCap)
+	}
 }
 
 // TestBindIgnoresAnAddressOutsideTheBoundPrefix: a litevirt network's subnet and

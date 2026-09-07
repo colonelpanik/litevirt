@@ -77,7 +77,18 @@ func (s *Server) RunNetBoxMaintenanceOnce(ctx context.Context) error {
 // netboxMaintenanceTick is ONE pass: revalidate, and sweep only if that
 // succeeded. It holds no logic of its own beyond that skip — both halves decide
 // everything else for themselves.
+//
+// Under this node's single-pass gate, for the same reason the inventory mirror
+// is: the orphan sweep reclaims the addresses a re-key is re-stamping, and the
+// `netbox` leader lease names the NODE, so on the node running a re-key it
+// separates nothing.
 func (s *Server) netboxMaintenanceTick(ctx context.Context, interval time.Duration) error {
+	return s.netboxExclusivePass(ctx, func(ctx context.Context) error {
+		return s.netboxMaintenancePass(ctx, interval)
+	})
+}
+
+func (s *Server) netboxMaintenancePass(ctx context.Context, interval time.Duration) error {
 	if err := s.revalidateBindings(ctx); err != nil {
 		slog.Warn("netbox: binding revalidation failed; skipping the sweep this pass", "error", err)
 		return err

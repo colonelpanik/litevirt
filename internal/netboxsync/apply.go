@@ -154,6 +154,10 @@ type Reconciler struct {
 	// latched is the cluster-wide capability predicate, re-read on every pass.
 	// See Options.Latched.
 	latched func(context.Context) bool
+
+	// exclusive is the caller's INTRA-NODE critical section around one pass.
+	// Nil runs the pass directly. See Options.Exclusive.
+	exclusive func(context.Context, func(context.Context) error) error
 }
 
 // sink returns the metrics sink, never nil.

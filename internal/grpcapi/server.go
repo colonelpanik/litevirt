@@ -87,6 +87,24 @@ type Server struct {
 	nbSweepUnreachable  bool
 	nbUnreachableStreak int
 
+	// nbPassMu admits ONE NetBox write pass at a time on this node: a
+	// maintenance pass (revalidate + orphan sweep), an inventory mirror pass, or
+	// a CA re-key.
+	//
+	// The `netbox` leader lease is the CROSS-node half of that exclusion and was
+	// mistaken for the whole of it. It names the NODE, so on the node that holds
+	// it every one of those three passes reads "ours" — the re-key even RENEWS
+	// it under the same holder — and the mirror's 15-minute tick and 60-second
+	// queue poll can run straight through a re-key that is rewriting the very
+	// identities they filter actual state on. This is the intra-node half.
+	//
+	// A zero-value mutex, deliberately: several tests build a Server literal, and
+	// a gate that needed initialising would be nil on exactly those paths. Held
+	// with TryLock, never Lock — an operator's re-key must be told a pass is in
+	// flight, not hang behind one, and a background pass that finds the gate
+	// taken has a next tick.
+	nbPassMu sync.Mutex
+
 	// onProofCollected and onProofsGathered are ORPHAN-SWEEPER TEST SEAMS,
 	// documented at their setters. Both are nil in production and are the only
 	// way a test can reach the two windows the sweeper's safety rests on: a

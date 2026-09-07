@@ -375,10 +375,20 @@ rewritten are skipped. Complete a re-key before replacing the CA again.
 Both forms of the command run under the same cluster-wide leader lease as the
 orphan sweeper and the inventory mirror, because all three write the objects the
 others read. A re-key that cannot take the lease **rewrites nothing** and refuses,
-naming the node that holds it — wait for that node's sweep to finish and run it
-again. If the lease is lost while a re-key is running, it stops where it is: the
-binding stays suspended and re-running finishes what was left. Taking the lease
-also stops a mirror sweep that is already in flight, at its next write batch.
+naming the node that holds it — **run the re-key on that node**. Waiting will not
+help: the holder renews the lease on every sweep, so it does not lapse while that
+node is up. If the lease is lost while a re-key is running, it stops where it is:
+the binding stays suspended and re-running finishes what was left. Taking the
+lease also stops a mirror sweep already in flight on ANOTHER node, at its next
+write batch.
+
+The lease names a node, so it cannot separate two of these operations on the
+*same* node — a re-key there renews the very lease its own sweeps read. Each node
+therefore admits one NetBox pass at a time: a re-key started while that node's
+maintenance or mirror pass is running is refused ("a NetBox … pass is already
+running on this node"), and here retrying shortly does work, because a pass ends
+on its own. In the other direction a sweep that comes due mid-re-key skips that
+tick rather than reconciling against a half-rewritten inventory.
 
 Three sets of objects are re-stamped, in this order:
 

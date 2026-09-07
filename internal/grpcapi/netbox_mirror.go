@@ -44,7 +44,33 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// A closure, so the latch is re-read on EVERY pass. See
 		// netboxMirrorAuthorized.
 		Latched: func(context.Context) bool { return s.netboxMirrorAuthorized() },
+		// The intra-node half of the exclusion the leader lease only covers
+		// across nodes. See netboxExclusivePass.
+		Exclusive: s.netboxExclusivePass,
 	})
+}
+
+// netboxExclusivePass runs one NetBox pass under this node's single-pass gate,
+// or declines it.
+//
+// DECLINES, rather than waits. A background pass has another tick a minute or
+// fifteen away, and queueing them behind a re-key that runs for as long as
+// NetBox takes would leave a pile of passes to run back to back the moment it
+// finished — every one of them reading state the one before it had just
+// rewritten.
+//
+// A declined pass returns nil and records nothing. It is not a failure: nothing
+// was skipped that the next pass does not re-derive from scratch, and counting
+// it as a failed sweep would raise the mirror's staleness signal every time an
+// operator re-keyed.
+func (s *Server) netboxExclusivePass(ctx context.Context, pass func(context.Context) error) error {
+	if !s.nbPassMu.TryLock() {
+		slog.Info("netbox mirror: another NetBox pass or a re-key is already running on this " +
+			"node; skipping this tick")
+		return nil
+	}
+	defer s.nbPassMu.Unlock()
+	return pass(ctx)
 }
 
 // netboxMirrorAuthorized reports whether this cluster has authorized inventory

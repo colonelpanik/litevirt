@@ -96,6 +96,23 @@ type Options struct {
 	// Nil is "not latched", matching the lease functions above: an incomplete
 	// wiring must be inert rather than an ungated writer.
 	Latched func(context.Context) bool
+
+	// Exclusive runs one pass inside the caller's INTRA-NODE critical section,
+	// and may decline to run it at all.
+	//
+	// The leader lease this mirror already takes is the CROSS-node half of the
+	// exclusion. It cannot be the whole of it, because it names the NODE: on the
+	// node that holds it, a CA re-key renews the very same holder, so the
+	// per-batch lease read still says "ours" and a sweep runs straight through a
+	// rewrite of the identities it filters actual state on. Which of this node's
+	// NetBox operations may run is not something this package can know — the
+	// re-key does not live here — so the decision is the caller's, threaded in
+	// exactly as the lease is.
+	//
+	// Nil runs the pass directly. That is the right default for a reconciler
+	// wired on its own: with no other writer on the node there is nothing to
+	// exclude.
+	Exclusive func(ctx context.Context, pass func(context.Context) error) error
 }
 
 // New builds a Reconciler.
@@ -121,6 +138,7 @@ func New(o Options) *Reconciler {
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
+		exclusive:    o.Exclusive,
 	}
 }
 
@@ -279,7 +297,25 @@ func (r *Reconciler) holdsLeader(ctx context.Context) bool {
 // them — while counted as an error it would raise one on every node but the
 // leader. The success stamp is set on exactly the path the ack is on, because
 // the two mean the same thing: this sweep converged.
+// Every entry point reaches the pass through here — SyncOnce, pollQueue, and a
+// test driving one directly — so this is where the caller's INTRA-NODE critical
+// section goes. Putting it in the two entry points instead would leave the
+// exclusion one new caller away from being bypassed, and the leader lease has
+// already shown what an exclusion with a hole in it is worth.
 func (r *Reconciler) Sync(ctx context.Context) error {
+	if r.exclusive != nil {
+		return r.exclusive(ctx, r.syncPass)
+	}
+	return r.syncPass(ctx)
+}
+
+// syncPass is Sync's body: everything a pass does once it has been admitted.
+//
+// Both counters live here rather than in Sync, so a pass the caller's exclusion
+// DECLINED records nothing at all — a declined pass is not a failed sweep, and
+// counting it as one would raise the staleness signal an operator alerts on
+// every time a re-key ran normally.
+func (r *Reconciler) syncPass(ctx context.Context) error {
 	queued := r.peekQueue(ctx)
 	converged, err := r.sweep(ctx)
 	if err != nil {

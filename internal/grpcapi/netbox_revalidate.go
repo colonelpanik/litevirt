@@ -151,6 +151,23 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"this node has no cluster database; run the re-key on a node that does")
 	}
+	// The INTRA-node exclusion, before either form runs. The `netbox` leader
+	// lease below is the cross-node half and cannot be this one: it names the
+	// NODE, so on the node that holds it the re-key merely RENEWS the same
+	// holder and this node's own mirror sweep and orphan sweep read "ours"
+	// throughout the rewrite. Held for the whole operation, released when it
+	// returns.
+	//
+	// A refusal, not a wait: a re-key can run for as long as NetBox takes, so an
+	// operator queued behind a sweep would see a hang with nothing to read. The
+	// retry this one advises is a real one — a maintenance or mirror pass ends
+	// on its own, unlike a lease the holder renews forever.
+	if !s.nbPassMu.TryLock() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"a NetBox maintenance or inventory pass is already running on this node, so "+
+				"nothing was rewritten; the pass ends on its own — run the re-key again in a moment")
+	}
+	defer s.nbPassMu.Unlock()
 	if req.GetNetwork() == "" {
 		return s.rekeyInventoryOnly(ctx)
 	}
@@ -200,12 +217,21 @@ func (e leaseRefusedError) Error() string {
 	if e.holder == "" {
 		// The row is absent, unreadable, or already expired but not yet taken
 		// by anyone. Naming a holder we cannot prove would be worse than
-		// naming none.
+		// naming none — and here a retry genuinely can win, because no live
+		// lease is standing in the way.
 		return "could not take the netbox leader lease, so nothing was rewritten;" +
 			" retry in a few minutes"
 	}
+	// NOT "retry": the holder RENEWS on every tick with a TTL of twice its
+	// interval, and acquireNetBoxLease refuses to steal an unexpired lease, so
+	// this refusal is permanent for as long as that node is up. Retrying here is
+	// waiting for something that does not happen — and this is the CA-rotation
+	// escape hatch, so while it is blocked every binding stays suspended and
+	// every create on a bound network refuses. The name is only useful if the
+	// message says to go and use it.
 	return fmt.Sprintf("the netbox leader lease is held by %q, so nothing was rewritten;"+
-		" that node may be mid-sweep — retry in a few minutes", e.holder)
+		" run the re-key on %s — that node renews the lease on every sweep, so waiting"+
+		" here will not release it", e.holder, e.holder)
 }
 
 // leaseLostError is a re-key that HELD the lease and lost it partway, and so

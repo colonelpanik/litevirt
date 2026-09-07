@@ -163,6 +163,15 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 		// before re-inserting a fresh one — the new row's newer updated_at wins LWW,
 		// so there is no cross-node resurrection window. (See the hard-delete guard
 		// test; full-state tables must otherwise soft-delete.)
+		//
+		// The `vm_interfaces` purge is keyed on vm_name ALONE while the NetBox
+		// mirror's NIC evidence is keyed (vm_name, mac) — and a re-create's MACs
+		// are freshly randomised — so re-creating a VM under a previously-used
+		// name takes the old incarnation's interface evidence with it. Bounded,
+		// not a leak: the parent VM delete stays proven by NAME (the row below is
+		// live under it) and a NetBox VM delete cascades its interfaces away. The
+		// cost is a withheld interface delete logged for one sweep. See
+		// MirrorEvidence.KnowsNIC.
 		{SQL: `DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},      // full-state-delete-ok
 		{SQL: `DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}}, // full-state-delete-ok
 		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{vm.Name}},              // full-state-delete-ok

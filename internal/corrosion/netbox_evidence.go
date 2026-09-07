@@ -73,6 +73,26 @@ func (e MirrorEvidence) KnowsVM(name string) bool {
 // precedence — the merged view decides what a NIC IS, this decides only whether
 // the cluster has ever mentioned one.
 //
+// `vm_nics` IS LOAD-BEARING, not belt-and-braces. On the commonest hotplug
+// sequence it is the only row left: `vm_interfaces` keys on
+// (vm_name, network_name) and InsertInterface is an INSERT OR REPLACE, so
+// re-attaching on the SAME network — with the freshly randomised MAC an attach
+// always gets — overwrites the detached NIC's row in place, MAC and tombstone
+// together. `vm_nics` keys on (vm_name, id) with the id derived from the MAC, so
+// the two incarnations are different rows and the old one's tombstone survives.
+// Drop that table from the union and every re-attached NIC permanently strands
+// its old NetBox interface: the delete is withheld on every sweep from then on.
+// Pinned by TestDetachedMACStaysProvableAfterReattach.
+//
+// KNOWN GAP, bounded: InsertVMWithHardware's same-name re-create purge is keyed
+// on `vm_name` ALONE, so re-creating a VM under a name that was used before
+// drops the previous incarnation's interface tombstones — and its MACs were
+// freshly randomised, so this evidence goes with them. It cannot lose an object:
+// the parent VM delete is proven by NAME, which the purge leaves live, and a
+// NetBox VM delete cascades its interfaces away anyway. What it costs is noise —
+// delete-then-recreate-under-the-same-name can log a withheld interface delete
+// that resolves itself on the next sweep, on the gauge an operator alerts on.
+//
 // An empty VM name or MAC is never evidence.
 func (e MirrorEvidence) KnowsNIC(vmName, mac string) bool {
 	if vmName == "" || mac == "" {

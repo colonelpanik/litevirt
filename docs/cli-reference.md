@@ -766,6 +766,7 @@ lv stats <vm>                                # VM resource statistics
 ```bash
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
+lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
 ```
 
 `divergence` is read-only; `repair-owner` is an audited, admin-gated repair for an

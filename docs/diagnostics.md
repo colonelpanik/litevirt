@@ -381,6 +381,44 @@ homogeneous cluster — every host resolving the alias identically is why this i
 a warning and not an error — but it should be cleared before introducing a host
 with a different qemu version.
 
+## `lv doctor fence`
+
+Read-only. Reports whether a cross-host transfer of a shared-disk VM would
+actually be fenced.
+
+```
+lv doctor fence
+```
+
+Starting a VM on a second host while the first may still be writing the same
+shared disk corrupts it. The guard against that is a **proof-grade fence** — an
+IPMI-confirmed power-off, or an operator `lv host fence-confirm` — required
+before an ownership transfer of any VM with a disk on shared storage
+(`nfs`, `ceph`, `rbd`, `iscsi`). Local-disk VMs need no fence: a relocation
+target holds a different image, not the same bytes.
+
+The guard has **two independent switches, and both must be on**:
+
+| Switch | Scope | Default |
+|---|---|---|
+| `shared_storage_fence_v1` | latches cluster-wide once every host advertises it | latches on upgrade |
+| `enforcement.shared_storage_fence` | per-host config | **false** |
+
+The gap this command exists to close: a host advertises the token **regardless
+of its own config flag**, because advertisement means "this binary supports the
+feature", not "this node enforces it" (see `advertisedCapabilities`). A cluster
+can therefore show the capability fully latched while any subset of hosts
+silently skips the fence — a state no peer and no operator could observe. This
+command asks every host for its own posture via `PingResponse.not_enforcing`,
+so the answer reflects what each node will actually do.
+
+A host is reported as `unknown` rather than as enforcing when it does not answer,
+or when it runs a binary predating the posture field. Unknown counts against
+readiness exactly as "not enforcing" does — a diagnostic that cannot see a host
+must not report the cluster clear on its behalf.
+
+Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
+
 ## Persisted LWW clock & backward-clock protection
 
 The `updated_at` conflict key is minted from a **monotonic** clock whose high-water

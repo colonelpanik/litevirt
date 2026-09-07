@@ -2520,6 +2520,29 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 		networkName = "production"
 	}
 
+	// A bound network's addresses are NetBox's. This call is a RECORD-ONLY
+	// edit — it writes `vm_interfaces.ip` and a DNS record, and configures
+	// nothing in the guest — so on a bound network it records a claim litevirt
+	// cannot honour, over an address the allocator claimed and the inventory
+	// mirror keeps assigned. The same refusal the container path already makes
+	// on this question.
+	//
+	// FAIL CLOSED on the read. The container guard was fail-open once: a
+	// swallowed error turned "could not read the record" into "this network
+	// names no prefix", and the write went ahead.
+	binding, err := corrosion.GetBindingByNetwork(ctx, s.db, networkName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether network %q is bound to a NetBox prefix: %v", networkName, err)
+	}
+	if binding != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"network %q is bound to NetBox prefix %d, so its addresses are allocated and "+
+				"recorded in NetBox; recording an operator-chosen IP here would describe an "+
+				"address litevirt does not hold",
+			networkName, binding.PrefixID)
+	}
+
 	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, req.Ip); err != nil {
 		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
 	}

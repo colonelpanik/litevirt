@@ -573,9 +573,9 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list NetBox leases: %w", err)
 	}
-	byAddress := make(map[string]int, len(leases))
+	byLease := make(map[string]int, len(leases))
 	for _, l := range leases {
-		byAddress[leaseKey(l.Network, l.IP)] = l.NetBoxIPID
+		byLease[leaseKey(l.Network, l.MAC)] = l.NetBoxIPID
 	}
 
 	// One device lookup per HOST, not per VM: a sweep over a large cluster
@@ -624,7 +624,7 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 			devices[v.HostName] = deviceID
 		}
 
-		nicSet, nicsSkipped := desiredNICs(nics, byAddress)
+		nicSet, nicsSkipped := desiredNICs(nics, byLease)
 		skipped += nicsSkipped
 		out = append(out, DesiredVM{
 			Name:     v.Name,
@@ -662,7 +662,7 @@ func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
 // desiredNICs maps litevirt NIC rows onto the mirror's NIC shape, resolving each
 // one's NetBox address object through the lease index. It also returns how many
 // NICs it skipped — see desiredState.
-func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) ([]DesiredNIC, int) {
+func desiredNICs(nics []corrosion.NICRecord, byLease map[string]int) ([]DesiredNIC, int) {
 	// Ordered before naming, because the names are derived positionally on a
 	// collision and map/query order must not decide them.
 	sort.Slice(nics, func(i, j int) bool {
@@ -692,7 +692,7 @@ func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) ([]Desire
 			Name:       nicName(n, used),
 			MAC:        strings.ToLower(n.MAC),
 			IP:         n.IP,
-			NetBoxIPID: byAddress[leaseKey(n.NetworkName, n.IP)],
+			NetBoxIPID: byLease[leaseKey(n.NetworkName, strings.ToLower(n.MAC))],
 		})
 	}
 	return out, skipped
@@ -714,9 +714,23 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 	return name
 }
 
-// leaseKey is the (network, ip) primary key of an ip_allocations row, which is
-// how a NIC finds the NetBox address object it holds.
-func leaseKey(network, ip string) string { return network + "\x00" + ip }
+// leaseKey keys a lease by (network, MAC) — not by (network, ip), which is the
+// row's primary key.
+//
+// The NetBox address object is named by the NIC's IDENTITY,
+// lv:<fingerprint>:<uuid>:<mac>, so the lookup that resolves it has to be keyed
+// on an identity component. The recorded IP is not one: `vm_interfaces.ip` is
+// an inventory field, and any disagreement between it and the IP the lease
+// claimed — an operator edit, a scanner, a lease re-claimed at a new address —
+// makes an IP-keyed lookup MISS. A miss reads as "this NIC holds no NetBox
+// address", which routes a correct, live assignment into the clear branch and
+// detaches it.
+//
+// The MAC is unique within a network by construction and is the same component
+// the identity carries, so it cannot drift out from under the join. Lower-cased
+// at both ends because NetBox echoes MACs upper-cased and litevirt records them
+// either way.
+func leaseKey(network, mac string) string { return network + "\x00" + strings.ToLower(mac) }
 
 // netboxStatus maps a litevirt VM state onto NetBox's status choice.
 //

@@ -65,3 +65,24 @@ func TestNetBoxIPAMV1Registered(t *testing.T) {
 		t.Fatalf("All() = %v, want it to contain %q", All(), NetBoxIPAMV1)
 	}
 }
+
+// TestNetBoxMirrorV1Registered pins the netbox_mirror_v1 token in both sets.
+//
+// Supported() is what peers see via Ping, so a token missing from it can never
+// latch and the inventory mirror would stay inert on a correctly configured
+// cluster. All() is what health.SetActivationMarker walks to preload the durable
+// per-token latch markers, and what the daemon's rollback detection diffs
+// against — a token absent THERE latches once and then silently loses the latch
+// on the next restart, which for this token means the mirror stops on a node
+// reboot and starts again only after the cluster re-negotiates.
+func TestNetBoxMirrorV1Registered(t *testing.T) {
+	if NetBoxMirrorV1 != "netbox_mirror_v1" {
+		t.Fatalf("NetBoxMirrorV1 = %q, want %q", NetBoxMirrorV1, "netbox_mirror_v1")
+	}
+	if !slices.Contains(Supported(), NetBoxMirrorV1) {
+		t.Fatalf("Supported() = %v, want it to contain %q", Supported(), NetBoxMirrorV1)
+	}
+	if !slices.Contains(All(), NetBoxMirrorV1) {
+		t.Fatalf("All() = %v, want it to contain %q", All(), NetBoxMirrorV1)
+	}
+}

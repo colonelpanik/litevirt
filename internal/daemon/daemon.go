@@ -763,6 +763,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// NetBox integration, so the cluster-wide latch requires config uniformity,
 	// not just a uniform build (see capabilities.NetBoxIPAMV1).
 	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
+	// The INVENTORY MIRROR is a second, narrower opt-in, driving its own token
+	// (netbox_mirror_v1) the same conditional-advertisement way. Default off:
+	// NetBox is pure IPAM unless this node asks for inventory too, and the latch
+	// requires every node to ask — the sweep runs on one lease holder, so a
+	// non-uniform flag makes the inventory follow leadership. Set BEFORE
+	// StartNetBoxMirror, which declines outright when it is off.
+	svc.SetNetBoxMirrorInventory(d.cfg.NetBox.MirrorInventory)
 	// BEFORE the mirror starts. The name decides which NetBox cluster object
 	// every mirrored VM hangs off, and the CA re-key resolves the same one.
 	svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)

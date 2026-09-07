@@ -80,6 +80,68 @@ func TestMirrorWritesNothingBeforeTheLatchForms(t *testing.T) {
 	}
 }
 
+// TestMirrorWritesNothingWithoutTheInventoryOptIn is the OTHER cluster-wide
+// contract, and the one that makes the mirror optional.
+//
+// `netbox.mirror_inventory` is off on one of two nodes here, so netbox_mirror_v1
+// cannot latch — and the node that DID opt in must still mirror nothing. That is
+// the whole point of expressing the opt-in as a token instead of reading config:
+// the sweep runs on whichever node holds the `netbox` leader lease, so a cluster
+// that mirrored on the strength of one node's config would have its inventory
+// appear and disappear with leadership, and every object the mirroring node
+// created would be left to a successor that never reaps it.
+//
+// netbox_ipam_v1 IS latched, so the refusal can only be the mirror token's — and
+// the IPAM half is asserted to keep working, because pure IPAM is the default
+// shape rather than a broken one.
+func TestMirrorWritesNothingWithoutTheInventoryOptIn(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
+
+	c := New(t, Options{Nodes: 2, NetBoxURL: nb.URL(), SharedCRDT: true})
+	// One node stays pure-IPAM. Two nodes, not one: a single-node cluster that
+	// opted out would refuse locally, and this scenario is about the node that
+	// opted IN being held back by a peer that did not.
+	c.Nodes[1].Server.SetNetBoxMirrorInventory(false)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+
+	n := c.Nodes[0]
+	// The IPAM half is unaffected: a bind still works, which is what "NetBox as
+	// pure IPAM" has to mean.
+	mustCreateBoundNetwork(t, c, n, orphanNetwork, orphanSubnet, orphanPrefixID)
+	if gates[n.Name].Enforced(context.Background(), capabilities.NetBoxMirrorV1) {
+		t.Fatal("netbox_mirror_v1 latched with mirror_inventory off on a peer")
+	}
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+
+	if got := nb.VMCountAll(); got != 0 {
+		t.Fatalf("%d virtual_machine object(s) mirrored without a cluster-wide opt-in", got)
+	}
+	if got := nb.InterfaceCount(); got != 0 {
+		t.Fatalf("%d vminterface object(s) mirrored without a cluster-wide opt-in", got)
+	}
+	// Nothing was even resolved: the pass must stop before its first NetBox
+	// call, not merely before its writes.
+	if got := nb.ClusterID(fleetClusterName); got != 0 {
+		t.Fatalf("the mirror resolved NetBox cluster %d without a cluster-wide opt-in", got)
+	}
+	// …and the address the VM claimed is still in NetBox, carrying this
+	// cluster's identity. Pure IPAM is the point of the default, so an
+	// un-mirrored cluster whose addresses had also stopped being recorded would
+	// be a different and much worse thing than "no inventory".
+	if got := nb.Addresses(); len(got) == 0 {
+		t.Fatal("a pure-IPAM cluster must still claim addresses in NetBox")
+	}
+	mustDeleteVM(t, n, "vm-1")
+	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 0 {
+		t.Fatalf("%d netbox_sync_queue row(s) written without a cluster-wide opt-in", got)
+	}
+}
+
 // TestMirrorStartsOnceTheLatchForms is the other half, and the reason the gate
 // is read PER PASS rather than once at startup.
 //
@@ -102,13 +164,16 @@ func TestMirrorStartsOnceTheLatchForms(t *testing.T) {
 	}
 
 	// The rolling upgrade completes. Same process, same server, same reconciler
-	// wiring — only the cluster-wide contract changed.
+	// wiring — only the cluster-wide contracts changed. BOTH of them: the mirror
+	// needs netbox_ipam_v1 for its v51 tables and netbox_mirror_v1 for the
+	// inventory opt-in, and either one alone still leaves it inert.
 	if !gates[n.Name].Enforced(ctx, capabilities.NetBoxIPAMV1) {
 		t.Fatalf("%s: netbox_ipam_v1 failed to latch with the integration configured", n.Name)
 	}
 	if !gates[n.Name].DurablyLatched(capabilities.NetBoxIPAMV1) {
 		t.Fatalf("%s: netbox_ipam_v1 latched only in memory", n.Name)
 	}
+	latchNetBoxMirror(t, c, gates)
 
 	if err := n.SyncNetBoxMirror(); err != nil {
 		t.Fatalf("the pass after the latch formed: %v", err)

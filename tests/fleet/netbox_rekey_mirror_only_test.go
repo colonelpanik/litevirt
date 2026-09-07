@@ -130,10 +130,12 @@ func mirrorOnlyClusterNamed(t *testing.T, nb *NetBoxFake, namePrefix, netboxClus
 	})
 	// The mirror is gated on netbox_ipam_v1 exactly as a prefix binding is: its
 	// statements are replicated, and an older peer carries neither of its
-	// tables. A mirror-only cluster has no binding to latch it, so the latch is
-	// driven here — the config uniformity it requires is satisfied, because
-	// every node of this fixture is NetBox-configured.
-	latchNetBoxIPAM(t, c, gateAll(t, c))
+	// tables. It is ALSO gated on netbox_mirror_v1, the inventory opt-in, which
+	// is a separate contract a pure-IPAM cluster never forms. A mirror-only
+	// cluster has no binding to latch either of them, so both are driven here —
+	// the config uniformity they require is satisfied, because every node of this
+	// fixture is NetBox-configured and opted into mirroring.
+	latchNetBoxBoth(t, c, gateAll(t, c))
 	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork, "")
 	return c
 }

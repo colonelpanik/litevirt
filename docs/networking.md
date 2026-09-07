@@ -445,13 +445,30 @@ against the new range.
 
 ### The inventory mirror
 
-A cluster configured for NetBox also mirrors its inventory there, whether or not
-any network is bound to a prefix. Mirroring requires the `netbox_ipam_v1`
-capability to be latched cluster-wide, exactly as binding a prefix does — the
-mirror writes replicated tables an older build does not carry, so a node
-configured ahead of its peers writes nothing until every node has opted in. It
-registers itself as a NetBox cluster (of type `litevirt`, named after the local
-cluster or after `netbox.cluster_name`) and mirrors:
+The inventory mirror is **opt-in**, and off by default. `netbox.enabled` alone
+makes NetBox litevirt's address authority and nothing more: the addresses
+litevirt claims exist as `ip_address` objects carrying this cluster's identity in
+a custom field, with no `virtual_machine`, no `vminterface`, and no assignment
+between them. That is a complete configuration rather than a degraded one. The
+identity is what makes an address litevirt's, and the orphan sweeper proves an
+address unclaimed by asking every eligible host whether it holds it — a proof
+that never reads what the address is assigned to — so binding a prefix, claiming
+from it, revalidating a binding and reclaiming an orphan all behave identically
+with the mirror off.
+
+Set `netbox.mirror_inventory: true` to turn it on. It must be set **identically
+on every node**, and that is enforced rather than asked for: the flag gates
+advertisement of a `netbox_mirror_v1` capability token, so the cluster-wide latch
+cannot form until every node has opted in, and enabling it on one node changes
+nothing. Mirroring additionally requires `netbox_ipam_v1` to be latched, exactly
+as binding a prefix does — the mirror writes replicated tables an older build
+does not carry, so a node configured ahead of its peers writes nothing. Turning
+the flag back off stops mirroring on that node immediately; a latch is monotone
+and durable, so the flag, not the latch, is the kill switch.
+
+With mirroring on, a cluster mirrors its inventory whether or not any network is
+bound to a prefix. It registers itself as a NetBox cluster (of type `litevirt`,
+named after the local cluster or after `netbox.cluster_name`) and mirrors:
 
 - each VM as a `virtual_machine` carrying its vCPUs, memory, disk and status —
   `active` while it runs and `offline` in every other state, because NetBox's

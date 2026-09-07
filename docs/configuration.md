@@ -335,6 +335,27 @@ netbox:
                             # objects written under the other name. Nothing
                             # detects it; the mirror logs the name it resolved
                             # at startup, so compare that line across nodes.
+  mirror_inventory: false   # opt into the INVENTORY MIRROR — the half that
+                            # creates NetBox virtual_machine / vminterface
+                            # objects and assigns addresses to them. Default
+                            # false: NetBox is pure IPAM, holding ip_address
+                            # objects that carry this cluster's identity and
+                            # nothing else. That is a complete configuration,
+                            # not a degraded one — the identity is what makes an
+                            # address litevirt's, and the orphan sweeper proves
+                            # an address unclaimed by a per-host negative
+                            # fan-out that never reads what it is assigned to,
+                            # so bind, claim, revalidate and reclaim all behave
+                            # identically. Advertises netbox_mirror_v1 only
+                            # while set, so the cluster-wide latch requires
+                            # config uniformity: enabling on one node changes
+                            # nothing, which matters because the sweep runs on
+                            # whichever node holds the `netbox` leader lease and
+                            # a non-uniform flag would make the inventory appear
+                            # and disappear with leadership. Mirroring also
+                            # still needs netbox_ipam_v1 (its tables are v51).
+                            # The flag stays the reversible kill switch — a
+                            # latch is monotone and durable.
   timeout_sec: 10           # per-request timeout.
   sweep_interval_sec: 900   # how often each configured node runs one maintenance
                             # pass: re-validate every binding, then reclaim

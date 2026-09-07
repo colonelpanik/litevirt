@@ -88,26 +88,53 @@ func (s *Server) netboxExclusivePass(ctx context.Context, pass func(context.Cont
 	return pass(ctx)
 }
 
-// netboxMirrorAuthorized reports whether this cluster has authorized inventory
-// mirroring, which is the netbox_ipam_v1 latch in its DURABLE form.
+// netboxMirrorAuthorized reports whether inventory mirroring is authorized on
+// this node: the local opt-in AND both cluster-wide latches, DURABLY.
 //
-// The mirror's statements are the reason. It writes `netbox_objects` and
-// `netbox_sync_queue`, and a build that predates them carries neither table in
-// either of its ledgers — a statement the LWW apply path cannot place does not
-// fail on that peer, it BACK-PRESSURES, which stalls the replication watermark
-// for the whole stream rather than for those rows. So one node upgraded and
-// configured ahead of its peers must write nothing, which is precisely the
-// cluster-wide contract this token carries: the latch requires config
-// uniformity, so enabling NetBox on one node changes nothing.
+// THREE conditions, and each answers a different question.
 //
-// DURABLY latched, the same form a prefix binding requires. A latch held only
-// in memory does not survive a restart, and the node that restarts mid-rolling-
-// upgrade is the one still replicating with an old peer.
+// `netbox.mirror_inventory` (enfNetBoxMirror) is whether this installation wants
+// the inventory half at all. NetBox is two integrations behind one config block
+// — an address authority and an inventory mirror — and only the first is the
+// default. With this off, NetBox holds `ip_address` objects carrying our
+// identity and nothing else: no `virtual_machine`, no `vminterface`, no assign
+// and no clear. That is coherent rather than degraded, because the identity is
+// what makes an address ours, and the orphan sweeper's negative proof is a
+// per-host fan-out that never asks what an address is assigned to.
+//
+// netbox_mirror_v1 is whether the CLUSTER wants it. The sweep runs on whichever
+// node holds the `netbox` leader lease, so a flag set on some nodes only makes
+// the inventory appear and disappear with leadership, and strands every object
+// the mirroring node created under a successor that never reaps it. The token is
+// advertised only while the flag is set, so its latch proves config uniformity
+// and not merely a uniform build — enabling on one node changes nothing.
+//
+// netbox_ipam_v1 remains required, for the reason it always was. The mirror
+// writes `netbox_objects` and `netbox_sync_queue`, and a build that predates
+// them carries neither table in either of its ledgers — a statement the LWW
+// apply path cannot place does not fail on that peer, it BACK-PRESSURES, which
+// stalls the replication watermark for the whole stream rather than for those
+// rows. netbox_mirror_v1 cannot stand in for it: a cluster can opt into
+// mirroring mid-rolling-upgrade, when every node has the flag but not every node
+// has the tables.
+//
+// Both latches in their DURABLE form, the same form a prefix binding requires. A
+// latch held only in memory does not survive a restart, and the node that
+// restarts mid-rolling-upgrade is the one still replicating with an old peer.
+//
+// The FLAG is checked here and not only at advertisement because a latch is
+// monotone and durable: it can never be withdrawn, so a flag that stopped
+// mattering once netbox_mirror_v1 formed would leave the mirror impossible to
+// turn off. Checking it at the decision keeps it the reversible kill switch.
 //
 // It is a method rather than a captured bool so every pass asks again: a latch
 // closes while the daemon runs, and nothing restarts the mirror when it does.
 func (s *Server) netboxMirrorAuthorized() bool {
-	return s.gate != nil && s.gate.DurablyLatched(capabilities.NetBoxIPAMV1)
+	if !s.enfNetBoxMirror || s.gate == nil {
+		return false
+	}
+	return s.gate.DurablyLatched(capabilities.NetBoxMirrorV1) &&
+		s.gate.DurablyLatched(capabilities.NetBoxIPAMV1)
 }
 
 // netboxMirrorHoldsLease is the lease READ — no write, no renewal — the mirror
@@ -132,8 +159,19 @@ func (s *Server) netboxMirrorHoldsLease(ctx context.Context) bool {
 // runs — it is the last act of a rolling upgrade — and a check made here would
 // leave the mirror inert for the life of a process that started a moment too
 // early, with nothing to say so.
+//
+// The LOCAL opt-in is different and IS checked here. `netbox.mirror_inventory`
+// is read from a config file at startup and cannot change while the process
+// runs, so a node that has not opted in will not opt in later — the goroutine it
+// would start could only ever be a ticker taking no decisions, and answering
+// false is what lets a caller (and a test) see that mirroring is off rather than
+// infer it from an absence of writes. The per-pass gate still re-checks the
+// flag, so nothing depends on this being the only place it is read.
 func (s *Server) StartNetBoxMirror(ctx context.Context, interval time.Duration) bool {
 	if s.netbox == nil || s.db == nil {
+		return false
+	}
+	if !s.enfNetBoxMirror {
 		return false
 	}
 	// Normalised BEFORE the log line below, not only inside netboxMirror: an

@@ -49,6 +49,43 @@ func latchNetBoxIPAM(t *testing.T, c *Cluster, gates map[string]*health.Checker)
 	}
 }
 
+// latchNetBoxMirror drives the netbox_mirror_v1 cluster latch on every node.
+//
+// A SECOND latch, not a rename of the one above, because the two contracts are
+// independent: netbox_ipam_v1 says every peer carries the v51 tables and parses
+// a prefix binding, and netbox_mirror_v1 says every peer has opted into the
+// INVENTORY half (`netbox.mirror_inventory`). A pure-IPAM cluster forms the
+// first and never the second, and that is the default shape.
+//
+// wireNetBox has already set the config flag on every node, for the same reason
+// it sets netbox.enabled: the daemon sets both from one config block. What is
+// left is the negotiation, which only an Enforced call performs.
+//
+// Both halves are asserted, as above: the mirror gates on the DURABLE form, so a
+// latch held only in memory — one that would not survive a restart mid-rolling-
+// upgrade — must not read as ready here either.
+func latchNetBoxMirror(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+	t.Helper()
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		if !gates[n.Name].Enforced(ctx, capabilities.NetBoxMirrorV1) {
+			t.Fatalf("%s: netbox_mirror_v1 failed to latch with mirror_inventory on everywhere", n.Name)
+		}
+		if !gates[n.Name].DurablyLatched(capabilities.NetBoxMirrorV1) {
+			t.Fatalf("%s: netbox_mirror_v1 latched only in memory — the mirror requires the durable form", n.Name)
+		}
+	}
+}
+
+// latchNetBoxBoth drives both NetBox latches, which is what a fixture that
+// mirrors needs: the mirror requires netbox_ipam_v1 for its tables AND
+// netbox_mirror_v1 for the opt-in.
+func latchNetBoxBoth(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
+	t.Helper()
+	latchNetBoxIPAM(t, c, gates)
+	latchNetBoxMirror(t, c, gates)
+}
+
 // mustCreateBoundNetwork creates a network on n bound to a NetBox prefix,
 // through the real CreateNetwork RPC over the harness's mTLS loopback.
 //

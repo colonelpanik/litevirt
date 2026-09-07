@@ -198,6 +198,22 @@ type Server struct {
 	// uniformity, not just a uniform build. Default false; the flag is the
 	// reversible kill switch.
 	enfNetBoxIPAM bool
+	// enfNetBoxMirror gates ADVERTISEMENT of netbox_mirror_v1 AND the mirror's own
+	// decision to run. It is `netbox.mirror_inventory`, default false: NetBox is
+	// pure IPAM unless an operator asks for the inventory mirror as well.
+	//
+	// Advertised only while this flag is set, like netbox_ipam_v1, because "this
+	// installation mirrors its inventory" is a CLUSTER-WIDE fact: the sweep runs
+	// on whichever node holds the `netbox` leader lease, so a value set on some
+	// nodes only makes the inventory appear and disappear with leadership, and
+	// leaves every object the mirroring node created to a successor that never
+	// reaps it. Withholding advertisement is what makes the latch require config
+	// uniformity rather than merely a uniform build.
+	//
+	// It gates the DECISION too, not only the advertisement: a latch is monotone
+	// and durable, so if the flag stopped mattering once netbox_mirror_v1 formed
+	// the mirror could never be turned off again. See netboxMirrorAuthorized.
+	enfNetBoxMirror bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -571,6 +587,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfNetBoxIPAM {
 		caps = withoutCapability(caps, capabilities.NetBoxIPAMV1)
 	}
+	// netbox_mirror_v1 is conditional on the SEPARATE mirror opt-in, so the two
+	// halves of the integration latch independently: a pure-IPAM cluster
+	// advertises netbox_ipam_v1 and never this one. A cluster that latched this
+	// token across a node whose flag is off would have its inventory rewritten
+	// only while that node was not the `netbox` lease holder.
+	if !s.enfNetBoxMirror {
+		caps = withoutCapability(caps, capabilities.NetBoxMirrorV1)
+	}
 	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
 	// a peer outright, and a node that isn't enforcing would keep accepting the
 	// isolated node's state and re-inject it — so the latch requires CONFIG
@@ -700,6 +724,13 @@ func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 // enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node
 // changes nothing until every node has opted in and the token has latched.
 func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
+
+// SetNetBoxMirrorInventory sets this node's `netbox.mirror_inventory` opt-in
+// (see enfNetBoxMirror). Default false — NetBox is pure IPAM. It must be set
+// before StartNetBoxMirror, which declines outright on a node that has not
+// opted in, and it stays the reversible kill switch after netbox_mirror_v1 has
+// latched.
+func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
 
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
@@ -880,6 +911,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:
 		return s.enfNetBoxIPAM
+	case capabilities.NetBoxMirrorV1:
+		return s.enfNetBoxMirror
 	default:
 		return false
 	}

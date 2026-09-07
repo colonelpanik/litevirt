@@ -120,6 +120,12 @@ func newTestServerWithNetBox(t *testing.T, fb fakeNetBox) *Server {
 		},
 	}
 	s.SetGate(fakeServerGate{enforced: true})
+	// The inventory mirror is a SEPARATE opt-in (`netbox.mirror_inventory`, see
+	// enfNetBoxMirror), so a fixture that only wired the client would model a
+	// pure-IPAM node and every mirror scenario would pass by declining. The
+	// daemon sets both from one config block; so does this. A scenario whose
+	// subject IS the opt-in turns it back off explicitly.
+	s.SetNetBoxMirrorInventory(true)
 	return s
 }
 

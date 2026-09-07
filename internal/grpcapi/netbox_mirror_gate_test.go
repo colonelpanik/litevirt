@@ -89,8 +89,15 @@ func TestMirrorPassTakesNoLeaseWithoutTheLatch(t *testing.T) {
 func TestMirrorRefusesAnInMemoryOnlyLatch(t *testing.T) {
 	s := newTestServerWithNetBox(t, fakeNetBox{})
 	s.SetGate(fakeServerGate{
-		enforced:          true, // Latched(netbox_ipam_v1) is TRUE…
-		durablyLatchedTok: map[string]bool{capabilities.NetBoxIPAMV1: false},
+		enforced: true, // Latched(netbox_ipam_v1) is TRUE…
+		durablyLatchedTok: map[string]bool{
+			capabilities.NetBoxIPAMV1: false,
+			// The mirror's own token IS durable here, so the only thing this
+			// scenario withholds is netbox_ipam_v1's marker. Left out, the map's
+			// zero value would withhold both and the refusal below would no longer
+			// say which contract produced it.
+			capabilities.NetBoxMirrorV1: true,
+		},
 	}) // …but the marker was never persisted.
 	ctx := context.Background()
 

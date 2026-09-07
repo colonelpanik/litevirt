@@ -240,13 +240,13 @@ func TestRekeyLeavesAnotherClustersInventoryAlone(t *testing.T) {
 	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
 
 	a := NewClusterWithNetBox(t, 1, nb)
-	latchNetBoxIPAM(t, a, gateAll(t, a))
+	latchNetBoxBoth(t, a, gateAll(t, a))
 	// A distinct node-name prefix gives the second cluster its own in-memory
 	// database, and therefore its own cluster row, CA and fingerprint. Without
 	// it both "clusters" would share one database and the scenario could not
 	// fail.
 	b := NewClusterWithNetBoxNamed(t, 1, nb, "peer-")
-	latchNetBoxIPAM(t, b, gateAll(t, b))
+	latchNetBoxBoth(t, b, gateAll(t, b))
 
 	mustCreateBoundNetwork(t, a, a.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
 	mustCreateBoundNetwork(t, b, b.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)

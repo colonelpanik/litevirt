@@ -219,7 +219,10 @@ func boundMirrorClusterGated(t *testing.T, nodes int) (*NetBoxFake, *Cluster, ma
 
 	c := New(t, Options{Nodes: nodes, NetBoxURL: nb.URL(), SharedCRDT: true})
 	gates := gateAll(t, c)
-	latchNetBoxIPAM(t, c, gates)
+	// BOTH NetBox latches: the bind needs netbox_ipam_v1, and the mirror
+	// additionally needs netbox_mirror_v1 — the inventory opt-in a pure-IPAM
+	// cluster never forms.
+	latchNetBoxBoth(t, c, gates)
 	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
 	return nb, c, gates
 }

@@ -787,6 +787,13 @@ func (c *Cluster) wireNetBox(n *Node) {
 	n.Server.SetNetBoxClient(client)
 	n.Server.SetNetBoxClusterName(c.opts.NetBoxClusterName)
 	n.Server.SetNetBoxIPAM(true)
+	// The INVENTORY MIRROR's own opt-in (`netbox.mirror_inventory`), which drives
+	// netbox_mirror_v1 the same conditional-advertisement way. Set alongside the
+	// client because the mirror scenarios are the reason this wiring exists: a
+	// fixture that left it off would model a pure-IPAM cluster and every mirror
+	// assertion would pass by declining. A scenario whose subject IS the opt-in
+	// turns it off on the node it wants to model.
+	n.Server.SetNetBoxMirrorInventory(true)
 
 	// Host bridges: CreateVM preflights every non-macvtap NIC with ensureBridge,
 	// which runs `ip link add … type bridge` when the interface is missing. The

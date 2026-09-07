@@ -311,15 +311,82 @@ who does not model hosts still gets a working mirror. Templates are never
 mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
 deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.
 
-**Deletes need whole evidence.** The mirror computes them from a read of the
-local replicated database, and that read has partial answers an empty cluster is
-indistinguishable from: a node hydrating after a database loss reports no VMs,
-and a VM whose record cannot be read is skipped. A sweep in either state applies
-its creates and updates but withholds every delete, logs why, and does not stamp
-`litevirt_netbox_mirror_last_success_seconds` — so NetBox may briefly advertise a
-machine that is gone, and never loses one that is not. Deleting the last VM in a
-cluster still retires its object: the deleted record leaves a tombstone behind,
-which is the evidence that the empty answer is a real one.
+**Removals need evidence.** The mirror computes them from a read of the local
+replicated database, and that read has partial answers a converged cluster is
+indistinguishable from. Two things can be taken away — a `delete`, which retires
+a `virtual_machine` or a `vminterface`, and a `clear`, which unassigns an
+`ip_address` from an interface — and neither runs without positive local
+evidence. Creates, updates and assignments are unaffected: they are additive, so
+the worst a partial read costs there is an object a later sweep reconciles.
+
+Three conditions withhold, at two different scopes.
+
+**The whole pass** is withheld when the read cannot be trusted at all:
+
+- an **empty** read. A node hydrating after a database loss reports no VMs,
+  exactly as a cluster that genuinely holds none does. The two are told apart by
+  tombstone history — a deleted VM leaves a soft-deleted row behind — so deleting
+  the last VM in a cluster still retires its object, while an unhydrated node
+  retires nothing.
+- a **skipped** record. A VM whose spec carries no uuid, a NIC with no MAC, or
+  two live leases claiming one MAC on one network, are dropped by the reader with
+  a warning. For an object never mirrored that is harmless; for one already
+  mirrored the skip is indistinguishable from the workload being gone.
+
+**Per object** is the third, and it covers the far more common shape the two
+above pass: a database holding *some* of the cluster's rows. A node that just
+joined, or one rebuilt from scratch, hydrates row by row, and nothing throttles
+it into safety — it takes the mirror's leader lease immediately and re-latches
+within seconds of starting. So each removal is asked for its own proof:
+
+- a **delete** needs a local row for the VM or NIC it retires — live or
+  tombstoned. litevirt soft-deletes, so a destroyed workload leaves one; a row
+  that has not replicated leaves nothing.
+- a **clear** needs a local lease row naming that NetBox address — again live or
+  tombstoned. A release keeps the address id on the row it tombstones, so a
+  genuinely stale assignment is always provable. This matters because
+  anti-entropy repairs *per table*: with VM and interface rows repaired but
+  leases not yet, every NIC resolves to "holds no address", which would otherwise
+  route every litevirt-owned address in the cluster into the clear branch.
+
+A pass that withheld a delete withholds its clears too — having proven its
+inventory read partial, it does not then act destructively on it. A withheld
+clear does not escalate that way; it is proven per address and costs only that
+one.
+
+In every case the sweep still applies its creates, updates and assignments, logs
+exactly what it withheld and why, and does **not** stamp
+`litevirt_netbox_mirror_last_success_seconds`. So NetBox may briefly advertise a
+machine that is gone, and never loses one that is not, and
+`litevirt_netbox_mirror_sweeps_total{result="error"}` climbs while the condition
+lasts.
+
+#### When a withheld removal does not clear itself
+
+For an unreplicated row the condition is transient: the row arrives and the next
+sweep converges. It is **permanent** for a NetBox object carrying this cluster's
+identity that the local database has no record of and never will — an object
+copied by hand, a whole-cluster database rebuild that kept the same identity
+fingerprint, a rename that happened while the mirror was down. Every sweep
+withholds that one removal, forever: the staleness gauge never advances and the
+error counter increments every sweep interval.
+
+That is the intended direction — the mirror will not remove what it cannot prove
+— but the alarm does not stop on its own, and there is no force, prune or
+acknowledge flag to silence it. `lv netbox` has `rekey` and `resume`, and neither
+addresses this.
+
+**The repair is by hand.** The withheld objects are named in the log line — VM
+names and interface MACs for a delete, NetBox address ids for a clear. Find each
+one in NetBox, confirm it names a workload this cluster does not hold (its
+`litevirt_identity` custom field carries the VM uuid and MAC), and remove it — the
+object for a withheld delete, or just the address's assignment for a withheld
+clear. NetBox's changelog keeps what was removed. The next sweep then has nothing
+to withhold and converges.
+
+If the object *is* this cluster's own, stranded under a fingerprint the cluster
+has moved away from, `lv netbox rekey` is the repair instead — see
+[Recovering from a moved cluster fingerprint](#recovering-from-a-moved-cluster-fingerprint).
 
 **One node writes.** The mirror runs under the same cluster-wide leader lease as
 the orphan sweeper and the re-key, and re-reads it before every batch of writes,

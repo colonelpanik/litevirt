@@ -1,0 +1,243 @@
+package netboxsync
+
+import (
+	"context"
+	"strconv"
+	"testing"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netbox"
+)
+
+// The delete-authorization guard.
+//
+// Every scenario here is about ONE rule: a delete may only be computed from a
+// desired state that is provably WHOLE. The mirror's desired side is a read of
+// the local replicated database, and that read has two silent partial answers —
+// an empty table (a node hydrating after a DB loss, or one that took an
+// uncontested lease because the `leader_election` row had not replicated yet)
+// and a row the reader skipped (no uuid, no MAC). Neither is an error, so
+// without a guard both arrive at Diff looking exactly like "litevirt no longer
+// holds this", and Diff's job is to emit a delete for that.
+//
+// The blast radius is the operator's source of truth: DeleteVM cascades away
+// every vminterface under it, and the NetBox object ids external systems
+// reference are gone for good.
+
+// macGuard is the NIC MAC these scenarios mirror.
+const macGuard = "52:54:00:aa:bb:cc"
+
+// mustFingerprint is the cluster fingerprint the seeded `cluster` row derives,
+// read the way the sweep reads it.
+func mustFingerprint(t *testing.T, r *Reconciler) string {
+	t.Helper()
+	fingerprint, err := corrosion.ClusterFingerprint(context.Background(), r.db)
+	if err != nil {
+		t.Fatalf("ClusterFingerprint: %v", err)
+	}
+	return fingerprint
+}
+
+// guardReconciler is a leader-held reconciler over a NetBox holding exactly one
+// mirrored VM and its interface, under identities this cluster owns.
+//
+// The objects are what makes every assertion here non-vacuous: a delete is
+// computed from what NetBox holds and litevirt does not, so a fixture with an
+// empty NetBox could not tell a guard from its absence.
+func guardReconciler(t *testing.T) (*stubVirt, *Reconciler, string) {
+	t.Helper()
+	nb := &stubVirt{byIdentity: map[string][]int{}}
+	r := pollingReconciler(t, nb, Options{AcquireLease: leaseHeld, HoldsLease: leaseHeld})
+	seedClusterRow(t, r)
+	fingerprint := mustFingerprint(t, r)
+	nb.listVMs = []netbox.VirtualMachine{{
+		ID: 11, Name: "vm-1", ClusterID: 5, VCPUs: 2, MemoryMB: 1024, Status: "active",
+		Identity: netbox.Identity(fingerprint, "uuid-1", ""),
+	}}
+	nb.listIfaces = []netbox.VMInterface{{
+		ID: 21, VMID: 11, Name: "eth0", MAC: macGuard,
+		Identity: netbox.Identity(fingerprint, "uuid-1", macGuard),
+	}}
+	return nb, r, fingerprint
+}
+
+// deletes returns what a sweep destroyed.
+func deletes(nb *stubVirt) ([]int, []int) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	return append([]int(nil), nb.deleted...), append([]int(nil), nb.deletedInterfaces...)
+}
+
+// TestSweepDeletesNothingWhenDesiredIsEmpty is the CRITICAL case.
+//
+// An empty desired set is not evidence that litevirt holds nothing; it is the
+// answer a local read gives while the database is still hydrating, and it is
+// also the answer a node gives after taking a lease nobody contested because
+// the `leader_election` row had not reached it. Against a populated NetBox it
+// diffs to "delete everything".
+//
+// The same rule P1's orphan sweeper already states about proofs: an empty
+// universe makes every proof vacuously complete, which is the one shape that
+// must never authorize a delete.
+func TestSweepDeletesNothingWhenDesiredIsEmpty(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	// No VM rows at all: desiredState returns ([], nil), not an error.
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("the sweep must still run its non-delete phases: %v", err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("an empty desired state deleted VMs %v and interfaces %v from NetBox — "+
+			"a local read that returned nothing is not evidence that litevirt holds nothing", vms, ifaces)
+	}
+}
+
+// TestSweepDeletesNothingWhenAVMWasSkipped covers the second partial read.
+//
+// desiredState SKIPS a VM whose spec carries no uuid and logs a warning. The
+// skip is silent to everything downstream: the sweep goes on to record a
+// success and stamp the staleness gauge, so a partial read is reported as a
+// converged mirror — while the VM it dropped is, to Diff, a VM litevirt no
+// longer holds.
+//
+// The claim in the code that a skip "can never turn into a delete" holds only
+// for a VM that was never mirrored. This one was.
+func TestSweepDeletesNothingWhenAVMWasSkipped(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	// The mirrored VM is present and whole, so nothing about IT is missing…
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-1","cpu":2,"memory_mib":1024}`, macGuard)
+	// …and a SECOND VM is unreadable. Its own object is not at risk — it has
+	// never been mirrored — but the pass that dropped it is no longer a
+	// complete picture of what litevirt holds.
+	seedVMRow(t, r, "vm-2", `{"cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+	// The interface object NetBox holds for the first VM is gone from the local
+	// database, so a sweep that trusted this read would detach it.
+	nb.listIfaces = append(nb.listIfaces, netbox.VMInterface{
+		ID: 22, VMID: 11, Name: "eth1", MAC: "52:54:00:aa:bb:ee",
+		Identity: netbox.Identity(mustFingerprint(t, r), "uuid-1", "52:54:00:aa:bb:ee"),
+	})
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatalf("the sweep must still run its non-delete phases: %v", err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("a sweep that skipped an unreadable VM deleted VMs %v and interfaces %v — "+
+			"a partial read must not authorize a delete", vms, ifaces)
+	}
+}
+
+// TestSweepDeletesNothingWhenANICWasSkipped is the same rule one level down.
+//
+// A NIC with no MAC cannot be named in NetBox, so desiredNICs drops it. The VM
+// it hangs off is still mirrored, so the sweep looks whole — but the interface
+// set it computed for that VM is not, and every interface missing from it is a
+// nic/delete.
+func TestSweepDeletesNothingWhenANICWasSkipped(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	// A second NIC on the SAME VM, with no MAC — the shape a legacy row leaves.
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-1","cpu":2,"memory_mib":1024}`, macGuard, "")
+	nb.listIfaces = append(nb.listIfaces, netbox.VMInterface{
+		ID: 22, VMID: 11, Name: "eth1", MAC: "52:54:00:aa:bb:ee",
+		Identity: netbox.Identity(mustFingerprint(t, r), "uuid-1", "52:54:00:aa:bb:ee"),
+	})
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatalf("the sweep must still run its non-delete phases: %v", err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("a sweep that skipped a MAC-less NIC deleted VMs %v and interfaces %v — "+
+			"an incomplete interface set must not authorize a delete", vms, ifaces)
+	}
+}
+
+// TestSweepStillDeletesOnWholeEvidence is the negative control.
+//
+// Without it every assertion above is satisfied by a mirror that never deletes
+// anything at all, which is a different bug: a NetBox that keeps advertising
+// VMs the cluster destroyed is exactly what the delete half exists to prevent.
+func TestSweepStillDeletesOnWholeEvidence(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	// litevirt holds a DIFFERENT VM, read completely. The mirrored one is gone.
+	seedVMRow(t, r, "vm-2", `{"uuid":"uuid-2","cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 1 || vms[0] != 11 {
+		t.Fatalf("a whole desired state must still delete the VM litevirt no longer holds, deleted %v", vms)
+	}
+	if len(ifaces) != 1 || ifaces[0] != 21 {
+		t.Fatalf("its interface must go with it, deleted %v", ifaces)
+	}
+}
+
+// TestSuppressedSweepRecordsNoSuccess pins the reporting half.
+//
+// litevirt_netbox_mirror_last_success_seconds is the staleness signal an
+// operator alerts on. A pass that withheld its deletes did NOT converge — it
+// left NetBox advertising objects the diff could not prove are still real — so
+// stamping success there reports a healthy mirror for exactly as long as the
+// condition lasts, and the alert never fires.
+func TestSuppressedSweepRecordsNoSuccess(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	m := mirrorSink(t, r)
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ts := m.lastSuccess(); !ts.IsZero() {
+		t.Fatalf("a sweep that withheld its deletes stamped a success at %v", ts)
+	}
+	if got := m.sweeps(); got[sweepOK] != 0 {
+		t.Fatalf("sweep results = %v, want no ok result for a pass that did not converge", got)
+	}
+
+	// The positive control: the same fixture with whole evidence must advance
+	// it, or the assertions above are satisfied by a sink nothing ever calls.
+	seedVMRow(t, r, "vm-2", `{"uuid":"uuid-2","cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ts := m.lastSuccess(); ts.IsZero() {
+		t.Fatal("a converged sweep must stamp the staleness gauge")
+	}
+	if got := m.sweeps(); got[sweepOK] != 1 {
+		t.Fatalf("sweep results = %v, want exactly one ok", got)
+	}
+	_ = nb
+}
+
+// seedVMRow writes one running VM, under a caller-supplied spec so a scenario
+// can model a spec the mirror cannot read, and one NIC per supplied MAC — an
+// empty one being the MAC-less shape a legacy vm_interfaces row leaves behind.
+func seedVMRow(t *testing.T, r *Reconciler, name, spec string, macs ...string) {
+	t.Helper()
+	ifaces := make([]corrosion.InterfaceRecord, 0, len(macs))
+	for i, mac := range macs {
+		// vm_interfaces is keyed on (vm_name, network_name), so a second NIC
+		// needs a network of its own.
+		ifaces = append(ifaces, corrosion.InterfaceRecord{
+			VMName: name, NetworkName: "bound-" + strconv.Itoa(i), Ordinal: i,
+			MAC: mac, IP: "10.0.5.100",
+		})
+	}
+	if err := corrosion.InsertVM(context.Background(), r.db, corrosion.VMRecord{
+		Name:     name,
+		HostName: "host-a",
+		State:    "running",
+		Spec:     spec,
+	}, ifaces, nil); err != nil {
+		t.Fatalf("InsertVM(%s): %v", name, err)
+	}
+}

@@ -224,18 +224,29 @@ func TestCreateInterfaceAcceptsAnUpperCasedMACEcho(t *testing.T) {
 	}
 }
 
-// seedMirrorableVM writes the rows one running VM with one NIC leaves behind,
-// plus the `cluster` row every identity is derived from.
-func seedMirrorableVM(t *testing.T, r *Reconciler, name, uuid, mac string) {
+// seedClusterRow writes the `cluster` row every identity is derived from, and
+// nothing else.
+//
+// Separate from seedMirrorableVM because a scenario about an EMPTY desired
+// state still needs a derivable fingerprint: without the row the sweep fails at
+// the fingerprint read and never reaches the diff it is about.
+func seedClusterRow(t *testing.T, r *Reconciler) {
 	t.Helper()
-	ctx := context.Background()
-	if err := r.db.Execute(ctx,
+	if err := r.db.Execute(context.Background(),
 		`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
 		 VALUES ('default', 'unit', 'unit.local', 'ca-pem', ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET ca_cert = excluded.ca_cert`,
 		r.db.NowWall(), r.db.NowWall()); err != nil {
 		t.Fatalf("seed cluster row: %v", err)
 	}
+}
+
+// seedMirrorableVM writes the rows one running VM with one NIC leaves behind,
+// plus the `cluster` row every identity is derived from.
+func seedMirrorableVM(t *testing.T, r *Reconciler, name, uuid, mac string) {
+	t.Helper()
+	ctx := context.Background()
+	seedClusterRow(t, r)
 	if err := corrosion.InsertVM(ctx, r.db, corrosion.VMRecord{
 		Name:     name,
 		HostName: "host-a",

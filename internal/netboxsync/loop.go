@@ -237,9 +237,24 @@ func (r *Reconciler) holdsLeader(ctx context.Context) bool {
 // the two mean the same thing: this sweep converged.
 func (r *Reconciler) Sync(ctx context.Context) error {
 	queued := r.peekQueue(ctx)
-	if err := r.sweep(ctx); err != nil {
+	converged, err := r.sweep(ctx)
+	if err != nil {
 		r.sink().IncMirrorSweep(sweepError)
 		return err
+	}
+	if !converged {
+		// The pass RAN — every non-delete phase applied — but its desired-state
+		// read was not whole enough to authorize a delete, so NetBox may still
+		// be advertising objects this sweep could not account for. That is not a
+		// converged mirror and must not read as one: the success stamp is the
+		// staleness signal an operator alerts on, and the queued items are
+		// triggers a later, whole pass still owes an answer to.
+		//
+		// No error is returned. The condition is a property of the local
+		// database, not a failure of this pass, and the next sweep re-evaluates
+		// it from scratch.
+		r.sink().IncMirrorSweep(sweepError)
+		return nil
 	}
 	r.sink().IncMirrorSweep(sweepOK)
 	// Wall clock, not the HLC: this is read as `time() - <gauge>` against
@@ -250,29 +265,102 @@ func (r *Reconciler) Sync(ctx context.Context) error {
 }
 
 // sweep is the reconciliation itself: read both sides, diff, apply in phases.
-func (r *Reconciler) sweep(ctx context.Context) error {
+//
+// It reports whether the pass CONVERGED. A pass that withheld its deletes —
+// see deleteBlocker — returns (false, nil): it did every piece of work it could
+// prove was right, and none that it could not.
+func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	fp, err := corrosion.ClusterFingerprint(ctx, r.db)
 	if err != nil {
-		return fmt.Errorf("cluster fingerprint: %w", err)
+		return false, fmt.Errorf("cluster fingerprint: %w", err)
 	}
 	// BEFORE the reads: actualState is scoped to this cluster id, and
 	// createVM/updateVM write it onto every object.
 	clusterID, err := r.ensureCluster(ctx)
 	if err != nil {
-		return fmt.Errorf("ensure cluster: %w", err)
+		return false, fmt.Errorf("ensure cluster: %w", err)
 	}
 	r.clusterID = clusterID
 
-	desired, err := r.desiredState(ctx)
+	desired, skipped, err := r.desiredState(ctx)
 	if err != nil {
-		return fmt.Errorf("read desired state: %w", err)
+		return false, fmt.Errorf("read desired state: %w", err)
 	}
 	actual, err := r.actualState(ctx, fp)
 	if err != nil {
-		return fmt.Errorf("read actual state: %w", err)
+		return false, fmt.Errorf("read actual state: %w", err)
 	}
 
-	return r.applyPhases(ctx, Diff(desired, actual, fp), indexDesired(desired, fp), fp)
+	actions := Diff(desired, actual, fp)
+	converged := true
+	if why := deleteBlocker(desired, skipped, actual); why != "" {
+		kept, withheld := withoutDeletes(actions)
+		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
+			"reason", why, "withheld_deletes", withheld,
+			"desired_vms", len(desired), "skipped_records", skipped,
+			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
+		actions, converged = kept, false
+	}
+
+	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
+		return false, err
+	}
+	return converged, nil
+}
+
+// deleteBlocker reports WHY this sweep may not delete, or "" when its evidence
+// is whole.
+//
+// A delete is the only irreversible thing the mirror does: DeleteVM cascades
+// away every vminterface under it, and the NetBox object ids other systems
+// reference do not come back. So it may rest only on a desired state that is
+// provably complete — and desiredState has two ways of being silently
+// incomplete, NEITHER of which is an error:
+//
+//  1. An EMPTY read. corrosion.ListVMs answers ([], nil) for a table that is
+//     empty because this node is hydrating after a database loss or a fresh
+//     join, exactly as it does for a cluster that genuinely holds no VMs.
+//     Nothing here can tell those apart — but against a NetBox that still holds
+//     objects for this cluster only one of them is plausible, and acting on the
+//     wrong one deletes the operator's inventory. P1's orphan sweeper states
+//     the same rule about proofs: an empty universe makes every proof vacuously
+//     complete, which is the one shape that must never authorize a delete.
+//
+//  2. A SKIPPED record. A VM whose spec carries no uuid, or a NIC with no MAC,
+//     is dropped by the reader with a warning. For an object that has never
+//     been mirrored that is harmless — no object of ours carries an identity
+//     naming it. For one that HAS been (a spec rewritten without its uuid, a
+//     MAC cleared) the skip is indistinguishable from the workload being gone,
+//     and the object is destroyed.
+//
+// Non-delete work is unaffected: this is about never deleting on thin evidence,
+// not about halting the mirror.
+func deleteBlocker(desired []DesiredVM, skipped int, actual Actual) string {
+	if skipped > 0 {
+		return fmt.Sprintf("%d local record(s) could not be read", skipped)
+	}
+	if len(desired) == 0 && (len(actual.VMs) > 0 || len(actual.NICs) > 0) {
+		return "the local inventory read returned no VMs while NetBox still holds objects for this cluster"
+	}
+	return ""
+}
+
+// withoutDeletes returns the actions that are not deletes, and how many it
+// dropped.
+//
+// It filters the ACTION LIST rather than skipping the delete PHASES: a phase is
+// a scheduling boundary, and one skipped by a flag is one a later ordering
+// change can quietly reintroduce. An action that does not exist cannot run,
+// whatever the phase runner does with it.
+func withoutDeletes(actions []Action) ([]Action, int) {
+	kept := make([]Action, 0, len(actions))
+	for _, a := range actions {
+		if a.Op == "delete" {
+			continue
+		}
+		kept = append(kept, a)
+	}
+	return kept, len(actions) - len(kept)
 }
 
 // peekQueue reads this mirror's own queued items WITHOUT consuming them.
@@ -418,14 +506,17 @@ type vmSpecFields struct {
 // Every read failure is RETURNED, never skipped past. Desired state is what the
 // delete half of the diff is computed against, so a VM missing from it because
 // a query failed is a VM the sweep would delete from NetBox.
-func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
+// It also returns how many records it SKIPPED — a VM with no uuid, a NIC with
+// no MAC. A skip is not an error and does not stop the read, but it does make
+// the answer partial, and the caller has to know: see deleteBlocker.
+func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error) {
 	vms, err := corrosion.ListVMs(ctx, r.db, "", "")
 	if err != nil {
-		return nil, fmt.Errorf("list VMs: %w", err)
+		return nil, 0, fmt.Errorf("list VMs: %w", err)
 	}
 	leases, err := corrosion.ListNetBoxLeases(ctx, r.db)
 	if err != nil {
-		return nil, fmt.Errorf("list NetBox leases: %w", err)
+		return nil, 0, fmt.Errorf("list NetBox leases: %w", err)
 	}
 	byAddress := make(map[string]int, len(leases))
 	for _, l := range leases {
@@ -438,6 +529,7 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
 	devices := map[string]int{}
 
 	out := make([]DesiredVM, 0, len(vms))
+	skipped := 0
 	for _, v := range vms {
 		if v.IsTemplate {
 			// A template is a disk image, never a running machine. Mirroring one
@@ -448,21 +540,27 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
 		var spec vmSpecFields
 		if err := json.Unmarshal([]byte(v.Spec), &spec); err != nil || spec.UUID == "" {
 			// The uuid is what makes an identity incarnation-unique, so a VM
-			// without one has never been mirrored and cannot be: no object of
-			// ours carries an identity naming it, which is also why omitting it
-			// here can never turn into a delete.
+			// without one cannot be named in NetBox at all.
+			//
+			// COUNTED, not merely logged. A VM that has never been mirrored is
+			// harmless to omit — no object of ours carries an identity naming
+			// it. But one whose spec LOST its uuid HAS been mirrored, and to the
+			// diff its absence from this list is indistinguishable from the VM
+			// having been destroyed. The count is what stops the sweep acting on
+			// that difference (see deleteBlocker).
 			slog.Warn("netbox mirror: skipping a VM whose spec carries no uuid",
 				"vm", v.Name, "error", err)
+			skipped++
 			continue
 		}
 
 		nics, err := corrosion.MergedVMNICs(ctx, r.db, v.Name)
 		if err != nil {
-			return nil, fmt.Errorf("read NICs of VM %s: %w", v.Name, err)
+			return nil, 0, fmt.Errorf("read NICs of VM %s: %w", v.Name, err)
 		}
 		disks, err := corrosion.GetVMDisks(ctx, r.db, v.Name)
 		if err != nil {
-			return nil, fmt.Errorf("read disks of VM %s: %w", v.Name, err)
+			return nil, 0, fmt.Errorf("read disks of VM %s: %w", v.Name, err)
 		}
 
 		deviceID, ok := devices[v.HostName]
@@ -471,6 +569,8 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
 			devices[v.HostName] = deviceID
 		}
 
+		nicSet, nicsSkipped := desiredNICs(nics, byAddress)
+		skipped += nicsSkipped
 		out = append(out, DesiredVM{
 			Name:     v.Name,
 			Host:     v.HostName,
@@ -480,13 +580,13 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
 			MemoryMB: orSpec(v.MemActual, spec.MemoryMiB),
 			DiskGB:   totalDiskGiB(disks),
 			DeviceID: deviceID,
-			NICs:     desiredNICs(nics, byAddress),
+			NICs:     nicSet,
 		})
 	}
 	// Sorted so a sweep over identical state produces an identical action list;
 	// ListVMs imposes no order of its own.
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out, skipped, nil
 }
 
 // lookupDevice resolves one host's DCIM device id, or 0.
@@ -505,8 +605,9 @@ func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
 }
 
 // desiredNICs maps litevirt NIC rows onto the mirror's NIC shape, resolving each
-// one's NetBox address object through the lease index.
-func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) []DesiredNIC {
+// one's NetBox address object through the lease index. It also returns how many
+// NICs it skipped — see desiredState.
+func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) ([]DesiredNIC, int) {
 	// Ordered before naming, because the names are derived positionally on a
 	// collision and map/query order must not decide them.
 	sort.Slice(nics, func(i, j int) bool {
@@ -517,13 +618,19 @@ func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) []Desired
 	})
 	out := make([]DesiredNIC, 0, len(nics))
 	used := make(map[string]bool, len(nics))
+	skipped := 0
 	for _, n := range nics {
 		if n.MAC == "" {
 			// The identity is MAC-derived, so a NIC without one cannot be named
 			// in NetBox at all. Mirroring it under an empty MAC would collide
 			// with its own VM's identity (a VM identity IS a NIC identity with an
 			// empty MAC).
+			//
+			// Counted for the same reason a uuid-less VM is: an interface whose
+			// MAC was cleared has already been mirrored, and dropping it here
+			// leaves the diff unable to tell that from a detached NIC.
 			slog.Warn("netbox mirror: skipping a NIC with no MAC", "vm", n.VMName, "nic", n.ID)
+			skipped++
 			continue
 		}
 		out = append(out, DesiredNIC{
@@ -533,7 +640,7 @@ func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) []Desired
 			NetBoxIPID: byAddress[leaseKey(n.NetworkName, n.IP)],
 		})
 	}
-	return out
+	return out, skipped
 }
 
 // nicName is the interface name NetBox shows, derived from the NIC's ordinal.

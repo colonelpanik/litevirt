@@ -700,6 +700,12 @@ type stubVirt struct {
 	createErr map[string]error
 	deleteErr error
 
+	// The NetBox-side state a sweep reads back, served by the collection half
+	// below. Empty by default, so every existing scenario is untouched.
+	listVMs    []netbox.VirtualMachine
+	listIfaces []netbox.VMInterface
+	listIPs    []netbox.IPAddress
+
 	// sweeps counts EnsureCluster calls — one per sweep, whether or not the
 	// sweep goes on to write anything. See Sweeps.
 	sweeps int
@@ -833,16 +839,28 @@ func (s *stubVirt) FindDeviceByName(_ context.Context, name string) (int, error)
 // The collection half of the interface. The applier never reads through it —
 // Reconciler.actualState does — but it is one interface so a fake cannot
 // satisfy the writes while a second, drifting path serves the reads.
+//
+// It answers from listVMs/listIfaces/listIPs, which are empty unless a scenario
+// fills them. A sweep-level scenario has to be able to put objects on the NetBox
+// side that litevirt does NOT hold — that is the only shape a delete is computed
+// from, so without it every "did this sweep delete anything?" assertion would be
+// vacuous.
 func (s *stubVirt) ListVMsByCluster(context.Context, int) ([]netbox.VirtualMachine, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.VirtualMachine(nil), s.listVMs...), nil
 }
 
 func (s *stubVirt) ListInterfacesByCluster(context.Context, int) ([]netbox.VMInterface, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.VMInterface(nil), s.listIfaces...), nil
 }
 
 func (s *stubVirt) ListOwnedIPsForInterfaces(context.Context, []int) ([]netbox.IPAddress, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]netbox.IPAddress(nil), s.listIPs...), nil
 }
 
 // The cluster half. Fixed ids: the applier is handed a resolved clusterID, so

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -599,15 +600,67 @@ func dupesCounted(t *testing.T, r *Reconciler) int {
 
 // countingMetrics is the test sink. The production one is process-global
 // Prometheus state, which cannot be asserted on per test.
+//
+// Objects are keyed "<netbox kind>/<op>" — the two label values joined — so a
+// scenario asserting on the pair fails if either label is dropped, rather than
+// silently summing two operations into one number.
 type countingMetrics struct {
-	mu    sync.Mutex
-	dupes int
+	mu       sync.Mutex
+	dupes    int
+	objects_ map[string]int
+	sweeps_  map[string]int
+	success  time.Time
 }
 
 func (m *countingMetrics) IncDuplicateObject() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.dupes++
+}
+
+func (m *countingMetrics) IncMirrorObject(kind, op string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.objects_ == nil {
+		m.objects_ = map[string]int{}
+	}
+	m.objects_[kind+"/"+op]++
+}
+
+func (m *countingMetrics) IncMirrorSweep(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sweeps_ == nil {
+		m.sweeps_ = map[string]int{}
+	}
+	m.sweeps_[result]++
+}
+
+func (m *countingMetrics) SetMirrorLastSuccess(t time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.success = t
+}
+
+// objects and sweeps return copies: apply runs a worker pool, so a caller
+// ranging over the live map would race the sink.
+func (m *countingMetrics) objects() map[string]int { return copyCounts(&m.mu, m.objects_) }
+func (m *countingMetrics) sweeps() map[string]int  { return copyCounts(&m.mu, m.sweeps_) }
+
+func (m *countingMetrics) lastSuccess() time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.success
+}
+
+func copyCounts(mu *sync.Mutex, in map[string]int) map[string]int {
+	mu.Lock()
+	defer mu.Unlock()
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 type updatedVM struct {

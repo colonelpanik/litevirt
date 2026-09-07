@@ -190,3 +190,11 @@ func (m *sweepMetrics) IncDuplicateObject() {
 	defer m.mu.Unlock()
 	m.duplicates++
 }
+
+// The inventory mirror's own counters. Discarded rather than recorded: this
+// fixture exists for the sweeper's signals, and what the mirror emits is
+// asserted where it is produced, against a sink these scenarios do not share.
+// They are here because the whole netboxMetrics sink is one interface.
+func (*sweepMetrics) IncMirrorObject(_, _ string)    {}
+func (*sweepMetrics) IncMirrorSweep(string)          {}
+func (*sweepMetrics) SetMirrorLastSuccess(time.Time) {}

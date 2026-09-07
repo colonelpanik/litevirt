@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -41,6 +42,9 @@ func TestNetBoxMetricsRegistered(t *testing.T) {
 	m.IncSweepSkipped("host_unreachable")
 	m.IncStuckLease()
 	m.IncBindingSuspended()
+	m.IncMirrorObject("virtual_machine", "created")
+	m.IncMirrorSweep("ok")
+	m.SetMirrorLastSuccess(time.Now())
 
 	want := []string{
 		"litevirt_netbox_api_errors_total",
@@ -50,6 +54,9 @@ func TestNetBoxMetricsRegistered(t *testing.T) {
 		"litevirt_netbox_stuck_leases_total",
 		"litevirt_netbox_bindings_suspended_total",
 		"litevirt_netbox_duplicate_objects_total",
+		"litevirt_netbox_mirror_objects_total",
+		"litevirt_netbox_mirror_sweeps_total",
+		"litevirt_netbox_mirror_last_success_seconds",
 	}
 	got := netboxFamilies(t)
 	for _, name := range want {
@@ -201,6 +208,9 @@ func TestNetBoxMetricsSatisfiesTheMirrorSink(t *testing.T) {
 	// Mirrors netboxsync.mirrorMetrics exactly.
 	type mirrorSink interface {
 		IncDuplicateObject()
+		IncMirrorObject(kind, op string)
+		IncMirrorSweep(result string)
+		SetMirrorLastSuccess(time.Time)
 	}
 	var s mirrorSink = NewNetBoxMetrics()
 	s.IncDuplicateObject()
@@ -211,5 +221,61 @@ func TestNetBoxMetricsSatisfiesTheMirrorSink(t *testing.T) {
 	}
 	if got := fam.GetMetric()[0].GetCounter().GetValue(); got < 1 {
 		t.Fatalf("litevirt_netbox_duplicate_objects_total = %v, want at least 1", got)
+	}
+}
+
+// TestMirrorObjectsCarryKindAndOp pins the churn counter's TWO labels onto
+// distinct series.
+//
+// A single-labelled counter would still register, still increment and still
+// satisfy every "is it registered" check — while summing creates, updates and
+// deletes into one number, which is exactly the distinction the metric exists to
+// draw. Two increments differing only in `op` must therefore produce two series.
+func TestMirrorObjectsCarryKindAndOp(t *testing.T) {
+	m := NewNetBoxMetrics()
+	m.IncMirrorObject("virtual_machine", "created")
+	m.IncMirrorObject("virtual_machine", "deleted")
+
+	fam := netboxFamilies(t)["litevirt_netbox_mirror_objects_total"]
+	if fam == nil {
+		t.Fatal("litevirt_netbox_mirror_objects_total is not registered")
+	}
+	ops := map[string]bool{}
+	for _, series := range fam.GetMetric() {
+		labels := map[string]string{}
+		for _, l := range series.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		if len(labels) != 2 || labels["kind"] == "" || labels["op"] == "" {
+			t.Fatalf("series labels = %v, want exactly kind and op", labels)
+		}
+		if labels["kind"] == "virtual_machine" {
+			ops[labels["op"]] = true
+		}
+	}
+	for _, op := range []string{"created", "deleted"} {
+		if !ops[op] {
+			t.Errorf("no virtual_machine series for op %q — the operations are collapsed into one", op)
+		}
+	}
+}
+
+// TestMirrorLastSuccessIsUnixSeconds pins the gauge's UNIT and its value.
+//
+// The alert it exists for is `time() - litevirt_netbox_mirror_last_success_seconds
+// > N`, which is arithmetic against Prometheus's own clock: a gauge carrying
+// nanoseconds, or a monotonic reading, or a count of sweeps would all look like
+// a healthy mirror forever. Only "the wall-clock second the sweep finished"
+// answers the question.
+func TestMirrorLastSuccessIsUnixSeconds(t *testing.T) {
+	when := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	NewNetBoxMetrics().SetMirrorLastSuccess(when)
+
+	fam := netboxFamilies(t)["litevirt_netbox_mirror_last_success_seconds"]
+	if fam == nil || len(fam.GetMetric()) == 0 {
+		t.Fatal("litevirt_netbox_mirror_last_success_seconds is not registered")
+	}
+	if got := fam.GetMetric()[0].GetGauge().GetValue(); got != float64(when.Unix()) {
+		t.Fatalf("last success gauge = %v, want %v (unix seconds)", got, float64(when.Unix()))
 	}
 }

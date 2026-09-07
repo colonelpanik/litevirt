@@ -228,11 +228,23 @@ func (r *Reconciler) holdsLeader(ctx context.Context) bool {
 // in place and the next poll retries immediately. Acking first would throw the
 // trigger away on exactly the passes that did not do the work, and the change
 // would then wait out a full sweep interval.
+//
+// Both counters are emitted HERE rather than in SyncOnce, so a node that never
+// took the lease records nothing at all: every configured node runs the loop,
+// and a skipped pass counted as ok would put a fresh success timestamp on all of
+// them — while counted as an error it would raise one on every node but the
+// leader. The success stamp is set on exactly the path the ack is on, because
+// the two mean the same thing: this sweep converged.
 func (r *Reconciler) Sync(ctx context.Context) error {
 	queued := r.peekQueue(ctx)
 	if err := r.sweep(ctx); err != nil {
+		r.sink().IncMirrorSweep(sweepError)
 		return err
 	}
+	r.sink().IncMirrorSweep(sweepOK)
+	// Wall clock, not the HLC: this is read as `time() - <gauge>` against
+	// Prometheus's own clock, and a logical timestamp there is meaningless.
+	r.sink().SetMirrorLastSuccess(time.Now())
 	r.ackQueued(ctx, queued)
 	return nil
 }

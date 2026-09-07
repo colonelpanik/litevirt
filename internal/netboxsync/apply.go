@@ -64,6 +64,24 @@ type netboxWriter interface {
 	EnsureCluster(ctx context.Context, name string, typeID int) (int, error)
 }
 
+// The operation vocabulary of litevirt_netbox_mirror_objects_total, in the PAST
+// tense on purpose: they name what the mirror actually wrote to NetBox, not what
+// the diff asked for. An adopted object satisfies a vm/create action without any
+// write, and a delete of an object already gone writes nothing either — neither
+// is counted, because the counter's job is to tell a converged mirror apart from
+// one that is churning.
+const (
+	opCreated = "created"
+	opUpdated = "updated"
+	opDeleted = "deleted"
+)
+
+// The sweep-result vocabulary of litevirt_netbox_mirror_sweeps_total.
+const (
+	sweepOK    = "ok"
+	sweepError = "error"
+)
+
 // mirrorMetrics is the counter sink the mirror emits into. An interface so the
 // package does not import internal/metrics — whose counters are process-global
 // Prometheus state a test cannot assert on.
@@ -71,13 +89,27 @@ type mirrorMetrics interface {
 	// IncDuplicateObject counts one NetBox object found duplicated for a single
 	// litevirt identity, and deleted by the sweep.
 	IncDuplicateObject()
+	// IncMirrorObject counts one NetBox object this mirror WROTE. kind is the
+	// NetBox object kind (netboxKindVM / netboxKindNIC), op one of the three
+	// above. Both vocabularies are closed: they become Prometheus labels.
+	IncMirrorObject(kind, op string)
+	// IncMirrorSweep counts one sweep that ran to a conclusion, ok or error. A
+	// pass that never took the lease is neither — see SyncOnce.
+	IncMirrorSweep(result string)
+	// SetMirrorLastSuccess records when a sweep last SUCCEEDED. It is the
+	// staleness signal an operator alerts on ("the mirror has not converged in
+	// N minutes"), so only a sweep that genuinely reconciled may advance it.
+	SetMirrorLastSuccess(t time.Time)
 }
 
 // noopMetrics is the sink used when none is wired. Metrics must never be a
 // reason the mirror panics.
 type noopMetrics struct{}
 
-func (noopMetrics) IncDuplicateObject() {}
+func (noopMetrics) IncDuplicateObject()            {}
+func (noopMetrics) IncMirrorObject(_, _ string)    {}
+func (noopMetrics) IncMirrorSweep(string)          {}
+func (noopMetrics) SetMirrorLastSuccess(time.Time) {}
 
 // Reconciler mirrors litevirt inventory into NetBox.
 //
@@ -273,6 +305,9 @@ func (r *Reconciler) createVM(ctx context.Context, a Action, idx desiredIndex, f
 		if err != nil {
 			return fmt.Errorf("netboxsync: create VM %s: %w", identity, err)
 		}
+		// Counted on the WRITE, not on the action: the adopt branch above
+		// reaches this same recordRef having created nothing.
+		r.sink().IncMirrorObject(netboxKindVM, opCreated)
 		id = vm.ID
 	}
 	return r.recordRef(ctx, kindVM, identity, netboxKindVM, id)
@@ -302,6 +337,7 @@ func (r *Reconciler) updateVM(ctx context.Context, a Action, idx desiredIndex) e
 	}); err != nil {
 		return fmt.Errorf("netboxsync: update VM %d: %w", a.NetBoxID, err)
 	}
+	r.sink().IncMirrorObject(netboxKindVM, opUpdated)
 	return r.recordRef(ctx, kindVM, a.Key, netboxKindVM, a.NetBoxID)
 }
 
@@ -350,6 +386,11 @@ func (r *Reconciler) createNIC(ctx context.Context, a Action, idx desiredIndex, 
 		if err != nil {
 			return fmt.Errorf("netboxsync: create interface %s: %w", identity, err)
 		}
+		// Counted BEFORE the MAC echo check below, which refuses an object
+		// NetBox has nonetheless created. The counter reports what was written,
+		// and an interface abandoned right after a successful POST is still an
+		// interface this mirror put there.
+		r.sink().IncMirrorObject(netboxKindNIC, opCreated)
 		// FAIL CLOSED on the echoed MAC.
 		//
 		// DRF silently IGNORES a write field its serializer does not know, so a
@@ -401,6 +442,7 @@ func (r *Reconciler) updateNIC(ctx context.Context, a Action, idx desiredIndex) 
 	}); err != nil {
 		return fmt.Errorf("netboxsync: update interface %d: %w", a.NetBoxID, err)
 	}
+	r.sink().IncMirrorObject(netboxKindNIC, opUpdated)
 	return r.recordRef(ctx, kindNIC, a.Key, netboxKindNIC, a.NetBoxID)
 }
 
@@ -411,18 +453,22 @@ func (r *Reconciler) updateNIC(ctx context.Context, a Action, idx desiredIndex) 
 // delete targets exactly the object the diff decided on. A second round trip
 // could observe different state — and this is the irreversible direction.
 func (r *Reconciler) deleteObject(ctx context.Context, a Action) error {
-	var kind string
+	var kind, netboxKind string
 	var err error
 	switch a.Kind {
 	case kindVM:
-		kind, err = kindVM, r.nb.DeleteVM(ctx, a.NetBoxID)
+		kind, netboxKind, err = kindVM, netboxKindVM, r.nb.DeleteVM(ctx, a.NetBoxID)
 	case kindNIC:
-		kind, err = kindNIC, r.nb.DeleteInterface(ctx, a.NetBoxID)
+		kind, netboxKind, err = kindNIC, netboxKindNIC, r.nb.DeleteInterface(ctx, a.NetBoxID)
 	default:
 		return fmt.Errorf("netboxsync: delete of unknown kind %q for %s", a.Kind, a.Key)
 	}
 	switch {
 	case err == nil:
+		// Only a delete that actually removed something is counted; the 404
+		// below removed nothing, and counting it would report churn on a mirror
+		// that is merely retiring a stale mapping.
+		r.sink().IncMirrorObject(netboxKind, opDeleted)
 	case isNotFound(err):
 		// Already gone IS the desired end state, so this falls through to the
 		// tombstone. Aborting here would strand the mapping PERMANENTLY: the

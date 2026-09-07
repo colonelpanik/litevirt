@@ -275,6 +275,63 @@ invisible to the reclaim proof. Either revert the CIDR in NetBox, or delete and
 recreate the litevirt network, which releases the binding and re-claims it
 against the new range.
 
+### The inventory mirror
+
+A cluster configured for NetBox also mirrors its inventory there, whether or not
+any network is bound to a prefix. It registers itself as a NetBox cluster (of
+type `litevirt`, named after the local cluster) and mirrors:
+
+- each VM as a `virtual_machine` carrying its vCPUs, memory, disk and status —
+  `active` while it runs and `offline` in every other state, because NetBox's
+  remaining choices describe an operator's intent for a machine rather than a
+  hypervisor's runtime, and writing one would overwrite what an operator put
+  there;
+- each VM NIC as a `vminterface`, keyed by its MAC;
+- each address litevirt claimed from NetBox as an `ip_address` assigned to the
+  interface that holds it.
+
+If a host is modelled as a DCIM device whose name matches the litevirt host, the
+VM links to it; if not, the VM is mirrored without a device link, so an operator
+who does not model hosts still gets a working mirror. Templates are never
+mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
+deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.
+
+**One node writes.** The mirror runs under the same cluster-wide leader lease as
+the orphan sweeper and the re-key, and re-reads it before every batch of writes,
+so a handover mid-sweep stops the outgoing leader instead of letting two nodes
+write the same objects. It writes only on change: a sweep over inventory that
+already matches issues no writes at all.
+
+**Two cadences.** A full sweep on the `netbox.sweep_interval_sec` cadence (900
+seconds by default) reconciles everything, and that is the correctness mechanism.
+Between sweeps the node holding the lease checks a local queue every 60 seconds
+and sweeps early when a VM lifecycle operation has left something in it. The
+queue is latency only — a VM whose enqueue never happened, because the node died
+mid-operation, is converged by the next full sweep just the same.
+
+#### The queue during a NetBox outage
+
+Queued items are acked only after a sweep has **succeeded**. While NetBox is
+unreachable every sweep fails, so nothing is acked: `netbox_sync_queue`
+accumulates one row per VM lifecycle operation and
+`litevirt_netbox_sync_queue_depth` climbs and stays up. Because the queue is not
+empty, the leader also retries on the 60-second poll rather than waiting out the
+15-minute sweep.
+
+Both are deliberate. Keeping the trigger is what makes a change reach NetBox on
+the first poll after recovery instead of a sweep interval later, and the backlog
+then clears in a single pass, because the sweep reconciles the whole fleet rather
+than replaying the queue item by item — a hundred queued rows are not a hundred
+sweeps. Correctness never depends on the queue, so nothing is lost if it is
+cleared by hand either.
+
+A queue depth that rises during an outage is therefore expected and self-heals.
+What is worth alerting on is a depth that does not return to 0 once NetBox is
+reachable again, which means sweeps are still failing:
+`litevirt_netbox_mirror_sweeps_total` and
+`litevirt_netbox_mirror_last_success_seconds` say whether any sweep is completing
+at all, and `litevirt_netbox_api_errors_total` says what NetBox is answering.
+
 ### Recovering from a CA replacement
 
 The cluster fingerprint in every NetBox identity is derived from the cluster CA
@@ -357,6 +414,25 @@ and two litevirt installations can share one NetBox and one NetBox cluster
 object, so that rule would seize the other installation's inventory. An operator
 whose index is genuinely gone removes the stranded objects in NetBox by hand and
 lets the mirror rebuild them.
+
+**The same limitation applies to a single lost row**, and it is the one residual
+gap in the re-key. If an object was created in NetBox but the index row recording
+it never landed — a crash in the moment between the two — no re-key can find that
+object again, because a re-key only ever rewrites objects whose fingerprint
+appears in the local index. An ordinary sweep heals this on its own, since the
+mirror searches NetBox by identity before it creates anything; but a CA
+replacement leaves the object under the old fingerprint with nothing pointing at
+it, and after the re-key the mirror searches under the new one, finds nothing,
+and tries to create inventory NetBox already holds. The symptom is a sweep that
+fails on a name NetBox says is already taken.
+
+It fails closed by choice. Repairing it would mean rewriting an object the
+cluster cannot prove is its own, which in a shared NetBox is another cluster's
+inventory. The repair is by hand: find the object in NetBox under the old
+fingerprint — its `litevirt_identity` custom field starts with it, and the
+cluster's own objects all carry the new one — confirm it names a VM this cluster
+holds, and delete it. The next sweep recreates it correctly and records the index
+row. NetBox's changelog keeps what was removed.
 
 Both commands are admin-only and both write an audit record (`netbox.rekey`,
 `netbox.resume`), so `lv audit verify` carries a trace of every identity rewrite

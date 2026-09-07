@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -28,6 +29,9 @@ var (
 	netboxStuckLeases       prometheus.Counter
 	netboxBindingsSuspended prometheus.Counter
 	netboxDuplicateObjects  prometheus.Counter
+	netboxMirrorObjects     *prometheus.CounterVec
+	netboxMirrorSweeps      *prometheus.CounterVec
+	netboxMirrorLastSuccess prometheus.Gauge
 )
 
 func netboxInit() {
@@ -65,15 +69,38 @@ func netboxInit() {
 			Name: "litevirt_netbox_duplicate_objects_total",
 			Help: "NetBox objects found duplicated for one litevirt identity by the inventory mirror.",
 		})
+		netboxMirrorObjects = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_netbox_mirror_objects_total",
+			Help: "NetBox objects the inventory mirror WROTE, by object kind and operation. " +
+				"The mirror writes only on change, so a count that keeps climbing over " +
+				"unchanging inventory is drift the diff cannot settle.",
+		}, []string{"kind", "op"})
+		netboxMirrorSweeps = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_netbox_mirror_sweeps_total",
+			Help: "Inventory mirror sweeps by result. Counted on the leader only — a node that " +
+				"does not hold the lease runs no sweep and records nothing.",
+		}, []string{"result"})
+		netboxMirrorLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "litevirt_netbox_mirror_last_success_seconds",
+			Help: "Unix time of the last SUCCESSFUL inventory mirror sweep on this node; 0 if it " +
+				"has never completed one. Alert on the cluster-wide max: only the leader sweeps.",
+		})
 		prometheus.DefaultRegisterer.MustRegister(
 			netboxAPIErrors, netboxAmbiguousClaims, netboxOrphansReclaimed,
 			netboxSweepsSkipped, netboxStuckLeases, netboxBindingsSuspended,
-			netboxDuplicateObjects,
+			netboxDuplicateObjects, netboxMirrorObjects, netboxMirrorSweeps,
+			netboxMirrorLastSuccess,
 		)
 		// Materialise the three error classes at zero so a dashboard shows the
 		// series before the first failure, and so rate() has a baseline.
 		for _, class := range []string{"transport", "client", "server"} {
 			netboxAPIErrors.WithLabelValues(class)
+		}
+		// Same for both sweep results. The error rate is what an operator
+		// alerts on, and a series that only appears once something has already
+		// failed gives the alert nothing to compare against.
+		for _, result := range []string{"ok", "error"} {
+			netboxMirrorSweeps.WithLabelValues(result)
 		}
 	})
 }
@@ -134,3 +161,26 @@ func (*NetBoxMetrics) IncBindingSuspended() { netboxBindingsSuspended.Inc() }
 // IncDuplicateObject counts one NetBox object found duplicated for a single
 // litevirt identity by the inventory mirror, and deleted by the sweep.
 func (*NetBoxMetrics) IncDuplicateObject() { netboxDuplicateObjects.Inc() }
+
+// IncMirrorObject counts one NetBox object the mirror wrote. BOTH label values
+// come from the mirror's closed vocabularies — the NetBox object kind
+// ("virtual_machine", "vminterface") and the operation ("created", "updated",
+// "deleted") — never from an error string or a litevirt object name, which
+// would make the label unbounded.
+func (*NetBoxMetrics) IncMirrorObject(kind, op string) {
+	netboxMirrorObjects.WithLabelValues(kind, op).Inc()
+}
+
+// IncMirrorSweep counts one mirror sweep by result ("ok" or "error").
+func (*NetBoxMetrics) IncMirrorSweep(result string) {
+	netboxMirrorSweeps.WithLabelValues(result).Inc()
+}
+
+// SetMirrorLastSuccess records when a sweep last SUCCEEDED, in unix seconds.
+//
+// Seconds, not nanoseconds and not a monotonic reading: the alert this exists
+// for is arithmetic against Prometheus's own wall clock (`time() - <this>`), and
+// any other unit reads as a mirror that converged in the distant future.
+func (*NetBoxMetrics) SetMirrorLastSuccess(t time.Time) {
+	netboxMirrorLastSuccess.Set(float64(t.Unix()))
+}

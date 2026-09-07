@@ -1495,6 +1495,15 @@ type netboxMetrics interface {
 	// reason as IncAmbiguousClaim: the whole sink is what gets passed on, and a
 	// second sink would be a second thing the daemon could forget to wire.
 	IncDuplicateObject()
+	// The inventory mirror's own observability, emitted by internal/netboxsync
+	// and declared here for the same reason: this whole sink is what gets passed
+	// to it. IncMirrorObject counts one NetBox object the mirror wrote, by object
+	// kind and operation; IncMirrorSweep counts one sweep by result; and
+	// SetMirrorLastSuccess records when a sweep last SUCCEEDED, which is the
+	// staleness signal an operator alerts on.
+	IncMirrorObject(kind, op string)
+	IncMirrorSweep(result string)
+	SetMirrorLastSuccess(t time.Time)
 }
 
 // noopNetBoxMetrics is what an UNWIRED sink resolves to — every bare test
@@ -1512,6 +1521,10 @@ func (noopNetBoxMetrics) IncStuckLease()              {}
 func (noopNetBoxMetrics) IncBindingSuspended()        {}
 func (noopNetBoxMetrics) IncAmbiguousClaim()          {}
 func (noopNetBoxMetrics) IncDuplicateObject()         {}
+
+func (noopNetBoxMetrics) IncMirrorObject(_, _ string)    {}
+func (noopNetBoxMetrics) IncMirrorSweep(string)          {}
+func (noopNetBoxMetrics) SetMirrorLastSuccess(time.Time) {}
 
 // SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
 func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }

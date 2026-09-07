@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -536,7 +537,13 @@ func newTestReconciler(t *testing.T, nb netboxWriter) *Reconciler {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	return &Reconciler{nb: nb, db: db, clusterID: 5, metrics: &countingMetrics{}}
+	return &Reconciler{
+		nb: nb, db: db, clusterID: 5, metrics: &countingMetrics{},
+		// Supplied EXPLICITLY. An unwired lease reads as "not the leader" (the
+		// fail-closed direction), so applyPhases would write nothing at all and
+		// every ordering assertion would pass vacuously.
+		holdsLease: func(context.Context) bool { return true },
+	}
 }
 
 // vmWireBody returns the body the PRODUCTION client puts on the wire for the VM
@@ -623,8 +630,16 @@ type stubVirt struct {
 	interfacesByIdentity map[string][]int
 	devices              map[string]int
 	deviceErr            error
-	createErr            map[string]error
-	deleteErr            error
+
+	// dropMACOnCreate models a NetBox whose vminterface serializer does not know
+	// mac_address: DRF ignores an unknown write field silently, so the object
+	// comes back 201 with no MAC at all. upperCaseMACEcho models what a real
+	// NetBox does — echo it UPPER-cased.
+	dropMACOnCreate  bool
+	upperCaseMACEcho bool
+
+	createErr map[string]error
+	deleteErr error
 
 	createCalls       int
 	created           []netbox.VirtualMachine
@@ -701,7 +716,14 @@ func (s *stubVirt) CreateInterface(_ context.Context, i netbox.VMInterface) (net
 	defer s.mu.Unlock()
 	i.ID = s.nextObjectID()
 	s.createdInterfaces = append(s.createdInterfaces, i)
-	return i, nil
+	echoed := i
+	switch {
+	case s.dropMACOnCreate:
+		echoed.MAC = ""
+	case s.upperCaseMACEcho:
+		echoed.MAC = strings.ToUpper(i.MAC)
+	}
+	return echoed, nil
 }
 
 func (s *stubVirt) UpdateInterface(_ context.Context, id int, i netbox.VMInterface) error {
@@ -759,3 +781,10 @@ func (s *stubVirt) ListInterfacesByCluster(context.Context, int) ([]netbox.VMInt
 func (s *stubVirt) ListOwnedIPsForInterfaces(context.Context, []int) ([]netbox.IPAddress, error) {
 	return nil, nil
 }
+
+// The cluster half. Fixed ids: the applier is handed a resolved clusterID, so
+// nothing here decides anything — Sync resolves it through these, and the fleet
+// exercises that against a real NetBox surface.
+func (s *stubVirt) EnsureClusterType(context.Context, string) (int, error) { return 1, nil }
+
+func (s *stubVirt) EnsureCluster(context.Context, string, int) (int, error) { return 5, nil }

@@ -36,6 +36,27 @@ func ClusterFingerprint(ctx context.Context, c *Client) (string, error) {
 	return fingerprintFromCert(rows[0].String("ca_cert"))
 }
 
+// ClusterName returns the operator-chosen cluster name, or "" when the row
+// carries none.
+//
+// It is what an operator RECOGNISES, which is why the NetBox mirror names its
+// cluster object after it rather than after the fingerprint: the fingerprint is
+// derived from the CA certificate, so a CA replacement would change it and the
+// mirror would create a second, empty NetBox cluster and orphan the first.
+//
+// It is deliberately NOT an identity. Two installations can share a name, so
+// nothing may be SCOPED by it — object identity stays the fingerprint's job.
+func ClusterName(ctx context.Context, c *Client) (string, error) {
+	rows, err := c.Query(ctx, `SELECT name FROM cluster LIMIT 1`)
+	if err != nil {
+		return "", fmt.Errorf("read cluster name: %w", err)
+	}
+	if len(rows) == 0 {
+		return "", fmt.Errorf("cluster row not found — cannot read a cluster name")
+	}
+	return strings.TrimSpace(rows[0].String("name")), nil
+}
+
 // fingerprintFromCert is the pure half, so the digest is testable without a DB.
 func fingerprintFromCert(caCert string) (string, error) {
 	if strings.TrimSpace(caCert) == "" {

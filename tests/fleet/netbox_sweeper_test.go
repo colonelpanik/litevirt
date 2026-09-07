@@ -255,7 +255,7 @@ func TestSweeperStuckLeaseIsSurfacedNotDeleted(t *testing.T) {
 	if m.stuck() != 1 {
 		t.Fatalf("stuck-lease counter = %d, want 1 — the operator has no other signal", m.stuck())
 	}
-	if q := pendingQueueItems(t, n); q != 0 {
+	if q := pendingQueueItems(t, n, "orphan"); q != 0 {
 		t.Fatalf("%d orphan-check items left pending, want 0 — a stuck lease must not re-fire every sweep", q)
 	}
 }

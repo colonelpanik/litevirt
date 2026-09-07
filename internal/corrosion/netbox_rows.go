@@ -200,11 +200,21 @@ func EnqueueSync(ctx context.Context, c *Client, kind, key, op string) error {
 		id, kind, key, op, c.NowWall(), c.NowTS())
 }
 
-// DrainSyncQueue reads up to limit pending items.
-func DrainSyncQueue(ctx context.Context, c *Client, limit int) ([]QueueItem, error) {
+// DrainSyncQueue reads up to limit pending items OF ONE KIND.
+//
+// The kind is a required parameter, not an optional filter, because the queue
+// has more than one producer and a consumer only ever owns its own kind. An
+// unfiltered drain takes the oldest items whatever they are, and a consumer
+// that skips a foreign kind without acking it (as the orphan sweeper must —
+// acking another component's work silently drops it) then makes no progress at
+// all once a full batch of somebody else's items sits at the head. The orphan
+// sweeper is the cluster's only stuck-lease detector, so that starvation is
+// silent and unbounded.
+func DrainSyncQueue(ctx context.Context, c *Client, kind string, limit int) ([]QueueItem, error) {
 	rows, err := c.Query(ctx,
 		`SELECT id, kind, key, op, COALESCE(attempts, 0) AS attempts
-		 FROM netbox_sync_queue WHERE deleted_at IS NULL ORDER BY created_at LIMIT ?`, limit)
+		 FROM netbox_sync_queue WHERE kind = ? AND deleted_at IS NULL
+		 ORDER BY created_at LIMIT ?`, kind, limit)
 	if err != nil {
 		return nil, fmt.Errorf("drain sync queue: %w", err)
 	}
@@ -304,6 +314,40 @@ func LeaseExistsByIP(ctx context.Context, c *Client, network, ip string) (bool, 
 		return false, fmt.Errorf("query lease by ip: %w", err)
 	}
 	return len(rows) > 0, nil
+}
+
+// ListNetBoxLeases returns every LIVE lease that carries a NetBox address
+// object — the join the inventory mirror needs to say which `ip_address` a NIC
+// holds.
+//
+// Scoped to non-null netbox_ip_id rather than returning every lease: a builtin
+// allocation has no remote object, and admitting it would put a NIC into the
+// mirror's desired set with address id 0, which reads exactly like "this NIC
+// has no address" and would make the two indistinguishable.
+//
+// One read per sweep, not one per NIC: a sweep touches every VM in the cluster,
+// and a per-NIC lookup would turn a quiet sweep into thousands of queries.
+func ListNetBoxLeases(ctx context.Context, c *Client) ([]LeaseRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT network, ip, mac,
+		        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
+		        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id
+		 FROM ip_allocations
+		 WHERE netbox_ip_id IS NOT NULL AND deleted_at IS NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("list netbox leases: %w", err)
+	}
+	out := make([]LeaseRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, LeaseRecord{
+			Network:      r.String("network"),
+			IP:           r.String("ip"),
+			MAC:          r.String("mac"),
+			NetBoxIPID:   r.Int("netbox_ip_id"),
+			NetBoxPrefix: r.Int("netbox_prefix_id"),
+		})
+	}
+	return out, nil
 }
 
 // ObjectRef maps one litevirt object to its NetBox counterpart. It is what

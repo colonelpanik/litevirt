@@ -121,7 +121,7 @@ func TestClaimSetEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 
 	// A release that fails during rollback leaves an address nothing references.
 	// It MUST become a sweeper candidate, or it is stranded forever.
-	items, err := corrosion.DrainSyncQueue(context.Background(), s.db, 10)
+	items, err := corrosion.DrainSyncQueue(context.Background(), s.db, "orphan", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestClaimSetSkipsTheNetBoxDeleteWhenTheLocalTombstoneFails(t *testing.T) {
 	if got := nb.Released(); len(got) != 0 {
 		t.Fatalf("the NetBox object must NOT be released while the lease is still held, got %v", got)
 	}
-	items, err := corrosion.DrainSyncQueue(ctx, s.db, 10)
+	items, err := corrosion.DrainSyncQueue(ctx, s.db, "orphan", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestReleaseAllUsesTheRecordedOwner(t *testing.T) {
 		if got := nb.Released(); len(got) != 0 {
 			t.Fatalf("the NetBox object must NOT be released while the lease is still live, got %v", got)
 		}
-		items, err := corrosion.DrainSyncQueue(ctx, s.db, 10)
+		items, err := corrosion.DrainSyncQueue(ctx, s.db, "orphan", 10)
 		if err != nil {
 			t.Fatal(err)
 		}

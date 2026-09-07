@@ -155,7 +155,7 @@ func TestCollectNetBoxGauges(t *testing.T) {
 			t.Fatalf("EnqueueSync: %v", err)
 		}
 	}
-	queued, err := corrosion.DrainSyncQueue(ctx, db, 1)
+	queued, err := corrosion.DrainSyncQueue(ctx, db, "vm", 1)
 	if err != nil || len(queued) == 0 {
 		t.Fatalf("DrainSyncQueue: %v (%d items)", err, len(queued))
 	}

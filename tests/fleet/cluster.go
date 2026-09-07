@@ -135,6 +135,10 @@ type Node struct {
 	// "no config, no goroutine" asserts on production code.
 	netboxMaintenance bool
 
+	// netboxMirror records what StartNetBoxMirror ANSWERED for this node, for
+	// the same reason as netboxMaintenance above.
+	netboxMirror bool
+
 	// partition gate: replication/state-sync RPCs whose mTLS caller CN is in
 	// blockedFrom are refused, modeling a network partition on the real
 	// transport. Guarded by partMu (Partition/Heal mutate it concurrently with
@@ -478,6 +482,12 @@ func (c *Cluster) buildServer(n *Node) {
 	// than any scenario: nothing ticks under a test, and scenarios drive a pass
 	// explicitly through RunNetBoxMaintenanceOnce.
 	n.netboxMaintenance = n.Server.StartNetBoxMaintenance(c.ctx, 0)
+	// The inventory mirror, started exactly as the daemon starts it and on every
+	// node, so a scenario exercises the server's own "is this node configured"
+	// guard rather than a harness branch. Same production default interval:
+	// nothing ticks under a test, and scenarios drive a pass explicitly through
+	// SyncNetBoxMirror.
+	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it
@@ -636,6 +646,50 @@ func (n *Node) HLCClock() *hlc.Clock { return n.DB.Clock() }
 // maintenance loop (binding revalidation + the orphan sweep).
 func (n *Node) NetBoxMaintenanceRunning() bool { return n.netboxMaintenance }
 
+// NetBoxMirrorRunning reports whether this node started the inventory mirror.
+func (n *Node) NetBoxMirrorRunning() bool { return n.netboxMirror }
+
+// SyncNetBoxMirror runs ONE leader-gated mirror pass on this node.
+//
+// It goes through the same gate the loop does, so a node that loses the lease
+// race does nothing and returns nil — which is the point: every configured node
+// runs a pass, and only one of them writes.
+func (n *Node) SyncNetBoxMirror() error {
+	return n.Server.RunNetBoxMirrorOnce(context.Background())
+}
+
+// ExpireLeaderLeaseAfter makes this node's mirror hold the `netbox` leader
+// lease for exactly `batches` per-batch re-validations and lose it thereafter.
+//
+// It models a leadership handover that lands MID-SWEEP. A real lease can be
+// stolen between passes, which a scenario can already do with stealNetBoxLease
+// — but not between two write batches of ONE pass without racing the test, and
+// mid-sweep is the only window the per-batch re-validation exists for.
+//
+// The ACQUIRE is untouched: this node still genuinely takes the lease, so the
+// pass starts for the real reason and only the re-validation is steered.
+func (n *Node) ExpireLeaderLeaseAfter(batches int) {
+	var mu sync.Mutex
+	seen := 0
+	n.Server.SetNetBoxLeaseProbe(func(context.Context) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		seen++
+		return seen <= batches
+	})
+}
+
+// ClearSyncQueue tombstones every netbox_sync_queue row on this node — the
+// state a node that died before enqueueing, or a peer that drained an item and
+// then died, leaves behind. The mirror's correctness may not depend on it.
+func (n *Node) ClearSyncQueue() {
+	if err := n.DB.Execute(context.Background(),
+		`UPDATE netbox_sync_queue SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL`,
+		n.DB.NowWall(), n.DB.NowTS()); err != nil {
+		n.cluster.t.Fatalf("clear sync queue on %s: %v", n.Name, err)
+	}
+}
+
 // ── external IPAM wiring ────────────────────────────────────────────────────
 
 // NewClusterWithNetBox brings up a fleet whose every node talks to nb. It is the
@@ -690,7 +744,11 @@ func (c *Cluster) wireNetBox(n *Node) {
 		c.t.Fatalf("mkdir netbox dir for %s: %v", n.Name, err)
 	}
 	tokenPath := filepath.Join(tokenDir, "token")
-	if err := os.WriteFile(tokenPath, []byte("fleet-netbox-token\n"), 0o600); err != nil {
+	// PER NODE, not one shared token. The token is what every request carries in
+	// its Authorization header, so it is the only thing that tells the fake
+	// WHICH node issued a write — and "exactly one of N masterless nodes writes
+	// the inventory" is otherwise unobservable from outside the cluster.
+	if err := os.WriteFile(tokenPath, []byte("fleet-netbox-token-"+n.Name+"\n"), 0o600); err != nil {
 		c.t.Fatalf("write netbox token for %s: %v", n.Name, err)
 	}
 	client, err := netbox.New(netbox.Config{

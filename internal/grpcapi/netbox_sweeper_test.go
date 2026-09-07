@@ -319,7 +319,7 @@ func hideLeaseTable(t *testing.T, s *Server) {
 
 func queueItems(t *testing.T, s *Server) []corrosion.QueueItem {
 	t.Helper()
-	items, err := corrosion.DrainSyncQueue(context.Background(), s.db, 10)
+	items, err := corrosion.DrainSyncQueue(context.Background(), s.db, "orphan", 10)
 	if err != nil {
 		t.Fatalf("DrainSyncQueue: %v", err)
 	}

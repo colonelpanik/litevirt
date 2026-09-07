@@ -34,6 +34,24 @@ type NetBoxFake struct {
 	prefixes map[int]fakePrefix
 	vrfs     map[int]bool
 
+	// The virtualization + dcim half the inventory mirror writes into. See
+	// netboxfake_inventory.go.
+	vms          map[int]*fakeVM
+	ifaces       map[int]*fakeIface
+	clusterTypes map[string]int
+	clusters     map[string]int
+	devices      map[string]int
+	nextVM       int
+	nextIface    int
+	nextNamed    int
+
+	// writers is the set of API tokens that have issued an inventory write, and
+	// patches counts every PATCH served. Each fleet node carries its own token,
+	// so together they answer "how many nodes wrote?" and "did a converged
+	// sweep write at all?" — neither of which is visible from the object graph.
+	writers map[string]bool
+	patches int
+
 	// released records every id deleted through the REST API, in order.
 	released []int
 
@@ -144,9 +162,55 @@ func NewNetBoxFake() *NetBoxFake {
 		byID:     map[int]*fakeIP{},
 		prefixes: map[int]fakePrefix{},
 		vrfs:     map[int]bool{},
+
+		vms:          map[int]*fakeVM{},
+		ifaces:       map[int]*fakeIface{},
+		clusterTypes: map[string]int{},
+		clusters:     map[string]int{},
+		devices:      map[string]int{},
+		writers:      map[string]bool{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
+}
+
+// The collection paths this fake serves. They match internal/netbox's, which is
+// what the client actually requests; a fake routing on a path of its own would
+// answer requests nobody makes and 404 the ones that are.
+const (
+	vmsAPIPath          = "/api/virtualization/virtual-machines/"
+	ifacesAPIPath       = "/api/virtualization/interfaces/"
+	clusterTypesAPIPath = "/api/virtualization/cluster-types/"
+	clustersAPIPath     = "/api/virtualization/clusters/"
+	devicesAPIPath      = "/api/dcim/devices/"
+)
+
+// Object ids come from three DISJOINT bands so a test that mistook one kind for
+// another fails loudly instead of matching the wrong object. Addresses keep
+// their own 9000+ band (nextID).
+func (f *NetBoxFake) nextVMID() int    { f.nextVM++; return 4000 + f.nextVM }
+func (f *NetBoxFake) nextIfaceID() int { f.nextIface++; return 6000 + f.nextIface }
+func (f *NetBoxFake) nextNamedID() int { f.nextNamed++; return 300 + f.nextNamed }
+
+// noteWrite records who issued a mutating request and counts PATCHes.
+//
+// The writer set is scoped to the virtualization paths: an IPAM claim is issued
+// by whichever node creates a VM, so counting those would make every multi-node
+// scenario read as several writers however the mirror's leader gate behaved.
+func (f *NetBoxFake) noteWrite(r *http.Request) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPatch, http.MethodDelete:
+	default:
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Method == http.MethodPatch {
+		f.patches++
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/virtualization/") {
+		f.writers[strings.TrimPrefix(r.Header.Get("Authorization"), "Token ")] = true
+	}
 }
 
 func (f *NetBoxFake) URL() string { return f.srv.URL }
@@ -234,7 +298,18 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 	w.Header().Set("Content-Type", "application/json")
+	f.noteWrite(r)
 	switch {
+	case strings.HasPrefix(r.URL.Path, vmsAPIPath):
+		f.virtualMachines(w, r)
+	case strings.HasPrefix(r.URL.Path, ifacesAPIPath):
+		f.vmInterfaces(w, r)
+	case strings.HasPrefix(r.URL.Path, clusterTypesAPIPath):
+		f.namedCollection(w, r, f.clusterTypes, f.nextNamedID)
+	case strings.HasPrefix(r.URL.Path, clustersAPIPath):
+		f.namedCollection(w, r, f.clusters, f.nextNamedID)
+	case strings.HasPrefix(r.URL.Path, devicesAPIPath):
+		f.namedCollection(w, r, f.devices, f.nextNamedID)
 	case strings.HasSuffix(r.URL.Path, "/available-ips/"):
 		f.claimAvailable(w, r)
 	case r.URL.Path == "/api/ipam/ip-addresses/" && r.Method == http.MethodPost:
@@ -474,9 +549,22 @@ func matchIP(ip *fakeIP, q map[string][]string, parent *net.IPNet) bool {
 	if v, ok := get("cf_litevirt_identity__n"); ok && ip.Identity == v {
 		return false
 	}
-	if v, ok := get("vminterface_id"); ok {
-		want, err := strconv.Atoi(v)
-		if err != nil || ip.AssignedObjectID != want {
+	// vminterface_id repeats: NetBox ORs a repeated filter value, and the
+	// mirror sends up to 50 interface ids in one query because the interface
+	// set IS its cluster scope. Matching only the FIRST value would return one
+	// interface's addresses and report every other interface as unassigned — so
+	// the mirror would re-assign addresses that were already correct, on every
+	// sweep, forever.
+	if want, ok := q["vminterface_id"]; ok {
+		match := false
+		for _, raw := range want {
+			id, err := strconv.Atoi(raw)
+			if err == nil && ip.AssignedObjectID == id {
+				match = true
+				break
+			}
+		}
+		if !match {
 			return false
 		}
 	}
@@ -571,12 +659,13 @@ func (f *NetBoxFake) release(w http.ResponseWriter, r *http.Request) {
 }
 
 // patchIdentity is PATCH /api/ipam/ip-addresses/{id}/ — the identity rewrite a
-// CA re-key performs.
+// CA re-key performs, and the assignment change the inventory mirror performs.
 //
-// It refuses a body carrying anything but the custom field. NetBox would accept
-// one, and a re-key that had somehow started sending `address` or `vrf` would
-// silently MOVE an address a guest is using; a fake that tolerated it would let
-// that bug pass in the fleet and only surface against a real server.
+// The two are the ONLY shapes accepted, and never mixed in one request. NetBox
+// would take any field, and a re-key that had somehow started sending `address`
+// or `vrf` would silently MOVE an address a guest is using; a fake that
+// tolerated it would let that bug pass in the fleet and only surface against a
+// real server.
 func (f *NetBoxFake) patchIdentity(w http.ResponseWriter, r *http.Request) {
 	id, ok := idFromPath(r.URL.Path, "/api/ipam/ip-addresses/")
 	if !ok {
@@ -588,12 +677,22 @@ func (f *NetBoxFake) patchIdentity(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
 		return
 	}
-	raw, hasCF := body["custom_fields"]
-	if len(body) != 1 || !hasCF {
+	_, hasCF := body["custom_fields"]
+	_, hasType := body["assigned_object_type"]
+	_, hasObj := body["assigned_object_id"]
+	switch {
+	case hasCF && len(body) == 1:
+		f.patchIPIdentity(w, body["custom_fields"], id)
+	case hasType && hasObj && len(body) == 2:
+		f.patchIPAssignment(w, body, id)
+	default:
 		writeErr(w, http.StatusBadRequest,
-			`{"detail":["an identity rewrite must send custom_fields and nothing else"]}`)
-		return
+			`{"detail":["a PATCH must send either custom_fields alone or both assignment halves, and nothing else"]}`)
 	}
+}
+
+// patchIPIdentity applies the CA re-key's custom-field rewrite.
+func (f *NetBoxFake) patchIPIdentity(w http.ResponseWriter, raw json.RawMessage, id int) {
 	var cf map[string]string
 	if err := json.Unmarshal(raw, &cf); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed custom_fields: %v", err)
@@ -623,6 +722,61 @@ func (f *NetBoxFake) patchIdentity(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	if !known {
 		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
+		return
+	}
+	writeJSON(w, ipJSON(updated))
+}
+
+// patchIPAssignment attaches an address to a VM interface, or detaches it.
+//
+// BOTH halves must travel together and both must be null to detach — an omitted
+// key is a no-op on a PATCH, so a caller that sent only the id would leave the
+// address attached to an interface that is about to disappear. The type is
+// checked rather than ignored: assignment is a generic relation in NetBox, and
+// a wrong type silently attaches the address to a DIFFERENT model's object with
+// the same primary key.
+func (f *NetBoxFake) patchIPAssignment(w http.ResponseWriter, body map[string]json.RawMessage, id int) {
+	var objType *string
+	if err := json.Unmarshal(body["assigned_object_type"], &objType); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed assigned_object_type: %v", err)
+		return
+	}
+	var objID *int
+	if err := json.Unmarshal(body["assigned_object_id"], &objID); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed assigned_object_id: %v", err)
+		return
+	}
+	if (objType == nil) != (objID == nil) {
+		writeErr(w, http.StatusBadRequest,
+			`{"assigned_object_id":["Both assignment halves must be set, or both null."]}`)
+		return
+	}
+	if objType != nil && *objType != "virtualization.vminterface" {
+		writeErr(w, http.StatusBadRequest,
+			`{"assigned_object_type":["Related object not found using the provided content type."]}`)
+		return
+	}
+
+	f.mu.Lock()
+	ip, known := f.byID[id]
+	var target int
+	if objID != nil {
+		target = *objID
+	}
+	_, ifaceKnown := f.ifaces[target]
+	var updated fakeIP
+	if known && (target == 0 || ifaceKnown) {
+		ip.AssignedObjectID = target
+		updated = *ip
+	}
+	f.mu.Unlock()
+	if !known {
+		writeErr(w, http.StatusNotFound, "no ip-address %d", id)
+		return
+	}
+	if target != 0 && !ifaceKnown {
+		writeErr(w, http.StatusBadRequest,
+			`{"assigned_object_id":["Invalid pk %d - object does not exist."]}`, target)
 		return
 	}
 	writeJSON(w, ipJSON(updated))

@@ -782,6 +782,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// itself is leader-gated, so every configured node running this loop
 		// still means exactly one reclaiming node cluster-wide.
 		svc.StartNetBoxMaintenance(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
+		// The inventory mirror, on the SAME cadence and the SAME leader lease.
+		// One key, not two: the sweeper reclaims addresses and the mirror
+		// rewrites the objects that name them, so a cluster where two different
+		// nodes led the two would have each acting on state the other was
+		// changing underneath it.
+		svc.StartNetBoxMirror(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
 	}
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.

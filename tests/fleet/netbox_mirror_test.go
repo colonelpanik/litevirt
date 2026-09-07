@@ -1,0 +1,286 @@
+// Fleet scenarios for the NetBox inventory mirror.
+//
+// The mirror is a DESIRED-STATE DIFF driven by a leader-gated sweep. Three
+// properties can only be shown multi-node, and every scenario here is one of
+// them: exactly one of N masterless nodes writes; an outgoing leader stops
+// mid-sweep rather than racing the incoming one; and the sweep — not the sync
+// queue — is what makes the mirror correct.
+//
+// They run on a SHARED CRDT database on purpose. The leader lease is a
+// `leader_election` row, so on the default per-node databases every node would
+// hold its own copy of the lease and "exactly one writer" would be unprovable —
+// the gate would read as held everywhere and the scenario would fail whether or
+// not the gate existed.
+
+package fleet
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netboxsync"
+)
+
+func TestExactlyOneNodeMirrors(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 3)
+
+	mustCreateVM(t, c.Nodes[0], "vm-1", "bound")
+	mustSyncAllNodes(t, c)
+
+	// Three masterless nodes must not all write inventory.
+	if n := nb.VMCount("vm-1"); n != 1 {
+		t.Fatalf("want exactly one virtual_machine object, got %d", n)
+	}
+	if writers := nb.DistinctWriters(); len(writers) != 1 {
+		t.Fatalf("want one writer, got %v", writers)
+	}
+}
+
+func TestOutgoingLeaderStopsMidSweep(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 2)
+
+	// More VMs than one write batch holds, so the lease is re-validated INSIDE
+	// a single phase. With a fixture that fits in one batch, a check made once
+	// per sweep and a check made per batch would both let the first batch
+	// through and the scenario could not tell them apart.
+	const vms = mirrorBatchSize + 5
+	for i := 0; i < vms; i++ {
+		mustCreateVM(t, c.Nodes[0], vmName(i), "bound")
+	}
+	c.Nodes[0].ExpireLeaderLeaseAfter(1) // lease lost after the first write batch
+
+	_ = c.Nodes[0].SyncNetBoxMirror()
+
+	// TTL is re-validated before each batch, so writes stop rather than racing
+	// the incoming leader.
+	if nb.VMCountAll() >= vms {
+		t.Fatalf("an outgoing leader must stop writing when its lease expires, mirrored %d of %d",
+			nb.VMCountAll(), vms)
+	}
+	// ...and it must have got far enough to be a genuine MID-sweep stop. A
+	// mirror that wrote nothing at all would satisfy the check above while
+	// proving nothing about the batch boundary.
+	if nb.VMCountAll() == 0 {
+		t.Fatal("nothing was mirrored at all — the scenario never reached a batch boundary")
+	}
+}
+
+func TestSyncCorrectWithQueueEmptied(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+
+	mustCreateVM(t, c.Nodes[0], "vm-1", "bound")
+	// The latency shortcut, then the loss: a node that died mid-create never
+	// enqueued at all, and one that enqueued may have had its item drained by a
+	// peer that then died. Both leave the same empty queue.
+	enqueueMirrorItem(t, c.Nodes[0], "vm-1")
+	c.Nodes[0].ClearSyncQueue()
+
+	mustSyncAllNodes(t, c)
+
+	// The full sweep, not the queue, is the correctness mechanism.
+	if nb.VMCount("vm-1") != 1 {
+		t.Fatalf("the full sweep must mirror a VM whose queue entry was lost, got %d objects",
+			nb.VMCount("vm-1"))
+	}
+}
+
+// TestSecondSweepIssuesNoPatches is the generic guard against a field the
+// mirror writes in one unit and reads back in another.
+//
+// NetBox's virtual_machine.disk has not consistently meant the same unit across
+// versions, and it echoes a MAC UPPER-cased; either mismatch makes the diff see
+// drift on state that never changed, and the mirror PATCHes the same objects on
+// every sweep forever — burying NetBox's changelog and hammering its API. A
+// converged mirror issues no writes at all.
+func TestSecondSweepIssuesNoPatches(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+
+	mustCreateVM(t, c.Nodes[0], "vm-1", "bound")
+	mustSyncAllNodes(t, c)
+	if nb.VMCount("vm-1") != 1 || nb.InterfaceCount() != 1 {
+		t.Fatalf("precondition: want one VM and one interface mirrored, got %d/%d",
+			nb.VMCount("vm-1"), nb.InterfaceCount())
+	}
+
+	before := nb.PatchCount()
+	mustSyncAllNodes(t, c) // nothing changed in litevirt
+	if got := nb.PatchCount() - before; got != 0 {
+		t.Fatalf("a second sweep over unchanged state issued %d PATCH requests, want 0 "+
+			"(a field is being written in one unit and read back in another)", got)
+	}
+}
+
+// TestOrphanChecksAreNotStarvedByMirrorItems pins the queue-kind filter.
+//
+// One `netbox_sync_queue` now has two producers. The sweeper drains the oldest
+// items and SKIPS a kind it does not own without acking it, so an unfiltered
+// drain whose first batch is all mirror items never reaches an orphan check —
+// and the orphan check is the only stuck-lease detector there is.
+func TestOrphanChecksAreNotStarvedByMirrorItems(t *testing.T) {
+	_, c := boundClusterWithOrphan(t, 2)
+	n := c.Nodes[0]
+
+	// Older than the orphan check, and more of them than one drain batch holds.
+	seedOldMirrorQueueItems(t, n, 100)
+	enqueueOrphanCheck(t, n, orphanIdentity(t, n))
+
+	mustSweep(t, n)
+
+	if got := pendingQueueItems(t, n, "orphan"); got != 0 {
+		t.Fatalf("%d orphan checks still queued — mirror items at the head starved the "+
+			"only stuck-lease detector there is", got)
+	}
+	// The sweeper must not ack another component's work either.
+	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 100 {
+		t.Fatalf("the sweeper acked %d mirror items; they belong to the mirror", 100-got)
+	}
+}
+
+// TestDualRunSemanticsUnchanged is the regression guard on the boundary between
+// the two detectors that both ask "is this workload alive?".
+//
+// The orphan proof counts a STOPPED-but-defined domain as a holder — a defined
+// domain can be started at any moment, so its address is not free. The dual-run
+// detector must NOT: diskHolderVMs feeds an alert-grade pager, and a stopped
+// domain on a second host is the normal aftermath of a migration, not a
+// dual-writer. That is why the orphan proof got its own type instead of
+// widening runtimeSnapshot. Both halves are asserted from ONE fixture, because
+// asserting either alone would let the two be merged.
+func TestDualRunSemanticsUnchanged(t *testing.T) {
+	nb, c := boundClusterWithOrphan(t, 2)
+
+	c.Nodes[1].Virt.DefineStoppedDomain("ghost", orphanMAC)
+
+	mustSweep(t, c.Nodes[0])
+	if len(nb.Identities()) != 1 {
+		t.Fatalf("a stopped-but-defined domain must block reclamation, released %v", nb.Released())
+	}
+
+	inv, err := c.SelfClient(c.Nodes[1]).GetRuntimeInventory(
+		context.Background(), &pb.GetRuntimeInventoryRequest{})
+	if err != nil {
+		t.Fatalf("GetRuntimeInventory on %s: %v", c.Nodes[1].Name, err)
+	}
+	var seen bool
+	for _, w := range inv.GetWorkloads() {
+		if w.GetName() != "ghost" {
+			continue
+		}
+		seen = true
+		if w.GetDiskHolder() {
+			t.Fatal("a stopped-but-defined domain must not be a dual-run disk holder — " +
+				"every migration would page")
+		}
+	}
+	if !seen {
+		t.Fatal("the stopped domain is absent from the inventory — the assertion would be vacuous")
+	}
+}
+
+// --- helpers -----------------------------------------------------------------
+
+// mirrorBatchSize mirrors netboxsync's batchSize. It is duplicated rather than
+// exported because the fixture only needs to be BIGGER than one batch; a
+// scenario reaching into the package for the exact number would still be right
+// if the constant changed.
+const mirrorBatchSize = 20
+
+// vmName names the i-th fixture VM.
+func vmName(i int) string { return fmt.Sprintf("vm-%02d", i) }
+
+// boundMirrorCluster is boundCluster on a SHARED database, so `leader_election`
+// is one row the whole fleet contends for. See the file comment.
+func boundMirrorCluster(t *testing.T, nodes int) (*NetBoxFake, *Cluster) {
+	t.Helper()
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
+
+	c := New(t, Options{Nodes: nodes, NetBoxURL: nb.URL(), SharedCRDT: true})
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
+	return nb, c
+}
+
+// mustCreateVM creates a one-NIC VM pinned to n.
+func mustCreateVM(t *testing.T, n *Node, name, netName string) *pb.VM {
+	t.Helper()
+	return mustCreateVMOnNetwork(t, n.cluster, n, name, netName)
+}
+
+// mustSyncAllNodes drives ONE mirror pass on EVERY node, CONCURRENTLY.
+//
+// Every node runs a pass, exactly as every configured node runs the loop in
+// production; the leader gate — not the caller — is what makes one of them the
+// writer.
+//
+// Concurrent is load-bearing, not incidental. Driven one after another, an
+// UNGATED mirror produces the same NetBox state as a gated one: the second node
+// finds the first node's object by identity and adopts it, so search-before-
+// create alone would make the scenario pass with the leader gate deleted. N
+// tickers do not take turns, and a race between three searches that all come
+// back empty is exactly what the gate exists to prevent.
+func mustSyncAllNodes(t *testing.T, c *Cluster) {
+	t.Helper()
+	var wg sync.WaitGroup
+	errs := make([]error, len(c.Nodes))
+	for i, n := range c.Nodes {
+		wg.Add(1)
+		go func(i int, n *Node) {
+			defer wg.Done()
+			errs[i] = n.SyncNetBoxMirror()
+		}(i, n)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("mirror sync on %s: %v", c.Nodes[i].Name, err)
+		}
+	}
+}
+
+// enqueueMirrorItem records the latency shortcut a lifecycle operation leaves
+// for the mirror.
+func enqueueMirrorItem(t *testing.T, n *Node, key string) {
+	t.Helper()
+	if err := corrosion.EnqueueSync(context.Background(), n.DB, netboxsync.QueueKind, key, "upsert"); err != nil {
+		t.Fatalf("enqueue mirror item on %s: %v", n.Name, err)
+	}
+}
+
+// enqueueOrphanCheck records the item a failed create-compensation leaves for
+// the sweeper — the same row internal/grpcapi's enqueueOrphanCheck writes.
+func enqueueOrphanCheck(t *testing.T, n *Node, identity string) {
+	t.Helper()
+	if err := corrosion.EnqueueSync(context.Background(), n.DB, "orphan", identity, "check"); err != nil {
+		t.Fatalf("enqueue orphan check on %s: %v", n.Name, err)
+	}
+}
+
+// seedOldMirrorQueueItems plants count mirror items STRICTLY OLDER than
+// anything enqueued afterwards.
+//
+// The backdating is what makes the scenario deterministic. EnqueueSync stamps
+// created_at at second resolution, so a hundred items and an orphan check
+// written in the same test tick all tie, and `ORDER BY created_at` is then free
+// to return them in any order — the starvation would appear or not appear at
+// random.
+func seedOldMirrorQueueItems(t *testing.T, n *Node, count int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < count; i++ {
+		if err := corrosion.EnqueueSync(ctx, n.DB, netboxsync.QueueKind, fmt.Sprintf("mirror-%03d", i), "upsert"); err != nil {
+			t.Fatalf("enqueue mirror item %d on %s: %v", i, n.Name, err)
+		}
+	}
+	if err := n.DB.Execute(ctx,
+		`UPDATE netbox_sync_queue SET created_at = '2000-01-01T00:00:00Z' WHERE kind = ?`,
+		netboxsync.QueueKind); err != nil {
+		t.Fatalf("backdate mirror queue items on %s: %v", n.Name, err)
+	}
+}

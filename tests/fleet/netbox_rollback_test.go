@@ -287,7 +287,7 @@ func TestDeleteVMTombstonesLeaseWhenBindingSuspended(t *testing.T) {
 		t.Fatalf("the NetBox object must be left for the sweeper, identities = %v", got)
 	}
 
-	items, err := corrosion.DrainSyncQueue(ctx, n.DB, 10)
+	items, err := corrosion.DrainSyncQueue(ctx, n.DB, "orphan", 10)
 	if err != nil {
 		t.Fatalf("DrainSyncQueue: %v", err)
 	}

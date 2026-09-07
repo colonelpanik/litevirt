@@ -67,6 +67,10 @@ type Server struct {
 	// claim or a sweep behaves differently.
 	nbMetricsSink netboxMetrics
 
+	// nbLeaseProbe replaces the lease READ the inventory mirror re-validates
+	// before each write batch. nil in production; see SetNetBoxLeaseProbe.
+	nbLeaseProbe func(context.Context) bool
+
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
 	// cannot read a Prometheus counter in-process. Written only by the sweep,
@@ -1485,6 +1489,12 @@ type netboxMetrics interface {
 	// by this package — it is declared here because the whole sink is passed to
 	// it (network.apiErrorCounter is the narrower structural view).
 	IncAmbiguousClaim()
+	// IncDuplicateObject counts one NetBox object found duplicated for a single
+	// litevirt identity, and deleted by the mirror. Emitted by
+	// internal/netboxsync, not by this package — declared here for the same
+	// reason as IncAmbiguousClaim: the whole sink is what gets passed on, and a
+	// second sink would be a second thing the daemon could forget to wire.
+	IncDuplicateObject()
 }
 
 // noopNetBoxMetrics is what an UNWIRED sink resolves to — every bare test
@@ -1501,6 +1511,7 @@ func (noopNetBoxMetrics) IncOrphansReclaimed()        {}
 func (noopNetBoxMetrics) IncStuckLease()              {}
 func (noopNetBoxMetrics) IncBindingSuspended()        {}
 func (noopNetBoxMetrics) IncAmbiguousClaim()          {}
+func (noopNetBoxMetrics) IncDuplicateObject()         {}
 
 // SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
 func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }

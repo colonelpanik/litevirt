@@ -443,7 +443,7 @@ func TestStaleRecordCleanupEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 	ctx := context.Background()
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "vm-1", orphanNetwork)
-	if got := pendingQueueItems(t, n); got != 0 {
+	if got := pendingQueueItems(t, n, "orphan"); got != 0 {
 		t.Fatalf("test setup: the sync queue must start empty, got %d items", got)
 	}
 	if err := n.Virt.UndefineDomain("vm-1", false); err != nil {
@@ -459,7 +459,7 @@ func TestStaleRecordCleanupEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 	if vm, gerr := corrosion.GetVM(ctx, n.DB, "vm-1"); gerr == nil && vm != nil {
 		t.Fatalf("the ghost row must still be removed, got state %q", vm.State)
 	}
-	if got := pendingQueueItems(t, n); got == 0 {
+	if got := pendingQueueItems(t, n, "orphan"); got == 0 {
 		t.Fatal("a failed release must name the address for the orphan sweep — " +
 			"a leaked lease whose only trace is a log line is invisible")
 	}

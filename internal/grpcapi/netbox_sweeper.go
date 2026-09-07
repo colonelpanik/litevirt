@@ -37,6 +37,11 @@ const orphanProofWorkers = 4
 // orphanQueueBatch is how many sync-queue items one pass drains.
 const orphanQueueBatch = 100
 
+// orphanQueueKind is the netbox_sync_queue kind this sweeper owns. The queue is
+// shared with the inventory mirror, and each consumer drains ONLY its own kind
+// (see corrosion.DrainSyncQueue).
+const orphanQueueKind = "orphan"
+
 // orphanCheckMaxAttempts bounds how many passes ONE queued orphan check may
 // fail before the sweeper gives up on it. Without a bound, an item whose lookup
 // can never succeed — an identity whose prefix is no longer bound, a NetBox that
@@ -657,10 +662,13 @@ func bareAddress(address string) (string, bool) {
 // STUCK lease is detected, because only here do we know an identity was
 // supposed to have been released.
 //
-// Items of other kinds are left alone (not acked): they belong to the mirror
-// reconciler, and acking another component's work would silently drop it.
+// The drain is SCOPED to "orphan". Items of other kinds belong to the mirror
+// reconciler and are never acked here — acking another component's work would
+// silently drop it — so an unscoped drain whose batch happened to be all mirror
+// items would do nothing at all, every pass, and the stuck-lease detector would
+// go quiet with no signal that it had.
 func (s *Server) drainOrphanChecks(ctx context.Context) {
-	items, err := corrosion.DrainSyncQueue(ctx, s.db, orphanQueueBatch)
+	items, err := corrosion.DrainSyncQueue(ctx, s.db, orphanQueueKind, orphanQueueBatch)
 	if err != nil {
 		slog.Warn("netbox sweep: drain sync queue", "error", err)
 		return
@@ -679,9 +687,6 @@ func (s *Server) drainOrphanChecks(ctx context.Context) {
 		return
 	}
 	for _, it := range items {
-		if it.Kind != "orphan" {
-			continue
-		}
 		if s.handleOrphanCheck(ctx, it, fp, bindings) {
 			if err := corrosion.AckSyncItem(ctx, s.db, it.ID); err != nil {
 				slog.Warn("netbox sweep: ack orphan check", "id", it.ID, "error", err)

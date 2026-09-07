@@ -1,0 +1,691 @@
+// The virtualization + dcim half of NetBoxFake: cluster types, clusters,
+// virtual machines, VM interfaces and DCIM device lookups.
+//
+// It is exactly as STRICT as the ipam half, and for the same reason: an
+// unrecognised query parameter is a 400, never a silently ignored filter.
+// NetBox's own filtersets reject unknown parameters, so a permissive fake would
+// let a query that has lost its scope — a mirror listing EVERY cluster's VMs
+// and then deleting the ones it does not recognise — pass in the fleet and fail
+// only against a real server.
+//
+// Two behaviours are modelled deliberately because the mirror's convergence
+// depends on them:
+//
+//   - A MAC is echoed UPPER-cased, as NetBox does. A diff that compared MACs
+//     case-sensitively would see drift on every sweep and PATCH forever.
+//   - Deleting a virtual machine CASCADES to its interfaces, and the addresses
+//     those interfaces held are UNASSIGNED rather than deleted. That is what
+//     makes a VM delete a single request instead of a cascade the mirror has to
+//     drive itself.
+
+package fleet
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// fakeVM is one virtualization.virtual_machine.
+type fakeVM struct {
+	ID        int
+	Name      string
+	ClusterID int
+	DeviceID  int
+	VCPUs     int
+	Memory    int
+	Disk      int
+	Status    string
+	Identity  string
+}
+
+// fakeIface is one virtualization.vminterface.
+type fakeIface struct {
+	ID       int
+	VMID     int
+	Name     string
+	MAC      string
+	Identity string
+}
+
+// ── named collections (cluster types, clusters, devices) ────────────────────
+
+// namedParams is every query parameter a name lookup understands.
+var namedParams = map[string]bool{"name": true, "limit": true, "offset": true}
+
+// namedCollection serves the GET-by-name / POST-if-absent shape the client's
+// ensureNamed and firstIDByName use.
+func (f *NetBoxFake) namedCollection(w http.ResponseWriter, r *http.Request, store map[string]int, nextID func() int) {
+	switch r.Method {
+	case http.MethodGet:
+		q := r.URL.Query()
+		for k := range q {
+			if !namedParams[k] {
+				writeErr(w, http.StatusBadRequest, `{"%s":["Unknown filter field"]}`, k)
+				return
+			}
+		}
+		name := q.Get("name")
+		f.mu.Lock()
+		id, ok := store[name]
+		f.mu.Unlock()
+		out := struct {
+			Count   int     `json:"count"`
+			Next    string  `json:"next"`
+			Results []idRef `json:"results"`
+		}{Results: []idRef{}}
+		if ok && name != "" {
+			out.Count, out.Results = 1, []idRef{{ID: id}}
+		}
+		writeJSON(w, out)
+	case http.MethodPost:
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+			return
+		}
+		if body.Name == "" {
+			writeErr(w, http.StatusBadRequest, `{"name":["This field is required."]}`)
+			return
+		}
+		f.mu.Lock()
+		id, exists := store[body.Name]
+		if !exists {
+			id = nextID()
+			store[body.Name] = id
+		}
+		f.mu.Unlock()
+		if exists {
+			// NetBox's unique-name constraint. The loser of a two-node race must
+			// see a DEFINITE refusal, not a second object.
+			writeErr(w, http.StatusBadRequest, `{"name":["This field must be unique."]}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, idRef{ID: id})
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed here", r.Method)
+	}
+}
+
+// AddDevice registers a DCIM device, so a scenario can model a host that IS
+// modelled in NetBox. Absent devices resolve to 0, which is the untested-by-
+// default case every existing scenario runs in.
+func (f *NetBoxFake) AddDevice(name string, id int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.devices[name] = id
+}
+
+// ── virtual machines ────────────────────────────────────────────────────────
+
+// vmParams is every query parameter the VM list understands.
+var vmParams = map[string]bool{
+	"cluster_id":           true,
+	"cf_litevirt_identity": true,
+	"name":                 true,
+	"limit":                true,
+	"offset":               true,
+}
+
+func (f *NetBoxFake) virtualMachines(w http.ResponseWriter, r *http.Request) {
+	if id, ok := idFromPath(r.URL.Path, vmsAPIPath); ok {
+		f.vmObject(w, r, id)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		f.listVMs(w, r)
+	case http.MethodPost:
+		f.createVM(w, r)
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed on the VM collection", r.Method)
+	}
+}
+
+func (f *NetBoxFake) listVMs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	for k := range q {
+		if !vmParams[k] {
+			writeErr(w, http.StatusBadRequest, `{"%s":["Unknown filter field"]}`, k)
+			return
+		}
+	}
+	limit, offset, ok := pageParams(w, q.Get("limit"), q.Get("offset"))
+	if !ok {
+		return
+	}
+
+	f.mu.Lock()
+	ids := make([]int, 0, len(f.vms))
+	for id := range f.vms {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids) // stable order so pagination is deterministic
+	var matched []vmView
+	for _, id := range ids {
+		vm := f.vms[id]
+		if v := q.Get("cluster_id"); v != "" {
+			want, err := strconv.Atoi(v)
+			if err != nil || vm.ClusterID != want {
+				continue
+			}
+		}
+		if v := q.Get("cf_litevirt_identity"); v != "" && vm.Identity != v {
+			continue
+		}
+		if v := q.Get("name"); v != "" && vm.Name != v {
+			continue
+		}
+		matched = append(matched, vmJSONOf(*vm))
+	}
+	f.mu.Unlock()
+
+	writePage(w, f.srv.URL+vmsAPIPath, matched, limit, offset)
+}
+
+func (f *NetBoxFake) createVM(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeVMBody(w, r)
+	if !ok {
+		return
+	}
+	f.mu.Lock()
+	vm := &fakeVM{ID: f.nextVMID()}
+	applyVMBody(vm, body)
+	f.vms[vm.ID] = vm
+	out := vmJSONOf(*vm)
+	f.mu.Unlock()
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, out)
+}
+
+func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
+	switch r.Method {
+	case http.MethodPatch:
+		body, ok := decodeVMBody(w, r)
+		if !ok {
+			return
+		}
+		f.mu.Lock()
+		vm, known := f.vms[id]
+		var out vmView
+		if known {
+			applyVMBody(vm, body)
+			out = vmJSONOf(*vm)
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no virtual-machine %d", id)
+			return
+		}
+		writeJSON(w, out)
+	case http.MethodDelete:
+		f.mu.Lock()
+		_, known := f.vms[id]
+		if known {
+			delete(f.vms, id)
+			// CASCADE, as NetBox does: the interfaces go, and every address
+			// they held is unassigned rather than deleted. An address is an IPAM
+			// object with a life of its own; only the assignment belonged to the
+			// interface.
+			for ifaceID, iface := range f.ifaces {
+				if iface.VMID != id {
+					continue
+				}
+				delete(f.ifaces, ifaceID)
+				f.unassignFromLocked(ifaceID)
+			}
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no virtual-machine %d", id)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed on a VM object", r.Method)
+	}
+}
+
+// vmBody is the write shape. Every key is a pointer so a PATCH can be told
+// apart from an absent field — which is what makes `"device": null` mean "clear
+// the link" instead of "leave it alone".
+type vmBody struct {
+	Name         *string            `json:"name"`
+	Cluster      *int               `json:"cluster"`
+	Device       *int               `json:"device"`
+	VCPUs        *int               `json:"vcpus"`
+	Memory       *int               `json:"memory"`
+	Disk         *int               `json:"disk"`
+	Status       *string            `json:"status"`
+	CustomFields *map[string]string `json:"custom_fields"`
+	hasDevice    bool
+}
+
+func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+		return vmBody{}, false
+	}
+	allowed := map[string]bool{
+		"name": true, "cluster": true, "device": true, "vcpus": true,
+		"memory": true, "disk": true, "status": true, "custom_fields": true,
+	}
+	for k := range raw {
+		if !allowed[k] {
+			writeErr(w, http.StatusBadRequest, `{"%s":["Unknown field."]}`, k)
+			return vmBody{}, false
+		}
+	}
+	var out vmBody
+	// Re-marshalled rather than decoded twice so the pointer fields keep the
+	// present/absent distinction the raw map just proved is legal.
+	buf, _ := json.Marshal(raw)
+	if err := json.Unmarshal(buf, &out); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+		return vmBody{}, false
+	}
+	_, out.hasDevice = raw["device"]
+	return out, true
+}
+
+func applyVMBody(vm *fakeVM, b vmBody) {
+	if b.Name != nil {
+		vm.Name = *b.Name
+	}
+	if b.Cluster != nil {
+		vm.ClusterID = *b.Cluster
+	}
+	if b.hasDevice {
+		// An explicit null clears the link; the key being absent leaves it.
+		vm.DeviceID = 0
+		if b.Device != nil {
+			vm.DeviceID = *b.Device
+		}
+	}
+	if b.VCPUs != nil {
+		vm.VCPUs = *b.VCPUs
+	}
+	if b.Memory != nil {
+		vm.Memory = *b.Memory
+	}
+	if b.Disk != nil {
+		vm.Disk = *b.Disk
+	}
+	if b.Status != nil {
+		vm.Status = *b.Status
+	}
+	if b.CustomFields != nil {
+		vm.Identity = (*b.CustomFields)["litevirt_identity"]
+	}
+}
+
+// ── VM interfaces ───────────────────────────────────────────────────────────
+
+// ifaceParams is every query parameter the interface list understands.
+var ifaceParams = map[string]bool{
+	"cluster_id":           true,
+	"cf_litevirt_identity": true,
+	"limit":                true,
+	"offset":               true,
+}
+
+func (f *NetBoxFake) vmInterfaces(w http.ResponseWriter, r *http.Request) {
+	if id, ok := idFromPath(r.URL.Path, ifacesAPIPath); ok {
+		f.ifaceObject(w, r, id)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		f.listIfaces(w, r)
+	case http.MethodPost:
+		f.createIface(w, r)
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed on the interface collection", r.Method)
+	}
+}
+
+func (f *NetBoxFake) listIfaces(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	for k := range q {
+		if !ifaceParams[k] {
+			writeErr(w, http.StatusBadRequest, `{"%s":["Unknown filter field"]}`, k)
+			return
+		}
+	}
+	limit, offset, ok := pageParams(w, q.Get("limit"), q.Get("offset"))
+	if !ok {
+		return
+	}
+
+	f.mu.Lock()
+	ids := make([]int, 0, len(f.ifaces))
+	for id := range f.ifaces {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	var matched []ifaceView
+	for _, id := range ids {
+		iface := f.ifaces[id]
+		if v := q.Get("cluster_id"); v != "" {
+			// An interface has no cluster of its own; NetBox resolves it through
+			// the parent VM, and so must this — a fake that ignored the filter
+			// would hide a mirror reading another cluster's interfaces.
+			want, err := strconv.Atoi(v)
+			vm, known := f.vms[iface.VMID]
+			if err != nil || !known || vm.ClusterID != want {
+				continue
+			}
+		}
+		if v := q.Get("cf_litevirt_identity"); v != "" && iface.Identity != v {
+			continue
+		}
+		matched = append(matched, ifaceJSONOf(*iface))
+	}
+	f.mu.Unlock()
+
+	writePage(w, f.srv.URL+ifacesAPIPath, matched, limit, offset)
+}
+
+func (f *NetBoxFake) createIface(w http.ResponseWriter, r *http.Request) {
+	body, ok := decodeIfaceBody(w, r)
+	if !ok {
+		return
+	}
+	if body.VirtualMachine == nil || *body.VirtualMachine == 0 {
+		writeErr(w, http.StatusBadRequest, `{"virtual_machine":["This field is required."]}`)
+		return
+	}
+	f.mu.Lock()
+	_, parentKnown := f.vms[*body.VirtualMachine]
+	if !parentKnown {
+		f.mu.Unlock()
+		writeErr(w, http.StatusBadRequest, `{"virtual_machine":["Invalid pk %d - object does not exist."]}`, *body.VirtualMachine)
+		return
+	}
+	iface := &fakeIface{ID: f.nextIfaceID()}
+	applyIfaceBody(iface, body)
+	f.ifaces[iface.ID] = iface
+	out := ifaceJSONOf(*iface)
+	f.mu.Unlock()
+
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, out)
+}
+
+func (f *NetBoxFake) ifaceObject(w http.ResponseWriter, r *http.Request, id int) {
+	switch r.Method {
+	case http.MethodPatch:
+		body, ok := decodeIfaceBody(w, r)
+		if !ok {
+			return
+		}
+		f.mu.Lock()
+		iface, known := f.ifaces[id]
+		var out ifaceView
+		if known {
+			applyIfaceBody(iface, body)
+			out = ifaceJSONOf(*iface)
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no interface %d", id)
+			return
+		}
+		writeJSON(w, out)
+	case http.MethodDelete:
+		f.mu.Lock()
+		_, known := f.ifaces[id]
+		if known {
+			delete(f.ifaces, id)
+			f.unassignFromLocked(id)
+		}
+		f.mu.Unlock()
+		if !known {
+			writeErr(w, http.StatusNotFound, "no interface %d", id)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed on an interface object", r.Method)
+	}
+}
+
+type ifaceBody struct {
+	VirtualMachine *int               `json:"virtual_machine"`
+	Name           *string            `json:"name"`
+	MAC            *string            `json:"mac_address"`
+	CustomFields   *map[string]string `json:"custom_fields"`
+}
+
+func decodeIfaceBody(w http.ResponseWriter, r *http.Request) (ifaceBody, bool) {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+		return ifaceBody{}, false
+	}
+	allowed := map[string]bool{
+		"virtual_machine": true, "name": true, "mac_address": true, "custom_fields": true,
+	}
+	for k := range raw {
+		if !allowed[k] {
+			writeErr(w, http.StatusBadRequest, `{"%s":["Unknown field."]}`, k)
+			return ifaceBody{}, false
+		}
+	}
+	var out ifaceBody
+	buf, _ := json.Marshal(raw)
+	if err := json.Unmarshal(buf, &out); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed body: %v", err)
+		return ifaceBody{}, false
+	}
+	return out, true
+}
+
+func applyIfaceBody(iface *fakeIface, b ifaceBody) {
+	if b.VirtualMachine != nil {
+		iface.VMID = *b.VirtualMachine
+	}
+	if b.Name != nil {
+		iface.Name = *b.Name
+	}
+	if b.MAC != nil {
+		iface.MAC = *b.MAC
+	}
+	if b.CustomFields != nil {
+		iface.Identity = (*b.CustomFields)["litevirt_identity"]
+	}
+}
+
+// unassignFromLocked detaches every address pointing at ifaceID. Caller holds
+// f.mu.
+func (f *NetBoxFake) unassignFromLocked(ifaceID int) {
+	for _, ip := range f.byID {
+		if ip.AssignedObjectID == ifaceID {
+			ip.AssignedObjectID = 0
+		}
+	}
+}
+
+// ── assertions ──────────────────────────────────────────────────────────────
+
+// VMCount is how many virtual_machine objects carry this name. Anything but 1
+// after a sweep is the failure that matters: 0 is a mirror that did not run, and
+// 2 is one that duplicated on retry.
+func (f *NetBoxFake) VMCount(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, vm := range f.vms {
+		if vm.Name == name {
+			n++
+		}
+	}
+	return n
+}
+
+// VMCountAll is every virtual_machine object.
+func (f *NetBoxFake) VMCountAll() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.vms)
+}
+
+// InterfaceCount is every vminterface object.
+func (f *NetBoxFake) InterfaceCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.ifaces)
+}
+
+// InterfaceMACs returns every interface's MAC as NetBox holds it, sorted.
+func (f *NetBoxFake) InterfaceMACs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for _, iface := range f.ifaces {
+		out = append(out, iface.MAC)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DistinctWriters returns the API tokens that have issued an INVENTORY write,
+// sorted.
+//
+// Each fleet node carries its own token (see wireNetBox), so this is the only
+// thing that distinguishes "one node mirrored" from "three nodes mirrored the
+// same object and NetBox merged them by name". Scoped to the virtualization
+// paths on purpose: an IPAM claim is issued by whichever node happens to create
+// a VM, and counting those would make every multi-node scenario read as several
+// writers whatever the mirror's leader gate did.
+func (f *NetBoxFake) DistinctWriters() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.writers))
+	for tok := range f.writers {
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// PatchCount is how many PATCH requests the fake has served, over every
+// endpoint.
+//
+// A converged mirror issues none. It is the generic catch for a field written
+// in one unit and read back in another: whatever the mismatch, the diff sees
+// drift on unchanged state and the same PATCH repeats on every sweep.
+func (f *NetBoxFake) PatchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.patches
+}
+
+// ── JSON views ──────────────────────────────────────────────────────────────
+
+type idRef struct {
+	ID int `json:"id"`
+}
+
+type choiceRef struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+type vmView struct {
+	ID           int               `json:"id"`
+	Name         string            `json:"name"`
+	VCPUs        int               `json:"vcpus"`
+	Memory       int               `json:"memory"`
+	Disk         int               `json:"disk"`
+	Status       *choiceRef        `json:"status"`
+	Cluster      *idRef            `json:"cluster"`
+	Device       *idRef            `json:"device"`
+	CustomFields map[string]string `json:"custom_fields"`
+}
+
+func vmJSONOf(vm fakeVM) vmView {
+	out := vmView{
+		ID: vm.ID, Name: vm.Name, VCPUs: vm.VCPUs, Memory: vm.Memory, Disk: vm.Disk,
+		// NetBox always serializes status as a choice object, never as the bare
+		// string it accepts on a write. A fake echoing the string back would let
+		// a decoder that never unwrapped it pass.
+		Status: &choiceRef{Value: vm.Status, Label: strings.ToUpper(vm.Status)},
+		// Always present, even when empty: NetBox returns every defined custom
+		// field on every object.
+		CustomFields: map[string]string{"litevirt_identity": vm.Identity},
+	}
+	if vm.ClusterID != 0 {
+		out.Cluster = &idRef{ID: vm.ClusterID}
+	}
+	if vm.DeviceID != 0 {
+		out.Device = &idRef{ID: vm.DeviceID}
+	}
+	return out
+}
+
+type ifaceView struct {
+	ID             int               `json:"id"`
+	Name           string            `json:"name"`
+	MAC            string            `json:"mac_address"`
+	VirtualMachine *idRef            `json:"virtual_machine"`
+	CustomFields   map[string]string `json:"custom_fields"`
+}
+
+func ifaceJSONOf(iface fakeIface) ifaceView {
+	// UPPER-cased, as NetBox does. A mirror comparing MACs case-sensitively
+	// would see drift on every sweep and PATCH the same interface forever.
+	out := ifaceView{
+		ID: iface.ID, Name: iface.Name, MAC: strings.ToUpper(iface.MAC),
+		CustomFields: map[string]string{"litevirt_identity": iface.Identity},
+	}
+	if iface.VMID != 0 {
+		out.VirtualMachine = &idRef{ID: iface.VMID}
+	}
+	return out
+}
+
+// ── shared paging ───────────────────────────────────────────────────────────
+
+func pageParams(w http.ResponseWriter, rawLimit, rawOffset string) (limit, offset int, ok bool) {
+	limit, err := intParam(rawLimit, 50)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad limit: %v", err)
+		return 0, 0, false
+	}
+	offset, err = intParam(rawOffset, 0)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad offset: %v", err)
+		return 0, 0, false
+	}
+	return limit, offset, true
+}
+
+// writePage serves one page of a list endpoint in NetBox's envelope, including
+// the `next` URL that makes the client's paginate loop terminate.
+func writePage[T any](w http.ResponseWriter, base string, matched []T, limit, offset int) {
+	total := len(matched)
+	if offset > total {
+		offset = total
+	}
+	end := min(offset+limit, total)
+
+	out := struct {
+		Count   int    `json:"count"`
+		Next    string `json:"next"`
+		Results []T    `json:"results"`
+	}{Count: total, Results: []T{}}
+	out.Results = append(out.Results, matched[offset:end]...)
+	if end < total {
+		out.Next = fmt.Sprintf("%s?limit=%d&offset=%d", base, limit, end)
+	}
+	writeJSON(w, out)
+}

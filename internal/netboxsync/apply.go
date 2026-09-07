@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -54,6 +56,12 @@ type netboxWriter interface {
 	ClearIPAssignment(ctx context.Context, ipID int) error
 
 	FindDeviceByName(ctx context.Context, name string) (int, error)
+
+	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
+	// halves are here because a cluster cannot be created without its type, and
+	// NetBox does not create one implicitly.
+	EnsureClusterType(ctx context.Context, name string) (int, error)
+	EnsureCluster(ctx context.Context, name string, typeID int) (int, error)
 }
 
 // mirrorMetrics is the counter sink the mirror emits into. An interface so the
@@ -85,6 +93,23 @@ type Reconciler struct {
 	// once per sweep before any action runs. It is not on Action because every
 	// action in a sweep shares it.
 	clusterID int
+
+	// interval is the sweep cadence Run ticks on.
+	interval time.Duration
+
+	// acquireLease takes or renews the leader lease; holdsLease is the READ
+	// alone, re-run before every write batch.
+	//
+	// They are function values rather than SQL of their own because the lease
+	// they gate on is the ORPHAN SWEEPER's, `leader_election` key "netbox",
+	// which lives in internal/grpcapi. A second key would let the sweeper and
+	// the mirror each believe it leads the cluster, and a copy of the same SQL
+	// under the same key is one edit away from becoming a second key.
+	//
+	// Both are nil-safe in the FAIL-CLOSED direction: an unwired reconciler
+	// holds no lease and writes nothing (see holdsLeader).
+	acquireLease func(context.Context) bool
+	holdsLease   func(context.Context) bool
 }
 
 // sink returns the metrics sink, never nil.
@@ -321,6 +346,23 @@ func (r *Reconciler) createNIC(ctx context.Context, a Action, idx desiredIndex, 
 		})
 		if err != nil {
 			return fmt.Errorf("netboxsync: create interface %s: %w", identity, err)
+		}
+		// FAIL CLOSED on the echoed MAC.
+		//
+		// DRF silently IGNORES a write field its serializer does not know, so a
+		// NetBox that has moved MACs to their own object model accepts
+		// `mac_address`, drops it, and returns 201. Every interface would then be
+		// created MAC-less while this code believed otherwise — and the MAC is
+		// what the identity is derived from, so nothing downstream could notice.
+		// Refusing here is the only place the discrepancy is visible.
+		//
+		// Compared case-INSENSITIVELY: NetBox echoes a MAC upper-cased, and a
+		// case-sensitive check would refuse every create against a real server.
+		if !strings.EqualFold(iface.MAC, dn.NIC.MAC) {
+			return fmt.Errorf(
+				"netboxsync: create interface %s: NetBox echoed mac_address %q for the %q it was sent — "+
+					"this NetBox does not accept a MAC on a vminterface write",
+				identity, iface.MAC, dn.NIC.MAC)
 		}
 		id = iface.ID
 	}

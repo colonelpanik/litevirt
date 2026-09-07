@@ -182,7 +182,7 @@ func domainHasNIC(t *testing.T, n *Node, vmName, mac string) bool {
 // were named for the orphan sweep.
 func orphanChecksQueued(t *testing.T, n *Node) []string {
 	t.Helper()
-	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, 50)
+	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, "orphan", 50)
 	if err != nil {
 		t.Fatalf("DrainSyncQueue: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestHotplugDetachTombstonesLeaseWhenBindingSuspended(t *testing.T) {
 		t.Fatalf("the NetBox object must be left for the sweeper, identities = %v", got)
 	}
 
-	items, err := corrosion.DrainSyncQueue(ctx, n.DB, 10)
+	items, err := corrosion.DrainSyncQueue(ctx, n.DB, "orphan", 10)
 	if err != nil {
 		t.Fatalf("DrainSyncQueue: %v", err)
 	}

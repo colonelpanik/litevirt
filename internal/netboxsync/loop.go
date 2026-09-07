@@ -1,0 +1,456 @@
+package netboxsync
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// QueueKind is the netbox_sync_queue kind the mirror owns.
+//
+// Exported because the producers live outside this package: every consumer of
+// the queue drains ONLY its own kind (see corrosion.DrainSyncQueue), so a
+// producer that enqueued under a different string would have its items skipped
+// by the sweeper AND never drained by the mirror — they would accumulate
+// forever with nothing reporting it.
+const QueueKind = "mirror"
+
+// batchSize is how many actions run under one leader-lease check.
+const batchSize = 20
+
+// queueBatch is how many of its own items one pass drains. It matches the
+// sweeper's, so neither consumer can starve the other by draining more slowly
+// than the other produces.
+const queueBatch = 100
+
+// defaultInterval is the sweep cadence when none is configured. It matches the
+// orphan sweeper's, because both are gated on the SAME leader lease and a lease
+// sized for one cadence must not be handed away between the other's passes.
+const defaultInterval = 15 * time.Minute
+
+// clusterTypeName is the NetBox cluster-type every litevirt cluster registers
+// under. A constant, not a config key: it names the SOFTWARE, so an operator
+// choosing it per-cluster would fragment the type list for no gain.
+const clusterTypeName = "litevirt"
+
+// fallbackClusterName names the NetBox cluster when the local `cluster` row
+// carries no name. Mirroring under a placeholder is better than not mirroring:
+// the name is a label, and identity — which does all the scoping — is the
+// fingerprint carried in the custom field.
+const fallbackClusterName = "litevirt"
+
+// Options is everything the reconciler needs. The daemon fills it from config;
+// see internal/grpcapi's mirror wiring, which is the only production caller.
+type Options struct {
+	// NetBox is the REST client. *netbox.Client satisfies it.
+	NetBox netboxWriter
+	// DB is the local corrosion handle every read and every identity-map write
+	// goes through.
+	DB *corrosion.Client
+	// Metrics may be nil — a metrics sink must never be why a mirror panics.
+	Metrics mirrorMetrics
+	// Interval is the sweep cadence; <= 0 means defaultInterval.
+	Interval time.Duration
+	// AcquireLease and HoldsLease gate the sweep on the cluster's `netbox`
+	// leader lease. Leaving either nil makes this reconciler write NOTHING —
+	// the fail-closed direction, so an incomplete wiring is inert rather than
+	// an ungated second writer.
+	AcquireLease func(context.Context) bool
+	HoldsLease   func(context.Context) bool
+}
+
+// New builds a Reconciler.
+func New(o Options) *Reconciler {
+	interval := o.Interval
+	if interval <= 0 {
+		interval = defaultInterval
+	}
+	return &Reconciler{
+		nb:           o.NetBox,
+		db:           o.DB,
+		metrics:      o.Metrics,
+		interval:     interval,
+		acquireLease: o.AcquireLease,
+		holdsLease:   o.HoldsLease,
+	}
+}
+
+// Run drives the reconciler until ctx ends.
+//
+// There is deliberately no pass at startup, matching the orphan sweeper: the
+// first pass lands one interval in, so a node that has just restarted — or a
+// cluster mid-rolling-upgrade — is not writing inventory while its own view of
+// the fleet is still assembling.
+func (r *Reconciler) Run(ctx context.Context) {
+	t := time.NewTicker(r.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.SyncOnce(ctx); err != nil {
+				slog.Warn("netbox mirror: sync failed", "error", err)
+			}
+		}
+	}
+}
+
+// SyncOnce is ONE leader-gated pass.
+//
+// Leader-gated: five masterless nodes must not all mirror inventory, and NetBox
+// has no idempotency key that would make concurrent writers merge. Every
+// configured node runs this — the gate, not the caller, decides which one
+// writes — so a node that loses the race does nothing and reports nothing.
+//
+// It exists as its own method so a test can drive a pass deterministically
+// instead of waiting on the ticker, through the SAME gate the loop uses.
+func (r *Reconciler) SyncOnce(ctx context.Context) error {
+	if !r.acquireLeader(ctx) {
+		return nil
+	}
+	return r.Sync(ctx)
+}
+
+// acquireLeader takes or renews the lease. An unwired reconciler never leads.
+func (r *Reconciler) acquireLeader(ctx context.Context) bool {
+	return r.acquireLease != nil && r.acquireLease(ctx)
+}
+
+// holdsLeader re-reads the lease WITHOUT renewing it, so it can be called
+// immediately before each write batch without extending a lease this node may
+// already have lost. An unwired reconciler never leads.
+func (r *Reconciler) holdsLeader(ctx context.Context) bool {
+	return r.holdsLease != nil && r.holdsLease(ctx)
+}
+
+// Sync reconciles litevirt state into NetBox.
+//
+// The queue drain is a latency optimisation; the full diff below runs
+// regardless of what the queue held, because a node that died mid-create never
+// enqueued anything and a peer that drained an item may have died before acting
+// on it. Nothing in this function branches on what the drain returned.
+func (r *Reconciler) Sync(ctx context.Context) error {
+	r.drainQueue(ctx)
+
+	fp, err := corrosion.ClusterFingerprint(ctx, r.db)
+	if err != nil {
+		return fmt.Errorf("cluster fingerprint: %w", err)
+	}
+	// BEFORE the reads: actualState is scoped to this cluster id, and
+	// createVM/updateVM write it onto every object.
+	clusterID, err := r.ensureCluster(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure cluster: %w", err)
+	}
+	r.clusterID = clusterID
+
+	desired, err := r.desiredState(ctx)
+	if err != nil {
+		return fmt.Errorf("read desired state: %w", err)
+	}
+	actual, err := r.actualState(ctx, fp)
+	if err != nil {
+		return fmt.Errorf("read actual state: %w", err)
+	}
+
+	return r.applyPhases(ctx, Diff(desired, actual, fp), indexDesired(desired, fp), fp)
+}
+
+// drainQueue acks this mirror's own queued items.
+//
+// It resolves nothing from them: the full diff below covers every object the
+// queue could name, so the drain exists only to keep the table from growing.
+// Every failure is logged and swallowed for the same reason — a queue this
+// component cannot read is not a reason to skip a sweep that does not depend on
+// it.
+func (r *Reconciler) drainQueue(ctx context.Context) {
+	items, err := corrosion.DrainSyncQueue(ctx, r.db, QueueKind, queueBatch)
+	if err != nil {
+		slog.Warn("netbox mirror: queue drain failed; the full sweep still runs", "error", err)
+		return
+	}
+	for _, it := range items {
+		if err := corrosion.AckSyncItem(ctx, r.db, it.ID); err != nil {
+			slog.Warn("netbox mirror: ack queue item", "id", it.ID, "error", err)
+		}
+	}
+}
+
+// applyPhases is the production phase runner.
+//
+// It exists as its own method so the ordering regression can exercise the REAL
+// orchestration. A test that loops over Phases() itself and calls apply cannot
+// detect this function flattening the list, skipping a boundary, or running two
+// phases concurrently — the test would be guaranteeing the very ordering it is
+// supposed to verify.
+func (r *Reconciler) applyPhases(ctx context.Context, actions []Action, idx desiredIndex, fp string) error {
+	// PHASES, not one flat list. apply runs a worker pool, so a flat list lets a
+	// NIC create race ahead of its VM, lets a clear undo a concurrent assign,
+	// and lets a VM delete cascade away an interface a concurrent
+	// DeleteInterface is still deleting.
+	//
+	// Parallelism stays INSIDE a phase, where actions are independent. Each
+	// phase must fully drain before the next begins.
+	for phase, phaseActions := range Phases(actions) {
+		if len(phaseActions) == 0 {
+			continue // a quiet sweep stays cheap
+		}
+		for start := 0; start < len(phaseActions); start += batchSize {
+			// Re-validated before EACH batch, not once per sweep, so an outgoing
+			// leader stops rather than racing the incoming one through a long
+			// sweep. A sweep over a large cluster is many seconds of writes; a
+			// single check at the top says nothing about the lease at the end.
+			if !r.holdsLeader(ctx) {
+				return fmt.Errorf("netboxsync: leader lease lost mid-sweep in phase %d after %d actions",
+					phase, start)
+			}
+			end := min(start+batchSize, len(phaseActions))
+			if err := r.apply(ctx, phaseActions[start:end], idx, fp); err != nil {
+				return fmt.Errorf("netboxsync: phase %d: %w", phase, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ensureCluster resolves the NetBox cluster every mirrored VM belongs to,
+// creating the cluster and its type on first use.
+//
+// Named after the operator's own cluster name, never after the fingerprint: the
+// fingerprint is derived from the CA certificate, so a CA replacement would
+// point the mirror at a NEW cluster object and orphan everything under the old
+// one. Two installations sharing a name therefore share a cluster object, which
+// is harmless — every object is still scoped by the identity fingerprint, and
+// that is what BuildActual and Diff filter on.
+func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
+	typeID, err := r.nb.EnsureClusterType(ctx, clusterTypeName)
+	if err != nil {
+		return 0, fmt.Errorf("cluster type %q: %w", clusterTypeName, err)
+	}
+	name, err := corrosion.ClusterName(ctx, r.db)
+	if err != nil {
+		return 0, err
+	}
+	if name == "" {
+		name = fallbackClusterName
+	}
+	id, err := r.nb.EnsureCluster(ctx, name, typeID)
+	if err != nil {
+		return 0, fmt.Errorf("cluster %q: %w", name, err)
+	}
+	if id == 0 {
+		// NetBox answered without an id. Continuing would list "cluster 0" —
+		// which has no filter meaning — and diff every object in the install
+		// against this cluster's desired set.
+		return 0, fmt.Errorf("netboxsync: NetBox returned no id for cluster %q", name)
+	}
+	return id, nil
+}
+
+// actualState is the reconciler's only NetBox read path.
+//
+// One line on purpose: BuildActual holds the identity-fingerprint filter that
+// stops one cluster's sweep from deleting another's inventory out of a shared
+// NetBox, and a second collection path here would be a second place for that
+// filter to be dropped.
+func (r *Reconciler) actualState(ctx context.Context, fingerprint string) (Actual, error) {
+	return BuildActual(ctx, r.nb, r.clusterID, fingerprint)
+}
+
+// vmSpecFields is the slice of the stored VM spec the mirror reads. The spec is
+// the marshalled pb.VMSpec, so these tags are the wire names.
+type vmSpecFields struct {
+	UUID      string `json:"uuid"`
+	CPU       int    `json:"cpu"`
+	MemoryMiB int    `json:"memory_mib"`
+}
+
+// desiredState is litevirt's own inventory, in the shape Diff compares.
+//
+// Every read failure is RETURNED, never skipped past. Desired state is what the
+// delete half of the diff is computed against, so a VM missing from it because
+// a query failed is a VM the sweep would delete from NetBox.
+func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, error) {
+	vms, err := corrosion.ListVMs(ctx, r.db, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("list VMs: %w", err)
+	}
+	leases, err := corrosion.ListNetBoxLeases(ctx, r.db)
+	if err != nil {
+		return nil, fmt.Errorf("list NetBox leases: %w", err)
+	}
+	byAddress := make(map[string]int, len(leases))
+	for _, l := range leases {
+		byAddress[leaseKey(l.Network, l.IP)] = l.NetBoxIPID
+	}
+
+	// One device lookup per HOST, not per VM: a sweep over a large cluster
+	// otherwise issues one NetBox request per VM to resolve the same handful of
+	// hosts.
+	devices := map[string]int{}
+
+	out := make([]DesiredVM, 0, len(vms))
+	for _, v := range vms {
+		if v.IsTemplate {
+			// A template is a disk image, never a running machine. Mirroring one
+			// would put a permanently-offline virtual_machine in NetBox for every
+			// image an operator keeps.
+			continue
+		}
+		var spec vmSpecFields
+		if err := json.Unmarshal([]byte(v.Spec), &spec); err != nil || spec.UUID == "" {
+			// The uuid is what makes an identity incarnation-unique, so a VM
+			// without one has never been mirrored and cannot be: no object of
+			// ours carries an identity naming it, which is also why omitting it
+			// here can never turn into a delete.
+			slog.Warn("netbox mirror: skipping a VM whose spec carries no uuid",
+				"vm", v.Name, "error", err)
+			continue
+		}
+
+		nics, err := corrosion.MergedVMNICs(ctx, r.db, v.Name)
+		if err != nil {
+			return nil, fmt.Errorf("read NICs of VM %s: %w", v.Name, err)
+		}
+		disks, err := corrosion.GetVMDisks(ctx, r.db, v.Name)
+		if err != nil {
+			return nil, fmt.Errorf("read disks of VM %s: %w", v.Name, err)
+		}
+
+		deviceID, ok := devices[v.HostName]
+		if !ok && v.HostName != "" {
+			deviceID = r.lookupDevice(ctx, v.HostName)
+			devices[v.HostName] = deviceID
+		}
+
+		out = append(out, DesiredVM{
+			Name:     v.Name,
+			Host:     v.HostName,
+			UUID:     spec.UUID,
+			Status:   netboxStatus(v.State),
+			VCPUs:    orSpec(v.CPUActual, spec.CPU),
+			MemoryMB: orSpec(v.MemActual, spec.MemoryMiB),
+			DiskGB:   totalDiskGiB(disks),
+			DeviceID: deviceID,
+			NICs:     desiredNICs(nics, byAddress),
+		})
+	}
+	// Sorted so a sweep over identical state produces an identical action list;
+	// ListVMs imposes no order of its own.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// lookupDevice resolves one host's DCIM device id, or 0.
+//
+// Best-effort in BOTH directions: a lookup failure and a host that is simply
+// not modelled both mean "no link". An operator who does not model hosts in
+// NetBox must still get a working mirror, so this never fails a sweep.
+func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
+	id, err := r.nb.FindDeviceByName(ctx, host)
+	if err != nil {
+		slog.Debug("netbox mirror: host device lookup failed; mirroring without the link",
+			"host", host, "error", err)
+		return 0
+	}
+	return id
+}
+
+// desiredNICs maps litevirt NIC rows onto the mirror's NIC shape, resolving each
+// one's NetBox address object through the lease index.
+func desiredNICs(nics []corrosion.NICRecord, byAddress map[string]int) []DesiredNIC {
+	// Ordered before naming, because the names are derived positionally on a
+	// collision and map/query order must not decide them.
+	sort.Slice(nics, func(i, j int) bool {
+		if nics[i].Ordinal != nics[j].Ordinal {
+			return nics[i].Ordinal < nics[j].Ordinal
+		}
+		return nics[i].MAC < nics[j].MAC
+	})
+	out := make([]DesiredNIC, 0, len(nics))
+	used := make(map[string]bool, len(nics))
+	for _, n := range nics {
+		if n.MAC == "" {
+			// The identity is MAC-derived, so a NIC without one cannot be named
+			// in NetBox at all. Mirroring it under an empty MAC would collide
+			// with its own VM's identity (a VM identity IS a NIC identity with an
+			// empty MAC).
+			slog.Warn("netbox mirror: skipping a NIC with no MAC", "vm", n.VMName, "nic", n.ID)
+			continue
+		}
+		out = append(out, DesiredNIC{
+			Name:       nicName(n, used),
+			MAC:        strings.ToLower(n.MAC),
+			IP:         n.IP,
+			NetBoxIPID: byAddress[leaseKey(n.NetworkName, n.IP)],
+		})
+	}
+	return out
+}
+
+// nicName is the interface name NetBox shows, derived from the NIC's ordinal.
+//
+// NetBox requires interface names to be unique WITHIN a virtual machine, so a
+// duplicate ordinal — which a legacy vm_interfaces row that never carried one
+// can produce — would make the second create a 400 and abort the sweep. The
+// collision suffix is the MAC, which is unique by construction and is already
+// this NIC's identity component.
+func nicName(n corrosion.NICRecord, used map[string]bool) string {
+	name := "eth" + strconv.Itoa(n.Ordinal)
+	if used[name] {
+		name += "-" + strings.ReplaceAll(strings.ToLower(n.MAC), ":", "")
+	}
+	used[name] = true
+	return name
+}
+
+// leaseKey is the (network, ip) primary key of an ip_allocations row, which is
+// how a NIC finds the NetBox address object it holds.
+func leaseKey(network, ip string) string { return network + "\x00" + ip }
+
+// netboxStatus maps a litevirt VM state onto NetBox's status choice.
+//
+// Only "running" is active. Every other state — stopped, migrating, error, a
+// state this version does not know — is offline, because NetBox's remaining
+// choices ("planned", "staged", "failed", "decommissioning") describe an
+// operator's INTENT for a machine, not a hypervisor's runtime, and writing one
+// would overwrite what an operator put there.
+func netboxStatus(state string) string {
+	if state == "running" {
+		return "active"
+	}
+	return "offline"
+}
+
+// orSpec prefers the live-resized actual and falls back to what the spec asked
+// for. A VM that has never been resized carries a zero actual.
+func orSpec(actual int, spec int) int {
+	if actual > 0 {
+		return actual
+	}
+	return spec
+}
+
+// totalDiskGiB sums a VM's disks, rounding each up exactly as project quota
+// does, so the two never disagree about the same VM.
+//
+// The value goes onto NetBox's `virtual_machine.disk`. That field's unit has
+// varied across NetBox releases, so what makes the mirror stable is not the
+// unit but the ROUND TRIP: whatever is written must read back equal, or the
+// diff sees drift on unchanged state and PATCHes forever. The fleet's
+// second-sweep-issues-no-PATCHes scenario is what pins that.
+func totalDiskGiB(disks []corrosion.DiskRecord) int {
+	total := 0
+	for _, d := range disks {
+		total += corrosion.DiskQuotaGiB(d.SizeBytes)
+	}
+	return total
+}

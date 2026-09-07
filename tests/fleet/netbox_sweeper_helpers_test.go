@@ -98,10 +98,14 @@ func insertLiveLease(t *testing.T, n *Node, network, ip, mac string) {
 	}
 }
 
-// pendingQueueItems counts un-acked netbox_sync_queue rows.
-func pendingQueueItems(t *testing.T, n *Node) int {
+// pendingQueueItems counts un-acked netbox_sync_queue rows OF ONE KIND.
+//
+// Kind-scoped because the queue has two producers: an unscoped count would
+// report the mirror's backlog as the sweeper's, so a scenario asserting "the
+// orphan check was acked" would fail on somebody else's untouched work.
+func pendingQueueItems(t *testing.T, n *Node, kind string) int {
 	t.Helper()
-	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, 100)
+	items, err := corrosion.DrainSyncQueue(context.Background(), n.DB, kind, 200)
 	if err != nil {
 		t.Fatalf("DrainSyncQueue on %s: %v", n.Name, err)
 	}
@@ -134,6 +138,7 @@ type sweepMetrics struct {
 	stuckLeases int
 	suspended   int
 	ambiguous   int
+	duplicates  int
 }
 
 func newSweepMetrics() *sweepMetrics { return &sweepMetrics{} }
@@ -178,4 +183,10 @@ func (m *sweepMetrics) IncAmbiguousClaim() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ambiguous++
+}
+
+func (m *sweepMetrics) IncDuplicateObject() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.duplicates++
 }

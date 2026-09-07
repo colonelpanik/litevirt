@@ -198,12 +198,12 @@ func TestCheckDHCPBindConflict(t *testing.T) {
 		wantRefusal:      false,
 	}, {
 		name:             "physical VLAN is bindable",
-		def:              compose.NetworkDef{Type: "bridge", Interface: "br0", Subnet: "10.0.5.0/24", VLAN: 209},
+		def:              compose.NetworkDef{Type: "bridge", Interface: "br0", Subnet: "10.0.5.0/24", VLAN: 100},
 		bridgeExistsHere: false,
 		wantRefusal:      false,
 	}, {
 		name:             "macvtap is bindable",
-		def:              compose.NetworkDef{Type: "direct", Interface: "bond0.209", Subnet: "10.0.5.0/24"},
+		def:              compose.NetworkDef{Type: "direct", Interface: "bond0.100", Subnet: "10.0.5.0/24"},
 		bridgeExistsHere: false,
 		wantRefusal:      false,
 	}, {

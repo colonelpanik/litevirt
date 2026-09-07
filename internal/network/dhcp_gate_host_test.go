@@ -15,14 +15,22 @@ import (
 // That refusal is what actually closes the host-local gap: BridgePreExisted is
 // runtime state no row records, so a bind validated on one node says nothing
 // about a node that lacks the bridge — and that node is exactly where litevirt
-// would create one and stand up a second allocator over the bound prefix. The
-// consequence, deliberately, is that a VM cannot be placed there.
+// would create one and stand up a second allocator over the bound prefix.
+//
+// WHAT IT DOES NOT DO IS STOP THE PLACEMENT. Every caller logs the refusal and
+// then creates the bridge itself (see BoundNetworkDHCPRefusal), so the VM lands
+// on the host the refusal named, on a bridge litevirt just made: no second DHCP
+// server — that part holds, and it is the whole of the win here — but no uplink
+// and no gateway either. Keeping that state visible is the health finding's job
+// (netbox_dhcp_would_race), not this refusal's.
 //
 // Which makes two things load-bearing that were not:
 //
-//  1. THE MESSAGE HAS TO SAY WHICH HOST. It is read as a placement failure on
-//     whichever node the scheduler picked, and "define the network differently"
-//     is not actionable without knowing where the bridge is missing.
+//  1. THE MESSAGE HAS TO SAY WHICH HOST. It is read in a log line on whichever
+//     node the scheduler picked — not as a placement failure, which is why
+//     nothing else in front of the operator names that node — and "define the
+//     network differently" is not actionable without knowing where the bridge
+//     is missing.
 //  2. THE REFUSAL HAS TO BE IDEMPOTENT. Provision created the bridge and THEN
 //     refused, so a retry saw a pre-existing bridge, decided litevirt was not
 //     the DHCP authority, and provisioned successfully — leaving a

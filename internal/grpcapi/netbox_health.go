@@ -95,14 +95,17 @@ const (
 	condNetBoxDiscoveryUnclaimable = "netbox_discovery_unclaimable"
 	// condNetBoxDHCPWouldRace: provisioning a bound network on THIS host would
 	// start litevirt's own DHCP server over the bound prefix, so this host
-	// refuses to provision it — and no VM can be placed on that network here.
+	// refuses to provision it.
 	//
 	// The provision-time refusal is what closes the host-local half of the
 	// hazard, and it has to stay: a bind is a cluster-wide decision and
 	// "did litevirt have to create this bridge" is host-local runtime state no
-	// row records. But the refusal only speaks once somebody has hit it, as a
-	// placement failure on whichever node the scheduler picked. This finding is
-	// the same fact stated in advance, on the node it is about.
+	// row records. But the refusal DOES NOT FAIL THE PLACEMENT — every caller
+	// logs it and creates the bridge itself — so on its own it speaks only in a
+	// log line on one node, and goes quiet as soon as the bridge it warned about
+	// exists. This finding is the same fact stated in advance and KEPT UP, on
+	// the node it is about; see evaluateNetBoxDHCPConflicts for the second
+	// predicate that stops it clearing itself.
 	//
 	// Subject is the HOST, for the same reason as its two neighbours: the input
 	// is this node's own bridge state, which no peer can read.

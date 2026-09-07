@@ -38,6 +38,18 @@ func BridgeExists(name string) bool {
 // FAIL CLOSED: a bridge that does not exist, or whose sysfs cannot be read, has
 // no uplink as far as this function is concerned. The caller's finding then
 // stays up, which is the direction that keeps a misconfiguration visible.
+//
+// THE FALSE-POSITIVE SET IS WIDER THAN THAT, and the extra case arrives through
+// sysfsParent: it answers only for a member with EXACTLY ONE `lower_*` link (see
+// there for why), so a member stacked on SEVERAL reads as no uplink here. A team
+// device is the ordinary example — it has no `device/`, no `bonding/` and no
+// `bridge/`, so nothing else in the disjunction above catches it either, and a
+// bridge whose only member is a team therefore reports no uplink while carrying
+// traffic off the host. The cost is a health finding that will not clear on a
+// correctly built host, whose named remedy (give the bridge an uplink) is
+// already done. Widening sysfsParent is not the fix — its other caller needs the
+// unambiguous answer — so closing this means a separate "is this member stacked
+// on anything at all" predicate.
 func BridgeHasUplink(bridge string) bool {
 	for _, m := range bridgeMembers(bridge) {
 		if isPhysicalNIC(m) || isBond(m) || isBridgeIface(m) || sysfsParent(m) != "" {
@@ -86,6 +98,17 @@ var sysfsNet = "/sys/class/net"
 
 // sysfsParent returns the parent interface name by reading
 // /sys/class/net/<iface>/lower_* entries. Returns "" if no parent.
+//
+// EXACTLY ONE `lower_*` or nothing, deliberately: resolveVLANParent walks this
+// upwards to find the single interface a VLAN should be created on, and a device
+// with several lowers has no single answer to give it — returning an arbitrary
+// leg would silently build the VLAN over the wrong one.
+//
+// BridgeHasUplink borrows the same call as a cheap "is this member stacked on
+// something", and inherits the restriction as a FALSE NEGATIVE: a team device,
+// or anything else carrying two or more lowers, answers "" and so reads as no
+// uplink. Fail-closed for that finding, but a finding that then cannot be
+// cleared — see BridgeHasUplink.
 func sysfsParent(iface string) string {
 	entries, _ := filepath.Glob(fmt.Sprintf("%s/%s/lower_*", sysfsNet, iface))
 	if len(entries) == 1 {

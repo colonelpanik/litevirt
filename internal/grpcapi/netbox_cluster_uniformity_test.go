@@ -384,18 +384,19 @@ func TestADownHostThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
 
 // TestAWitnessThatHasNotPublishedDoesNotBlockThePass.
 //
-// A witness votes and never hosts a workload, so it never mirrors and has no
-// reason to be configured for NetBox — but `health.VotingEligible` counts
-// witnesses (the quorum denominator does, so the live-host predicate must), and
-// the gate blocks until every live host has published. A witness therefore
-// blocks mirroring FOREVER, on a cluster whose configuration is entirely
-// correct, and the only remedies would be to configure NetBox on a node that
-// does not need it or to remove the witness.
+// A witness votes and never hosts a workload, so it has no reason to be
+// configured for NetBox — but `health.VotingEligible` counts witnesses (the
+// quorum denominator does, so the live-host predicate must), and the gate blocks
+// until every live host has published. A witness therefore blocks mirroring
+// FOREVER, on a cluster whose configuration is entirely correct, and the only
+// remedies would be to configure NetBox on a node that does not need it or to
+// remove the witness.
 //
-// The sweeper's own participant universe (eligibleProofHosts) already excludes
-// `role='witness'` for exactly this reason. This is the same exclusion for the
-// same reason, and it is safe for the same one: a node that never mirrors cannot
-// flap an inventory, which is the only thing this comparison protects.
+// It is NOT safe because a witness cannot mirror: a NetBox-configured witness
+// takes the lease and mirrors like anything else. It is safe because excusing a
+// node from THIS node's set does not excuse it from its own — see
+// TestTwoWitnessesStillGateEachOther for the one case where that argument runs
+// out and the exclusion has to stop.
 func TestAWitnessThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
 	ctx := context.Background()
 	s := uniformityServer(t, "site-a")
@@ -407,11 +408,11 @@ func TestAWitnessThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
 	}
 	if !s.netboxMirrorPassAuthorized(ctx) {
 		t.Fatal("a live witness that never publishes must not block mirroring forever: it hosts " +
-			"no workload, so it never mirrors and has nothing to be uniform about")
+			"no workload, so it has nothing to be uniform about — and it still gates itself")
 	}
 }
 
-// TestAWitnessCannotBlockButAWorkerStill Can is the control: the exclusion must
+// TestAWitnessExclusionDoesNotExcuseAWorker is the control: the exclusion must
 // be about the ROLE and nothing else, or it would hand every unpublished host a
 // way through.
 func TestAWitnessExclusionDoesNotExcuseAWorker(t *testing.T) {
@@ -443,5 +444,80 @@ func TestAPublicationFailureStillStopsTheGate(t *testing.T) {
 
 	if s.netboxMirrorPassAuthorized(ctx) {
 		t.Fatal("a node that could not publish its own value must not mirror")
+	}
+}
+
+// asWitness gives host a live `hosts` row with role=witness, so the exclusion
+// below has something to act on. Separate from publishAs because the witnesses
+// these cases need differ in whether they published at all.
+func asWitness(t *testing.T, s *Server, host string) {
+	t.Helper()
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+		Name: host, Address: "192.0.2.11", State: "active",
+		CertSerial: "serial-" + host, Role: "witness",
+	}); err != nil {
+		t.Fatalf("insert witness host %s: %v", host, err)
+	}
+}
+
+// TestTwoWitnessesStillGateEachOther is the hole the exclusion would otherwise
+// open, and the reason it is ONE-WAY.
+//
+// Excluding a witness is safe because the excluded node still runs this
+// comparison itself and declines the moment it disagrees with a live host it did
+// not exclude. That argument needs the excluded node to have somebody left to be
+// gated by. Two witnesses resolving different names, with no live non-witness
+// host, would each compute a live set of {self}, agree with themselves, and both
+// mirror — the inventory flap the whole gate exists to prevent, arriving through
+// the exemption meant to keep a witness from wedging it.
+func TestTwoWitnessesStillGateEachOther(t *testing.T) {
+	ctx := context.Background()
+	s := uniformityServer(t, "site-a")
+	asWitness(t, s, s.hostName)
+	asWitness(t, s, "peer-1")
+	if err := corrosion.PublishNetBoxHostConfig(ctx, s.db, "peer-1", "site-b"); err != nil {
+		t.Fatalf("publish peer-1: %v", err)
+	}
+
+	if s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("two witnesses resolving different names, with no live worker between them: each " +
+			"would mirror under its own name and delete the other's objects, which is exactly " +
+			"the flap this comparison exists to stop. A witness must not excuse another witness")
+	}
+}
+
+// TestAWitnessDoesNotExcuseAPeerWitnessSilence is the same rule for the other
+// finding: a peer witness that has published NOTHING must still stop a witness
+// that is about to mirror, because that witness is the one node its peers have
+// stopped watching.
+func TestAWitnessDoesNotExcuseAPeerWitnessSilence(t *testing.T) {
+	ctx := context.Background()
+	s := uniformityServer(t, "site-a")
+	asWitness(t, s, s.hostName)
+	asWitness(t, s, "peer-1")
+
+	if s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a witness with an unpublished witness peer and no live worker must decline: " +
+			"nothing else is comparing the two")
+	}
+}
+
+// TestAWorkerStillExcusesAWitness is the control that keeps the fix scoped. The
+// wedge the exclusion removes — one witness blocking an otherwise correct
+// cluster forever — is the ordinary topology, and it must stay removed.
+func TestAWorkerStillExcusesAWitness(t *testing.T) {
+	ctx := context.Background()
+	s := uniformityServer(t, "site-a")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: s.hostName, Address: "192.0.2.9", State: "active",
+		CertSerial: "serial-self", Role: "worker",
+	}); err != nil {
+		t.Fatalf("insert self as worker: %v", err)
+	}
+	asWitness(t, s, "peer-1")
+
+	if !s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a MIRRORING node must still excuse a witness that has published nothing: it is " +
+			"the only node comparing, and a witness has nothing to be uniform about")
 	}
 }

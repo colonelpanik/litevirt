@@ -50,23 +50,27 @@ import (
 // and a health condition names the hosts whose value is missing. That wait is
 // bounded for a host that is coming up — every configured node publishes on its
 // own first pass — and a host that has LEFT is excluded by the same predicate
-// that excludes a stale disagreeing value, as is a witness (which never
-// mirrors). It is NOT bounded for a live worker running with `netbox.enabled`
-// off: nothing excludes that node, so it blocks until somebody acts, which is
+// that excludes a stale disagreeing value, as is a witness (for a reason that is
+// NOT "a witness cannot mirror" — see liveHostsForNetBoxUniformity). It is NOT
+// bounded for a live worker running with `netbox.enabled` off: nothing
+// excludes that node, so it blocks until somebody acts, which is
 // why the condition names the hosts it is waiting for. See WHAT IT STILL DOES
 // NOT CLOSE below; the two paragraphs must not disagree, and they used to.
 // Stopping the mirror costs stale inventory; mirroring under an unverified set
 // costs objects written under the wrong cluster name, and this branch ranks a
 // leak above a collision.
 //
-// ONLY LIVE HOSTS COUNT, AND ONLY ONES THAT COULD MIRROR. A host that is down,
-// in maintenance, fenced or decommissioned keeps its published row — nothing
-// deletes a departed node's publication — and must not be able to stop mirroring
-// forever by holding a stale value. The live set is the health checker's own
-// predicate, health.VotingEligible over the replicated `hosts` rows: the same
-// one the quorum denominator uses, not a fourth answer to "is this host live".
+// ONLY LIVE HOSTS COUNT, MINUS WITNESSES. A host that is down, in maintenance,
+// fenced or decommissioned keeps its published row — nothing deletes a departed
+// node's publication — and must not be able to stop mirroring forever by
+// holding a stale value. The live set is the health checker's own predicate,
+// health.VotingEligible over the replicated `hosts` rows: the same one the
+// quorum denominator uses, not a fourth answer to "is this host live".
 // Witnesses are then subtracted, because VotingEligible deliberately includes
-// them and a witness never mirrors — see liveHostsForNetBoxUniformity.
+// them and a witness has no reason to be configured for NetBox at all. What
+// makes subtracting them safe is NOT that a witness cannot mirror — it can —
+// but that an excluded node still gates itself; the whole argument, and the one
+// case it does not cover, is in liveHostsForNetBoxUniformity.
 //
 // NOT HealthyPeers, which the orphan sweeper uses for REACHABILITY. That answer
 // additionally requires a successful probe this run, so it differs per node and
@@ -296,24 +300,48 @@ func (s *Server) compareNetBoxClusterName(ctx context.Context) (netboxClusterDis
 // so excluding it would compare a set against a value not in it.
 //
 // WITNESSES ARE EXCLUDED, and this is the most plausible permanent wedge in the
-// whole gate. A witness votes and never hosts a workload, so it never runs a
-// mirror pass and has no reason to be configured for NetBox at all — but
-// health.VotingEligible counts witnesses (it has to: the quorum denominator
-// does), and the gate blocks until every live host has published. A witness
-// would therefore stop mirroring FOREVER on a cluster whose configuration is
-// entirely correct, with no remedy but configuring NetBox on a node that does
-// not need it or removing the witness.
+// whole gate. A witness votes and never hosts a workload, so it has no reason to
+// be configured for NetBox at all — but health.VotingEligible counts witnesses
+// (it has to: the quorum denominator does), and the gate blocks until every live
+// host has published. A witness would therefore stop mirroring FOREVER on a
+// cluster whose configuration is entirely correct, with no remedy but
+// configuring NetBox on a node that does not need it or removing the witness.
 //
-// Excluding it costs nothing the comparison is for. What this gate protects
-// against is an inventory FLAPPING between two NetBox clusters as the `netbox`
-// lease moves, and a node that never mirrors can never be the node that moves
-// it. The sweeper's participant universe (eligibleProofHosts) already excludes
-// `role='witness'` for the same reason, and this is deliberately the same
-// exclusion rather than a second answer to it.
+// WHY THAT IS SAFE, AND IT IS NOT "A WITNESS NEVER MIRRORS". Nothing stops one:
+// StartNetBoxMirror gates on a NetBox client plus `netbox.mirror_inventory`,
+// acquireNetBoxLease has no role check, and the reconciler mirrors the whole
+// CLUSTER's inventory rather than this host's share of it — so a witness
+// configured for NetBox takes the lease and writes like any other node. The
+// exclusion is safe for a different reason: excusing a node from OTHER nodes'
+// sets does not excuse it from its own. An excluded witness still runs this
+// comparison, still counts every live host IT has not excluded, and declines
+// itself the moment one disagrees or has not spoken. The node this gate has to
+// stop is the node that would mirror under a name its peers do not share, and
+// that node is still fully gated — by itself.
 //
-// Self is exempt from the role check, for the same reason it is exempt from the
-// state check: this node is demonstrably running this code, and a comparison
-// that dropped the node making it would compare a set against a value not in it.
+// WHICH IS WHY THE EXCLUSION IS ONE-WAY. That argument needs the excused node to
+// have somebody left to be gated by, and two witnesses have nobody: with no live
+// non-witness host, each would compute a live set of {self}, agree with itself
+// and mirror, and the two would delete each other's objects on every handover.
+// So a witness does not excuse another witness — the exclusion is what a node
+// still being watched grants to a node nobody is watching. A node with no `hosts`
+// row of its own reads as a non-witness, which is the answer that keeps the
+// ordinary worker-plus-witness cluster out of the wedge; the cost is a flap
+// window for a witness whose own row has not replicated yet, on a cluster that
+// has two of them and no worker.
+//
+// The sweeper's participant universe (eligibleProofHosts) excludes
+// `role='witness'` too, but on its own ground and not this one: a negative proof
+// is about who might be RUNNING the workload holding an address, and a witness
+// hosts none. That reason does not transfer here, so this one is stated in full
+// rather than borrowed.
+//
+// Self is never excluded, by state or by role: this node's resolved name is the
+// value the comparison is made FROM, so a set that dropped it would be compared
+// against a value not in it. Seeding `live` with s.hostName is what guarantees
+// that, which is why the loop below needs no self-exemption of its own — a
+// non-witness self cannot match the role check anyway, and a witness self
+// excludes nobody.
 //
 // FAIL CLOSED on an unreadable host table: it returns an error rather than an
 // empty set, because "no live hosts" and "we could not tell who is live" must
@@ -324,10 +352,20 @@ func (s *Server) liveHostsForNetBoxUniformity(ctx context.Context) (map[string]b
 	if err != nil {
 		return nil, fmt.Errorf("read the host table to decide which published values count: %w", err)
 	}
+	// Whether THIS node is a witness decides whether it may excuse one: a node
+	// its peers have stopped watching owes the comparison to its fellows.
+	selfIsWitness := false
+	for _, h := range hosts {
+		if h.Name == s.hostName {
+			selfIsWitness = h.IsWitness()
+			break
+		}
+	}
 	live := map[string]bool{s.hostName: true}
 	for _, h := range hosts {
-		if h.Name != s.hostName && h.IsWitness() {
-			continue // a witness votes and never mirrors, so it has nothing to be uniform about
+		if h.IsWitness() && !selfIsWitness {
+			// A witness has nothing to be uniform about, and it gates itself.
+			continue
 		}
 		if health.VotingEligible(h.State) {
 			live[h.Name] = true

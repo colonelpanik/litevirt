@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -21,11 +22,21 @@ import (
 // workloads are meant.
 const fenceReadinessSampleVMs = 10
 
-// fenceReadinessPingTimeout bounds one peer's posture Ping. A host that cannot
-// answer promptly is reported as unreachable — unknown posture, never assumed
-// good — rather than stalling a diagnostic an operator is running during an
-// incident.
-const fenceReadinessPingTimeout = 5 * time.Second
+const (
+	// fenceReadinessPingTimeout bounds ONE peer's posture Ping. A host that
+	// cannot answer promptly is reported as unreachable — unknown posture, never
+	// assumed good.
+	fenceReadinessPingTimeout = 5 * time.Second
+	// fenceReadinessTotalBudget bounds the WHOLE fan-out. A per-peer timeout
+	// alone does not: probed one after another, thirty unreachable hosts would
+	// take thirty times the per-peer timeout, and the caller's own deadline
+	// would kill the RPC before it returned anything — losing the per-host
+	// detail exactly when an operator is running this during an incident.
+	fenceReadinessTotalBudget = 20 * time.Second
+	// fenceReadinessProbeWorkers bounds concurrent peer dials, so a large fleet
+	// does not open one connection per host at once.
+	fenceReadinessProbeWorkers = 8
+)
 
 // GetFenceReadiness answers whether the shared-storage fence would actually run
 // if a shared-disk VM had to change hosts right now.
@@ -65,21 +76,65 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 		resp.SampleVms = append(resp.SampleVms, sharedVMs...)
 	}
 
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
+	resp.Hosts = s.probeFencePostures(ctx, hosts)
+
 	// enforced_everywhere starts true and is cleared by any host that is not
 	// demonstrably enforcing. Unknown clears it exactly like "not enforcing"
 	// does: a diagnostic that cannot see a host's posture must not report the
 	// cluster clear on its behalf.
 	everywhere := len(hosts) > 0
-	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
-	for _, h := range hosts {
-		p := s.fenceHostPosture(ctx, h.Name)
+	for _, p := range resp.Hosts {
 		if !p.GetReachable() || !p.GetPostureKnown() || !p.GetEnforcing() {
 			everywhere = false
 		}
-		resp.Hosts = append(resp.Hosts, p)
 	}
 	resp.EnforcedEverywhere = everywhere
 	return resp, nil
+}
+
+// probeFencePostures asks every host for its posture, concurrently and under one
+// overall budget, returning results in the order given.
+//
+// The budget is the point: probes are independent, so running them serially
+// multiplies one slow host's timeout by the fleet size, and a caller deadline
+// tripping mid-sweep would fail the whole RPC instead of returning the per-host
+// detail that makes the report useful. A probe cut short by the budget lands as
+// unreachable — unknown, which clears readiness — never as covered.
+func (s *Server) probeFencePostures(ctx context.Context, hosts []corrosion.HostRecord) []*pb.FenceHostPosture {
+	probeCtx, cancel := context.WithTimeout(ctx, fenceReadinessTotalBudget)
+	defer cancel()
+
+	out := make([]*pb.FenceHostPosture, len(hosts))
+	sem := make(chan struct{}, fenceReadinessProbeWorkers)
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-probeCtx.Done():
+				out[i] = budgetExpiredPosture(name)
+				return
+			}
+			out[i] = s.fenceHostPosture(probeCtx, name)
+		}(i, h.Name)
+	}
+	wg.Wait()
+	return out
+}
+
+// budgetExpiredPosture is the answer for a host never probed because the report
+// budget ran out first. It is deliberately shaped like every other unknown: a
+// host nothing asked is not a host that answered.
+func budgetExpiredPosture(host string) *pb.FenceHostPosture {
+	return &pb.FenceHostPosture{
+		Host: host,
+		Detail: fmt.Sprintf("not probed: the %s report budget expired before this host's turn",
+			fenceReadinessTotalBudget),
+	}
 }
 
 // fenceHostPosture fresh-Pings one host for its own shared-storage-fence
@@ -123,6 +178,24 @@ func postureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
 		return &pb.FenceHostPosture{
 			Host: host, Reachable: true, PostureKnown: false,
 			Detail: "host runs a binary that does not report enforcement posture",
+		}
+	}
+
+	// not_enforcing is scoped to what the peer advertises, so a peer advertising
+	// NOTHING sends an empty list that says nothing about its kill-switches.
+	// That is not a hypothetical: advertisedCapabilities returns nothing at all
+	// for a self-fenced or WAL-quarantined node. Reading the absence of the token
+	// as "enforcing" would hand the most degraded node in the cluster the
+	// cleanest posture — the precise false all-clear this whole field exists to
+	// prevent. Require the peer to advertise the token before believing it acts
+	// on it.
+	if !slices.Contains(resp.GetCapabilities(), capabilities.SharedStorageFenceV1) {
+		detail := "host does not advertise shared_storage_fence_v1, so its posture cannot be read"
+		if resp.GetWalQuarantined() {
+			detail = "host is WAL-quarantined and advertising nothing"
+		}
+		return &pb.FenceHostPosture{
+			Host: host, Reachable: true, PostureKnown: false, Detail: detail,
 		}
 	}
 

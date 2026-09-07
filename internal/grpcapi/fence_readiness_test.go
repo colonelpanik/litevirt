@@ -126,6 +126,10 @@ func enforceEveryToken(s *Server) {
 // fully-enforcing node's is, so reading emptiness as "enforcing" would report a
 // host covered on the strength of a question it never answered — the exact
 // false all-clear this diagnostic exists to prevent.
+// advertisesFence is the minimum a peer must advertise for its posture to be
+// readable at all.
+var advertisesFence = []string{capabilities.SharedStorageFenceV1}
+
 func TestPostureFromPing_OldPeerSilenceIsUnknown(t *testing.T) {
 	for _, tc := range []struct {
 		name                     string
@@ -135,12 +139,21 @@ func TestPostureFromPing_OldPeerSilenceIsUnknown(t *testing.T) {
 		{"old binary: empty list, no flag",
 			&pb.PingResponse{}, false, false},
 		{"current binary, nothing unenforced",
-			&pb.PingResponse{PostureReported: true}, true, true},
+			&pb.PingResponse{PostureReported: true, Capabilities: advertisesFence}, true, true},
 		{"current binary, fence off",
-			&pb.PingResponse{PostureReported: true,
+			&pb.PingResponse{PostureReported: true, Capabilities: advertisesFence,
 				NotEnforcing: []string{capabilities.SharedStorageFenceV1}}, true, false},
-		{"current binary, a DIFFERENT token off",
+		// A self-fenced or WAL-quarantined node advertises NOTHING, so its
+		// not_enforcing list is empty for a reason that has nothing to do with
+		// its kill-switches. Reading that as "enforcing" would give the most
+		// degraded node the cleanest posture.
+		{"quarantined peer: advertises nothing, empty list",
+			&pb.PingResponse{PostureReported: true, WalQuarantined: true}, false, false},
+		{"peer advertises other tokens but not the fence",
 			&pb.PingResponse{PostureReported: true,
+				Capabilities: []string{capabilities.SafeFenceDefaultV1}}, false, false},
+		{"current binary, a DIFFERENT token off",
+			&pb.PingResponse{PostureReported: true, Capabilities: advertisesFence,
 				NotEnforcing: []string{capabilities.SafeFenceDefaultV1}}, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -254,5 +267,37 @@ func TestGetFenceReadiness_UnreachableHostIsNotAllClear(t *testing.T) {
 	if !ghost {
 		t.Error("the unreachable host is missing from the per-host report, so an operator " +
 			"cannot see which host is unaccounted for")
+	}
+}
+
+// TestProbeFencePostures_ExpiredBudgetYieldsUnknown pins the fan-out's failure
+// shape. Probes run concurrently under one overall budget so a large fleet of
+// unreachable hosts cannot multiply the per-peer timeout into a report the
+// caller's own deadline kills before it returns. When that budget is already
+// gone, every host must come back UNKNOWN — a host nothing asked is not a host
+// that answered — and readiness must not be reported as covered.
+func TestProbeFencePostures_ExpiredBudgetYieldsUnknown(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	hosts := []corrosion.HostRecord{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got := s.probeFencePostures(ctx, hosts)
+
+	if len(got) != len(hosts) {
+		t.Fatalf("got %d postures for %d hosts", len(got), len(hosts))
+	}
+	for i, p := range got {
+		if p == nil {
+			t.Fatalf("host %q has no posture entry: a missing entry reads as covered downstream", hosts[i].Name)
+		}
+		if p.GetHost() != hosts[i].Name {
+			t.Errorf("posture %d is for %q, want %q — results must stay aligned with the hosts asked",
+				i, p.GetHost(), hosts[i].Name)
+		}
+		if p.GetEnforcing() || p.GetPostureKnown() {
+			t.Errorf("%s: unprobed host reported enforcing=%v posture_known=%v, want both false",
+				p.GetHost(), p.GetEnforcing(), p.GetPostureKnown())
+		}
 	}
 }

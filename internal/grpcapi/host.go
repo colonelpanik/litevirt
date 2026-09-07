@@ -150,6 +150,19 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // wal_quarantined is: a node misreporting its posture would claim to enforce,
 // not to skip. It must stay diagnostic — no enforcement decision may read it,
 // in either direction.
+//
+// The list is scoped to what this node ADVERTISES, which has a consequence the
+// consumer must handle rather than this function: a self-fenced or
+// WAL-quarantined node advertises nothing, so its list is empty and says nothing
+// about its kill-switches. Reading that emptiness as "enforces everything" would
+// give exactly the most degraded node the cleanest posture. postureFromPing
+// therefore requires the peer to advertise the token before it will call it
+// enforcing.
+//
+// Scoping to Supported() instead would not fix that and would add noise:
+// tokenEnabled's default is false — correct fail-closed behaviour for the
+// decisions it actually gates — so every supported token with no kill-switch
+// case (hardware_v2 today) would be reported unenforced on every node forever.
 func (s *Server) notEnforcingTokens() []string {
 	advertised := s.advertisedCapabilities()
 	out := make([]string, 0, len(advertised))

@@ -222,6 +222,14 @@ Binding requires:
 While NetBox is unreachable, creating a VM on a bound network fails. Existing
 VMs are unaffected, and unbound networks are unaffected.
 
+`lv run` is the only path that claims an address, so the paths that would
+otherwise hand a guest an address litevirt never reserved are refused on a bound
+network: clone, live-restore, import, rebuild, and a renamed promote. Converting
+a VM to a **template** is refused too, for the opposite reason — a template is
+invisible to the inventory mirror, so the address it kept holding would be
+reclaimable by neither the mirror nor the orphan sweep. Detach the NIC first;
+that releases the address, and the conversion then goes through.
+
 ### Suspended bindings
 
 Bind-time validation is re-run continuously, because it goes stale: a prefix can

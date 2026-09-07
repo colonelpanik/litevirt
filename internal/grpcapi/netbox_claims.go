@@ -466,3 +466,68 @@ func (s *Server) refuseRebuildIfBound(ctx context.Context, vmName string) error 
 	}
 	return nil
 }
+
+// refuseTemplateIfBound refuses converting a VM that holds an address on a bound
+// network into a template.
+//
+// A template is INVISIBLE to the inventory mirror — desiredState skips it — so
+// the conversion hands the next sweep a delete: the `virtual_machine` object
+// goes, the `vminterface` under it cascades away, and the address is unassigned.
+// The local `ip_allocations` row, meanwhile, stays LIVE, because nothing in the
+// conversion releases anything.
+//
+// That is the one combination neither reclaim path can answer. The orphan
+// sweeper vetoes on the live lease, and vetoes CORRECTLY — a live lease is
+// litevirt still holding the address, and that veto is what protects a running
+// guest. The mirror cannot see the VM at all. What is left is an address
+// carrying this cluster's identity, assigned to nothing, named by no inventory
+// object, and held until an operator finds it by hand.
+//
+// REFUSED rather than released, and the ordering rule is why. Releasing would
+// have to free the address while the NIC row still names it: the row survives the
+// conversion (a template keeps its hardware, and `--revert` turns it back into a
+// startable VM), so a released address is one the cluster still names — and on
+// revert the guest would boot holding an address NetBox may have handed to
+// somebody else. Removing the NIC rows instead would make "mark this a template"
+// silently reconfigure the VM's hardware, and leave revert producing a VM with no
+// network. Never free what the cluster still names; refuse instead.
+//
+// The remedy in the message is a real one: detaching the NIC releases the lease
+// through the same single implementation every other release path uses, and the
+// conversion then goes through.
+//
+// Resolution runs through allocatorFor, so every refusal the selector already
+// makes is INHERITED — a suspended binding, a bound network on a node carrying no
+// NetBox client — exactly as in the sibling refusals above. The NIC list comes
+// from MergedVMNICs, not the stored spec, because a hot-attached NIC holds an
+// address long before any spec names it.
+func (s *Server) refuseTemplateIfBound(ctx context.Context, vmName string) error {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		// Fail closed: an unreadable NIC list means we do not know whether this
+		// VM holds an external address, and the next step makes it invisible to
+		// the mirror. Retryable — nothing has run yet.
+		return status.Errorf(codes.Internal,
+			"convert %s to a template: could not read its NICs to check for a NetBox-bound network (retry is safe): %v",
+			vmName, err)
+	}
+	seen := make(map[string]bool, len(nics))
+	for _, nic := range nics {
+		if nic.NetworkName == "" || seen[nic.NetworkName] {
+			continue
+		}
+		seen[nic.NetworkName] = true
+		alloc, _, aerr := s.allocatorFor(ctx, "vm", nic.NetworkName)
+		if aerr != nil {
+			return status.Errorf(codes.FailedPrecondition, "convert %s to a template: %v", vmName, aerr)
+		}
+		if alloc != nil {
+			return status.Errorf(codes.FailedPrecondition,
+				"converting to a template is not supported for a VM on the NetBox-bound network %q; "+
+					"detach that NIC first — a template is invisible to the inventory mirror, so its "+
+					"address would be left held by nothing and reclaimable by neither the mirror nor the sweep",
+				nic.NetworkName)
+		}
+	}
+	return nil
+}

@@ -2554,12 +2554,24 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 	// FAIL CLOSED on the read, which allocatorFor also does. The container guard
 	// was fail-open once: a swallowed error turned "could not read the record"
 	// into "this network names no prefix", and the write went ahead.
-	_, binding, err := s.allocatorFor(ctx, "vm", networkName)
+	alloc, binding, err := s.allocatorFor(ctx, "vm", networkName)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"cannot record an IP on network %q: %v", networkName, err)
 	}
-	if binding != nil {
+	if alloc != nil {
+		// Branched on the ALLOCATOR, as every other allocatorFor call site is.
+		// "An allocator was selected" is the question that means "these
+		// addresses are not the operator's to name"; the binding is what says
+		// WHICH prefix owns them. Branching on the binding alone would let an
+		// allocator paired with no binding through — the state CreateVM and the
+		// hotplug attach both treat as a fail-closed impossibility — and this
+		// call site would be the one that silently allowed it.
+		if binding == nil {
+			return nil, status.Errorf(codes.Internal,
+				"network %q: an address allocator was selected for a VM with no NetBox binding",
+				networkName)
+		}
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"network %q is bound to NetBox prefix %d, so its addresses are allocated and "+
 				"recorded in NetBox; recording an operator-chosen IP here would describe an "+

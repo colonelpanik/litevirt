@@ -403,6 +403,16 @@ skipped, and leaves `litevirt_netbox_mirror_last_success_seconds` standing still
 so the staleness alert fires. Set the name before the first sweep — changing it
 later strands everything written under the previous cluster.
 
+`netbox.cluster_name` **must be uniform cluster-wide**: identical on every node,
+or unset on every node. There is no latch mediating it the way there is for the
+`enforcement.*` flags, and the mirror sweeps from whichever node holds the
+`netbox` lease — so two values in one fleet duplicate the whole inventory into a
+second `virtualization.cluster` at the first handover, with nothing failing to
+say so. A node cannot read a peer's configured value; what makes a disagreement
+findable is the `netbox mirror: starting` line each node logs at startup, which
+names the cluster it would mirror into and the sweep cadence it will run at.
+Compare it across the fleet.
+
 **Two cadences.** A full sweep on the `netbox.sweep_interval_sec` cadence (900
 seconds by default) reconciles everything, and that is the correctness mechanism.
 Between sweeps the node holding the lease checks a local queue every 60 seconds

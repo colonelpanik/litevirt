@@ -27,9 +27,7 @@ import (
 // harness-driven pass would let one pass observe the other's half-resolved
 // state.
 func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
-	if interval <= 0 {
-		interval = defaultNetBoxSweepInterval
-	}
+	interval = effectiveNetBoxSweepInterval(interval)
 	return netboxsync.New(netboxsync.Options{
 		NetBox:      s.netbox,
 		DB:          s.db,
@@ -48,6 +46,23 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// across nodes. See netboxExclusivePass.
 		Exclusive: s.netboxExclusivePass,
 	})
+}
+
+// effectiveNetBoxSweepInterval is the cadence a mirror built with this argument
+// actually runs at.
+//
+// It exists so the normalisation has ONE home. `netbox.sweep_interval_sec`
+// defaults to 0, and every consumer of that zero has to reach the same answer:
+// the reconciler's cadence, the leader lease TTL sized from it, and the line
+// StartNetBoxMirror logs. The log was the one that did not — it printed the raw
+// argument, so an unset key read `sweep_interval=0s` while the mirror swept
+// every 15 minutes, which is exactly the logged-vs-used divergence these lines
+// exist to make findable.
+func effectiveNetBoxSweepInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return defaultNetBoxSweepInterval
+	}
+	return interval
 }
 
 // netboxExclusivePass runs one NetBox pass under this node's single-pass gate,
@@ -121,6 +136,10 @@ func (s *Server) StartNetBoxMirror(ctx context.Context, interval time.Duration) 
 	if s.netbox == nil || s.db == nil {
 		return false
 	}
+	// Normalised BEFORE the log line below, not only inside netboxMirror: an
+	// unset `netbox.sweep_interval_sec` arrives here as 0, and logging that
+	// would report a cadence no mirror ever runs at.
+	interval = effectiveNetBoxSweepInterval(interval)
 	// The NetBox cluster this node would mirror into, named ONCE at startup.
 	//
 	// `netbox.cluster_name` has to be uniform cluster-wide and has no latch to

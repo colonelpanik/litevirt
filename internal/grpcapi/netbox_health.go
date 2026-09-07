@@ -299,6 +299,19 @@ func (s *Server) evaluateNetBoxDiscoveryRefusals(ctx context.Context) {
 // second read it as pre-existing, so any evaluator would have reported the
 // opposite of what the next provision did.
 //
+// TWO PREDICATES, ONE FINDING, because the misconfiguration has two states and
+// the refusal can only speak for the first. The refusal does not fail the
+// placement — every caller logs it and creates the bridge itself — and once the
+// bridge exists the refusal correctly goes quiet, since a pre-existing bridge
+// gets no DHCP server. That is what made this finding SELF-CLEARING: a warning
+// appeared and resolved itself two passes later while a guest sat on an
+// uplink-less, gateway-less bridge holding a NetBox address. So a bridge that
+// exists here with no uplink — what a bridge litevirt auto-created for a
+// placement looks like — keeps the finding up through
+// network.BoundNetworkAutoBridgeFinding, and only the operator's actual
+// remedies clear it: an uplinked infrastructure bridge, or a definition litevirt
+// serves no DHCP for.
+//
 // Its blind spot, stated: it evaluates the OTHER host-local input
 // (IsGatewayHost) as false, because a bound network for which that input matters
 // — vxlan with a subnet — cannot exist. The bind refuses those cluster-wide, on
@@ -343,10 +356,22 @@ func (s *Server) evaluateNetBoxDHCPConflicts(ctx context.Context, bindings []cor
 		if bridge == "" {
 			bridge = b.Network
 		}
+		exists := s.bridgeExistsHere(bridge)
 		if rerr := network.BoundNetworkDHCPRefusal(def,
-			network.DHCPHostFacts{BridgePreExisted: s.bridgeExistsHere(bridge)},
+			network.DHCPHostFacts{BridgePreExisted: exists},
 			b.Network, bridge, s.hostName); rerr != nil {
 			reasons = append(reasons, rerr.Error())
+			continue
+		}
+		// The SECOND state of the same misconfiguration. The refusal above does
+		// not fail the placement — the caller creates the bridge itself — and
+		// once it exists the refusal is silent, because a pre-existing bridge
+		// genuinely gets no DHCP server. Nothing was fixed, so the finding must
+		// not clear: it re-states itself against what the bridge actually is.
+		if aerr := network.BoundNetworkAutoBridgeFinding(def,
+			exists, s.bridgeHasUplinkHere(bridge),
+			b.Network, bridge, s.hostName); aerr != nil {
+			reasons = append(reasons, aerr.Error())
 		}
 	}
 	if len(reasons) > 0 {

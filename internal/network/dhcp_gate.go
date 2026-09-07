@@ -219,12 +219,29 @@ func overlapReason(subnetCIDR, prefixCIDR string) (string, bool) {
 // server would serve it on a host observing f.
 //
 // hostName IS IN THE MESSAGE, and that is the point of the parameter. This
-// refusal surfaces as a VM placement failure on whichever node the scheduler
-// picked, and the remedy — "make sure the bridge exists there, or define the
-// network so litevirt serves no DHCP on it" — is not actionable without knowing
-// which node is missing the bridge. A message that said "this host" left the
-// operator to work that out from a log line on a node they had not been looking
-// at.
+// refusal surfaces on whichever node the scheduler picked, and the remedy —
+// "make sure the bridge exists there, or define the network so litevirt serves
+// no DHCP on it" — is not actionable without knowing which node is missing the
+// bridge. A message that said "this host" left the operator to work that out
+// from a log line on a node they had not been looking at.
+//
+// WHAT IT DOES NOT CLAIM, and used to. It said "until then no VM can be placed
+// on <host>". That was untrue, and it was untrue in the direction that costs an
+// operator time: EVERY caller of provisioning logs this refusal at warn level
+// and then carries on with the network name as the bridge — CreateVM,
+// clone-from-template, the reconciler restarting a VM after a failover, NIC
+// hot-attach — and the next thing each of them does is create that very bridge
+// through ensureBridge. So the placement SUCCEEDS, on the host the refusal
+// named, and what the guest gets is a bridge litevirt just made: no DHCP server
+// (that part of the refusal does hold), no uplink, no gateway, and a NetBox
+// address that routes nowhere.
+//
+// The refusal is still worth making and still worth reading — it is the only
+// thing that names the misconfiguration, and it is what the
+// netbox_dhcp_would_race health finding reports — but it must describe what
+// happens, so the message says the bridge gets created anyway. Making the
+// placement actually fail is a change to four callers' error handling on a
+// pre-existing path, and is deliberately not made here.
 func BoundNetworkDHCPRefusal(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, hostName string) error {
 	if def.NetBoxPrefixID == 0 || !DHCPWouldServe(def, f) {
 		return nil
@@ -233,12 +250,66 @@ func BoundNetworkDHCPRefusal(def compose.NetworkDef, f DHCPHostFacts, networkNam
 		"%w: network %q is bound to NetBox prefix %d, and provisioning it on host %s would start "+
 			"a DHCP server for subnet %s on bridge %s — dnsmasq would assign the gateway and "+
 			"lease a pool across that subnet with no row NetBox can see, so the two would hand "+
-			"the same addresses to different guests. Either create %s on %s (an infrastructure "+
-			"bridge litevirt did not make gets no DHCP server), or define the network so litevirt "+
-			"serves no DHCP on it at all: set a VLAN for a tagged physical network, use type "+
-			"direct, or drop the subnet. Until then no VM can be placed on %s",
+			"the same addresses to different guests. Either create %s on %s as an infrastructure "+
+			"bridge with an uplink (a bridge litevirt did not make gets no DHCP server), or define "+
+			"the network so litevirt serves no DHCP on it at all: set a VLAN for a tagged physical "+
+			"network, use type direct, or drop the subnet. THIS DOES NOT STOP A PLACEMENT: the "+
+			"caller logs this refusal and creates %s itself, so a guest placed on %s gets that "+
+			"bridge with no DHCP server, no uplink and no gateway while holding an address NetBox "+
+			"believes is routable",
 		ErrDHCPWouldRaceNetBox, networkName, def.NetBoxPrefixID, hostName, def.Subnet, bridge,
-		bridge, hostName, hostName)
+		bridge, hostName, bridge, hostName)
+}
+
+// BoundNetworkAutoBridgeFinding is the SECOND state of the same
+// misconfiguration: the bridge the refusal declined to create exists now,
+// because a placement created it.
+//
+// It exists because BoundNetworkDHCPRefusal cannot report that state and must
+// not. Provisioning asks "would I start dnsmasq here", and once the bridge
+// exists the honest answer is no — a pre-existing bridge gets no DHCP server,
+// which is the whole shape the refusal steers an operator towards. So the
+// refusal goes quiet, and the health finding built on it cleared itself two
+// passes later while nothing had been fixed.
+//
+// The three conditions, and why each is needed:
+//
+//   - the network is BOUND, so NetBox is the address authority and a guest here
+//     holds an address something else believes is routable;
+//   - the definition is one litevirt WOULD serve DHCP for had it created the
+//     bridge (DHCPWouldServe with BridgePreExisted false — the same predicate,
+//     not a copy). This is the part an operator fixes: a VLAN, type direct, no
+//     subnet, or unbinding all turn it off, and then this finding goes away
+//     whatever the bridge looks like;
+//   - the bridge that now exists has NO UPLINK. This is what separates the
+//     remedy from the symptom. An infrastructure bridge enslaves a NIC, a bond,
+//     a VLAN sub-interface or another bridge, so the router that owns the subnet
+//     is reachable and the definition works as documented. A bridge litevirt
+//     auto-created holds nothing but guest taps, so the guest has no gateway.
+//
+// Deliberately NOT called from Provision. Provisioning must keep succeeding on a
+// host whose bridge exists — that is the supported configuration — and turning
+// this into a provision-time refusal would fail placements on every correctly
+// configured host that happens to have a bridge litevirt itself made earlier.
+func BoundNetworkAutoBridgeFinding(def compose.NetworkDef, bridgeExists, bridgeHasUplink bool,
+	networkName, bridge, hostName string) error {
+	if def.NetBoxPrefixID == 0 || !bridgeExists || bridgeHasUplink {
+		return nil
+	}
+	if !DHCPWouldServe(def, DHCPHostFacts{BridgePreExisted: false}) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w: network %q is bound to NetBox prefix %d, and bridge %s on host %s has no uplink — "+
+			"nothing is enslaved to it that reaches the router for subnet %s, which is what a "+
+			"bridge litevirt created for a placement looks like. Provisioning refused to create "+
+			"it (litevirt would have started a DHCP server over the bound prefix) and the caller "+
+			"created it anyway, so a guest here has an address from NetBox, no DHCP server and no "+
+			"gateway. The definition is still unfixed: give %s an uplink on %s (a NIC, a bond, or "+
+			"a VLAN sub-interface), or define the network so litevirt serves no DHCP on it — set a "+
+			"VLAN, use type direct, or drop the subnet",
+		ErrDHCPWouldRaceNetBox, networkName, def.NetBoxPrefixID, bridge, hostName, def.Subnet,
+		bridge, hostName)
 }
 
 // startDHCPFor is the ONLY place Provision starts a DHCP server, and the second

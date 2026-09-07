@@ -279,9 +279,8 @@ speak for the rest. Two things follow:
   naming **that host**, the network, the prefix and the bridge. That is where the
   host-local fact is finally known, and it is what stops a node added later — or
   a node that never had the bridge — from standing up a second allocator over a
-  prefix NetBox believes it owns. The consequence is that a VM cannot be placed
-  on such a host until the definition is corrected; that is deliberate, and
-  better than two DHCP authorities on one subnet.
+  prefix NetBox believes it owns. No `dnsmasq` is started over the bound prefix
+  on any host, under any local state: that part is unconditional.
 
   The refusal happens **before** the bridge is created, so it is idempotent: a
   retry reads the same host state and refuses identically. (It used to create the
@@ -289,13 +288,27 @@ speak for the rest. Two things follow:
   concluded litevirt was not the DHCP authority, and provisioned with no DHCP
   server at all — guests with no addresses and no explanation.)
 
+  **It does not stop the placement.** Every caller of provisioning logs the
+  refusal and falls back to the network name as the bridge, then creates that
+  bridge itself — VM create, clone-from-template, the reconciler restarting a VM
+  after a failover, and NIC hot-attach all behave this way, and always have. So
+  a VM *is* placed on the host the refusal named, on a bridge litevirt just
+  made: no DHCP server, nothing enslaved to carry traffic off the host, and no
+  gateway, while the guest holds an address NetBox believes is routable. The
+  refusal's message says so. Fix the network definition — a bridge with no
+  uplink is not a working configuration for a bound network.
+
   It is also **discoverable before anybody hits it**. Every configured node
   checks its own bridge state against every bound network on each maintenance
-  pass and raises `netbox_dhcp_would_race` in `lv health` when it would refuse,
-  naming the network and both remedies: create the bridge on that host, or define
-  the network so litevirt serves no DHCP on it. The two remedies are
-  interchangeable — an infrastructure bridge litevirt did not create gets no DHCP
-  server, so making the bridge exist is enough.
+  pass and raises `netbox_dhcp_would_race` in `lv health`, naming the network
+  and both remedies: create an **uplinked** bridge on that host, or define the
+  network so litevirt serves no DHCP on it. The two remedies are interchangeable
+  — an infrastructure bridge litevirt did not create gets no DHCP server — but
+  the first one only counts if the bridge actually enslaves something (a NIC, a
+  bond, a VLAN sub-interface, another bridge). A bridge that exists and carries
+  nothing but guest taps is the one a placement auto-created, so the finding
+  **stays raised** on it rather than resolving itself while the guest sits
+  there with no route.
 
 ##### What this does NOT cover
 

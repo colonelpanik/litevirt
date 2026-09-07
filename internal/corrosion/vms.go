@@ -1013,7 +1013,30 @@ func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 			}
 		}
 	}
-	stmts := []Statement{vmsUpdate}
+	// Purge any TOMBSTONED rows already holding newName before the rekey takes
+	// it. `vms.name` is the PRIMARY KEY and DeleteVM soft-deletes, so a replaced
+	// VM's tombstone still occupies the key its replacement is about to take —
+	// which is exactly what `lv cutover` does, and every child table DeleteVM
+	// tombstones collides the same way on its own composite PK.
+	//
+	// full-state-delete-ok: this only drops ALREADY-tombstoned rows immediately
+	// before the rekey writes the live row under the same name, in ONE batch and
+	// with a newer updated_at, so the surviving row wins LWW and there is no
+	// cross-node resurrection window. Same rule and same reasoning as the
+	// same-name re-create purge in InsertVMWithHardware.
+	stmts := []Statement{
+		{SQL: `DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}}, // full-state-delete-ok
+		{SQL: `DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},      // full-state-delete-ok
+		// vm_nics needs no purge: its id is DeterministicNICID(vmName, mac), so
+		// after the rekey the surviving row and any tombstone sit under the same
+		// vm_name but different MACs — hence different ids, no PK collision. (And
+		// UpsertNIC is INSERT OR REPLACE regardless.) Every new replicated shape
+		// is a mixed-version liability, so this one is deliberately not added.
+		{SQL: `DELETE FROM vm_pci_intent WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},       // full-state-delete-ok
+		{SQL: `DELETE FROM vm_pci_realizations WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}}, // full-state-delete-ok
+		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},                    // full-state-delete-ok
+		vmsUpdate,
+	}
 	// vm_interfaces and vm_disks key on a COMPOSITE PK (vm_name + X) whose vm_name component
 	// is being rekeyed; row-scope them to full-PK statements so each is per-row LWW-gated on
 	// apply (a bulk WHERE vm_name = ? can't be). Enumerate the other PK component locally.

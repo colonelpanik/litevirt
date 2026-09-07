@@ -1032,3 +1032,89 @@ func TestInsertVMWithHardware_AdoptFalseLeavesPending(t *testing.T) {
 		t.Errorf("errReason = %q, want empty", errReason)
 	}
 }
+
+// TestRenameVMOntoATombstonedName is the cutover shape.
+//
+// `lv cutover` tombstones the VM being replaced and then renames its
+// replacement onto that name. `vms.name` is the PRIMARY KEY and DeleteVM is a
+// SOFT delete, so the tombstoned row still holds the key the rename needs — and
+// the rename runs AFTER the replaced VM's disks, firmware state and cloud-init
+// ISO are already gone. A collision here therefore destroys the original and
+// leaves the replacement stranded under its temporary name.
+//
+// Every pre-existing cutover test drives the case where the replaced VM does
+// not exist, which is why this went unnoticed.
+func TestRenameVMOntoATombstonedName(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	// Both carry children, because DeleteVM tombstones vm_interfaces and
+	// vm_disks too and each collides on its own composite PK during the rekey —
+	// the parent row is not the only thing holding the name.
+	replaced := VMRecord{Name: "app", HostName: "h1", Spec: `{"cpu":2}`, State: "running"}
+	if err := InsertVM(ctx, c,
+		replaced,
+		[]InterfaceRecord{{VMName: "app", NetworkName: "default", Ordinal: 0, MAC: "52:54:00:aa:bb:01"}},
+		[]DiskRecord{{VMName: "app", DiskName: "root", HostName: "h1", Path: "/disks/a.qcow2", SizeBytes: 1 << 30, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM replaced: %v", err)
+	}
+	replacement := VMRecord{Name: "app-next", HostName: "h1", Spec: `{"cpu":4}`, State: "running"}
+	if err := InsertVM(ctx, c,
+		replacement,
+		[]InterfaceRecord{{VMName: "app-next", NetworkName: "default", Ordinal: 0, MAC: "52:54:00:aa:bb:02"}},
+		[]DiskRecord{{VMName: "app-next", DiskName: "root", HostName: "h1", Path: "/disks/b.qcow2", SizeBytes: 1 << 30, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM replacement: %v", err)
+	}
+
+	// What cutover does immediately before the rename.
+	if err := DeleteVM(ctx, c, "app"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	if err := RenameVM(ctx, c, "app-next", "app"); err != nil {
+		t.Fatalf("RenameVM onto a tombstoned name: %v", err)
+	}
+
+	got, err := GetVM(ctx, c, "app")
+	if err != nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if got == nil {
+		t.Fatal("no live VM named \"app\" after the rename — the replacement did not take the name")
+	}
+	// RenameVM patches the spec's own "name" field, so compare the field that
+	// distinguishes the two incarnations rather than the whole document.
+	if !strings.Contains(got.Spec, `"cpu":4`) {
+		t.Fatalf("VM \"app\" carries spec %q, want the replacement's (cpu 4) — the tombstone was resurrected", got.Spec)
+	}
+	if gone, err := GetVM(ctx, c, "app-next"); err != nil {
+		t.Fatalf("GetVM old name: %v", err)
+	} else if gone != nil {
+		t.Fatal("the replacement is still live under its temporary name")
+	}
+
+	// The children must have moved too, and must be the REPLACEMENT's — a
+	// resurrected tombstone would show the replaced VM's MAC and disk path.
+	ifaces, err := GetVMInterfaces(ctx, c, "app")
+	if err != nil {
+		t.Fatalf("GetVMInterfaces: %v", err)
+	}
+	if len(ifaces) != 1 {
+		t.Fatalf("interfaces on \"app\" = %d, want 1", len(ifaces))
+	}
+	if ifaces[0].MAC != "52:54:00:aa:bb:02" {
+		t.Fatalf("interface MAC = %q, want the replacement's", ifaces[0].MAC)
+	}
+	disks, err := GetVMDisks(ctx, c, "app")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 {
+		t.Fatalf("disks on \"app\" = %d, want 1", len(disks))
+	}
+	if disks[0].Path != "/disks/b.qcow2" {
+		t.Fatalf("disk path = %q, want the replacement's", disks[0].Path)
+	}
+}

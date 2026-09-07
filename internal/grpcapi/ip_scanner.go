@@ -9,7 +9,6 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // IPScanner periodically discovers IPs for local VMs via ARP/DHCP and
@@ -45,6 +44,14 @@ func (s *IPScanner) Start(ctx context.Context) {
 	}
 }
 
+// ScanOnce runs exactly one discovery pass — what Start's ticker drives.
+//
+// Exported so the pass can be exercised without a 30-second wall-clock wait.
+// It is the only way to reach the discovery gate from outside this package: the
+// gate turns a discovered address into a NetBox claim, and a scenario about what
+// it refuses to record cannot be built out of RPCs alone.
+func (s *IPScanner) ScanOnce(ctx context.Context) { s.scan(ctx) }
+
 func (s *IPScanner) scan(ctx context.Context) {
 	s.scanVMs(ctx)
 	s.scanContainers(ctx)
@@ -65,19 +72,31 @@ func (s *IPScanner) scanVMs(ctx context.Context) {
 			if iface.IP != "" {
 				continue
 			}
-			ip := lv.GetIPFromARP(iface.MAC)
-			if ip == "" {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
-			}
+			ip := s.server.discoverNICAddress(iface.MAC)
 			if ip == "" {
 				continue
 			}
 
-			corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
-			slog.Debug("ip_scanner: discovered IP", "vm", vm.Name, "network", iface.NetworkName, "ip", ip)
+			// GATED, not written directly. On a NetBox-bound network the address
+			// is recorded only once NetBox has granted it to this NIC; on an
+			// unbound one this is the write it always was. See
+			// netbox_discovery.go — this tick is the pass that DOES claim, which
+			// is why the read RPCs can leave it to us.
+			recorded := s.server.claimAndRecordDiscoveredVMIP(ctx, &vm, iface.NetworkName, iface.MAC, ip)
+			slog.Debug("ip_scanner: discovered IP",
+				"vm", vm.Name, "network", iface.NetworkName, "ip", ip, "recorded", recorded)
 
-			// Update DNS record so VM is reachable by name.
-			if domain := s.server.dnsDomain; domain != "" {
+			// The FDB entry is deliberately OUTSIDE that gate, below: it maps a
+			// MAC to a VTEP and carries no address at all, so it is L2
+			// reachability for a guest that exists either way. Suppressing it
+			// would black-hole a running VM over an address bookkeeping dispute.
+
+			// Update DNS record so VM is reachable by name — but only for an
+			// address litevirt actually recorded. A DNS record asserts the same
+			// address to a second reader, so publishing one the NIC row was not
+			// allowed to carry would put the two records into exactly the
+			// disagreement the gate exists to prevent.
+			if domain := s.server.dnsDomain; recorded && domain != "" {
 				dnsName := dns.VMRecordName(vm.Name, vm.StackName, domain)
 				if err := dns.UpsertRecord(ctx, s.db, dnsName, ip); err != nil {
 					slog.Warn("ip_scanner: DNS upsert failed", "vm", vm.Name, "error", err)

@@ -77,6 +77,11 @@ type Server struct {
 	// before each write batch. nil in production; see SetNetBoxLeaseProbe.
 	nbLeaseProbe func(context.Context) bool
 
+	// nicIPDiscovery replaces the ARP / dnsmasq-lease lookup every discovery
+	// path uses to find the address a MAC is answering on. nil in production;
+	// see SetNICIPDiscovery.
+	nicIPDiscovery func(mac string) string
+
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
 	// cannot read a Prometheus counter in-process. Written only by the sweep,
@@ -1524,6 +1529,17 @@ type netboxMetrics interface {
 	// by this package — it is declared here because the whole sink is passed to
 	// it (network.apiErrorCounter is the narrower structural view).
 	IncAmbiguousClaim()
+	// IncUnclaimableDiscovery counts one address a guest was discovered USING
+	// that litevirt declined to record, because NetBox would not grant it on a
+	// bound network. Takes a BOUNDED reason, for the same cardinality reason as
+	// IncSweepSkipped.
+	//
+	// It is the only outward sign of the one collision litevirt cannot prevent:
+	// an external DHCP server handing a guest an address NetBox has already
+	// given to something else. Nothing repairs it automatically, and the address
+	// stays absent from the NIC row rather than being recorded as one litevirt
+	// holds — so without this counter the state is a log line and nothing else.
+	IncUnclaimableDiscovery(reason string)
 	// IncDuplicateObject counts one NetBox object found duplicated for a single
 	// litevirt identity, and deleted by the mirror. Emitted by
 	// internal/netboxsync, not by this package — declared here for the same
@@ -1556,6 +1572,8 @@ func (noopNetBoxMetrics) IncStuckLease()              {}
 func (noopNetBoxMetrics) IncBindingSuspended()        {}
 func (noopNetBoxMetrics) IncAmbiguousClaim()          {}
 func (noopNetBoxMetrics) IncDuplicateObject()         {}
+
+func (noopNetBoxMetrics) IncUnclaimableDiscovery(string) {}
 
 func (noopNetBoxMetrics) IncMirrorObject(_, _ string)    {}
 func (noopNetBoxMetrics) IncMirrorSweep(string)          {}

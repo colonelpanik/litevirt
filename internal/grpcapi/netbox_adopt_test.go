@@ -41,9 +41,16 @@ func newAdoptTestServer(t *testing.T) *Server {
 // network — the state a guest is in before anybody binds that subnet to NetBox.
 func seedVMHoldingIP(t *testing.T, s *Server, vmName, netName, mac, ip, uuid string) {
 	t.Helper()
+	seedVMInState(t, s, vmName, netName, mac, ip, uuid, "running")
+}
+
+// seedVMInState is seedVMHoldingIP with the RUN STATE spelled out, for the cases
+// whose whole subject is whether a guest is holding an address right now.
+func seedVMInState(t *testing.T, s *Server, vmName, netName, mac, ip, uuid, state string) {
+	t.Helper()
 	spec := fmt.Sprintf(`{"name":%q,"uuid":%q}`, vmName, uuid)
 	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
-		Name: vmName, HostName: "test-host", State: "running", Spec: spec,
+		Name: vmName, HostName: "test-host", State: state, Spec: spec,
 	}, []corrosion.InterfaceRecord{{
 		VMName: vmName, NetworkName: netName, MAC: mac, IP: ip,
 	}}, nil); err != nil {
@@ -226,5 +233,233 @@ func TestBindIgnoresAnAddressOutsideTheBoundPrefix(t *testing.T) {
 	}
 	if b.Suspended {
 		t.Fatalf("nothing was owed, so the binding must be live, reason: %q", b.SuspendReason)
+	}
+}
+
+// liveLeaseCount is how many LIVE ip_allocations rows a network has, asked with
+// its own query rather than through corrosion.ListLeasesByNetwork.
+//
+// The reader is what the refusal under test uses, so a precondition built on it
+// would move a failure onto the helper instead of onto the behaviour — and here
+// the precondition is the whole point: it is what proves the container route
+// below is NOT the lease route wearing a different hat.
+func liveLeaseCount(t *testing.T, s *Server, netName string) int {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(),
+		`SELECT COUNT(*) AS n FROM ip_allocations WHERE network = ? AND deleted_at IS NULL`, netName)
+	if err != nil {
+		t.Fatalf("count leases on %q: %v", netName, err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("count query returned no rows")
+	}
+	return rows[0].Int("n")
+}
+
+// TestBindRefusesAContainerNICOnASubnetLessNetwork is the DHCP-container route.
+//
+// A container on a SUBNET-LESS network takes no lease — the create path says so
+// itself ("a subnet-less network is DHCP (blank IP, no lease)") — so the
+// lease-based refusal never fires for one. Its address lands in
+// `container_interfaces.ip`, written by the IP scanner, and that is the third of
+// the three tables nicClaimTables enumerates as recording a NIC's MAC and IP.
+//
+// Seeded through corrosion.UpsertContainerInterface, the production writer the
+// migrate/restore/relocate paths use, and with the ZERO-LEASE precondition
+// asserted: without it this case would pass on the lease branch and prove
+// nothing about the table adoption never read.
+func TestBindRefusesAContainerNICOnASubnetLessNetwork(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "test-host", CtName: "ct-dhcp", NetworkName: "shared", Ordinal: 0,
+		MAC: "52:aa:bb:cc:dd:01", IP: "10.0.5.100",
+		VethDevice: corrosion.ContainerVethName("ct-dhcp", 0),
+	}); err != nil {
+		t.Fatalf("seed container NIC: %v", err)
+	}
+	if got := liveLeaseCount(t, s, "shared"); got != 0 {
+		t.Fatalf("precondition: a DHCP container holds NO lease, got %d rows — this case "+
+			"has to reach the refusal through container_interfaces, not through the lease table", got)
+	}
+
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	if err == nil {
+		t.Fatal("a network holding a container NIC must refuse the bind; binding it hands " +
+			"the container's address to the next VM created on the network")
+	}
+	if !strings.Contains(err.Error(), "ct-dhcp") {
+		t.Fatalf("the refusal must NAME the container so the operator can move it, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "10.0.5.100") {
+		t.Fatalf("the refusal must name the address the container holds, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "container") {
+		t.Fatalf("the refusal must say containers are the reason, got: %v", err)
+	}
+	assertNothingBound(t, s)
+}
+
+// TestBindRefusesAContainerNICWithNoRecordedAddress: the same NIC one scanner
+// tick EARLIER, while DHCP is still pending.
+//
+// The row exists and its `ip` is empty, and the guest may already hold an
+// address the scanner has not written yet. Refusing on the ROW rather than on
+// its address is what makes the container refusal complete instead of racing a
+// 30-second tick — and it is the right rule anyway, because a container is
+// unsupported on a bound network at any address.
+func TestBindRefusesAContainerNICWithNoRecordedAddress(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "test-host", CtName: "ct-pending", NetworkName: "shared", Ordinal: 0,
+		MAC: "52:aa:bb:cc:dd:02", IP: "",
+		VethDevice: corrosion.ContainerVethName("ct-pending", 0),
+	}); err != nil {
+		t.Fatalf("seed container NIC: %v", err)
+	}
+
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	if err == nil {
+		t.Fatal("a container NIC whose address is not recorded yet must still refuse the bind")
+	}
+	if !strings.Contains(err.Error(), "ct-pending") {
+		t.Fatalf("the refusal must name the container, got: %v", err)
+	}
+	assertNothingBound(t, s)
+}
+
+// TestBindIgnoresATombstonedContainerNIC is the negative control for the two
+// above: the refusal must read LIVE rows only.
+//
+// A container's delete cascade tombstones its NIC rows, and a refusal that
+// ignored `deleted_at` would make every network that ever hosted a container
+// permanently unbindable — with no command to clear it.
+func TestBindIgnoresATombstonedContainerNIC(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	if err := corrosion.UpsertContainerInterface(ctx, s.db, corrosion.ContainerInterfaceRecord{
+		HostName: "test-host", CtName: "ct-gone", NetworkName: "shared", Ordinal: 0,
+		MAC: "52:aa:bb:cc:dd:03", IP: "10.0.5.100",
+		VethDevice: corrosion.ContainerVethName("ct-gone", 0),
+	}); err != nil {
+		t.Fatalf("seed container NIC: %v", err)
+	}
+	// The production cascade, not a hand-rolled UPDATE.
+	if err := corrosion.DeleteContainerInterfaces(ctx, s.db, "test-host", "ct-gone"); err != nil {
+		t.Fatalf("tombstone container NICs: %v", err)
+	}
+
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+		t.Fatalf("a tombstoned container NIC must not refuse the bind: %v", err)
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || b.Suspended {
+		t.Fatalf("nothing was owed, so the binding must be live, got %+v", b)
+	}
+}
+
+// TestBindRefusesARunningVMWithNoRecordedAddress closes the fail-OPEN branch.
+//
+// An empty NIC IP was the one state planAdoption stepped over, and it is the
+// state that matters most: on an unbound network every VM created without an
+// explicit address has one, because VMs get no allocator there. There is
+// genuinely nothing to adopt for such a NIC — but the guest may be holding an
+// address inside the prefix that litevirt has never recorded, and NetBox is
+// about to offer that same address to the next VM.
+func TestBindRefusesARunningVMWithNoRecordedAddress(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	seedVMInState(t, s, "live-guest", "shared", "aa:bb:cc:00:01:01", "",
+		"55555555-5555-5555-5555-555555555555", "running")
+
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	if err == nil {
+		t.Fatal("a RUNNING VM whose NIC address litevirt has not recorded must refuse the bind")
+	}
+	if !strings.Contains(err.Error(), "live-guest") {
+		t.Fatalf("the refusal must name the VM, got: %v", err)
+	}
+	assertNothingBound(t, s)
+}
+
+// TestBindProceedsForAStoppedVMWithNoRecordedAddress is the other half of that
+// judgement, and the one that keeps the feature usable.
+//
+// A stopped guest holds no address right now, so there is nothing for NetBox to
+// collide with. Refusing here would refuse the bind on every stopped VM with an
+// unrecorded address — which on a real cluster is most of them — and the address
+// such a guest picks up when it is next started is caught by the discovery gate,
+// not by this check.
+func TestBindProceedsForAStoppedVMWithNoRecordedAddress(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	seedVMInState(t, s, "cold-guest", "shared", "aa:bb:cc:00:01:02", "",
+		"66666666-6666-6666-6666-666666666666", "stopped")
+
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+		t.Fatalf("a STOPPED VM with no recorded address must not refuse the bind: %v", err)
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b == nil || b.Suspended {
+		t.Fatalf("nothing was owed, so the binding must be live, got %+v", b)
+	}
+}
+
+// TestBindRefusesAVMWhoseRunStateIsNotProvablyStopped: the line is "provably
+// stopped", not "not running".
+//
+// `error`, `migrating`, `unknown` and an empty state all describe a VM whose
+// guest may well be up — a migrating one certainly is — so treating anything
+// that is merely != "running" as safe would step over exactly the guests this
+// check exists for. Only "stopped" is a positive statement that the guest holds
+// nothing.
+func TestBindRefusesAVMWhoseRunStateIsNotProvablyStopped(t *testing.T) {
+	for _, state := range []string{"migrating", "error", "starting", "stopping", "", "unknown"} {
+		t.Run("state="+state, func(t *testing.T) {
+			s := newAdoptTestServer(t)
+			seedVMInState(t, s, "odd-guest", "shared", "aa:bb:cc:00:01:03", "",
+				"77777777-7777-7777-7777-777777777777", state)
+
+			err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix)
+			if err == nil {
+				t.Fatalf("state %q is not a proof that the guest holds no address; the bind must refuse", state)
+			}
+			if !strings.Contains(err.Error(), "odd-guest") {
+				t.Fatalf("the refusal must name the VM, got: %v", err)
+			}
+			assertNothingBound(t, s)
+		})
+	}
+}
+
+// TestBindIgnoresAnUnrecordedNICOnAnotherNetwork is the scope control for the
+// unrecorded-address refusal: it must look only at NICs on the network being
+// bound. A VM elsewhere with an empty NIC address says nothing about this
+// prefix, and refusing on it would make the bind unusable for a reason that has
+// nothing to do with the prefix.
+func TestBindIgnoresAnUnrecordedNICOnAnotherNetwork(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	seedVMInState(t, s, "elsewhere-guest", "other-net", "aa:bb:cc:00:01:04", "",
+		"88888888-8888-8888-8888-888888888888", "running")
+
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+		t.Fatalf("an unrecorded NIC on ANOTHER network must not refuse this bind: %v", err)
+	}
+	if b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix); err != nil || b == nil || b.Suspended {
+		t.Fatalf("the binding must be live, got %+v (err %v)", b, err)
 	}
 }

@@ -29,9 +29,11 @@ var (
 	netboxStuckLeases       prometheus.Counter
 	netboxBindingsSuspended prometheus.Counter
 	netboxDuplicateObjects  prometheus.Counter
-	netboxMirrorObjects     *prometheus.CounterVec
-	netboxMirrorSweeps      *prometheus.CounterVec
-	netboxMirrorLastSuccess prometheus.Gauge
+
+	netboxUnclaimableDiscoveries *prometheus.CounterVec
+	netboxMirrorObjects          *prometheus.CounterVec
+	netboxMirrorSweeps           *prometheus.CounterVec
+	netboxMirrorLastSuccess      prometheus.Gauge
 )
 
 func netboxInit() {
@@ -71,6 +73,14 @@ func netboxInit() {
 			Name: "litevirt_netbox_duplicate_objects_total",
 			Help: "NetBox objects found duplicated for one litevirt identity by the inventory mirror.",
 		})
+		netboxUnclaimableDiscoveries = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_netbox_unclaimable_discoveries_total",
+			Help: "Addresses a guest was discovered USING on a bound network that litevirt " +
+				"declined to record, by bounded reason. reason=not_ours is the serious one: " +
+				"NetBox holds that address for something else, so two things are using it. " +
+				"Nothing repairs it automatically and the address is left off the NIC record " +
+				"rather than asserted as litevirt's.",
+		}, []string{"reason"})
 		netboxMirrorObjects = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_netbox_mirror_objects_total",
 			Help: "NetBox objects the inventory mirror WROTE, by object kind and operation. " +
@@ -91,7 +101,7 @@ func netboxInit() {
 			netboxAPIErrors, netboxAmbiguousClaims, netboxOrphansReclaimed,
 			netboxSweepsSkipped, netboxStuckLeases, netboxBindingsSuspended,
 			netboxDuplicateObjects, netboxMirrorObjects, netboxMirrorSweeps,
-			netboxMirrorLastSuccess,
+			netboxMirrorLastSuccess, netboxUnclaimableDiscoveries,
 		)
 		// Materialise the three error classes at zero so a dashboard shows the
 		// series before the first failure, and so rate() has a baseline.
@@ -169,6 +179,14 @@ func (*NetBoxMetrics) IncBindingSuspended() { netboxBindingsSuspended.Inc() }
 // IncDuplicateObject counts one NetBox object found duplicated for a single
 // litevirt identity by the inventory mirror, and deleted by the sweep.
 func (*NetBoxMetrics) IncDuplicateObject() { netboxDuplicateObjects.Inc() }
+
+// IncUnclaimableDiscovery counts one discovered address litevirt would not
+// record. The reason MUST come from the discovery gate's closed vocabulary —
+// never from an error string, which names a VM and an address and would make
+// this label unbounded.
+func (*NetBoxMetrics) IncUnclaimableDiscovery(reason string) {
+	netboxUnclaimableDiscoveries.WithLabelValues(reason).Inc()
+}
 
 // IncMirrorObject counts one NetBox object the mirror wrote. BOTH label values
 // come from the mirror's closed vocabularies — the NetBox object kind

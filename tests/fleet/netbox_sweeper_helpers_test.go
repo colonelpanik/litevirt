@@ -139,6 +139,7 @@ type sweepMetrics struct {
 	suspended   int
 	ambiguous   int
 	duplicates  int
+	unclaimable []string
 }
 
 func newSweepMetrics() *sweepMetrics { return &sweepMetrics{} }
@@ -192,6 +193,24 @@ func (m *sweepMetrics) IncAmbiguousClaim() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ambiguous++
+}
+
+// IncUnclaimableDiscovery records one address a guest was discovered using that
+// litevirt declined to record. Like the skip reasons above, this counter is the
+// ONLY signal the refusal produces: no error reaches any caller and the NIC row
+// simply stays empty.
+func (m *sweepMetrics) IncUnclaimableDiscovery(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unclaimable = append(m.unclaimable, reason)
+}
+
+// unclaimableDiscoveries is every reason this sink recorded a declined address
+// recording for.
+func (m *sweepMetrics) unclaimableDiscoveries() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.unclaimable...)
 }
 
 func (m *sweepMetrics) IncDuplicateObject() {

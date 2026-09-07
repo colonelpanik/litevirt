@@ -1102,13 +1102,17 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		for _, iface := range allIfaces[vm.Name] {
 			ip := iface.IP
 			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromARP(iface.MAC)
-			}
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
+				ip = s.discoverNICAddress(iface.MAC)
 			}
 			if ip != "" && ip != iface.IP {
-				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
+				// GATED. A read RPC persisting a discovered address is still a
+				// write, and on a bound network the same one SetVMIP refuses. It
+				// records on an unbound network exactly as before and records
+				// NOTHING on a bound one — it does not claim, because a list must
+				// not POST to NetBox once per undiscovered NIC. The IP scanner on
+				// this host covers the same population every 30 seconds. The
+				// address is still REPORTED below either way.
+				s.recordDiscoveredVMIPIfUnbound(ctx, &vm, iface.NetworkName, iface.MAC, ip)
 			}
 			pbVM.Interfaces = append(pbVM.Interfaces, &pb.VMInterface{
 				NetworkName: iface.NetworkName,
@@ -2007,14 +2011,13 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	for _, iface := range ifaces {
 		ip := iface.IP
 		if ip == "" && vm.HostName == s.hostName {
-			ip = lv.GetIPFromARP(iface.MAC)
+			ip = s.discoverNICAddress(iface.MAC)
 		}
-		if ip == "" && vm.HostName == s.hostName {
-			ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
-		}
-		// If we discovered a new IP, persist it.
+		// If we discovered a new IP, persist it — through the same gate ListVMs
+		// uses, and for the same reason (netbox_discovery.go): on a bound network
+		// this read RPC records nothing and leaves the claim to the IP scanner.
 		if ip != "" && ip != iface.IP {
-			corrosion.UpdateVMInterfaceIP(ctx, s.db, name, iface.NetworkName, ip)
+			s.recordDiscoveredVMIPIfUnbound(ctx, vm, iface.NetworkName, iface.MAC, ip)
 		}
 		pbVM.Interfaces = append(pbVM.Interfaces, &pb.VMInterface{
 			NetworkName: iface.NetworkName,

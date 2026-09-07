@@ -256,12 +256,47 @@ never offer an address it does not contain. Re-running a bind is safe: an addres
 litevirt has already recorded against that prefix is skipped, and issues no
 NetBox request at all.
 
+#### What is not adopted
+
+Adoption can only record an address litevirt actually **has** written down, so
+being explicit about the rest matters more than the happy path:
+
+- **A NIC with no recorded address is not adopted** — there is nothing to claim.
+  If its VM is anything other than **stopped**, the bind is **refused** instead:
+  that guest may already be using an address inside the prefix, and NetBox would
+  offer the same one to the next VM created here. Usually the fix is simply to
+  wait — the IP scanner records a running guest's DHCP address within 30 seconds,
+  and then the bind adopts it. Stopping the VM or detaching the NIC also clears
+  it.
+- **A stopped VM with no recorded address is stepped over**, and the bind
+  proceeds. Its guest is holding nothing right now, so there is nothing to
+  collide with, and refusing here would refuse the bind on almost every real
+  cluster. What covers it afterwards is the
+  [discovery gate](#addresses-discovered-after-the-bind): when it is next started
+  and its address is discovered, recording that address becomes a *claim*.
+- **A container's address is never adopted** — it refuses the bind, from any of
+  the places a container NIC is recorded (its address lease, or its managed NIC
+  row on a subnet-less/DHCP network where there is no lease at all). Containers
+  are not supported on a bound network, so an adopted container lease could never
+  be renegotiated.
+- **A legacy raw-bridge container NIC is invisible**, and cannot be otherwise. It
+  attaches to a host *device* rather than to a litevirt network, so litevirt
+  cannot attribute it to the network being bound, and a DHCP one records its
+  address nowhere at all. (A raw bridge that resolves to exactly one managed
+  network is *not* in this class: it becomes a managed NIC, and is then covered by
+  the refusal above.) Such a NIC is in the same position as any non-litevirt host
+  on the same L2 — a physical server, another hypervisor — and NetBox is the
+  authority for those: an `ip_address` object in NetBox is what keeps its address
+  out of `/available-ips/`. If you have raw-bridge containers or external hosts
+  sharing a bound prefix, record them in NetBox.
+
 Some states refuse the bind rather than being adopted around, and every refusal
 names the object so it can be dealt with:
 
 | State | Why it refuses | What to do |
 |---|---|---|
-| the network holds **container** address leases | containers are not supported on a bound network, so an adopted container would hold a lease it could never renegotiate, migrate or recreate | move the containers to another network, or delete them |
+| the network holds a **container** NIC or address lease | containers are not supported on a bound network, so an adopted container would hold a lease it could never renegotiate, migrate or recreate. A NIC row whose address is not discovered yet refuses too — the guest may already hold one | move the containers to another network, or delete them |
+| a VM that is **not stopped** has a NIC on the network with **no recorded address** | litevirt cannot tell NetBox what that guest is using, and NetBox would offer the same address to the next VM created here | let the address be discovered (30s), or record it, stop the VM, or detach the NIC |
 | a **template** holds an address inside the prefix | a template is invisible to the inventory mirror, so its address would be held by nothing and reclaimable by neither the mirror nor the orphan sweep — the same reason converting a bound-network VM to a template is refused | detach that NIC, or revert the template to a VM |
 | the address already exists in NetBox under **another identity** | it belongs to another litevirt installation (or to this one before a fingerprint move); taking it would seize another cluster's object | confirm who owns it; if it is genuinely stale, remove it in NetBox |
 | the address already exists in NetBox with **no litevirt identity** | an operator-created object or a reservation. litevirt will not stamp its identity onto a record it did not create — that identity is exactly what would later authorize the orphan sweep to delete it | remove the object in NetBox and let the bind create it, or move the workload off that address |
@@ -293,6 +328,34 @@ Resume completes exactly the work the failed pass left — the already-recorded
 addresses cost nothing — and lifts the suspension only once every one of them is
 in NetBox. A resume that still cannot finish refuses and the binding stays
 suspended. Deleting the network is the other way out: that releases the prefix.
+
+### Addresses discovered after the bind
+
+litevirt discovers addresses it did not allocate: the IP scanner reads the host's
+ARP cache and libvirt's DHCP leases every 30 seconds, and the load-balancer
+render does the same when it resolves backends. On an unbound network that
+discovery is simply recorded, and that is how every DHCP guest's address reaches
+the inventory.
+
+On a **bound** network it is a **claim**. The discovered address is recorded only
+once NetBox has granted it to that NIC — the same explicit-claim path `lv run`
+uses — because the NIC record is what cloud-init, the inventory mirror and every
+"is this address free" answer read, and a row litevirt wrote without holding the
+address describes something that is not true.
+
+If NetBox will not grant it, **nothing is recorded**: no NIC address, no DNS
+record. An `ERROR` is logged and
+`litevirt_netbox_unclaimable_discoveries_total{reason="not_ours"}` is
+incremented. That combination means what it says — a guest is using an address
+NetBox holds for something else, which is what an external DHCP server does when
+it re-offers a lease it remembers. litevirt cannot resolve that from here; move
+the guest off the address, or reconcile the NetBox object.
+
+The two **read** RPCs that also discover (`lv ls` and `lv inspect`, i.e. ListVMs
+and GetVM) still *report* the address — the guest is using it, and hiding it helps
+nobody — but they record nothing on a bound network and make no NetBox request.
+A list must not POST once per undiscovered NIC; the IP scanner on that same host
+covers the same guests within 30 seconds.
 
 ### Suspended bindings
 

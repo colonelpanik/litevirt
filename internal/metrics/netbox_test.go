@@ -42,6 +42,7 @@ func TestNetBoxMetricsRegistered(t *testing.T) {
 	m.IncSweepSkipped("host_unreachable")
 	m.IncStuckLease()
 	m.IncBindingSuspended()
+	m.IncUnclaimableDiscovery("not_ours")
 	m.IncMirrorObject("virtual_machine", "created")
 	m.IncMirrorSweep("ok")
 	m.SetMirrorLastSuccess(time.Now())
@@ -54,6 +55,7 @@ func TestNetBoxMetricsRegistered(t *testing.T) {
 		"litevirt_netbox_stuck_leases_total",
 		"litevirt_netbox_bindings_suspended_total",
 		"litevirt_netbox_duplicate_objects_total",
+		"litevirt_netbox_unclaimable_discoveries_total",
 		"litevirt_netbox_mirror_objects_total",
 		"litevirt_netbox_mirror_sweeps_total",
 		"litevirt_netbox_mirror_last_success_seconds",
@@ -93,6 +95,7 @@ func TestNetBoxMetricsSatisfiesTheServerSink(t *testing.T) {
 		IncStuckLease()
 		IncBindingSuspended()
 		IncAmbiguousClaim()
+		IncUnclaimableDiscovery(reason string)
 	}
 	var _ serverSink = NewNetBoxMetrics()
 }

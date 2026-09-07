@@ -35,6 +35,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/netbox"
 )
 
@@ -557,5 +558,95 @@ func TestFleetBindWithNothingToAdoptTouchesNoAddresses(t *testing.T) {
 	b := bindingFor(t, n)
 	if b == nil || b.Suspended {
 		t.Fatalf("a bind with nothing to adopt must be live immediately, got %+v", b)
+	}
+}
+
+// TestFleetBindRefusesADHCPContainerHoldingAnAddress is the container route,
+// end to end and entirely through production paths.
+//
+// A container on a SUBNET-LESS network is DHCP: the create path takes NO lease
+// ("blank IP, no lease"), so the bind's lease-based container refusal never
+// fires for one. Its live address arrives later, from the IP scanner, into
+// `container_interfaces.ip` — a table bind-time adoption did not read. Nothing
+// refused, nothing was adopted, the binding went live over an address a
+// container was holding, and NetBox offered it to the next VM.
+//
+// The address is 10.0.5.100 for the reason the whole file turns on: it is the
+// FIRST address the fake hands out, so with the refusal removed the very next
+// VM created here gets it.
+//
+// Every step is real — CreateContainer over gRPC, the IP scanner's own pass
+// against the container runtime, then the bind — with only the runtime's IP
+// report stubbed, which is what CTFake is for.
+func TestFleetBindRefusesADHCPContainerHoldingAnAddress(t *testing.T) {
+	_, c, n := adoptCluster(t)
+	ctx := context.Background()
+
+	// A SUBNET-LESS bridge network, which is what makes this DHCP. Seeded as a
+	// row rather than created through CreateNetwork because a bridge network is
+	// provisioned for real (`ip link add`) and the harness is unprivileged —
+	// the same reason mustCreateBoundNetwork uses sriov. Containers refuse
+	// sriov outright, so this scenario needs the bridge family.
+	if err := corrosion.UpsertNetwork(ctx, n.DB, corrosion.NetworkRecord{
+		Name: adoptNetName, Type: "bridge",
+		Config: `{"type":"bridge","interface":"br-adopt"}`,
+	}); err != nil {
+		t.Fatalf("seed subnet-less network: %v", err)
+	}
+
+	if _, err := c.SelfClient(n).CreateContainer(ctx, &pb.CreateContainerRequest{
+		HostName: n.Name, Name: "dhcp-ct", Template: "download",
+		Distro: "debian", Release: "bookworm", Arch: "amd64",
+		Cpu: 1, MemoryMib: 256,
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: adoptNetName}},
+	}); err != nil {
+		t.Fatalf("CreateContainer on a subnet-less network: %v", err)
+	}
+	// The precondition that makes this the container_interfaces route and not
+	// the lease route: a subnet-less network leases NOTHING.
+	if got := leaseCount(t, n, adoptNetName); got != 0 {
+		t.Fatalf("precondition: a DHCP container must hold no lease, got %d rows — this "+
+			"scenario has to reach the refusal through container_interfaces", got)
+	}
+
+	// The container comes up on the address, and the IP scanner records it —
+	// the production writer, driven by the production pass. Started first,
+	// because the scanner maintains RUNNING containers only.
+	if _, err := c.SelfClient(n).StartContainer(ctx, &pb.StartContainerRequest{
+		HostName: n.Name, Name: "dhcp-ct",
+	}); err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	n.CT.SetIP("dhcp-ct", adoptFirstIP)
+	grpcapi.NewIPScanner(n.Server).ScanOnce(ctx)
+	ifaces, err := corrosion.GetContainerInterfaces(ctx, n.DB, n.Name, "dhcp-ct")
+	if err != nil || len(ifaces) == 0 {
+		t.Fatalf("GetContainerInterfaces: %v (%d rows)", err, len(ifaces))
+	}
+	if ifaces[0].IP != adoptFirstIP {
+		t.Fatalf("precondition: the scanner recorded %q, want %s — without it the "+
+			"container holds no address anywhere and there is nothing to detect",
+			ifaces[0].IP, adoptFirstIP)
+	}
+
+	// Now the operator links the subnet.
+	err = relink(c, n, t)
+	if err == nil {
+		t.Fatalf("the bind SUCCEEDED over a container holding %s — NetBox would hand that "+
+			"same address to the next VM created on this network", adoptFirstIP)
+	}
+	if !strings.Contains(err.Error(), "dhcp-ct") {
+		t.Fatalf("the refusal must NAME the container so it can be moved, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), adoptFirstIP) {
+		t.Fatalf("the refusal must name the address, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "container") {
+		t.Fatalf("the refusal must say containers are the reason, got: %v", err)
+	}
+	// Decided from local rows alone, so it claimed nothing: no binding row at
+	// all, which is what lets the operator move the container and retry.
+	if b := bindingFor(t, n); b != nil {
+		t.Fatalf("a refusal decided from local rows must claim nothing, got %+v", b)
 	}
 }

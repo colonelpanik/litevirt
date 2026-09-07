@@ -140,6 +140,30 @@ func ListContainerInterfacesByHost(ctx context.Context, c *Client, hostName stri
 	return scanContainerInterfaces(rows), nil
 }
 
+// ListContainerInterfacesByNetwork returns every live container NIC attached to
+// one litevirt network, across the whole fleet.
+//
+// Deliberately NOT joined to `containers`, unlike the by-host reader above. The
+// caller is bind-time adoption, which asks "does anything still name an address
+// on this network" and must fail CLOSED: a NIC row that outlived its container
+// row (a half-finished delete leaves exactly that) still names the address, and
+// a join would report it free. It is the same rule the orphan proof's
+// nicClaimTables scan follows over this table — live rows, no join.
+//
+// Ordered so a refusal message naming the rows is stable across runs.
+func ListContainerInterfacesByNetwork(ctx context.Context, c *Client, netName string) ([]ContainerInterfaceRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, ct_name, network_name, ordinal, mac, ip, veth_device,
+		        COALESCE(security_groups, '') AS security_groups
+		 FROM container_interfaces
+		 WHERE network_name = ? AND deleted_at IS NULL
+		 ORDER BY host_name, ct_name, ordinal`, netName)
+	if err != nil {
+		return nil, err
+	}
+	return scanContainerInterfaces(rows), nil
+}
+
 func scanContainerInterfaces(rows []Row) []ContainerInterfaceRecord {
 	out := make([]ContainerInterfaceRecord, len(rows))
 	for i, r := range rows {

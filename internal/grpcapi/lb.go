@@ -164,16 +164,22 @@ func (s *Server) resolveStackBackends(ctx context.Context, stackName string, all
 			ip = iface.IP
 			// Live discovery only makes sense for a running VM.
 			if ip == "" && running && vm.HostName == s.hostName {
-				ip = lv.GetIPFromARP(iface.MAC)
-			}
-			if ip == "" && running && vm.HostName == s.hostName {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
+				ip = s.discoverNICAddress(iface.MAC)
 			}
 			if ip == "" && running && allowRemote && vm.HostName != s.hostName {
 				ip = s.remoteVMIP(ctx, vm.HostName, iface.MAC, iface.NetworkName)
 			}
 			if persist && running && ip != "" && ip != iface.IP {
-				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
+				// GATED (netbox_discovery.go). This is the render path — a
+				// background pass that already makes peer RPCs — so it is one of
+				// the two that may CLAIM: on a bound network the address is
+				// recorded only once NetBox grants it to this NIC.
+				//
+				// The backend list below is built from `ip` regardless. The guest
+				// is answering on that address whatever NetBox thinks, and
+				// refusing to route to a running backend would turn an address
+				// bookkeeping dispute into an outage.
+				s.claimAndRecordDiscoveredVMIP(ctx, &vm, iface.NetworkName, iface.MAC, ip)
 			}
 			if ip != "" {
 				break

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -38,6 +39,30 @@ import (
 // treats `ip_allocations` as the record of what litevirt has ALREADY accounted
 // for, which is the reverse of the obvious reading and the only one that reaches
 // the guests this exists to protect.
+//
+// WHAT IS NOT ADOPTED, which is the other half of being explicit about it:
+//
+//   - A CONTAINER's address, on any of the three tables that can hold one. It is
+//     not adopted at all — it REFUSES the bind — because a container is
+//     unsupported on a bound network, so an adopted container lease could never
+//     be renegotiated.
+//   - An address litevirt has not RECORDED. There is nothing to claim, so a NIC
+//     with no address refuses the bind while its guest is not provably stopped,
+//     and is stepped over when it is. See the empty-IP branch in planAdoption.
+//   - A legacy raw-bridge CONTAINER NIC, which is genuinely invisible: it names
+//     a host DEVICE rather than a litevirt network, so it has no
+//     container_interfaces row and no lease, and a DHCP one records its address
+//     nowhere at all. The narrow reason that is acceptable: a raw bridge that
+//     resolves to exactly one managed network is PROMOTED to a managed NIC by
+//     resolveContainerNICs, which gives it a row and puts it behind
+//     allocatorFor's refusal — so what is left is a NIC on a device litevirt
+//     cannot attribute to this network, in the same class as any non-litevirt
+//     host on the same L2. NetBox is the authority for those, and it excludes
+//     them from `/available-ips/` by holding an ip_address object for each. The
+//     two signals that could be guessed from instead are both unsound: bridge
+//     names are host-local (br0 on two hosts is two L2s), and matching on the
+//     address alone would refuse a bind over a container on an unrelated L2
+//     whose private range happens to overlap.
 //
 // ORDERING. The binding is created SUSPENDED whenever there is anything to
 // adopt, adoption runs, and only a pass that adopted EVERY address resumes it. A
@@ -187,9 +212,18 @@ func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.Binding
 // is returned for the same reason — an unreadable NIC list is not an empty one.
 //
 // It runs BEFORE the prefix is claimed as well as during the adoption itself.
-// The refusals it can make from local rows alone — a container lease, a
-// template, the cap — therefore cost a refused bind that claimed nothing, and
-// only the refusals that need NetBox leave a binding behind to resume.
+// The refusals it can make from local rows alone — a container NIC or lease, a
+// template, an unrecorded address on a live guest, the cap — therefore cost a
+// refused bind that claimed nothing, and only the refusals that need NetBox
+// leave a binding behind to resume.
+//
+// That pre-claim ordering is load-bearing for the unrecorded-address refusal in
+// particular. The remedy for it is usually "wait for the address to be
+// discovered", and discovery can only record an address while the network is
+// UNBOUND: on a bound network recording becomes a claim, and on a SUSPENDED one
+// allocatorFor refuses outright. A refusal that left a suspended binding behind
+// would therefore be a deadlock — the resume waiting for an address discovery
+// was no longer permitted to write.
 func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([]adoptCandidate, error) {
 	if b.ClusterFingerprint == "" {
 		// Every identity is built from it, and an identity without one names
@@ -227,10 +261,53 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 		}
 		byIP[l.IP] = l
 	}
+
+	// The lease table is not the only place a container's address lives, and for
+	// the shape an operator is most likely to bind it is not the place at all: a
+	// SUBNET-LESS network is DHCP, so the create path takes no lease ("blank IP,
+	// no lease" — resolveContainerNICs) and the live address is persisted by the
+	// IP scanner into `container_interfaces.ip` alone. A refusal that read only
+	// the leases called that address free while a row still named it, the bind
+	// went live, and NetBox handed the container's address to the next VM.
+	//
+	// This is the third of the three tables nicClaimTables (netbox_proof.go)
+	// enumerates as recording a NIC's MAC and IP, for exactly this reason. The
+	// other two — vm_nics and vm_interfaces — are the VM side, read below through
+	// MergedVMNICs.
+	//
+	// Refused on the ROW, not on its address, and so deliberately WITHOUT the
+	// `prefix.Contains` test the VM path applies:
+	//
+	//   - a container is unsupported on a bound network at ANY address
+	//     (allocatorFor refuses it outright), so its address is not what makes
+	//     this a problem — its presence is. The VM path tolerates an
+	//     out-of-prefix address because a VM on this network is legitimate and
+	//     NetBox will never offer an address the prefix does not contain; there
+	//     is no equivalent "legitimate" reading for a container.
+	//   - a row whose `ip` is still empty is a container whose DHCP has not been
+	//     discovered YET. The guest may already hold an address; the scanner
+	//     writes it on its next 30-second tick. Gating on the recorded address
+	//     would make this refusal a race against that tick.
+	ctNICs, cerr := corrosion.ListContainerInterfacesByNetwork(ctx, s.db, b.Network)
+	if cerr != nil {
+		return nil, fmt.Errorf("read container NICs on network %q: %w", b.Network, cerr)
+	}
+	for _, nic := range ctNICs {
+		held := nic.IP
+		if held == "" {
+			held = "an address litevirt has not discovered yet"
+		}
+		containers = append(containers,
+			fmt.Sprintf("%s on %s holds %s", nic.CtName, nic.HostName, held))
+	}
 	if len(containers) > 0 {
+		// Deduplicated: a container with BOTH a lease and a NIC row (the
+		// subnet-ful case) is named by both reads, and a refusal that listed it
+		// twice would read as two containers to move.
 		sort.Strings(containers)
+		containers = slices.Compact(containers)
 		return nil, adoptRefusef(
-			"network %q holds %d container address lease(s) — %v — and containers are not "+
+			"network %q holds %d container NIC(s)/address lease(s) — %v — and containers are not "+
 				"supported on a network bound to NetBox; move them to another network (or delete "+
 				"them) before binding prefix %d",
 			b.Network, len(containers), containers, b.PrefixID)
@@ -248,8 +325,47 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 			return nil, fmt.Errorf("read NICs of VM %s: %w", vm.Name, nerr)
 		}
 		for _, nic := range nics {
-			if nic.NetworkName != b.Network || nic.IP == "" {
+			if nic.NetworkName != b.Network {
 				continue
+			}
+			if nic.IP == "" {
+				// The one state that was stepped over, and the one that matters
+				// most: an address litevirt has NOT recorded is exactly the
+				// address NetBox is about to hand out, because `/available-ips/`
+				// means "no ip_address object exists" and nothing here can say
+				// otherwise. On an unbound network this population is large
+				// rather than exceptional — allocatorFor gives a VM no allocator
+				// there, so every VM created without an explicit address has an
+				// empty NIC IP.
+				//
+				// There is genuinely nothing to ADOPT: no address to claim, and
+				// an identity claiming nothing would be worse than no object.
+				// So the bind refuses, unless the guest is provably holding
+				// nothing.
+				//
+				// "Provably stopped", not "not running". A stopped VM's guest
+				// holds no address right now, so a bind over one collides with
+				// nothing and proceeding keeps the feature usable on a real
+				// cluster — refusing on every stopped VM with an unrecorded
+				// address would refuse nearly every bind. Every OTHER state is
+				// refused, including `error`, `migrating` and `unknown`: a
+				// migrating guest is certainly up, and the rest are the absence
+				// of a statement rather than a statement of absence.
+				//
+				// What covers the stopped VM afterwards is the discovery gate
+				// (netbox_discovery.go): when it is next started and its address
+				// is discovered, recording it becomes a CLAIM, and a claim NetBox
+				// will not grant is refused and surfaced instead of written.
+				if vm.State == "stopped" {
+					continue
+				}
+				return nil, adoptRefusef(
+					"network %q: VM %s (state %q) has a NIC (%s) on this network with no address "+
+						"recorded, so litevirt cannot tell NetBox what that guest is using — and "+
+						"NetBox would offer the same address to the next VM created here. Let the "+
+						"address be discovered (or record it, stop the VM, or detach the NIC) "+
+						"before binding prefix %d",
+					b.Network, vm.Name, vm.State, nic.MAC, b.PrefixID)
 			}
 			addr := net.ParseIP(nic.IP)
 			if addr == nil {

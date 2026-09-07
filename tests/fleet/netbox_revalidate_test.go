@@ -168,7 +168,7 @@ func TestBindingSuspendsOnCAReplacement(t *testing.T) {
 	n := c.Nodes[0]
 	mustCreateVMOnNetwork(t, c, n, "vm-1", orphanNetwork)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 
 	if _, err := createVMOnNetwork(c, n, "vm-2", orphanNetwork); err == nil {
@@ -180,7 +180,7 @@ func TestBindingSuspendsOnCAReplacement(t *testing.T) {
 		t.Fatalf("suspend reason = %q, want the re-key command an operator has to run", reason)
 	}
 	if !vmRunning(t, n, "vm-1") {
-		t.Fatal("a CA replacement must not disturb running VMs")
+		t.Fatal("a moved cluster fingerprint must not disturb running VMs")
 	}
 }
 
@@ -252,7 +252,7 @@ func TestRekeyRewritesIdentitiesAndResumes(t *testing.T) {
 		t.Fatalf("want exactly one identity before the re-key, got %v", before)
 	}
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 	mustRekey(t, c, n, orphanNetwork)
 
@@ -289,7 +289,7 @@ func TestRekeyPartialFailureLeavesBindingSuspended(t *testing.T) {
 	mustCreateVMOnNetwork(t, c, n, "vm-2", orphanNetwork)
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	mustRevalidate(t, n)
 
@@ -523,7 +523,7 @@ func TestRekeyRefusesToResumeWhileDrifted(t *testing.T) {
 	n := c.Nodes[0]
 	mustCreateVMOnNetwork(t, c, n, "vm-1", orphanNetwork)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	nb.RecidrPrefix(orphanPrefixID, "10.0.6.0/24") // a SECOND, unrelated drift
 	mustRevalidate(t, n)

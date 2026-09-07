@@ -72,8 +72,9 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		return fmt.Errorf("network %q is already bound to NetBox prefix %d", netName, bound.PrefixID)
 	}
 
-	// 6. Pin the fingerprint. Pinned, not recomputed: a CA replacement must
-	//    SUSPEND the binding rather than silently re-identify every object.
+	// 6. Pin the fingerprint. Pinned, not recomputed: a fingerprint that moved
+	//    must SUSPEND the binding rather than silently re-identify every object
+	//    litevirt already wrote under the old one.
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("derive cluster fingerprint: %w", err)

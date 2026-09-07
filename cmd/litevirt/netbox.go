@@ -25,15 +25,22 @@ func newNetboxCmd() *cobra.Command {
 func newNetboxRekeyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "rekey [network]",
-		Short: "Rewrite NetBox identities after a cluster CA replacement",
+		Short: "Re-stamp NetBox identities after the cluster fingerprint moved",
 		Long: `Rewrite the identities litevirt owns in NetBox.
 
 Every NetBox object litevirt creates is stamped with a fingerprint derived from
-the cluster CA certificate, which is what keeps two clusters sharing one NetBox
-from reclaiming each other's objects. Replacing the CA changes that fingerprint,
-so bindings suspend, new allocations refuse and the inventory mirror stops
-recognising what it wrote, until the existing objects are re-stamped. Running
-VMs are unaffected throughout.
+the cluster CA certificate recorded in the replicated 'cluster' row, which is
+what keeps two clusters sharing one NetBox from reclaiming each other's objects.
+That fingerprint is minted ONCE, from whichever node first found the row
+missing, and it never tracks 'ca.crt' again -- so replacing the CA on disk does
+not move it, does not suspend anything, and needs no re-key.
+
+This command is for a fingerprint that has genuinely moved: the value a binding
+recorded no longer equals the cluster's current one, which today means the
+'cluster' row itself was rewritten out of band -- an operator edit, or a restore
+carrying another installation's CA. Bindings then suspend, new allocations
+refuse and the inventory mirror stops recognising what it wrote, until the
+existing objects are re-stamped. Running VMs are unaffected throughout.
 
 With a NETWORK, it re-stamps that network's addresses, the mirrored VM and
 interface objects, and litevirt's local identity index -- in that order -- and
@@ -99,7 +106,7 @@ binding whose drift is still present is refused with the reason.
 
 Resume does NOT accept a changed CIDR. Re-CIDRing a bound prefix is unsupported:
 revert the CIDR in NetBox, or delete and recreate the network to bind against
-the new range. A suspension caused by a cluster CA replacement needs the
+the new range. A suspension caused by a moved cluster fingerprint needs the
 identity rewrite instead -- run ` + "`lv netbox rekey`" + `.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

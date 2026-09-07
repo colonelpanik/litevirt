@@ -480,14 +480,15 @@ state, not against the index, it searches by identity before creating anything,
 and an update re-records the mapping. The very next sweep re-adopts the object
 and writes the row again. No operator action, and no re-key.
 
-**It becomes a real gap only if that object is then orphaned by a CA
-replacement**, which is the one residual gap in the re-key. The searches are
-exact matches on the full identity, so once the fingerprint moves the mirror
-looks under the new one, finds nothing, and tries to create inventory NetBox
-already holds under the old — while the re-key cannot reach the object either,
-because it only rewrites fingerprints the local index records and this object's
-was never recorded. The symptom is a sweep that skips a VM, naming it as one
-whose name the NetBox cluster already holds under another identity.
+**It becomes a real gap only if the cluster fingerprint then moves**, which is
+the one residual gap in the re-key. (Replacing the CA does not move it — see
+above; it takes an out-of-band rewrite of the replicated `cluster` row.) The
+searches are exact matches on the full identity, so once the fingerprint moves
+the mirror looks under the new one, finds nothing, and tries to create inventory
+NetBox already holds under the old — while the re-key cannot reach the object
+either, because it only rewrites fingerprints the local index records and this
+object's was never recorded. The symptom is a sweep that skips a VM, naming it
+as one whose name the NetBox cluster already holds under another identity.
 
 That case fails closed by choice. Repairing it would mean rewriting an object the
 cluster cannot prove is its own, which in a shared NetBox is another cluster's

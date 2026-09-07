@@ -83,10 +83,10 @@ func TestRekeyRefusedWithoutTheLease(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 	if !bindingSuspended(t, n, orphanPrefixID) {
-		t.Fatal("precondition: a CA replacement must suspend the binding")
+		t.Fatal("precondition: a moved cluster fingerprint must suspend the binding")
 	}
 
 	// A peer holds the lease, and it has not expired: the mirror on that node
@@ -148,10 +148,10 @@ func TestRekeyInventoryOnlyTakesTheLeaseToo(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	if newFP == oldFP {
-		t.Fatal("the CA replacement did not change the fingerprint — the scenario would be vacuous")
+		t.Fatal("the cluster fingerprint did not move — the scenario would be vacuous")
 	}
 	assertNoBindings(t, n)
 
@@ -204,7 +204,7 @@ func TestRekeyAbortsIfItLosesTheLease(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	mustRevalidate(t, n)
 

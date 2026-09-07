@@ -1,16 +1,17 @@
-// Fleet scenarios for the CA re-key over INVENTORY objects.
+// Fleet scenarios for the identity re-key over INVENTORY objects.
 //
 // P1's re-key rewrote `ipam.ip-address` identities and nothing else, because VM
 // and interface objects did not exist yet. The identity is
 // `lv:<cluster-fingerprint>:<vm-uuid>:<mac>` and the fingerprint is derived from
-// the replicated cluster CA, so a CA replacement changes it on EVERY object
-// litevirt owns — the virtual_machine and vminterface objects the P2 mirror
-// writes included, and the local `netbox_objects` index whose litevirt_key IS
-// that identity string.
+// the CA certificate in the replicated `cluster` row, so a fingerprint that
+// moves moves on EVERY object litevirt owns — the virtual_machine and
+// vminterface objects the P2 mirror writes included, and the local
+// `netbox_objects` index whose litevirt_key IS that identity string. (Only an
+// out-of-band rewrite of that row moves it; see Cluster.MoveClusterFingerprint.)
 //
 // Three properties, and none of them is reachable from a single-package test
 // because each needs a real cluster fingerprint derived from a real replicated
-// CA row:
+// `cluster` row:
 //
 //   - the re-key rewrites inventory as well as addresses, so the next sweep
 //     still finds its own objects instead of trying to create a second set;
@@ -59,7 +60,7 @@ func mirroredCluster(t *testing.T, name string) (*NetBoxFake, *Cluster) {
 // component of its litevirt_key.
 //
 // The key is the identity string, so the local index carries the fingerprint
-// exactly as the NetBox objects do — and is stranded by a CA replacement in
+// exactly as the NetBox objects do — and is stranded by a fingerprint move in
 // exactly the same way.
 func objectRefFingerprints(t *testing.T, n *Node) map[string]int {
 	t.Helper()
@@ -116,7 +117,7 @@ func TestRekeyRewritesInventoryIdentitiesToo(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	mustRevalidate(t, n)
 	mustRekey(t, c, n, orphanNetwork)
@@ -179,7 +180,7 @@ func TestRekeyRewritesNetBoxBeforeTheLocalIndex(t *testing.T) {
 		t.Fatalf("precondition: want exactly one VM object to refuse, got %v", vmIDs)
 	}
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	mustRevalidate(t, n)
 
@@ -259,7 +260,7 @@ func TestRekeyLeavesAnotherClustersInventoryAlone(t *testing.T) {
 		t.Fatalf("precondition: want two of the second cluster's objects mirrored, got %v", got)
 	}
 
-	a.ReplaceClusterCA()
+	a.MoveClusterFingerprint()
 	newFPA := clusterFP(t, a.Nodes[0])
 	mustRevalidate(t, a.Nodes[0])
 	mustRekey(t, a, a.Nodes[0], orphanNetwork)

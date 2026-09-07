@@ -800,16 +800,22 @@ func (c *Cluster) wireNetBox(n *Node) {
 	n.Server.SetBridgeEnsure(func(string) error { return nil })
 }
 
-// ReplaceClusterCA rewrites cluster.ca_cert on EVERY node, modeling a cluster
-// CA replacement as the NetBox identity path sees one.
+// MoveClusterFingerprint rewrites cluster.ca_cert on EVERY node, which is the
+// ONLY thing that moves the cluster identity fingerprint.
+//
+// It is deliberately NOT named after a CA replacement.
+// corrosion.EnsureClusterRecord mints the fingerprint once and never rewrites
+// the row, so replacing `ca.crt` on disk does not reach it; the producible cause
+// is exactly what this helper does — an out-of-band rewrite of the replicated
+// row (an operator edit, or a restore carrying another installation's CA).
 //
 // No real TLS re-issue happens, and none is needed: corrosion.ClusterFingerprint
 // is a SHA-256 of that column, so ANY different string is a different cluster
 // identity. Re-minting the PKI would additionally invalidate every node
 // certificate the harness dials with — a second, unrelated failure that would
 // stop these scenarios reaching the binding logic at all. Every node is written
-// so the fleet stays uniform, exactly as a replicated CA row would be.
-func (c *Cluster) ReplaceClusterCA() {
+// so the fleet stays uniform, exactly as a replicated row would be.
+func (c *Cluster) MoveClusterFingerprint() {
 	c.t.Helper()
 	replacement := fmt.Sprintf("-----BEGIN CERTIFICATE-----\nreplacement-ca-%d\n-----END CERTIFICATE-----\n",
 		time.Now().UnixNano())
@@ -817,7 +823,7 @@ func (c *Cluster) ReplaceClusterCA() {
 		if err := n.DB.Execute(context.Background(),
 			`UPDATE cluster SET ca_cert = ?, updated_at = ? WHERE id = 'default'`,
 			replacement, n.DB.NowWall()); err != nil {
-			c.t.Fatalf("replace cluster CA on %s: %v", n.Name, err)
+			c.t.Fatalf("move the cluster fingerprint on %s: %v", n.Name, err)
 		}
 	}
 }

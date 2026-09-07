@@ -37,9 +37,10 @@ func (s *Server) RevalidateBindingsOnce(ctx context.Context) error {
 // A suspension is never lifted by this pass — an already-suspended binding is
 // skipped entirely — because the whole point is that litevirt stopped trusting
 // the binding, and only an operator says otherwise: `lv netbox resume` for a
-// binding that re-validates cleanly again, or `lv netbox rekey` when the CA
-// changed and the identity pin itself has to be rewritten (resume refuses that
-// case and names rekey).
+// binding that re-validates cleanly again, or `lv netbox rekey` when the
+// cluster's identity fingerprint has moved away from the binding's pin and the
+// objects carrying the old one have to be re-stamped (resume refuses that case
+// and names rekey).
 func (s *Server) revalidateBindings(ctx context.Context) error {
 	if s.db == nil || s.netbox == nil {
 		// A node with no NetBox configuration cannot read the facts a
@@ -82,14 +83,23 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 // intervenes, with nothing actually having changed. The failure is logged and
 // counted instead, and the next pass asks again.
 func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, liveFingerprint string) string {
-	// The PIN, not a recomputation. A CA replacement must be an operation, not a
-	// silent re-identification of every object litevirt has written: recomputing
-	// here would compare a value with itself, never disagree, and quietly leave
-	// every existing NetBox object stranded under an identity this cluster no
-	// longer recognises as its own.
+	// The PIN, not a recomputation. Recomputing here would compare a value with
+	// itself, never disagree, and quietly leave every existing NetBox object
+	// stranded under an identity this cluster no longer recognises as its own.
+	//
+	// What this branch is NOT is a CA-replacement detector. The fingerprint is
+	// minted once by corrosion.EnsureClusterRecord and deliberately never tracks
+	// `ca.crt`; nothing in production rewrites `cluster.ca_cert` afterwards. So a
+	// disagreement here means the replicated `cluster` row itself moved out of
+	// band — an operator edit, or a restore carrying another installation's CA —
+	// and the reason string says that rather than naming a cause an operator
+	// mid-incident would go looking for and never find.
 	if b.ClusterFingerprint != liveFingerprint {
 		return fmt.Sprintf(
-			"cluster CA changed; run `lv netbox rekey %s` to rewrite identities", b.Network)
+			"cluster identity fingerprint moved: this binding is pinned to %s and the cluster "+
+				"now derives %s from its replicated `cluster` row; run `lv netbox rekey %s` to "+
+				"re-stamp the objects still carrying the old one",
+			b.ClusterFingerprint, liveFingerprint, b.Network)
 	}
 
 	p, err := s.netbox.GetPrefix(ctx, b.PrefixID)
@@ -129,9 +139,9 @@ func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, li
 // cluster's CURRENT fingerprint, then resumes the binding IF nothing else is
 // wrong with it.
 //
-// A pinned fingerprint with no rotation path is an outage waiting for the first
-// CA replacement, so this is the operation that turns one into a chore. It
-// answers the fingerprint pin and only that: a binding that had also drifted in
+// A pinned fingerprint with no re-stamping path is an outage waiting for the
+// first fingerprint move, so this is the operation that turns one into a chore.
+// It answers the fingerprint pin and only that: a binding that had also drifted in
 // NetBox stays suspended under the remaining reason, for `lv netbox resume`
 // once an operator has repaired it.
 //
@@ -225,8 +235,9 @@ func (e leaseRefusedError) Error() string {
 	// NOT "retry": the holder RENEWS on every tick with a TTL of twice its
 	// interval, and acquireNetBoxLease refuses to steal an unexpired lease, so
 	// this refusal is permanent for as long as that node is up. Retrying here is
-	// waiting for something that does not happen — and this is the CA-rotation
-	// escape hatch, so while it is blocked every binding stays suspended and
+	// waiting for something that does not happen — and this is the only
+	// re-stamping path there is, so while it is blocked every binding stays
+	// suspended and
 	// every create on a bound network refuses. The name is only useful if the
 	// message says to go and use it.
 	return fmt.Sprintf("the netbox leader lease is held by %q, so nothing was rewritten;"+
@@ -397,9 +408,9 @@ func (s *Server) netBoxLeaseHolder(ctx context.Context) string {
 // It is idempotent and RESUMABLE. Objects already carrying the new fingerprint
 // no longer match the binding's (old) pin and are skipped, so a re-run finishes
 // exactly the work a failed run left. What it is not is safe to interleave with
-// a SECOND CA replacement: objects stamped with an intermediate fingerprint
-// match neither the old pin nor the new one. Finish a re-key before rotating
-// again.
+// a SECOND fingerprint move: objects stamped with an intermediate fingerprint
+// match neither the old pin nor the new one. Finish a re-key before the
+// fingerprint moves again.
 func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (rekeyCounts, error) {
 	var counts rekeyCounts
 	newFP, err := corrosion.ClusterFingerprint(ctx, s.db)
@@ -422,7 +433,8 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// is also what revalidation would do on its next pass; doing it here makes
 	// the re-key safe to run on its own, before any pass has noticed.
 	if b.ClusterFingerprint != newFP && !b.Suspended {
-		reason := fmt.Sprintf("cluster CA changed; re-key in progress for %s", b.Network)
+		reason := fmt.Sprintf(
+			"cluster identity fingerprint moved; re-key in progress for %s", b.Network)
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
 			return counts, fmt.Errorf("suspend binding %d before re-key: %w", b.PrefixID, err)
 		}
@@ -545,7 +557,7 @@ const rekeyInventoryTarget = "(inventory)"
 // StartNetBoxMirror asks for a NetBox client and nothing else, so a cluster with
 // no bound network is a supported configuration — and one the per-network form
 // cannot serve, because it takes its old-fingerprint pin from a binding row that
-// does not exist. A CA replacement there leaves every virtual_machine and
+// does not exist. A fingerprint move there leaves every virtual_machine and
 // vminterface carrying a fingerprint the cluster no longer answers to, and the
 // next sweep tries to duplicate the whole inventory into a NetBox cluster whose
 // VM names are already taken.
@@ -554,7 +566,7 @@ const rekeyInventoryTarget = "(inventory)"
 // `netbox_objects.litevirt_key` IS the identity string, and those rows are
 // written only by this cluster's own mirror into this cluster's own replicated
 // database — so any fingerprint appearing in one is provably ours, and needs no
-// binding to vouch for it. A CA replacement does not disturb the index either;
+// binding to vouch for it. A fingerprint move does not disturb the index either;
 // nothing rewrites it but recordRef and rekeyObjectIndex.
 //
 // What it must NEVER do is fall back to "rewrite anything that is not the
@@ -836,7 +848,7 @@ func (s *Server) rekeyObjectIndex(ctx context.Context, lease *rekeyLease, oldFP,
 			if !ok || cf != oldFP {
 				// Same pin as the NetBox side, and for the same reason: a row
 				// under an intermediate fingerprint belongs to a re-key that was
-				// interrupted by a second CA replacement, and guessing at it
+				// interrupted by a second fingerprint move, and guessing at it
 				// would orphan the object it names.
 				continue
 			}
@@ -908,7 +920,7 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 		return &emptypb.Empty{}, nil
 	}
 
-	// The LIVE fingerprint, so a CA replacement is still caught here and routed
+	// The LIVE fingerprint, so a moved fingerprint is still caught here and routed
 	// to the re-key that actually fixes it — the reason string already names it.
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {

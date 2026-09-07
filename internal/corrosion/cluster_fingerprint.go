@@ -40,9 +40,10 @@ func ClusterFingerprint(ctx context.Context, c *Client) (string, error) {
 // carries none.
 //
 // It is what an operator RECOGNISES, which is why the NetBox mirror names its
-// cluster object after it rather than after the fingerprint: the fingerprint is
-// derived from the CA certificate, so a CA replacement would change it and the
-// mirror would create a second, empty NetBox cluster and orphan the first.
+// cluster object after it rather than after the fingerprint: a fingerprint that
+// moved would point the mirror at a second, empty NetBox cluster and orphan the
+// first. (See EnsureClusterRecord — the fingerprint is minted once and does not
+// track `ca.crt`, so replacing the CA is not what moves it.)
 //
 // It is deliberately NOT an identity. Two installations can share a name, so
 // nothing may be SCOPED by it — object identity stays the fingerprint's job.

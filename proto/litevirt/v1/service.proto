@@ -2131,10 +2131,10 @@ service LiteVirt {
     rpc GetNetwork(GetNetworkRequest)         returns (NetworkInfo);
     rpc DeleteNetwork(DeleteNetworkRequest)   returns (google.protobuf.Empty);
     rpc ListNetworks(google.protobuf.Empty)   returns (ListNetworksResponse);
-    // RekeyBinding recovers a NetBox binding suspended by a cluster CA
-    // replacement: it rewrites every owned object's identity under the new
-    // fingerprint and resumes allocation. Idempotent and resumable — a partial
-    // rewrite leaves the binding suspended for the next run to finish.
+    // RekeyBinding recovers a NetBox binding suspended by a MOVED cluster
+    // identity fingerprint: it rewrites every owned object's identity under the
+    // new fingerprint and resumes allocation. Idempotent and resumable — a
+    // partial rewrite leaves the binding suspended for the next run to finish.
     rpc RekeyBinding(RekeyBindingRequest)     returns (google.protobuf.Empty);
     // ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
     // It re-runs the bind-time checks against the binding's pinned prefix facts

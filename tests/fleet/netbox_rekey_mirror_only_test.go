@@ -1,9 +1,9 @@
-// Fleet scenarios for the CLUSTER-SCOPED, network-less CA re-key.
+// Fleet scenarios for the CLUSTER-SCOPED, network-less identity re-key.
 //
 // `lv netbox rekey <network>` re-stamps identities under the fingerprint the
 // BINDING row recorded. A cluster that uses NetBox purely for INVENTORY has no
 // binding at all — StartNetBoxMirror needs a client and nothing else — so that
-// form has nothing to look up and refuses. A CA replacement there makes every
+// form has nothing to look up and refuses. A fingerprint move there makes every
 // virtual_machine and vminterface unfindable by identity, and the next sweep
 // tries to duplicate the whole inventory into a cluster whose VM names are
 // already taken.
@@ -191,7 +191,7 @@ func seedForeignVM(t *testing.T, nb *NetBoxFake, n *Node, name string) (id int, 
 //
 // The per-network form looks its pin up by network and refuses an unbound one,
 // so before this there was no command at all for a cluster that mirrors
-// inventory without binding a prefix. A CA replacement left every object
+// inventory without binding a prefix. A fingerprint move left every object
 // carrying a fingerprint the cluster no longer answers to: BuildActual filters
 // actual state by identity, so the next sweep sees an empty cluster, emits a
 // create for everything, and is refused by NetBox's per-cluster VM-name
@@ -201,10 +201,10 @@ func TestRekeyInventoryWithNoBindings(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	if newFP == oldFP {
-		t.Fatal("the CA replacement did not change the fingerprint — the scenario would be vacuous")
+		t.Fatal("the cluster fingerprint did not move — the scenario would be vacuous")
 	}
 
 	mustRekeyInventoryOnly(t, c, n)
@@ -260,7 +260,7 @@ func TestRekeyInventoryDerivesThePinFromTheLocalIndex(t *testing.T) {
 
 	foreignID, foreignIdentity := seedForeignVM(t, nb, n, "vm-elsewhere")
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 
 	mustRekeyInventoryOnly(t, c, n)
@@ -307,7 +307,7 @@ func TestRekeyInventoryLeavesAnotherClustersObjectsAlone(t *testing.T) {
 		t.Fatalf("precondition: want two of the second cluster's objects mirrored, got %v", got)
 	}
 
-	a.ReplaceClusterCA()
+	a.MoveClusterFingerprint()
 	newFPA := clusterFP(t, a.Nodes[0])
 	mustRekeyInventoryOnly(t, a, a.Nodes[0])
 
@@ -341,7 +341,7 @@ func TestRekeyInventoryOnAConsistentClusterChangesNothing(t *testing.T) {
 
 	foreignID, foreignIdentity := seedForeignVM(t, nb, n, "vm-elsewhere")
 
-	// No CA replacement: every index row already carries the live fingerprint.
+	// No fingerprint move: every index row already carries the live fingerprint.
 	before := nb.PatchCount()
 	mustRekeyInventoryOnly(t, c, n)
 
@@ -384,7 +384,7 @@ func TestRekeyInventoryOnlyRewritesNetBoxBeforeTheLocalIndex(t *testing.T) {
 		t.Fatalf("precondition: want exactly one VM object to refuse, got %v", vmIDs)
 	}
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 
 	// A DEFINITE refusal on the VM object only — the inventory rewrite stops on
@@ -445,7 +445,7 @@ func TestRekeyInventoryRepairsAnAlreadyAdvancedPin(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 
 	// The state that build left: the pin advanced and the binding live, with
@@ -495,7 +495,7 @@ func TestRekeyInventoryRefusedWithNoLocalIndex(t *testing.T) {
 	c := mirrorOnlyClusterOn(t, nb, "")
 	n := c.Nodes[0]
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 
 	err := rekeyInventoryOnly(c, n)
 	if err == nil {
@@ -525,11 +525,11 @@ func TestRekeyWithANetworkStillRekeysThatBinding(t *testing.T) {
 	n := c.Nodes[0]
 	oldFP := clusterFP(t, n)
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	newFP := clusterFP(t, n)
 	mustRevalidate(t, n)
 	if !bindingSuspended(t, n, orphanPrefixID) {
-		t.Fatal("precondition: a CA replacement must suspend the binding")
+		t.Fatal("precondition: a moved cluster fingerprint must suspend the binding")
 	}
 
 	mustRekey(t, c, n, orphanNetwork)

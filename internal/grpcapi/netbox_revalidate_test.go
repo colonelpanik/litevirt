@@ -31,9 +31,18 @@ func liveFingerprint(t *testing.T, s *Server) string {
 	return fp
 }
 
-// TestBindingDriftFingerprintMismatchNamesTheRekey pins BOTH halves of the pin:
-// the comparison is against the RECORDED fingerprint, and the reason tells the
-// operator the one command that resolves it.
+// TestBindingDriftFingerprintMismatchNamesTheRekey pins all three halves of the
+// pin: the comparison is against the RECORDED fingerprint, the reason tells the
+// operator the one command that resolves it, and it states a cause production
+// can actually produce.
+//
+// That last one is not cosmetic. This string is PERSISTED to
+// netbox_bindings.suspend_reason and is what an operator reads mid-incident —
+// through every allocation refusal, every ResumeBinding refusal, and the durable
+// health-condition evidence `lv health` prints. The fingerprint is minted ONCE by
+// corrosion.EnsureClusterRecord and deliberately never tracks `ca.crt`, and
+// nothing in production rewrites `cluster.ca_cert` after that heal, so blaming a
+// CA replacement sends the operator looking for a cause that cannot exist.
 func TestBindingDriftFingerprintMismatchNamesTheRekey(t *testing.T) {
 	s := newTestServerWithNetBox(t, fakeNetBox{
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
@@ -45,6 +54,20 @@ func TestBindingDriftFingerprintMismatchNamesTheRekey(t *testing.T) {
 	}
 	if !strings.Contains(reason, "netbox rekey") {
 		t.Fatalf("reason = %q, want the re-key command", reason)
+	}
+	if !strings.Contains(reason, "fingerprint moved") {
+		t.Fatalf("reason = %q, want the moved fingerprint named as the cause", reason)
+	}
+	if !strings.Contains(reason, "an-older-ca") {
+		t.Fatalf("reason = %q, want the fingerprint the binding is pinned to", reason)
+	}
+	lower := strings.ToLower(reason)
+	for _, blame := range []string{"ca changed", "ca replac", "ca rotat", "ca was"} {
+		if strings.Contains(lower, blame) {
+			t.Fatalf("reason = %q blames the cluster CA — replacing it cannot move the "+
+				"fingerprint, so this sends an operator after a cause production cannot produce",
+				reason)
+		}
 	}
 }
 
@@ -109,7 +132,8 @@ func TestRevalidateSuspendsTheDriftedRow(t *testing.T) {
 	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	// The CA is replaced under the binding's feet; the pin no longer matches.
+	// The replicated `cluster` row is rewritten out of band — the only thing that
+	// moves the fingerprint — so the binding's pin no longer matches.
 	if err := s.db.Execute(ctx, `UPDATE cluster SET ca_cert = ? WHERE id = 'default'`,
 		"a-different-ca-cert"); err != nil {
 		t.Fatalf("replace ca_cert: %v", err)
@@ -525,7 +549,7 @@ func TestRekeyRefusedWithoutTheLease(t *testing.T) {
 		t.Fatalf("bind: %v", err)
 	}
 	seedObjectRefs(t, s, leaseFingerprint)
-	// The CA is replaced under the binding's feet, so the pin is stale and the
+	// The replicated `cluster` row is rewritten out of band, so the pin is stale and the
 	// re-key has a reason to suspend before it rewrites.
 	if err := s.db.Execute(ctx, `UPDATE cluster SET ca_cert = ? WHERE id = 'default'`,
 		"a-different-ca-cert"); err != nil {

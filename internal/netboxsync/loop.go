@@ -377,12 +377,13 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 		// Diff has already withheld every action for these VMs. What is left is
 		// to say so: the mirror cannot represent them, and it will not be able
 		// to until the operator gives one of the two installations a NetBox
-		// cluster of its own — or, if this is the aftermath of a CA
-		// replacement, until `lv netbox rekey` re-stamps the objects that still
-		// carry the old fingerprint.
+		// cluster of its own — or, if these objects are this cluster's own
+		// stranded under a fingerprint it has moved away from, until
+		// `lv netbox rekey` re-stamps them.
 		slog.Warn("netbox mirror: skipping VMs whose names this NetBox cluster already holds "+
 			"under another identity; set netbox.cluster_name to give this installation a "+
-			"cluster of its own, or run `lv netbox rekey` if this cluster's CA was replaced",
+			"cluster of its own, or run `lv netbox rekey` if they are this cluster's own "+
+			"objects left under a fingerprint it has moved away from",
 			"vms", collided, "netbox_cluster", r.clusterID)
 		converged = false
 	}
@@ -714,10 +715,11 @@ func ClusterName(ctx context.Context, db *corrosion.Client, override string) (st
 // ensureCluster resolves the NetBox cluster every mirrored VM belongs to,
 // creating the cluster and its type on first use.
 //
-// Named after the operator's own cluster name, never after the fingerprint: the
-// fingerprint is derived from the CA certificate, so a CA replacement would
-// point the mirror at a NEW cluster object and orphan everything under the old
-// one. Two installations sharing a name therefore share a cluster object, and that
+// Named after the operator's own cluster name, never after the fingerprint: a
+// fingerprint that moved would point the mirror at a NEW cluster object and
+// orphan everything under the old one. (The fingerprint is minted once and does
+// not track `ca.crt` — see corrosion.EnsureClusterRecord — so replacing the CA
+// is not what moves it.) Two installations sharing a name therefore share a cluster object, and that
 // is NOT harmless: a NetBox cluster is the scope in which NetBox enforces one VM
 // name per cluster, so the two share the namespace their VM names live in. The
 // delete half is safe — every object is scoped by the identity fingerprint,

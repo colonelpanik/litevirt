@@ -9,8 +9,9 @@
 //     interval, so it never expires while the leader is alive, and
 //     acquireNetBoxLease refuses to steal an unexpired one. A message telling
 //     the operator to retry describes something that cannot happen — and this is
-//     the mandatory CA-rotation escape hatch, so while it is blocked every
-//     binding stays suspended and every create on a bound network refuses.
+//     the only path there is for re-stamping a moved fingerprint, so while it is
+//     blocked every binding stays suspended and every create on a bound network
+//     refuses.
 //
 //   - On the LEADER — the only node where it can succeed — the lease excludes
 //     NOTHING. The re-key renews the same holder name the mirror wrote, so the
@@ -42,7 +43,7 @@ func TestRekeyRefusalSaysWhereToRunIt(t *testing.T) {
 	_, c := mirroredCluster(t, "vm-1")
 	n := c.Nodes[0]
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 
 	stealNetBoxLease(t, n, "another-node")
@@ -86,7 +87,7 @@ func TestRekeyRefusedWhileAMirrorSweepRunsOnTheSameNode(t *testing.T) {
 	for i := 0; i < vms; i++ {
 		mustCreateVM(t, n, vmName(i), orphanNetwork)
 	}
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 
 	var once sync.Once
@@ -189,7 +190,7 @@ func TestAMirrorSweepFiredInsideARekeyIsExcluded(t *testing.T) {
 		t.Fatalf("precondition: %d VMs mirrored, want %d", got, vms)
 	}
 
-	c.ReplaceClusterCA()
+	c.MoveClusterFingerprint()
 	mustRevalidate(t, n)
 
 	m := &mirrorSweepCounter{sweepMetrics: newSweepMetrics()}

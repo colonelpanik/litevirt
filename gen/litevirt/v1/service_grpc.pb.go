@@ -384,10 +384,10 @@ type LiteVirtClient interface {
 	GetNetwork(ctx context.Context, in *GetNetworkRequest, opts ...grpc.CallOption) (*NetworkInfo, error)
 	DeleteNetwork(ctx context.Context, in *DeleteNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListNetworks(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListNetworksResponse, error)
-	// RekeyBinding recovers a NetBox binding suspended by a cluster CA
-	// replacement: it rewrites every owned object's identity under the new
-	// fingerprint and resumes allocation. Idempotent and resumable — a partial
-	// rewrite leaves the binding suspended for the next run to finish.
+	// RekeyBinding recovers a NetBox binding suspended by a MOVED cluster
+	// identity fingerprint: it rewrites every owned object's identity under the
+	// new fingerprint and resumes allocation. Idempotent and resumable — a
+	// partial rewrite leaves the binding suspended for the next run to finish.
 	RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
 	// It re-runs the bind-time checks against the binding's pinned prefix facts
@@ -3430,10 +3430,10 @@ type LiteVirtServer interface {
 	GetNetwork(context.Context, *GetNetworkRequest) (*NetworkInfo, error)
 	DeleteNetwork(context.Context, *DeleteNetworkRequest) (*emptypb.Empty, error)
 	ListNetworks(context.Context, *emptypb.Empty) (*ListNetworksResponse, error)
-	// RekeyBinding recovers a NetBox binding suspended by a cluster CA
-	// replacement: it rewrites every owned object's identity under the new
-	// fingerprint and resumes allocation. Idempotent and resumable — a partial
-	// rewrite leaves the binding suspended for the next run to finish.
+	// RekeyBinding recovers a NetBox binding suspended by a MOVED cluster
+	// identity fingerprint: it rewrites every owned object's identity under the
+	// new fingerprint and resumes allocation. Idempotent and resumable — a
+	// partial rewrite leaves the binding suspended for the next run to finish.
 	RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error)
 	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
 	// It re-runs the bind-time checks against the binding's pinned prefix facts

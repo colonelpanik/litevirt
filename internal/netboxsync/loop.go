@@ -493,11 +493,15 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 // level down, where a `vms` row that replicated ahead of its `vm_interfaces`
 // rows leaves a mirrored VM with every interface deleted out from under it.
 //
-// Nothing else stands in the way, either. Such a node reclaims the shared
-// `netbox` lease immediately, derives a fingerprint from the locally-healed
-// cluster record, and re-latches the capability within seconds of starting; the
-// only remaining brake is the first sweep tick, which is a delay and not a
-// proof.
+// Nothing else stands in the way, either — only a DELAY. Such a node derives a
+// fingerprint from the locally-healed cluster record and re-latches the
+// capability on its own, and the lease is no obstacle: it is a shared lease any
+// configured node may take, and this one takes it on its FIRST SWEEP TICK, one
+// interval after start (15 minutes by default; see Run, which deliberately runs
+// no pass at startup, and pollQueue, which acquires nothing at all). A wait is
+// not a proof — it is the same duration whether the database has hydrated or
+// not, and a node slow enough to still be replicating at the next tick gets no
+// second grace period.
 //
 // So the rule the empty read already obeys is applied PER OBJECT: a removal needs
 // positive local evidence that the thing it takes away is genuinely gone, and the
@@ -601,7 +605,14 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 }
 
 // destructive reports whether an action TAKES something away. The two ops are
-// the delete and the clear; withoutDestructive filters on the same pair.
+// the delete and the clear.
+//
+// This is the ONLY spelling of that pair: hasRemovals, withoutUnprovenRemovals
+// and withoutDestructive all call it rather than re-testing the ops, so the
+// per-object gate and the whole-list drop cannot come to disagree about what
+// they cover. A third destructive op therefore reaches both gates the moment it
+// is added here — and provenRemovable fails it closed until someone gives it an
+// evidence question.
 func destructive(a Action) bool { return a.Op == "delete" || a.Op == "clear" }
 
 // provenRemovable reports whether the local database holds a record — live or
@@ -667,10 +678,15 @@ func hasRemovals(actions []Action) bool {
 // phase is a scheduling boundary, and one skipped by a flag is one a later
 // ordering change can quietly reintroduce. An action that does not exist cannot
 // run, whatever the phase runner does with it.
+//
+// It calls destructive rather than re-spelling the op pair, so the whole-list
+// drop and the per-object gate cannot disagree about what "destructive" means:
+// an op added to one and not the other is how this gate would develop a hole
+// that every test still passes over.
 func withoutDestructive(actions []Action) ([]Action, int) {
 	kept := make([]Action, 0, len(actions))
 	for _, a := range actions {
-		if a.Op == "delete" || a.Op == "clear" {
+		if destructive(a) {
 			continue
 		}
 		kept = append(kept, a)

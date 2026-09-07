@@ -120,6 +120,128 @@ func TestDetachedMACStaysProvableAfterReattach(t *testing.T) {
 	}
 }
 
+// TestBridgedNICIDsStayMACDerived is the TRIPWIRE under the mitigation above,
+// and the assertion it makes is the one the test before it cannot.
+//
+// TestDetachedMACStaysProvableAfterReattach hand-derives both `vm_nics` ids with
+// DeterministicNICID, so it asserts the CONSEQUENCE of the id being MAC-derived
+// while baking that premise into its own fixture. Re-key production ids on
+// something a re-attach PRESERVES — (vm_name, network_name), or the ordinal — and
+// it stays green while the mitigation collapses underneath it: the re-attach
+// would resolve to the same `vm_nics` key, and UpsertNIC is an INSERT OR REPLACE
+// that clears deleted_at, so it would resurrect the row in place and take the old
+// MAC's tombstone with it, exactly as `vm_interfaces` already does.
+//
+// This test therefore names DeterministicNICID nowhere and takes every id from
+// production. It drives the legacy→v42 bridge, which derives the id itself
+// (GetVMNICsRaw's `vm_interfaces` projection), over the same detach-and-re-attach
+// on ONE network — same network name, same ordinal, fresh MAC, which is the only
+// field that changes. Two rows out means the derivation still separates the two
+// incarnations; one row out means it does not.
+//
+// It guards a derivation twelve production construction sites share and none of
+// them checks, and it is a fair proxy for all of them: they mint the id the same
+// way, from (vm name, MAC), so the property is the helper's, not the call site's.
+func TestBridgedNICIDsStayMACDerived(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	// A legacy-only NIC — what an old peer writes mid-rolling-upgrade — bridged
+	// into vm_nics, which is where the id gets derived.
+	if err := InsertInterface(ctx, c, InterfaceRecord{
+		VMName: "vm-1", NetworkName: "net-a", Ordinal: 0, MAC: evidenceMACFirst,
+	}); err != nil {
+		t.Fatalf("InsertInterface(first): %v", err)
+	}
+	if err := BridgeVMNICs(ctx, c, "vm-1"); err != nil {
+		t.Fatalf("BridgeVMNICs(first): %v", err)
+	}
+	if rows := nicRows(t, c); len(rows) != 1 {
+		t.Fatalf("the bridge produced %d vm_nics rows for one legacy NIC, want 1: %v", len(rows), rows)
+	}
+
+	// Detach, and let the bridge carry the tombstone across.
+	if err := SoftDeleteInterfaceByMAC(ctx, c, "vm-1", evidenceMACFirst); err != nil {
+		t.Fatalf("SoftDeleteInterfaceByMAC: %v", err)
+	}
+	if err := BridgeVMNICs(ctx, c, "vm-1"); err != nil {
+		t.Fatalf("BridgeVMNICs(detach): %v", err)
+	}
+
+	// Re-attach on the SAME network and ordinal with the fresh MAC an attach
+	// always gets. This overwrites the legacy row in place — see the test above
+	// — so from here only vm_nics can carry the old MAC.
+	if err := InsertInterface(ctx, c, InterfaceRecord{
+		VMName: "vm-1", NetworkName: "net-a", Ordinal: 0, MAC: evidenceMACSecond,
+	}); err != nil {
+		t.Fatalf("InsertInterface(second): %v", err)
+	}
+	if err := BridgeVMNICs(ctx, c, "vm-1"); err != nil {
+		t.Fatalf("BridgeVMNICs(reattach): %v", err)
+	}
+
+	rows := nicRows(t, c)
+	if len(rows) != 2 {
+		t.Fatalf("vm_nics holds %d rows after a detach-and-re-attach on one network, want 2: %v.\n"+
+			"One row means the two incarnations shared an id, so UpsertNIC resurrected the "+
+			"tombstone in place. `vm_nics.id` MUST stay derived from the MAC (DeterministicNICID): "+
+			"an id keyed on anything a re-attach preserves — the network name, the ordinal — "+
+			"collapses the only evidence a detached NIC leaves, and the NetBox mirror then "+
+			"withholds that interface's delete on every sweep forever", len(rows), rows)
+	}
+	byMAC := map[string]nicRow{}
+	for _, r := range rows {
+		byMAC[r.mac] = r
+	}
+	old, oldOK := byMAC[evidenceMACFirst]
+	live, liveOK := byMAC[evidenceMACSecond]
+	if !oldOK || !liveOK {
+		t.Fatalf("want one row per MAC, got %v", rows)
+	}
+	if old.id == live.id {
+		t.Fatalf("both incarnations derived id %q — the id is not MAC-derived", old.id)
+	}
+	if old.deletedAt == "" {
+		t.Fatalf("the detached NIC's row is live: %v", old)
+	}
+	if live.deletedAt != "" {
+		t.Fatalf("the re-attached NIC's row is tombstoned: %v", live)
+	}
+
+	// And the point of all of it: the detached MAC is still provable, so the
+	// mirror may retire its NetBox interface.
+	known, err := ReadMirrorEvidence(ctx, c)
+	if err != nil {
+		t.Fatalf("ReadMirrorEvidence: %v", err)
+	}
+	if !known.KnowsNIC("vm-1", evidenceMACFirst) {
+		t.Fatal("the detached MAC is unprovable after a bridged re-attach")
+	}
+}
+
+// nicRow is one raw `vm_nics` row, read straight from the table so the ids under
+// test are production's and not the caller's.
+type nicRow struct {
+	id, mac, deletedAt string
+}
+
+func nicRows(t *testing.T, c *Client) []nicRow {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT id, mac, COALESCE(deleted_at, '') AS deleted_at
+		   FROM vm_nics WHERE vm_name = 'vm-1' ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read vm_nics: %v", err)
+	}
+	out := make([]nicRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, nicRow{
+			id: r.String("id"), mac: r.String("mac"), deletedAt: r.String("deleted_at"),
+		})
+	}
+	return out
+}
+
 // TestKnowsAddressNeedsALeaseRecord pins the clear half's evidence: a lease row
 // of ANY kind naming a NetBox address proves it, and nothing else does.
 //

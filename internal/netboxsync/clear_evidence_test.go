@@ -48,6 +48,9 @@ const (
 	clearMAC2  = "52:54:00:dd:00:02"
 	clearMAC3  = "52:54:00:dd:00:03"
 	clearStale = "10.0.7.99"
+	// A second stale address, deliberately WITHOUT a lease record of any kind —
+	// the permanently unprovable clear the mixed-pass test below needs.
+	clearOrphan = "10.0.7.98"
 )
 
 // clearFixture is three mirrored VMs, one NIC each, each NIC holding one
@@ -253,5 +256,76 @@ func TestProvenStaleAddressIsClearedWhenNothingIsWithheld(t *testing.T) {
 	got := cleared(nb)
 	if len(got) != 1 || got[0] != 99 {
 		t.Fatalf("cleared %v, want exactly the address whose lease this cluster released", got)
+	}
+}
+
+// TestMixedClearsWithholdOnlyTheUnprovableOne pins the ASYMMETRY between the two
+// withheld ops, and nothing else in this package does.
+//
+// The whole-pass rule above is deliberately ONE-DIRECTIONAL: a withheld delete
+// withholds the clears, but a withheld CLEAR does not escalate to the whole
+// destructive list. The reasoning is on the `unprovenDeletes > 0` branch in
+// Reconciler.sweep, and it is not a simplification — a withheld clear proves only
+// that `ip_allocations` is partial, which says nothing about the three tables
+// DELETE evidence reads. Escalating it would therefore protect no delete and no
+// other clear, while letting ONE permanently-unprovable address withhold every
+// clear in the cluster for as long as it exists.
+//
+// Every other clear test here is all-unprovable or all-provable, and neither
+// shape can tell per-object withholding from whole-list escalation: rewriting
+// that branch to the symmetric `unprovenDeletes+unprovenClears > 0` leaves all of
+// them green. This pass is MIXED — two stale addresses on one interface, one
+// carrying the released-lease tombstone that proves it and one with no lease
+// record at all — so "the provable clear still runs" is the assertion, and the
+// symmetric form is what fails it.
+//
+// The unprovable address is the shape an operator produces by hand: a NetBox
+// object assigned to a litevirt-owned interface that this cluster never leased.
+// No sweep can ever prove it, which is exactly why it must not be allowed to hold
+// the other clear hostage.
+func TestMixedClearsWithholdOnlyTheUnprovableOne(t *testing.T) {
+	// Hydrated on BOTH halves, so the pass computes no delete at all and
+	// deleteBlocker has nothing to say. The only destructive actions here are
+	// the two clears below — which is what isolates the per-object rule.
+	nb, r := clearFixture(t, true, true)
+	fp := mustFingerprint(t, r)
+
+	// PROVABLE: this cluster leased address 99 and released it through the
+	// production path, so a tombstone retaining netbox_ip_id 99 is right there.
+	nb.listIPs = append(nb.listIPs, netbox.IPAddress{
+		ID: 99, Address: clearStale + "/24", AssignedObjectID: 21,
+		Identity: netbox.Identity(fp, "uuid-1", clearMAC1),
+	})
+	seedReleasedLease(t, r, clearStale, clearMAC1, "vm-1", 99)
+
+	// UNPROVABLE: no `ip_allocations` row of any kind names address 98. Same
+	// interface as the provable one, so both are computed by the same diff and
+	// run in the same phase of the same pass.
+	nb.listIPs = append(nb.listIPs, netbox.IPAddress{
+		ID: 98, Address: clearOrphan + "/24", AssignedObjectID: 21,
+		Identity: netbox.Identity(fp, "uuid-1", clearMAC1),
+	})
+
+	if err := r.SyncOnce(context.Background()); err != nil {
+		t.Fatalf("the sweep must still run its non-destructive phases: %v", err)
+	}
+
+	got := cleared(nb)
+	if len(got) != 1 || got[0] != 99 {
+		t.Fatalf("cleared %v, want exactly [99]. An unprovable clear must withhold ITSELF and "+
+			"nothing else. An EMPTY list here means the `unprovenDeletes > 0` branch in "+
+			"Reconciler.sweep has been made symmetric over clears: that asymmetry is deliberate, "+
+			"because a withheld clear proves only that `ip_allocations` is partial — which says "+
+			"nothing about the tables delete evidence reads — so escalating it protects no delete "+
+			"and no other clear, and lets one permanently-unprovable address withhold every clear "+
+			"in the cluster forever", got)
+	}
+
+	// The pass computed no delete at all, so nothing may have been retired: the
+	// assertion above must not be satisfiable by a pass that skipped the gate
+	// and ran the whole destructive half unfiltered.
+	vms, ifaces := deletes(nb)
+	if len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("a pass that computed no delete retired VMs %v and interfaces %v", vms, ifaces)
 	}
 }

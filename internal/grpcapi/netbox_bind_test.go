@@ -13,10 +13,24 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/netbox"
 )
+
+// noDHCPNetworkDef is the network definition every bind test that is NOT about
+// the DHCP refusal binds. It records NO SUBNET, which is a claim and not a
+// convenience: litevirt starts dnsmasq only for a network with a subnet, so this
+// def is the one shape check 2b provably passes over. Spelling it at every call
+// site keeps the hazard input visible — a fixture that defaulted it would make
+// every one of these tests silently assert the safe branch, which is exactly how
+// TestExplicitClaimCrossChecksAndRefusesDisagreement came to pass for the wrong
+// reason.
+//
+// The refusal's own scenarios are in netbox_dhcp_bind_test.go and pass real
+// subnets.
+var noDHCPNetworkDef = compose.NetworkDef{Type: "bridge", Interface: "lv-bind-test"}
 
 // netboxPrefix is the fake's canned answer for GET /api/ipam/prefixes/{id}/.
 type netboxPrefix struct {
@@ -133,7 +147,7 @@ func TestBindRefusesGlobalTablePrefix(t *testing.T) {
 	s := newTestServerWithNetBox(t, fakeNetBox{
 		prefix: netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 0}, // no VRF
 	})
-	err := s.validateAndBindPrefix(context.Background(), "net-a", 7)
+	err := s.validateAndBindPrefix(context.Background(), "net-a", 7, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("want refusal for a global-table prefix")
 	}
@@ -150,7 +164,7 @@ func TestBindRefusesVRFWithoutUniqueness(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: false,
 	})
-	err := s.validateAndBindPrefix(context.Background(), "net-a", 7)
+	err := s.validateAndBindPrefix(context.Background(), "net-a", 7, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("want refusal when the VRF does not enforce uniqueness")
 	}
@@ -162,10 +176,10 @@ func TestBindRefusesSecondNetworkOnSamePrefix(t *testing.T) {
 		enforceUnique: true,
 	})
 	ctx := context.Background()
-	if err := s.validateAndBindPrefix(ctx, "net-a", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "net-a", 7, noDHCPNetworkDef); err != nil {
 		t.Fatal(err)
 	}
-	err := s.validateAndBindPrefix(ctx, "net-b", 7)
+	err := s.validateAndBindPrefix(ctx, "net-b", 7, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("want refusal: one litevirt network per NetBox prefix")
 	}
@@ -186,8 +200,8 @@ func TestConcurrentBindsDoNotStealThePrefix(t *testing.T) {
 	ctx := context.Background()
 	errA := make(chan error, 1)
 	errB := make(chan error, 1)
-	go func() { errA <- s.validateAndBindPrefix(ctx, "net-a", 7) }()
-	go func() { errB <- s.validateAndBindPrefix(ctx, "net-b", 7) }()
+	go func() { errA <- s.validateAndBindPrefix(ctx, "net-a", 7, noDHCPNetworkDef) }()
+	go func() { errB <- s.validateAndBindPrefix(ctx, "net-b", 7, noDHCPNetworkDef) }()
 	a, b := <-errA, <-errB
 	if (a == nil) == (b == nil) {
 		t.Fatalf("exactly one bind must win, got a=%v b=%v", a, b)
@@ -200,7 +214,7 @@ func TestBindPinsClusterFingerprint(t *testing.T) {
 		enforceUnique: true,
 	})
 	ctx := context.Background()
-	if err := s.validateAndBindPrefix(ctx, "net-a", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "net-a", 7, noDHCPNetworkDef); err != nil {
 		t.Fatal(err)
 	}
 	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
@@ -233,7 +247,7 @@ func TestBindRefusesWhenLatchNotDurable(t *testing.T) {
 		enforced:          true,
 		durablyLatchedTok: map[string]bool{},
 	})
-	err := s.validateAndBindPrefix(context.Background(), "net-a", 7)
+	err := s.validateAndBindPrefix(context.Background(), "net-a", 7, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("want refusal when the latch is not durably persisted")
 	}
@@ -253,10 +267,10 @@ func TestBindRefusesSecondPrefixForSameNetwork(t *testing.T) {
 		enforceUnique: true,
 	})
 	ctx := context.Background()
-	if err := s.validateAndBindPrefix(ctx, "net-a", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "net-a", 7, noDHCPNetworkDef); err != nil {
 		t.Fatal(err)
 	}
-	err := s.validateAndBindPrefix(ctx, "net-a", 8)
+	err := s.validateAndBindPrefix(ctx, "net-a", 8, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("want refusal: one NetBox prefix per litevirt network")
 	}
@@ -316,7 +330,7 @@ func TestCreateNetworkReleasesBindingWhenUpsertFails(t *testing.T) {
 	}
 	// The real recovery the operator needs: the prefix is bindable again, under
 	// a different network name.
-	if err := s.validateAndBindPrefix(ctx, "net-b", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "net-b", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("released prefix must be bindable again, got: %v", err)
 	}
 }
@@ -351,7 +365,7 @@ func TestDeleteNetworkReleasesBinding(t *testing.T) {
 	if b != nil {
 		t.Fatalf("deleting the network must release its prefix, got %+v", b)
 	}
-	if err := s.validateAndBindPrefix(ctx, "net-b", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "net-b", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("released prefix must be bindable by another network, got: %v", err)
 	}
 }

@@ -296,6 +296,10 @@ type Server struct {
 	// network.EnsureBridge validation path.
 	bridgeEnsure func(name string) error
 
+	// bridgeExists is a test seam for "does this bridge already exist on this
+	// host". Production leaves it nil, preserving network.BridgeExists.
+	bridgeExists func(name string) bool
+
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
 	// state. Production leaves it nil.
@@ -735,6 +739,12 @@ func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
 // SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
 // rootless harness cannot create a real bridge, so it substitutes a no-op.
 func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetBridgeExists injects the "does this bridge already exist here" seam (see
+// bridgeExists). It is the host-local fact the NetBox bind-time DHCP refusal
+// reads, so a test that exercises that refusal must fix it rather than inherit
+// whatever interfaces the machine running the test happens to have.
+func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
 
 // SetNetBoxClient wires the NetBox REST client the daemon builds from config.
 // nil (the default) means every NetBox-dependent path refuses: binding a

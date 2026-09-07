@@ -5,14 +5,22 @@ import (
 	"fmt"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/netboxsync"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // validateAndBindPrefix runs every bind-time precondition and records the
 // binding. Each check fails closed with an operator-actionable message.
-func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, prefixID int) error {
+//
+// def is the network definition the bind is FOR, not a copy of anything already
+// persisted — nothing is persisted yet, and check 2b needs it. It is passed
+// explicitly rather than defaulted, because a default would be a value for the
+// hazard input: a fixture that quietly supplied a subnet-less def would make
+// every caller look safe and check 2b reachable by nothing.
+func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, prefixID int, def compose.NetworkDef) error {
 	if s.netbox == nil {
 		return fmt.Errorf("binding a NetBox prefix requires netbox configuration on this node")
 	}
@@ -32,6 +40,27 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 	if err != nil {
 		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return fmt.Errorf("read NetBox prefix %d: %w", prefixID, err)
+	}
+
+	// 2b. litevirt's own DHCP server must not be a second allocator over this
+	//     prefix. Where dnsmasq serves, it derives the gateway as network+1 and
+	//     leases a pool spanning essentially the whole subnet — none of it a
+	//     database row, so nothing adopts or reserves any of it, and NetBox's
+	//     /available-ips/ will hand the same addresses (the gateway included) to
+	//     the next VM.
+	//
+	//     Refusing rather than reserving: the gateway is one address and could
+	//     be reserved the way adoption reserves the addresses guests already
+	//     hold, but the POOL cannot — it is dynamic and spans the prefix, so
+	//     reserving it would leave NetBox nothing to allocate. See
+	//     internal/network/dhcp_gate.go, which owns the predicate that
+	//     provisioning starts dnsmasq from, and docs/networking.md for what this
+	//     still does not cover.
+	//
+	//     Placed here, immediately after the prefix read it needs and before the
+	//     VRF round-trip, so the cheapest refusal costs the fewest NetBox calls.
+	if err := network.CheckDHCPBindConflict(def, p.Prefix, s.bridgeExistsHere(def.Interface)); err != nil {
+		return err
 	}
 
 	// 3. It must live in a VRF. NetBox does not expose the global

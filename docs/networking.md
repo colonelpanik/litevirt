@@ -217,7 +217,8 @@ Binding requires:
   node;
 - the prefix to live in a VRF with `enforce_unique` set — global-table prefixes
   are refused, because NetBox does not expose the global uniqueness setting;
-- the prefix not to be bound to another litevirt network already.
+- the prefix not to be bound to another litevirt network already;
+- litevirt's own DHCP server not to serve the network's subnet — see below.
 
 While NetBox is unreachable, creating a VM on a bound network fails. Existing
 VMs are unaffected, and unbound networks are unaffected.
@@ -229,6 +230,78 @@ a VM to a **template** is refused too, for the opposite reason — a template is
 invisible to the inventory mirror, so the address it kept holding would be
 reclaimable by neither the mirror nor the orphan sweep. Detach the NIC first;
 that releases the address, and the conversion then goes through.
+
+#### litevirt's own DHCP server is refused over a bound prefix
+
+When litevirt starts `dnsmasq` for a network it derives the gateway as the
+subnet's first host and leases a pool spanning essentially the whole subnet.
+**None of that is a database row.** There is no lease, no allocation, nothing
+NetBox is ever told — so if a bound prefix overlaps that subnet, NetBox's
+`/available-ips/` and `dnsmasq` allocate from the same range with no knowledge
+of each other, and NetBox will eventually offer a VM the gateway address itself.
+
+So a bind is **refused** when litevirt would serve DHCP for a subnet that
+overlaps the prefix. That refusal is not a reservation, and could not be: the
+gateway is one address and could be reserved, but the pool is dynamic and spans
+the prefix, so reserving it would leave NetBox nothing to allocate.
+
+Whether `dnsmasq` runs depends on the network definition:
+
+| Network shape | litevirt serves DHCP | Bindable |
+|---|---|---|
+| No `--subnet` | never | yes |
+| `--type bridge` on a bridge litevirt creates | yes | **no** |
+| `--type bridge` on a bridge that already exists, no `--dhcp` | no | yes |
+| `--type bridge` with `--dhcp` | yes | **no** |
+| `--type bridge --vlan N` (tagged physical network) | never | yes |
+| `--type direct` (macvtap) or `--type sriov` | never | yes |
+| `--type isolated` with a subnet | yes, on every host | **no** |
+| `--type vxlan` with a subnet | yes, on the elected gateway host | **no** |
+| `host-isolation: true` | never | yes |
+| Subnet disjoint from the bound prefix | (irrelevant) | yes |
+
+The usual production shape — a NetBox-bound network on an existing
+infrastructure bridge, with the subnet recorded so guests get the right prefix
+length and default gateway — is bindable, and stays bindable. A tagged physical
+VLAN (`--vlan`) and macvtap (`--type direct`) are bindable too.
+
+**Whether the bridge already exists is a fact about ONE host.** The same network
+definition starts `dnsmasq` on a host where litevirt has to create the bridge
+and not on a host that already has it, so a bind validated on one node cannot
+speak for the rest. Two things follow:
+
+- The bind refuses on the two grounds it can establish: shapes that serve DHCP
+  on *every* host (or on an elected host) whatever the local state, and the
+  binding node's own answer for the bridge case. The error message says which of
+  the two it was.
+- **Provisioning refuses as well.** A host that would start `dnsmasq` for a
+  network bound to a NetBox prefix fails the provision instead, with a message
+  naming the bridge. That is where the host-local fact is finally known, and it
+  is what stops a node added later — or a node that never had the bridge — from
+  standing up a second allocator over a prefix NetBox believes it owns. The
+  consequence is that a VM cannot be placed on such a host until the definition
+  is corrected; that is deliberate, and better than two DHCP authorities on one
+  subnet.
+
+##### What this does NOT cover
+
+- **Load-balancer VIPs are not reserved.** A VIP never takes a lease, so no
+  `ip_address` object is created for it and NetBox will offer it to the next VM
+  that claims an address from an overlapping prefix. A VIP can also be
+  configured long after the bind, so no bind-time check could catch it. Record
+  VIP addresses in NetBox by hand before binding a prefix that contains them.
+- **The gateway is still not reserved on the shapes this permits.** On an
+  infrastructure bridge the gateway belongs to a router litevirt does not
+  manage, and litevirt creates no `ip_address` object for it. Record the gateway
+  (and any other infrastructure address inside the prefix) in NetBox before
+  binding, or reserve that part of the range in NetBox. Removing litevirt's own
+  DHCP server as a competing allocator is what the refusal does; it does not
+  make the prefix exclusively litevirt's.
+- **A foreign DHCP server on the same subnet** is outside litevirt's knowledge
+  entirely.
+- **A second litevirt network sharing the subnet.** The bind inspects the
+  definition being bound; an unbound network with the same subnet, serving DHCP
+  from its own `dnsmasq`, is not visible to it.
 
 ### Binding a subnet that already has VMs on it
 

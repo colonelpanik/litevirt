@@ -91,17 +91,13 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		} else if !onPhysicalVLAN {
 			// Start DHCP only on a litevirt-managed bridge — a pre-existing
 			// infrastructure bridge (e.g. br0) must not get a DHCP server unless
-			// the user explicitly enabled it. This gate stays keyed on
-			// (!bridgePreExisted || def.DHCP).
-			if def.Subnet != "" && (!bridgePreExisted || def.DHCP) {
-				gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
-				if err != nil {
-					return "", fmt.Errorf("derive DHCP range: %w", err)
-				}
-				pidFile := dnsmasqPidFile(bridge)
-				if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
-					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
-				}
+			// the user explicitly enabled it. The gate is still keyed on
+			// (!bridgePreExisted || def.DHCP); it lives in DHCPWouldServe now
+			// because the NetBox bind-time refusal decides from the same
+			// predicate, and two copies of it would drift.
+			if err := startDHCPFor(def, DHCPHostFacts{BridgePreExisted: bridgePreExisted},
+				networkName, bridge, dnsmasqPidFile(bridge)); err != nil {
+				return "", err
 			}
 			// Record NAT (masquerade) intent whenever this managed subnet-network
 			// wants NAT — independent of the DHCP-start gate above. On a
@@ -183,15 +179,10 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 					}
 					natSubnet = def.Subnet
 				}
-				if isGatewayHost(ctx, db, networkName, hostName) {
-					gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
-					if err != nil {
-						return "", fmt.Errorf("derive DHCP range: %w", err)
-					}
-					pidFile := dnsmasqPidFileVNI(vni)
-					if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
-						return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
-					}
+				if err := startDHCPFor(def,
+					DHCPHostFacts{IsGatewayHost: isGatewayHost(ctx, db, networkName, hostName)},
+					networkName, bridge, dnsmasqPidFileVNI(vni)); err != nil {
+					return "", err
 				}
 			}
 		}
@@ -236,16 +227,16 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			if err := corrosion.DeleteHostFWIntent(ctx, db, hostName, scope); err != nil {
 				return "", err
 			}
-			// If subnet is defined, enable DHCP implicitly.
+			// If subnet is defined, enable DHCP implicitly — an isolated network
+			// has no uplink and no router, so litevirt is the only possible
+			// source of addresses. DHCPWouldServe says so for every host, which
+			// is why a bind over an isolated network's subnet is refused
+			// cluster-wide rather than on the binding node's own evidence.
+			if err := startDHCPFor(def, DHCPHostFacts{},
+				networkName, bridge, dnsmasqPidFile(bridge)); err != nil {
+				return "", err
+			}
 			if def.Subnet != "" {
-				gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)
-				if err != nil {
-					return "", fmt.Errorf("derive DHCP range: %w", err)
-				}
-				pidFile := dnsmasqPidFile(bridge)
-				if err := startDHCPFunc(bridge, gw, rangeStart, rangeEnd, mask, pidFile); err != nil {
-					return "", fmt.Errorf("start DHCP on %s: %w", bridge, err)
-				}
 				// NAT is skipped for isolated networks — they have no uplink.
 				if def.NAT != nil && *def.NAT {
 					slog.Warn("NAT requested on isolated network (no uplink) — skipping", "network", networkName)

@@ -30,7 +30,7 @@ import (
 // bindOne runs a successful bind against a fake holding one usable prefix.
 func bindOne(t *testing.T, s *Server, network string, prefixID int) {
 	t.Helper()
-	if err := s.validateAndBindPrefix(context.Background(), network, prefixID); err != nil {
+	if err := s.validateAndBindPrefix(context.Background(), network, prefixID, noDHCPNetworkDef); err != nil {
 		t.Fatalf("validateAndBindPrefix(%s, %d): %v", network, prefixID, err)
 	}
 }

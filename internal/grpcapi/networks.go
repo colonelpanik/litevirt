@@ -76,7 +76,7 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 	// failed bind must abort the create rather than leave a network whose
 	// config names a prefix nothing actually reserved.
 	if req.NetboxPrefixId != 0 {
-		if err := s.validateAndBindPrefix(ctx, req.Name, int(req.NetboxPrefixId)); err != nil {
+		if err := s.validateAndBindPrefix(ctx, req.Name, int(req.NetboxPrefixId), def); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		def.NetBoxPrefixID = int(req.NetboxPrefixId)

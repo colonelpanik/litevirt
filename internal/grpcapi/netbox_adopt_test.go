@@ -93,7 +93,7 @@ func TestBindRefusesWhenTheNetworkHoldsContainerLeases(t *testing.T) {
 		t.Fatalf("seed container lease: ok=%v err=%v", ok, err)
 	}
 
-	err = s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err = s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a network holding container leases must refuse the bind")
 	}
@@ -127,7 +127,7 @@ func TestBindRefusesWhenATemplateHoldsAnAddressInThePrefix(t *testing.T) {
 		t.Fatalf("mark template: %v", err)
 	}
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a template holding an address inside the prefix must refuse the bind")
 	}
@@ -163,7 +163,7 @@ func TestBindRefusesALeaseNamingAnotherPrefix(t *testing.T) {
 		t.Fatalf("seed stale lease: %v", err)
 	}
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a lease naming another prefix must refuse the bind, not read as already adopted")
 	}
@@ -201,7 +201,7 @@ func TestBindRefusesOverTheAdoptionCap(t *testing.T) {
 			fmt.Sprintf("33333333-3333-3333-3333-%012d", i))
 	}
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatalf("a network with %d existing addresses must refuse a bind over the cap of %d",
 			adoptionCap+1, adoptionCap)
@@ -227,7 +227,7 @@ func TestBindIgnoresAnAddressOutsideTheBoundPrefix(t *testing.T) {
 	seedVMHoldingIP(t, s, "elsewhere", "shared", "aa:bb:cc:00:00:03", "10.9.9.9",
 		"44444444-4444-4444-4444-444444444444")
 
-	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("an address outside the bound prefix must not refuse the bind: %v", err)
 	}
 	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
@@ -290,7 +290,7 @@ func TestBindRefusesAContainerNICOnASubnetLessNetwork(t *testing.T) {
 			"has to reach the refusal through container_interfaces, not through the lease table", got)
 	}
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a network holding a container NIC must refuse the bind; binding it hands " +
 			"the container's address to the next VM created on the network")
@@ -327,7 +327,7 @@ func TestBindRefusesAContainerNICWithNoRecordedAddress(t *testing.T) {
 		t.Fatalf("seed container NIC: %v", err)
 	}
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a container NIC whose address is not recorded yet must still refuse the bind")
 	}
@@ -359,7 +359,7 @@ func TestBindIgnoresATombstonedContainerNIC(t *testing.T) {
 		t.Fatalf("tombstone container NICs: %v", err)
 	}
 
-	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("a tombstoned container NIC must not refuse the bind: %v", err)
 	}
 	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
@@ -386,7 +386,7 @@ func TestBindRefusesARunningVMWithNoRecordedAddress(t *testing.T) {
 	seedVMInState(t, s, "live-guest", "shared", "aa:bb:cc:00:01:01", "",
 		"55555555-5555-5555-5555-555555555555", "running")
 
-	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix)
+	err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef)
 	if err == nil {
 		t.Fatal("a RUNNING VM whose NIC address litevirt has not recorded must refuse the bind")
 	}
@@ -411,7 +411,7 @@ func TestBindProceedsForAStoppedVMWithNoRecordedAddress(t *testing.T) {
 	seedVMInState(t, s, "cold-guest", "shared", "aa:bb:cc:00:01:02", "",
 		"66666666-6666-6666-6666-666666666666", "stopped")
 
-	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("a STOPPED VM with no recorded address must not refuse the bind: %v", err)
 	}
 	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
@@ -438,7 +438,7 @@ func TestBindRefusesAVMWhoseRunStateIsNotProvablyStopped(t *testing.T) {
 			seedVMInState(t, s, "odd-guest", "shared", "aa:bb:cc:00:01:03", "",
 				"77777777-7777-7777-7777-777777777777", state)
 
-			err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix)
+			err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix, noDHCPNetworkDef)
 			if err == nil {
 				t.Fatalf("state %q is not a proof that the guest holds no address; the bind must refuse", state)
 			}
@@ -462,7 +462,7 @@ func TestBindIgnoresAnUnrecordedNICOnAnotherNetwork(t *testing.T) {
 	seedVMInState(t, s, "elsewhere-guest", "other-net", "aa:bb:cc:00:01:04", "",
 		"88888888-8888-8888-8888-888888888888", "running")
 
-	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("an unrecorded NIC on ANOTHER network must not refuse this bind: %v", err)
 	}
 	if b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix); err != nil || b == nil || b.Suspended {
@@ -487,7 +487,7 @@ func suspendedBindingServer(t *testing.T) *Server {
 		enforceUnique: true,
 	})
 	ctx := context.Background()
-	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if err := corrosion.SuspendBinding(ctx, s.db, adoptTestPrefix, "suspended by a test"); err != nil {
@@ -590,7 +590,7 @@ func TestBindWithNothingOwedDoesNotContendForThePassGate(t *testing.T) {
 		enforceUnique: true,
 	})
 	ctx := context.Background()
-	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	// Live, because nothing was owed.
@@ -618,7 +618,7 @@ func bindAndCaptureLogs(t *testing.T, s *Server) string {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	if err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix); err != nil {
+	if err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	return buf.String()

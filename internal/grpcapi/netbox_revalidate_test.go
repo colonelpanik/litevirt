@@ -129,7 +129,7 @@ func TestRevalidateSuspendsTheDriftedRow(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	// The replicated `cluster` row is rewritten out of band — the only thing that
@@ -165,7 +165,7 @@ func TestRevalidateIsANoopWithoutANetBoxClient(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if err := s.db.Execute(ctx, `UPDATE cluster SET ca_cert = ? WHERE id = 'default'`,
@@ -194,7 +194,7 @@ func TestRekeyBindingRequiresAdmin(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(context.Background(), "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(context.Background(), "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestRekeyBindingWritesAnAuditRow(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{Network: "bound"}); err != nil {
@@ -417,7 +417,7 @@ func TestResumeBindingRequiresAdmin(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(context.Background(), "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(context.Background(), "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 
@@ -460,7 +460,7 @@ func TestResumeBindingRefusesADriftedCIDRAndKeepsThePin(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	// The binding as a re-CIDR would leave it: suspended, still pinned to the
@@ -545,7 +545,7 @@ func TestRekeyRefusedWithoutTheLease(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	if err := s.validateAndBindPrefix(ctx, "bound", 7); err != nil {
+	if err := s.validateAndBindPrefix(ctx, "bound", 7, noDHCPNetworkDef); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	seedObjectRefs(t, s, leaseFingerprint)

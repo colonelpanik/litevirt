@@ -567,6 +567,27 @@ free an address something is really using. Reconcile it by hand — confirm no
 guest holds the address, then delete the allocation and let the next pass
 reclaim the NetBox object.
 
+### One leak the sweep cannot close
+
+A release tombstones the local allocation row first and deletes the NetBox object
+second, so a NetBox failure in between leaves the object held with no local row
+behind it. That state cannot be retried — the row a retry would prove ownership
+with is gone — so the identity is queued for the orphan sweep instead.
+
+The sweep closes that where the **workload** is also gone: a delete, a
+stale-record cleanup, a cutover or a rebuild leave no host claiming the identity,
+the proof completes, and the address is reclaimed.
+
+It does **not** close it for a **NIC detached from a VM that is still running**.
+The identity carries the owning VM's uuid, and the proof asks every host whether
+it still claims the uuid, the MAC or the address — the surviving VM still claims
+the uuid, so the reclamation is declined, on that pass and every pass after it.
+This is the safe direction (a leak, never a double-assignment) but nothing raises
+a health condition for it: the counter `litevirt_netbox_sweeps_skipped_total`
+gains a `host_still_claims` sample and a warning names the address. If a hot
+detach reported a failed release, check that address in NetBox and remove it by
+hand once the guest no longer holds it.
+
 ## NAT
 
 By default, litevirt enables IP masquerading (NAT) for networks with a subnet defined. This gives VMs outbound internet access through the host.

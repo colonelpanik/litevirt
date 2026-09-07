@@ -167,6 +167,15 @@ func (m *sweepMetrics) IncStuckLease() {
 	m.stuckLeases++
 }
 
+// skips is every reason this sink recorded a DECLINED reclamation for. A
+// declined reclamation produces no deletion and no error, so for the scenarios
+// about what the sweep would not do it is the only evidence there is.
+func (m *sweepMetrics) skips() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.skipped...)
+}
+
 func (m *sweepMetrics) stuck() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -21,6 +21,12 @@ import (
 // the entire single-package suite green, and that mutation is precisely the
 // false all-clear this feature exists to prevent. These tests are what makes it
 // go red.
+//
+// They also carry the only end-to-end check of the posture DISCLOSURE gate. Ping
+// answers not_enforcing / posture_reported only to a caller presenting a host
+// certificate, and these peers present real ones over real mTLS — so a gate that
+// wrongly refused a peer would blank every posture here, while the unit tests
+// (which hand Ping a hand-built context) would not notice.
 
 // seedSharedDiskVM gives the cluster something to be exposed: a VM with a disk
 // on shared storage, which is the only kind whose cross-host transfer needs the
@@ -71,10 +77,17 @@ func TestFleet_FenceReadiness_PostureCrossesTheWire(t *testing.T) {
 
 	r := fenceReadinessFrom(t, c, observer)
 
-	if p := postureOf(t, r, holdout.Name); p.GetEnforcing() {
-		t.Errorf("%s has enforcement.shared_storage_fence off, but %s reads it as enforcing "+
-			"(reachable=%v posture_known=%v detail=%q)",
-			holdout.Name, observer.Name, p.GetReachable(), p.GetPostureKnown(), p.GetDetail())
+	// Both halves are asserted. "not enforcing" alone would still pass if the
+	// holdout came back UNKNOWN, and unknown is the wrong answer here: the
+	// holdout answered, and what it said — advertising other tokens while
+	// withholding this one — is exactly how a node reports the switch is off.
+	// Reporting that as unknown would hide the single finding this command exists
+	// to produce behind the word used for a host nothing could reach.
+	if p := postureOf(t, r, holdout.Name); p.GetEnforcing() || !p.GetPostureKnown() {
+		t.Errorf("%s has enforcement.shared_storage_fence off, but %s reads it as "+
+			"enforcing=%v posture_known=%v (reachable=%v detail=%q)",
+			holdout.Name, observer.Name, p.GetEnforcing(), p.GetPostureKnown(),
+			p.GetReachable(), p.GetDetail())
 	}
 	for _, n := range c.Nodes {
 		if n == holdout {

@@ -18145,8 +18145,17 @@ type PingResponse struct {
 	NotEnforcing []string `protobuf:"bytes,7,rep,name=not_enforcing,json=notEnforcing,proto3" json:"not_enforcing,omitempty"`
 	// posture_reported disambiguates an empty not_enforcing list, which otherwise
 	// has two very different meanings: "this node enforces everything it
-	// advertises" and "this node is too old to say". Every binary carrying the
-	// field above sets this true unconditionally, so false means UNKNOWN.
+	// advertises" and "nothing was said". False means UNKNOWN, and a consumer must
+	// never read it as all-clear.
+	//
+	// False has TWO causes and they are not distinguishable on the wire, which is
+	// deliberate: the peer predates this field, or it declined to answer THIS
+	// caller. Posture is served only to a caller presenting a host certificate,
+	// because Ping bypasses the identity interceptor (skipAuth) and this list
+	// names which security kill-switches are off — the distributable lv-cli
+	// certificate would otherwise read it with no session and no role. Report the
+	// ambiguity rather than guessing: naming version skew would send an operator
+	// to upgrade a fleet over a credential property of the node they asked from.
 	//
 	// wall_clock got away without a companion flag because its zero value is not
 	// a legal reading; an empty token list is, so it needs one.

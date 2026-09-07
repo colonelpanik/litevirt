@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/x509"
 	"slices"
 	"strings"
 	"testing"
@@ -59,15 +60,79 @@ func TestNotEnforcingTokens_ReportsTheKillSwitch(t *testing.T) {
 	}
 }
 
-// TestPing_AlwaysReportsPosture pins that posture_reported is UNCONDITIONAL.
+// TestAdvertise_SharedStorageFenceIsUnconditional pins a decision that has been
+// proposed and rejected twice, so the third attempt meets a red test instead of
+// a design argument.
+//
+// The token gates a corruption hazard, which makes it look like it belongs with
+// operation_protocol_v1 and the other tokens withheld while their flag is off.
+// It does not, because nothing RELIES on a peer enforcing it: the coordinator
+// refuses to create a shared-disk transfer without a proof-grade fence of the
+// old owner, so whenever a transfer exists the old owner is provably down and a
+// destination with its flag off starts it safely.
+//
+// Withholding therefore prevents no corruption while costing:
+//
+//   - internal/health/capability.go gates the latch on every voting-eligible
+//     host with NO role filter, so a witness with the flag off — and a witness
+//     operator has no reason to set it, since a witness cannot perform a fence —
+//     would hold the fence off fleet-wide, permanently
+//   - every node mid-rollout stops enforcing, including ones already configured
+//   - driveCapabilityActivation drives one unlatched token per cycle, so a
+//     config-on token that can never latch starves every later token forever
+//
+// TestFleet_SharedStorageFenceLatchesOnMixedConfig covers the first two over a
+// real cluster; this one is the cheap guard on the advertisement itself.
+func TestAdvertise_SharedStorageFenceIsUnconditional(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		enforcing bool
+	}{
+		{"kill-switch off", false},
+		{"kill-switch on", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := fenceTestServer(t, tc.enforcing, true)
+			if !slices.Contains(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1) {
+				t.Errorf("%s is not advertised with enforcement.shared_storage_fence=%v; "+
+					"a host that withholds it keeps the cluster from latching, and a witness "+
+					"or any mid-rollout host would hold the fence off fleet-wide",
+					capabilities.SharedStorageFenceV1, tc.enforcing)
+			}
+		})
+	}
+
+	// The posture signal must stay in not_enforcing rather than in the
+	// advertisement, which is what TestNotEnforcingTokens_ReportsTheKillSwitch
+	// pins from the other side.
+	off := fenceTestServer(t, false, true)
+	if !slices.Contains(off.notEnforcingTokens(), capabilities.SharedStorageFenceV1) {
+		t.Error("the token is advertised with the flag off but not_enforcing does not say so, " +
+			"which leaves the kill-switch invisible to every peer")
+	}
+}
+
+// hostCertCtx / clientCertCtx are the two callers Ping must tell apart. Only
+// GenerateHostCert issues ServerAuth; the lv-cli certificate is ClientAuth alone
+// and is handed to every operator.
+func hostCertCtx() context.Context {
+	return certCtx("node-1", x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
+}
+
+func clientCertCtx() context.Context {
+	return certCtx("lv-cli", x509.ExtKeyUsageClientAuth)
+}
+
+// TestPing_ReportsPostureToAHostCertificate pins that posture_reported is
+// unconditional FOR A PEER.
 //
 // An empty not_enforcing list has two opposite meanings — "this node enforces
 // everything it advertises" and "this node is too old to say" — and only this
-// flag separates them. Deriving it from anything (whether the list is empty, a
-// config value, a capability) would reintroduce exactly the ambiguity it exists
-// to remove, and the failure mode is a diagnostic reporting all-clear for a host
-// whose posture it never learned.
-func TestPing_AlwaysReportsPosture(t *testing.T) {
+// flag separates them. Deriving it from anything about the node (whether the
+// list is empty, a config value, a capability) would reintroduce exactly the
+// ambiguity it exists to remove, and the failure mode is a diagnostic reporting
+// all-clear for a host whose posture it never learned.
+func TestPing_ReportsPostureToAHostCertificate(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		enforceAll bool
@@ -87,13 +152,61 @@ func TestPing_AlwaysReportsPosture(t *testing.T) {
 					t.Fatalf("fixture did not reach the ambiguous case: not_enforcing = %v", got)
 				}
 			}
-			resp, err := s.Ping(context.Background(), nil)
+			resp, err := s.Ping(hostCertCtx(), nil)
 			if err != nil {
 				t.Fatalf("Ping: %v", err)
 			}
 			if !resp.GetPostureReported() {
-				t.Error("posture_reported is false on a binary that does report posture, " +
+				t.Error("posture_reported is false for a peer on a binary that does report posture, " +
 					"so its not_enforcing list cannot be told apart from an old peer's silence")
+			}
+		})
+	}
+}
+
+// TestPing_WithholdsPostureFromANonHostCertificate is the disclosure boundary.
+//
+// Ping is in skipAuth: it never reaches the identity interceptor, so it carries
+// no role and no session. not_enforcing enumerates which security kill-switches
+// are off — the same facts GetFenceReadiness requires the `viewer` role to
+// return — so leaving it on an un-roled RPC hands the fleet's security posture
+// to every holder of the DISTRIBUTABLE lv-cli certificate.
+//
+// The withheld answer must be `posture_reported = false`, not an empty list with
+// the flag still true: postureFromPing reads an empty list under a true flag as
+// "enforces everything", which would turn a refusal to answer into an all-clear.
+func TestPing_WithholdsPostureFromANonHostCertificate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"lv-cli client certificate", clientCertCtx()},
+		{"no certificate at all", context.Background()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Every kill-switch off, so a leak would be maximally informative and
+			// the empty list cannot be mistaken for a node that simply enforces
+			// everything.
+			s := fenceTestServer(t, false, true)
+			if got := s.notEnforcingTokens(); len(got) == 0 {
+				t.Fatalf("fixture has nothing to leak: not_enforcing = %v", got)
+			}
+
+			resp, err := s.Ping(tc.ctx, nil)
+			if err != nil {
+				t.Fatalf("Ping: %v", err)
+			}
+			if got := resp.GetNotEnforcing(); len(got) != 0 {
+				t.Errorf("a caller without a host certificate was told which kill-switches are off: %v", got)
+			}
+			if resp.GetPostureReported() {
+				t.Error("posture_reported = true with an empty not_enforcing, so a refusal to " +
+					"answer reads as an all-clear")
+			}
+			// Withholding posture must not withhold liveness: Ping is the health
+			// checker's probe and the REST /health handler's only call.
+			if resp.GetHostName() == "" {
+				t.Error("the liveness answer was withheld along with the posture")
 			}
 		})
 	}
@@ -150,6 +263,11 @@ func TestPostureFromPing_OldPeerSilenceIsUnknown(t *testing.T) {
 		// degraded node the cleanest posture.
 		{"quarantined peer: advertises nothing, empty list",
 			&pb.PingResponse{PostureReported: true, WalQuarantined: true}, false, false},
+		// Advertisement is UNCONDITIONAL, so a healthy peer with the flag off
+		// still carries the token and reports the switch through not_enforcing.
+		// A peer missing it has some other problem — a regressed binary, a
+		// self-fence — and naming a cause would send the operator to change a
+		// config value that is not what is wrong.
 		{"peer advertises other tokens but not the fence",
 			&pb.PingResponse{PostureReported: true,
 				Capabilities: []string{capabilities.SafeFenceDefaultV1}}, false, false},
@@ -383,6 +501,27 @@ func TestFenceHostPosture_SelfFencedLocalHostIsUnknown(t *testing.T) {
 		t.Errorf("a self-fenced local host reports posture_known=%v enforcing=%v detail=%q; "+
 			"it advertises nothing, so its posture is no more readable than a peer's",
 			p.GetPostureKnown(), p.GetEnforcing(), p.GetDetail())
+	}
+}
+
+// TestFenceHostPosture_LocalKillSwitchOffIsKnown is the other side of that
+// standard, and the line between them is the whole point.
+//
+// "Cannot report a posture" must mean self-fenced or WAL-quarantined, never
+// merely "has the switch off". Sweeping the second into the first would report
+// the operator's own node as unknown and lose the one finding the command
+// exists to produce, on the node they are most likely to run it against.
+func TestFenceHostPosture_LocalKillSwitchOffIsKnown(t *testing.T) {
+	s := fenceTestServer(t, false, true)
+
+	p := s.fenceHostPosture(context.Background(), s.hostName)
+	if !p.GetPostureKnown() {
+		t.Errorf("a healthy local host with enforcement.shared_storage_fence off reports its own "+
+			"posture as unknown (detail %q); its config is right here, and calling it unreadable "+
+			"hides the finding behind the word used for a host nothing could reach", p.GetDetail())
+	}
+	if p.GetEnforcing() {
+		t.Error("a local host with the kill-switch off reports itself enforcing")
 	}
 }
 

@@ -179,7 +179,18 @@ func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHos
 		// is logged into — the one that just self-fenced — would be the ONLY host
 		// in the fleet given a confident posture while every peer in that state
 		// reads unknown.
-		if !slices.Contains(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1) {
+		//
+		// The two predicates are read directly rather than through
+		// advertisedCapabilities, which returns an empty list for exactly these
+		// two states and nothing else. Equivalent, and better on both counts: it
+		// is two atomic loads instead of a list build that walks the runtime
+		// inventory under its own 10s context when enforcement.owner_epoch is on
+		// — inside a probe already holding one of the sweep's semaphore slots and
+		// bounded by a budget that context cannot see. A residual race remains
+		// (the watchdog can trip between this check and the config read below),
+		// which is inherent to a node reporting on itself; the peers' answers are
+		// the authority in that window.
+		if s.selfFenced() || s.walQuarantinedNow() {
 			return &pb.FenceHostPosture{
 				Host: host, Reachable: true, PostureKnown: false,
 				Detail: "this host advertises nothing (self-fenced or WAL-quarantined), so its posture cannot be read",
@@ -214,12 +225,19 @@ func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHos
 // that judgement untested.
 func postureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
 	// An empty not_enforcing list is ambiguous without this flag: it means both
-	// "enforces everything" and "too old to say". posture_reported separates
+	// "enforces everything" and "nothing was said". posture_reported separates
 	// them, and false is UNKNOWN — never all-clear.
+	//
+	// The detail names no cause, because two reach here and they call for
+	// opposite actions: the peer predates the field, or it declined to answer a
+	// caller without a host certificate. Asserting the first would have an
+	// operator upgrade every binary in the fleet over a credential property of
+	// the one node they ran the command from.
 	if !resp.GetPostureReported() {
 		return &pb.FenceHostPosture{
 			Host: host, Reachable: true, PostureKnown: false,
-			Detail: "host runs a binary that does not report enforcement posture",
+			Detail: "host reported no enforcement posture (its binary predates the field, " +
+				"or it withheld posture from this caller)",
 		}
 	}
 
@@ -231,6 +249,13 @@ func postureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
 	// cleanest posture — the precise false all-clear this whole field exists to
 	// prevent. Require the peer to advertise the token before believing it acts
 	// on it.
+	//
+	// Absence is UNKNOWN and never "not enforcing", because this token is
+	// advertised unconditionally (see advertisedCapabilities): a healthy node
+	// with the flag off still carries it and reports the switch through
+	// not_enforcing below, so absence means something else went wrong — a
+	// regressed binary, a self-fence — and naming a cause would send the operator
+	// to fix a config value that is not the problem.
 	if !slices.Contains(resp.GetCapabilities(), capabilities.SharedStorageFenceV1) {
 		// Keyed on what the peer actually said. Reporting a self-fenced node as
 		// "does not advertise the token" reads as version skew and points an

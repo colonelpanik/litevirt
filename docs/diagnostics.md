@@ -412,10 +412,26 @@ silently skips the fence — a state no peer and no operator could observe. This
 command asks every host for its own posture via `PingResponse.not_enforcing`,
 so the answer reflects what each node will actually do.
 
+That the token is advertised unconditionally is deliberate, and the reasoning is
+kept in `advertisedCapabilities`: the fence is enforced where a transfer is
+*created*, so no node relies on a peer enforcing it, and withholding the token
+would leave a witness — or any host mid-rollout — holding the whole cluster on
+the legacy path.
+
 A host is reported as `unknown` rather than as enforcing whenever its posture
-cannot be read, which now covers four cases: it did not answer; it runs a binary
-predating the posture field; it advertises nothing because it is self-fenced or
-WAL-quarantined; or the report's overall budget expired before it was probed.
+cannot be read, which covers five cases: it did not answer; it did not report a
+posture (it runs a binary predating the field, or it withheld posture from this
+caller — see below); it advertises nothing because it is self-fenced or
+WAL-quarantined; it advertises other tokens but not this one; or the report's
+overall budget expired before it was probed.
+
+Posture is answered only to a caller presenting a **host** certificate.
+`not_enforcing` names which security kill-switches are off, and `Ping` bypasses
+the identity interceptor, so the distributable `lv-cli` certificate would
+otherwise read it with no session and no role. The daemon's own fan-out uses its
+host certificate, so this is invisible in normal use; a caller reaching `Ping`
+some other way lands in the `unknown` bucket above rather than being told
+anything.
 Unknown counts against readiness exactly as "not enforcing" does — a diagnostic
 that cannot see a host must not report the cluster clear on its behalf.
 

@@ -658,6 +658,30 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfAuditSignature {
 		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
 	}
+	// shared_storage_fence_v1 is deliberately NOT withheld here, and the reason is
+	// worth keeping because the change has been proposed more than once. Ask where
+	// the guarantee is enforced: the coordinator refuses to CREATE a shared-disk
+	// transfer without a proof-grade fence of the old owner
+	// (failover/coordinator.go), so whenever a transfer exists at all the old
+	// owner is provably down and even a destination with the flag off starts it
+	// safely. No node relies on a peer enforcing this one, so withholding
+	// prevents no corruption — while costing a great deal, all of it verified:
+	//
+	//   - the latch gates on every voting-eligible host and health/capability.go
+	//     has NO role filter, so a WITNESS with the flag off (its operator has no
+	//     reason to set it — a witness cannot perform a fence) would keep the
+	//     fence off fleet-wide, permanently and invisibly
+	//   - during any partial rollout the token would not latch, so the nodes that
+	//     HAVE opted in would stop enforcing — both the source-side refusal and
+	//     the executor's re-verify (health/reconciler.go) gate on the latch
+	//   - a config-on token that can never latch would consume the HA monitor's
+	//     one-unlatched-token-per-cycle budget forever (driveCapabilityActivation),
+	//     starving every token after it in Supported() and stopping the post-latch
+	//     freshness check entirely
+	//
+	// The gap withholding WOULD close — a latched token proving config uniformity
+	// — is reported directly by `lv doctor fence` instead, which asks each host
+	// for its own posture. See TestAdvertise_SharedStorageFenceIsUnconditional.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard

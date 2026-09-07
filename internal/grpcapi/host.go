@@ -125,7 +125,40 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// records our isolation on the strength of this, because we cannot
 		// record it ourselves.
 		WalQuarantined: s.walQuarantinedNow(),
+		// The other self-report: tokens advertised above but NOT acted on,
+		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
+		// PingResponse.not_enforcing and notEnforcingTokens.
+		NotEnforcing: s.notEnforcingTokens(),
+		// Always true on this binary, so an empty NotEnforcing above reads as
+		// "nothing unenforced" rather than "too old to say".
+		PostureReported: true,
 	}, nil
+}
+
+// notEnforcingTokens lists capability tokens this node advertises but does not
+// act on, because the matching `enforcement.*` / `auth.*` config flag is false.
+//
+// Advertising and enforcing are deliberately separate here (see
+// advertisedCapabilities): a node advertises so the cluster can LATCH a token,
+// while its own kill-switch decides whether it honours it. The consequence is
+// that a token can be latched cluster-wide while members silently skip it, and
+// until this list existed nothing could observe that — not a peer, not an
+// operator. For shared_storage_fence_v1 the invisible state is a cross-host
+// transfer of a shared-disk VM running without the proof-grade fence.
+//
+// This is a self-report of DEGRADATION, trustworthy for the same reason
+// wal_quarantined is: a node misreporting its posture would claim to enforce,
+// not to skip. It must stay diagnostic — no enforcement decision may read it,
+// in either direction.
+func (s *Server) notEnforcingTokens() []string {
+	advertised := s.advertisedCapabilities()
+	out := make([]string, 0, len(advertised))
+	for _, token := range advertised {
+		if !s.tokenEnabled(token) {
+			out = append(out, token)
+		}
+	}
+	return out
 }
 
 // PeerCapabilities fresh-Pings a peer (or short-circuits for self) and returns

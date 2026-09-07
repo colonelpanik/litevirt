@@ -28,6 +28,7 @@ const (
 	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
+	LiteVirt_GetFenceReadiness_FullMethodName          = "/litevirt.v1.LiteVirt/GetFenceReadiness"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
 	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
@@ -274,6 +275,7 @@ type LiteVirtClient interface {
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
+	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -782,6 +784,16 @@ func (c *liteVirtClient) GetClusterHealth(ctx context.Context, in *GetClusterHea
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClusterHealth)
 	err := c.cc.Invoke(ctx, LiteVirt_GetClusterHealth_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceReadiness)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFenceReadiness_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3339,6 +3351,7 @@ type LiteVirtServer interface {
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
+	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -3778,6 +3791,9 @@ func (UnimplementedLiteVirtServer) FenceHost(context.Context, *FenceHostRequest)
 }
 func (UnimplementedLiteVirtServer) GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterHealth not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFenceReadiness not implemented")
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
@@ -4619,6 +4635,24 @@ func _LiteVirt_GetClusterHealth_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).GetClusterHealth(ctx, req.(*GetClusterHealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetFenceReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFenceReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFenceReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFenceReadiness(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8547,6 +8581,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetClusterHealth",
 			Handler:    _LiteVirt_GetClusterHealth_Handler,
+		},
+		{
+			MethodName: "GetFenceReadiness",
+			Handler:    _LiteVirt_GetFenceReadiness_Handler,
 		},
 		{
 			MethodName: "RemoveHost",

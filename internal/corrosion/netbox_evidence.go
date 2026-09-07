@@ -54,10 +54,12 @@ type MirrorEvidence struct {
 // WHAT ACTUALLY TAKES A ROW AWAY FROM A NAME is three paths, not one — the
 // create-path cleanup above, DiscardReplicatedStateForReseed's outright
 // truncation of `vms`/`vm_interfaces`/`vm_nics`, and RenameVM, which UPDATEs
-// `vm_name` and so leaves nothing at the old name. See HasVMRecords for why each
-// is safe. The common property, and the only one this type relies on, is that
-// absent evidence means the caller WITHHOLDS its removal: a path that takes
-// evidence away can cost a withheld delete, never an unproven one.
+// `vms.name` (`vm_name` in the child tables, where the rename MOVES the evidence
+// to the new name rather than removing it) and so leaves nothing at the old name.
+// See HasVMRecords for why each is safe. The common property, and the only one
+// this type relies on, is that absent evidence means the caller WITHHOLDS its
+// removal: a path that takes evidence away can cost a withheld delete, never an
+// unproven one.
 //
 // An empty name is never evidence.
 func (e MirrorEvidence) KnowsVM(name string) bool {
@@ -83,6 +85,17 @@ func (e MirrorEvidence) KnowsVM(name string) bool {
 // Drop that table from the union and every re-attached NIC permanently strands
 // its old NetBox interface: the delete is withheld on every sweep from then on.
 // Pinned by TestDetachedMACStaysProvableAfterReattach.
+//
+// That mitigation covers the LOCAL write path only, and one more path overwrites
+// a MAC in place: buildMergeUpsertSQL assigns every sender-supplied non-PK
+// column, and `vm_interfaces` keys on (vm_name, network_name), so a merged peer
+// row replaces the local `mac` outright. `vm_nics` keys on (vm_name, id) with the
+// id derived from the MAC, so the merge lands the peer's NIC as a SEPARATE row
+// and cannot overwrite another MAC's — but anti-entropy repairs per TABLE, so
+// during the window where `vm_interfaces` has merged and `vm_nics` has not,
+// neither table names the displaced MAC. It fails the same direction as
+// everything else here: the mirror withholds that interface's delete until the
+// `vm_nics` merge closes the window.
 //
 // KNOWN GAP, bounded: InsertVMWithHardware's same-name re-create purge is keyed
 // on `vm_name` ALONE, so re-creating a VM under a name that was used before
@@ -113,12 +126,32 @@ func (e MirrorEvidence) KnowsNIC(vmName, mac string) bool {
 // so "`vms` repaired, `ip_allocations` not yet" is a state the repair mechanism
 // itself produces.
 //
-// The evidence is complete because nothing hard-deletes an `ip_allocations` row:
-// ReleaseLease tombstones it and RETAINS netbox_ip_id, so a genuinely released
-// address still has a row naming it. Requiring evidence therefore cannot strand
-// a stale assignment — it can only defer one to a sweep that can prove it.
+// It is NOT complete, and the tempting argument for why it would be does not
+// hold. Nothing hard-deletes an `ip_allocations` row — ReleaseLease tombstones it
+// and RETAINS netbox_ip_id — but the read below filters `WHERE netbox_ip_id IS
+// NOT NULL`, so losing the COLUMN VALUE loses the evidence exactly as a hard
+// delete would, and two paths do that by UPDATE:
+//
+//   - network's NetBox allocator resurrects a tombstoned lease with an upsert
+//     keyed on (network, ip) that assigns `netbox_ip_id = excluded.netbox_ip_id`.
+//     Re-claiming a released address therefore overwrites the PRIOR object's id
+//     with the new one's. The producible permanent case: the compensating
+//     ReleaseIP after a failed persist does not go through, an explicit re-claim
+//     of the same address mints a fresh object, and the old litevirt-owned object
+//     — still assigned to a surviving interface — becomes unclearable for good.
+//   - buildMergeUpsertSQL (anti-entropy merge) assigns every sender-supplied
+//     non-PK column, so a strictly-newer peer row carrying a NULL `netbox_ip_id`
+//     nulls the local value.
+//
+// What saves the caller is the DIRECTION, not completeness: a missing id yields
+// "not proven", and the mirror's answer to that is to withhold the clear. The
+// cost is a withheld clear — an address NetBox keeps advertising — never an
+// unproven one. Leak over collision, the same direction as every other
+// fail-closed decision here. A withheld clear that never resolves is an object
+// for an operator to unassign in NetBox by hand.
+//
 // (DiscardReplicatedStateForReseed truncates the table, and the merge behind it
-// restores the rows; the window in between costs withheld clears.)
+// restores the rows; the window in between costs withheld clears the same way.)
 //
 // Address 0 is never evidence: it is what a builtin, non-NetBox lease reads back
 // as, and what an unresolved lookup returns.
@@ -179,6 +212,11 @@ func ReadMirrorEvidence(ctx context.Context, c *Client) (MirrorEvidence, error) 
 	// lease keeps its netbox_ip_id, so the tombstone IS the proof that the
 	// address the mirror wants to unassign is genuinely unclaimed. Filtering to
 	// live rows would make every correct clear unprovable.
+	//
+	// The `netbox_ip_id IS NOT NULL` predicate is what makes this evidence
+	// INCOMPLETE rather than merely conservative: two UPDATE paths can clear the
+	// column and take the proof with it. See KnowsAddress — both cost a withheld
+	// clear, which is the safe direction.
 	rows, err = c.Query(ctx,
 		`SELECT netbox_ip_id FROM ip_allocations WHERE netbox_ip_id IS NOT NULL`)
 	if err != nil {

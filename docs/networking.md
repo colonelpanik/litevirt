@@ -317,7 +317,13 @@ indistinguishable from. Two things can be taken away — a `delete`, which retir
 a `virtual_machine` or a `vminterface`, and a `clear`, which unassigns an
 `ip_address` from an interface — and neither runs without positive local
 evidence. Creates, updates and assignments are unaffected: they are additive, so
-the worst a partial read costs there is an object a later sweep reconciles.
+the worst a partial read costs there is an object a later sweep reconciles. One
+destructive call sits outside this gate: adopting an identity that NetBox holds
+*twice* keeps the lowest object id and deletes the duplicates, from the
+create/adopt path rather than the removal phases. It cannot reach an object the
+gate would have protected — it fires only on duplicates of an identity that is
+in the desired set, so the local record proving that identity necessarily
+exists — but it is a real `DELETE`, and the enumeration above does not cover it.
 
 Three conditions withhold, at two different scopes.
 
@@ -336,8 +342,14 @@ Three conditions withhold, at two different scopes.
 **Per object** is the third, and it covers the far more common shape the two
 above pass: a database holding *some* of the cluster's rows. A node that just
 joined, or one rebuilt from scratch, hydrates row by row, and nothing throttles
-it into safety — it takes the mirror's leader lease immediately and re-latches
-within seconds of starting. So each removal is asked for its own proof:
+it into safety. What stands between such a node and its first destructive sweep
+is only a **delay**: the mirror deliberately runs no pass at startup, so its
+first lease acquisition and its first sweep both land one
+`netbox.sweep_interval_sec` in (15 minutes by default), and the queue poll that
+can bring a sweep forward takes no lease, so it cannot lead before then. A wait
+is not a proof — it is the same 15 minutes whether the database has hydrated or
+not, and a node still replicating when the tick arrives gets no second grace
+period. So each removal is asked for its own proof:
 
 - a **delete** needs a local row for the VM or NIC it retires — live or
   tombstoned. litevirt soft-deletes, so a destroyed workload leaves one; a row
@@ -354,12 +366,22 @@ inventory read partial, it does not then act destructively on it. A withheld
 clear does not escalate that way; it is proven per address and costs only that
 one.
 
-In every case the sweep still applies its creates, updates and assignments, logs
-exactly what it withheld and why, and does **not** stamp
+In every case the sweep still applies its creates, updates and assignments, warns
+about what it withheld, and does **not** stamp
 `litevirt_netbox_mirror_last_success_seconds`. So NetBox may briefly advertise a
 machine that is gone, and never loses one that is not, and
 `litevirt_netbox_mirror_sweeps_total{result="error"}` climbs while the condition
 lasts.
+
+How much the warning tells you depends on the scope. A **per-object** withholding
+names the objects: the VM names, the interface MACs, or the NetBox address ids,
+sorted so a condition lasting several sweeps logs the same list each time. A
+**whole-pass** one — the empty read, the skipped record, or a failure to read the
+local record history at all — gives the reason and a *count* of the actions it
+dropped, not the list, because at that scope the read it would enumerate from is
+the one it has just called untrustworthy. To identify the objects behind a
+whole-pass withholding, fix the condition it names and read the next sweep's
+per-object warnings.
 
 #### When a withheld removal does not clear itself
 

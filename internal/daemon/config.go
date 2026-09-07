@@ -209,9 +209,26 @@ type Config struct {
 
 // NetBoxConfig configures the external NetBox IPAM integration. Default off.
 type NetBoxConfig struct {
-	Enabled          bool   `yaml:"enabled"`
-	URL              string `yaml:"url"`
-	TokenPath        string `yaml:"token_path"`
+	Enabled   bool   `yaml:"enabled"`
+	URL       string `yaml:"url"`
+	TokenPath string `yaml:"token_path"`
+	// ClusterName overrides the NetBox `virtualization.cluster` this
+	// installation mirrors its inventory into. Empty (the default) uses the
+	// local cluster name.
+	//
+	// It exists because a NetBox cluster is the scope in which NetBox enforces
+	// one VM name per cluster, so two litevirt installations sharing one NetBox
+	// under one cluster name share that namespace — and the first same-named VM
+	// makes the second installation's create a 400 it cannot get past. Setting
+	// a distinct name here gives each installation a namespace of its own.
+	//
+	// Deliberately operator-chosen and NOT derived from the cluster
+	// fingerprint: the fingerprint changes when the CA is replaced, and a
+	// fingerprint-derived name would point the mirror at a fresh cluster object
+	// on the next sweep, duplicating the whole inventory and leaving `lv netbox
+	// rekey` — which resolves the cluster by this same name — with nothing to
+	// repair.
+	ClusterName      string `yaml:"cluster_name,omitempty"`
 	TimeoutSec       int    `yaml:"timeout_sec"`
 	SweepIntervalSec int    `yaml:"sweep_interval_sec"`
 }

@@ -31,10 +31,11 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		interval = defaultNetBoxSweepInterval
 	}
 	return netboxsync.New(netboxsync.Options{
-		NetBox:   s.netbox,
-		DB:       s.db,
-		Metrics:  s.nbMetrics(),
-		Interval: interval,
+		NetBox:      s.netbox,
+		DB:          s.db,
+		Metrics:     s.nbMetrics(),
+		Interval:    interval,
+		ClusterName: s.netboxClusterName,
 		// The TTL is sized from the cadence this node actually runs at, exactly
 		// as the sweeper's is, so a cluster on a slower cadence does not hand
 		// leadership away between its own passes.

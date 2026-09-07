@@ -317,6 +317,13 @@ netbox:
   token_path: ""            # path to a file containing the API token. The token
                             # is read from this file at startup and is NEVER held
                             # inline in config.
+  cluster_name: ""          # NetBox `virtualization.cluster` to mirror inventory
+                            # into. Empty uses the local cluster name. NetBox
+                            # allows one VM name per cluster, so two litevirt
+                            # installations sharing one NetBox need a distinct
+                            # name here or same-named VMs collide. Set it before
+                            # the first sweep — changing it later strands
+                            # everything written under the previous cluster.
   timeout_sec: 10           # per-request timeout.
   sweep_interval_sec: 900   # how often each configured node runs one maintenance
                             # pass: re-validate every binding, then reclaim

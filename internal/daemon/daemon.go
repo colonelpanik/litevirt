@@ -758,6 +758,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// NetBox integration, so the cluster-wide latch requires config uniformity,
 	// not just a uniform build (see capabilities.NetBoxIPAMV1).
 	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
+	// BEFORE the mirror starts. The name decides which NetBox cluster object
+	// every mirrored VM hangs off, and the CA re-key resolves the same one.
+	svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)
 	// The client itself. A node whose config ENABLES the integration but whose
 	// client cannot be built (missing/empty token file, no URL) must not start:
 	// it would advertise netbox_ipam_v1 — helping the cluster latch — while

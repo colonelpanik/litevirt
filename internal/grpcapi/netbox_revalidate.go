@@ -765,7 +765,7 @@ func (s *Server) rekeyInventory(ctx context.Context, lease *rekeyLease, oldFP, n
 // looking at a different cluster than the mirror writes to would report zero
 // objects rewritten and resume the binding over inventory it never touched.
 func (s *Server) netboxClusterID(ctx context.Context) (int, error) {
-	name, err := netboxsync.ClusterName(ctx, s.db)
+	name, err := netboxsync.ClusterName(ctx, s.db, s.netboxClusterName)
 	if err != nil {
 		return 0, fmt.Errorf("read cluster name for re-key: %w", err)
 	}

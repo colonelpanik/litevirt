@@ -74,6 +74,10 @@ type Options struct {
 	// Interval is clamped to it — a poll slower than the sweep it exists to
 	// anticipate would never be the thing that noticed a change.
 	PollInterval time.Duration
+	// ClusterName overrides the NetBox cluster this mirror writes into. Empty
+	// means "the local cluster name", which is the default every
+	// single-installation deployment runs.
+	ClusterName string
 	// AcquireLease and HoldsLease gate the sweep on the cluster's `netbox`
 	// leader lease. Leaving either nil makes this reconciler write NOTHING —
 	// the fail-closed direction, so an incomplete wiring is inert rather than
@@ -113,6 +117,7 @@ func New(o Options) *Reconciler {
 		metrics:      o.Metrics,
 		interval:     interval,
 		pollInterval: poll,
+		clusterName:  o.ClusterName,
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
@@ -332,6 +337,19 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 
 	actions := Diff(desired, actual, fp)
 	converged := true
+	if collided := collidingNames(desired, actual); len(collided) > 0 {
+		// Diff has already withheld every action for these VMs. What is left is
+		// to say so: the mirror cannot represent them, and it will not be able
+		// to until the operator gives one of the two installations a NetBox
+		// cluster of its own — or, if this is the aftermath of a CA
+		// replacement, until `lv netbox rekey` re-stamps the objects that still
+		// carry the old fingerprint.
+		slog.Warn("netbox mirror: skipping VMs whose names this NetBox cluster already holds "+
+			"under another identity; set netbox.cluster_name to give this installation a "+
+			"cluster of its own, or run `lv netbox rekey` if this cluster's CA was replaced",
+			"vms", collided, "netbox_cluster", r.clusterID)
+		converged = false
+	}
 	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
 		kept, withheld := withoutDeletes(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
@@ -488,15 +506,23 @@ func (r *Reconciler) applyPhases(ctx context.Context, actions []Action, idx desi
 	return nil
 }
 
-// ClusterName is the NetBox cluster name this litevirt cluster mirrors under,
-// placeholder included.
+// ClusterName is the NetBox cluster name this litevirt cluster mirrors under —
+// the configured override, the local cluster name, or the placeholder, in that
+// order.
 //
 // Exported because the CA re-key — in internal/grpcapi, which owns the operation
 // but not the mirror — has to resolve the SAME cluster object the mirror writes
-// into, to enumerate the inventory it must re-stamp. A second copy of the
-// fallback would strand every object a mirror wrote under the placeholder the
-// moment the two strings diverged, with nothing failing to say so.
-func ClusterName(ctx context.Context, db *corrosion.Client) (string, error) {
+// into, to enumerate the inventory it must re-stamp. A second copy of this
+// precedence would strand every object a mirror wrote the moment the two
+// resolutions diverged, with nothing failing to say so.
+//
+// The override short-circuits the read: an operator who has named the cluster
+// explicitly has said everything there is to say, and a `cluster` row that
+// cannot be read must not change which objects a re-key can find.
+func ClusterName(ctx context.Context, db *corrosion.Client, override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
 	name, err := corrosion.ClusterName(ctx, db)
 	if err != nil {
 		return "", err
@@ -513,15 +539,18 @@ func ClusterName(ctx context.Context, db *corrosion.Client) (string, error) {
 // Named after the operator's own cluster name, never after the fingerprint: the
 // fingerprint is derived from the CA certificate, so a CA replacement would
 // point the mirror at a NEW cluster object and orphan everything under the old
-// one. Two installations sharing a name therefore share a cluster object, which
-// is harmless — every object is still scoped by the identity fingerprint, and
-// that is what BuildActual and Diff filter on.
+// one. Two installations sharing a name therefore share a cluster object, and that
+// is NOT harmless: a NetBox cluster is the scope in which NetBox enforces one VM
+// name per cluster, so the two share the namespace their VM names live in. The
+// delete half is safe — every object is scoped by the identity fingerprint,
+// which is what BuildActual and Diff filter on — but a create is not, and the
+// collision is what `netbox.cluster_name` and Diff's name guard exist for.
 func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
 	typeID, err := r.nb.EnsureClusterType(ctx, clusterTypeName)
 	if err != nil {
 		return 0, fmt.Errorf("cluster type %q: %w", clusterTypeName, err)
 	}
-	name, err := ClusterName(ctx, r.db)
+	name, err := ClusterName(ctx, r.db, r.clusterName)
 	if err != nil {
 		return 0, err
 	}

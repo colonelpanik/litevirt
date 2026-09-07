@@ -62,6 +62,12 @@ type Server struct {
 	// orphan sweep) rather than dereferencing a nil pointer.
 	netbox *netbox.Client
 
+	// netboxClusterName overrides the NetBox cluster this installation mirrors
+	// into (config `netbox.cluster_name`). Empty means "use the local cluster
+	// name" — see netboxsync.ClusterName, which is the single place that
+	// resolves it for both the mirror and the CA re-key.
+	netboxClusterName string
+
 	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
 	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
 	// claim or a sweep behaves differently.
@@ -682,6 +688,12 @@ func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = 
 // this client are set together — a node whose config enables the integration
 // but whose client failed to construct must not advertise the token.
 func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
+
+// SetNetBoxClusterName sets the NetBox cluster override (see
+// netboxClusterName). It must be set before the mirror starts: the name decides
+// which cluster object every mirrored VM hangs off, and changing it later
+// strands everything written under the previous one.
+func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name }
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same

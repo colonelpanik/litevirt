@@ -77,6 +77,15 @@ type Options struct {
 	// scenario meaning "two independent installations" would silently be
 	// testing one.
 	NamePrefix string
+	// NetBoxClusterName sets config `netbox.cluster_name` on every node, giving
+	// this cluster a NetBox cluster object of its own.
+	//
+	// It is what a second installation sharing one NetBox needs: a NetBox
+	// cluster is the scope in which NetBox enforces one VM name per cluster, so
+	// two installations under one cluster name cannot both mirror a same-named
+	// VM. Empty (the default) leaves every existing scenario resolving the
+	// `cluster` row's name, exactly as before.
+	NetBoxClusterName string
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -763,6 +772,7 @@ func (c *Cluster) wireNetBox(n *Node) {
 		c.t.Fatalf("netbox client for %s: %v", n.Name, err)
 	}
 	n.Server.SetNetBoxClient(client)
+	n.Server.SetNetBoxClusterName(c.opts.NetBoxClusterName)
 	n.Server.SetNetBoxIPAM(true)
 
 	// Host bridges: CreateVM preflights every non-macvtap NIC with ensureBridge,

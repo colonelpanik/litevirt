@@ -121,6 +121,11 @@ type Reconciler struct {
 	db      *corrosion.Client
 	metrics mirrorMetrics
 
+	// clusterName overrides the NetBox cluster name (config
+	// `netbox.cluster_name`); empty means the local cluster name. See
+	// Options.ClusterName.
+	clusterName string
+
 	// clusterID is the NetBox cluster every mirrored VM belongs to, resolved
 	// once per sweep before any action runs. It is not on Action because every
 	// action in a sweep shares it.

@@ -278,8 +278,12 @@ against the new range.
 ### The inventory mirror
 
 A cluster configured for NetBox also mirrors its inventory there, whether or not
-any network is bound to a prefix. It registers itself as a NetBox cluster (of
-type `litevirt`, named after the local cluster) and mirrors:
+any network is bound to a prefix. Mirroring requires the `netbox_ipam_v1`
+capability to be latched cluster-wide, exactly as binding a prefix does — the
+mirror writes replicated tables an older build does not carry, so a node
+configured ahead of its peers writes nothing until every node has opted in. It
+registers itself as a NetBox cluster (of type `litevirt`, named after the local
+cluster or after `netbox.cluster_name`) and mirrors:
 
 - each VM as a `virtual_machine` carrying its vCPUs, memory, disk and status —
   `active` while it runs and `offline` in every other state, because NetBox's
@@ -296,11 +300,30 @@ who does not model hosts still gets a working mirror. Templates are never
 mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
 deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.
 
+**Deletes need whole evidence.** The mirror computes them from a read of the
+local replicated database, and that read has partial answers an empty cluster is
+indistinguishable from: a node hydrating after a database loss reports no VMs,
+and a VM whose record cannot be read is skipped. A sweep in either state applies
+its creates and updates but withholds every delete, logs why, and does not stamp
+`litevirt_netbox_mirror_last_success_seconds` — so NetBox may briefly advertise a
+machine that is gone, and never loses one that is not. Deleting the last VM in a
+cluster still retires its object: the deleted record leaves a tombstone behind,
+which is the evidence that the empty answer is a real one.
+
 **One node writes.** The mirror runs under the same cluster-wide leader lease as
 the orphan sweeper and the re-key, and re-reads it before every batch of writes,
 so a handover mid-sweep stops the outgoing leader instead of letting two nodes
 write the same objects. It writes only on change: a sweep over inventory that
 already matches issues no writes at all.
+
+**Two litevirt clusters, one NetBox.** Give each one a NetBox cluster of its own
+with `netbox.cluster_name`. NetBox allows one VM name per cluster, so two
+installations mirroring into a single NetBox cluster cannot both hold a `web-01`
+— the second one's create is rejected. The mirror detects that before it writes:
+it skips exactly the colliding VM, converges everything else, logs the names it
+skipped, and leaves `litevirt_netbox_mirror_last_success_seconds` standing still
+so the staleness alert fires. Set the name before the first sweep — changing it
+later strands everything written under the previous cluster.
 
 **Two cadences.** A full sweep on the `netbox.sweep_interval_sec` cadence (900
 seconds by default) reconciles everything, and that is the correctness mechanism.

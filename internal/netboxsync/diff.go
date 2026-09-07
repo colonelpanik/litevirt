@@ -76,6 +76,20 @@ type Actual struct {
 	VMs  map[string]netbox.VirtualMachine
 	NICs map[string]netbox.VMInterface
 
+	// ForeignVMNames are the virtual_machine names this NetBox cluster already
+	// holds under something that is NOT this cluster's identity — a co-tenant
+	// installation's object, or one an operator made by hand.
+	//
+	// It exists because a NetBox cluster is the scope in which NetBox enforces
+	// one VM name per cluster, and that rule reaches across identities: a create
+	// for a name already taken is a 400 whoever holds it. Identity keeps the
+	// DELETE half safe, and can do nothing at all for the create half.
+	//
+	// Names, not identities, because the constraint is on the name. An empty
+	// identity counts as foreign for the same reason: an operator's own VM holds
+	// the name just as firmly as a co-tenant's.
+	ForeignVMNames map[string]bool
+
 	// OwnedIPsByIface maps a NetBox interface id to the litevirt-owned addresses
 	// currently assigned to it.
 	//
@@ -112,6 +126,7 @@ func BuildActual(ctx context.Context, c ActualLister, clusterID int, fingerprint
 	out := Actual{
 		VMs:             map[string]netbox.VirtualMachine{},
 		NICs:            map[string]netbox.VMInterface{},
+		ForeignVMNames:  map[string]bool{},
 		OwnedIPsByIface: map[int][]netbox.IPAddress{},
 	}
 
@@ -121,6 +136,9 @@ func BuildActual(ctx context.Context, c ActualLister, clusterID int, fingerprint
 	}
 	for _, v := range vms {
 		if !ownedBy(v.Identity, fingerprint) {
+			// Discarded from the diff — but its NAME is recorded, because
+			// NetBox's uniqueness rule does not care whose object holds it.
+			out.ForeignVMNames[v.Name] = true
 			continue
 		}
 		out.VMs[v.Identity] = v
@@ -173,6 +191,24 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 	for _, d := range desired {
 		vmID := netbox.Identity(fingerprint, d.UUID, "")
 		seenVM[vmID] = true
+
+		if actual.ForeignVMNames[d.Name] {
+			// Somebody else's object holds this name in this NetBox cluster, so
+			// a create or a rename onto it is a 400 — and one 400 fails the
+			// whole sweep, on every pass, for as long as both VMs exist. Emit
+			// nothing for this VM rather than post a write we can prove will be
+			// rejected.
+			//
+			// SEEN FIRST, including its NICs. Skipping without marking them
+			// would take the objects we may already hold for this VM out of the
+			// desired set, and the delete half would then reap them — turning a
+			// name collision into a deletion, which is the one outcome worse
+			// than not mirroring.
+			for _, n := range d.NICs {
+				seenNIC[netbox.Identity(fingerprint, d.UUID, n.MAC)] = true
+			}
+			continue
+		}
 
 		a, ok := actual.VMs[vmID]
 		if !ok {
@@ -270,6 +306,23 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 			NetBoxID: n.ID, ParentNetBoxID: n.VMID,
 		})
 	}
+	return out
+}
+
+// collidingNames returns the desired VM names this NetBox cluster already holds
+// under a foreign identity, sorted.
+//
+// Diff acts on the same predicate and needs no list; the sweep needs the list,
+// to name the VMs in the warning and to report the pass as unconverged. One
+// predicate, read twice, so the two cannot disagree about what a collision is.
+func collidingNames(desired []DesiredVM, actual Actual) []string {
+	var out []string
+	for _, d := range desired {
+		if actual.ForeignVMNames[d.Name] {
+			out = append(out, d.Name)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

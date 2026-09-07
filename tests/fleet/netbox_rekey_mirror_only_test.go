@@ -111,7 +111,18 @@ func assertNoBindings(t *testing.T, n *Node) {
 // one database, one cluster row and one fingerprint.
 func mirrorOnlyClusterOn(t *testing.T, nb *NetBoxFake, namePrefix string) *Cluster {
 	t.Helper()
-	c := New(t, Options{Nodes: 1, NetBoxURL: nb.URL(), NamePrefix: namePrefix})
+	return mirrorOnlyClusterNamed(t, nb, namePrefix, "")
+}
+
+// mirrorOnlyClusterNamed is mirrorOnlyClusterOn with a NetBox cluster name of
+// its own, which is what a second installation sharing one NetBox needs — see
+// Options.NetBoxClusterName.
+func mirrorOnlyClusterNamed(t *testing.T, nb *NetBoxFake, namePrefix, netboxCluster string) *Cluster {
+	t.Helper()
+	c := New(t, Options{
+		Nodes: 1, NetBoxURL: nb.URL(), NamePrefix: namePrefix,
+		NetBoxClusterName: netboxCluster,
+	})
 	// The mirror is gated on netbox_ipam_v1 exactly as a prefix binding is: its
 	// statements are replicated, and an older peer carries neither of its
 	// tables. A mirror-only cluster has no binding to latch it, so the latch is
@@ -154,7 +165,7 @@ func mirrorOnlyCluster(t *testing.T, vmName string) (*NetBoxFake, *Cluster) {
 // "it was left alone".
 func netboxClusterOf(t *testing.T, nb *NetBoxFake, n *Node) int {
 	t.Helper()
-	name, err := netboxsync.ClusterName(context.Background(), n.DB)
+	name, err := netboxsync.ClusterName(context.Background(), n.DB, n.cluster.opts.NetBoxClusterName)
 	if err != nil {
 		t.Fatalf("ClusterName on %s: %v", n.Name, err)
 	}

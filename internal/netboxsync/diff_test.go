@@ -21,6 +21,61 @@ const fp = "abc123"
 func vmIdent(uuid string) string  { return netbox.Identity(fp, uuid, "") }
 func nicIdent(u, m string) string { return netbox.Identity(fp, u, m) }
 
+// TestDiffSkipsAVMWhoseNameACoTenantHolds pins the pre-create name guard.
+//
+// NetBox allows one VM name per cluster and enforces it across identities, so a
+// create for a name a co-tenant installation (or an operator, by hand) already
+// holds is a 400 — and one 400 fails the whole sweep, every pass, for as long as
+// both VMs exist. The action has to be withheld rather than issued and mourned.
+func TestDiffSkipsAVMWhoseNameACoTenantHolds(t *testing.T) {
+	actual := Actual{
+		VMs:            map[string]netbox.VirtualMachine{},
+		ForeignVMNames: map[string]bool{"vm-1": true},
+	}
+	got := Diff([]DesiredVM{{
+		Name: "vm-1", UUID: "u1", VCPUs: 2,
+		NICs: []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:bb:cc"}},
+	}}, actual, fp)
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want no action for a VM whose name this cluster cannot claim", got)
+	}
+}
+
+// TestDiffNeverReapsACollidedVMsOwnObjects is the dangerous half of that skip.
+//
+// A rename ONTO a taken name reaches the same guard while this cluster's own
+// objects for that VM are already standing. Skipping the VM without first
+// marking its identities as seen takes them out of the desired set, and the
+// delete half then reaps them — turning a name collision into a deletion, which
+// is worse than not mirroring at all.
+func TestDiffNeverReapsACollidedVMsOwnObjects(t *testing.T) {
+	const mac = "52:54:00:aa:bb:cc"
+	actual := Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u1"): {ID: 11, Name: "vm-old", Identity: vmIdent("u1")},
+		},
+		NICs: map[string]netbox.VMInterface{
+			nicIdent("u1", mac): {ID: 21, VMID: 11, Name: "eth0", MAC: mac,
+				Identity: nicIdent("u1", mac)},
+		},
+		// The VM was renamed onto a name a co-tenant holds.
+		ForeignVMNames: map[string]bool{"vm-new": true},
+	}
+	got := Diff([]DesiredVM{{
+		Name: "vm-new", UUID: "u1", VCPUs: 2,
+		NICs: []DesiredNIC{{Name: "eth0", MAC: mac}},
+	}}, actual, fp)
+
+	for _, a := range got {
+		if a.Op == "delete" {
+			t.Fatalf("a name collision emitted %+v — this cluster's own objects must survive it", a)
+		}
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want no action at all", got)
+	}
+}
+
 func TestDiffCreatesMissingVM(t *testing.T) {
 	got := Diff([]DesiredVM{{Name: "vm-1", UUID: "u1", VCPUs: 2}}, Actual{}, fp)
 	if len(got) != 1 || got[0].Op != "create" || got[0].Key != vmIdent("u1") {

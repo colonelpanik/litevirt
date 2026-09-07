@@ -74,17 +74,23 @@ func latchNetBoxIPAM(t *testing.T, c *Cluster, gates map[string]*health.Checker)
 // mutation-fails without it.
 func mustCreateBoundNetwork(t *testing.T, c *Cluster, n *Node, name, subnet string, prefixID int) *pb.NetworkInfo {
 	t.Helper()
-	ni, err := c.SelfClient(n).CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
+	ni, err := createBoundNetwork(c, n, name, subnet, prefixID)
+	if err != nil {
+		t.Fatalf("CreateNetwork(%s, prefix %d) on %s: %v", name, prefixID, n.Name, err)
+	}
+	return ni
+}
+
+// createBoundNetwork is mustCreateBoundNetwork without the fatal, for the
+// scenarios whose subject IS the refusal.
+func createBoundNetwork(c *Cluster, n *Node, name, subnet string, prefixID int) (*pb.NetworkInfo, error) {
+	return c.SelfClient(n).CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
 		Name:           name,
 		Type:           "sriov",
 		Pf:             "ens1f0",
 		Subnet:         subnet,
 		NetboxPrefixId: int32(prefixID),
 	})
-	if err != nil {
-		t.Fatalf("CreateNetwork(%s, prefix %d) on %s: %v", name, prefixID, n.Name, err)
-	}
-	return ni
 }
 
 // TestFleetNetBoxWiring is the end-to-end proof that the harness reaches a real

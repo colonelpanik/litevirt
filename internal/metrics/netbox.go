@@ -62,8 +62,10 @@ func netboxInit() {
 		})
 		netboxBindingsSuspended = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_netbox_bindings_suspended_total",
-			Help: "Bindings taken out of service by revalidation drift. Cumulative; the number " +
-				"suspended RIGHT NOW is litevirt_netbox_bindings_suspended.",
+			Help: "Bindings taken out of service and left that way: by revalidation drift, or " +
+				"by a bind whose adoption of the addresses its guests already hold could not " +
+				"finish. Cumulative; the number suspended RIGHT NOW is " +
+				"litevirt_netbox_bindings_suspended.",
 		})
 		netboxDuplicateObjects = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_netbox_duplicate_objects_total",
@@ -155,7 +157,13 @@ func (*NetBoxMetrics) IncSweepSkipped(reason string) {
 // IncStuckLease counts one address leaked in both systems until an operator acts.
 func (*NetBoxMetrics) IncStuckLease() { netboxStuckLeases.Inc() }
 
-// IncBindingSuspended counts one binding taken out of service by drift.
+// IncBindingSuspended counts one binding taken out of service AND LEFT THERE —
+// by revalidation drift, or by a bind-time adoption that could not finish.
+//
+// Not emitted for the suspension a successful bind takes while it adopts: that
+// one is lifted inside the same RPC, and counting it would page an operator
+// alerting on this counter's rate for a bind that worked. The live gauge reads
+// the rows, so it shows that one for as long as it lasts.
 func (*NetBoxMetrics) IncBindingSuspended() { netboxBindingsSuspended.Inc() }
 
 // IncDuplicateObject counts one NetBox object found duplicated for a single

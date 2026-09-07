@@ -230,6 +230,70 @@ invisible to the inventory mirror, so the address it kept holding would be
 reclaimable by neither the mirror nor the orphan sweep. Detach the NIC first;
 that releases the address, and the conversion then goes through.
 
+### Binding a subnet that already has VMs on it
+
+This is the ordinary way a bind happens on a cluster that is already running, and
+the bind handles it: **the addresses your guests already hold are adopted into
+NetBox as part of the bind**, before the binding ever serves a claim.
+
+It has to be. NetBox's notion of an available address is "no `ip_address` object
+exists", so an address a guest holds that NetBox has never been told about is one
+NetBox will offer to the next VM created on that network — two guests, one
+address. Nothing else in litevirt ever tells NetBox about such an address: the
+inventory mirror only assigns and clears objects that already carry a NetBox id,
+and those ids come only from a claim.
+
+The bind therefore creates the binding **suspended**, records every existing
+address, and only then resumes it. While it is suspended the network serves no
+address claims, so a half-finished adoption can never hand out an address that
+has not been recorded yet.
+
+An address is adopted from the guest's **NIC record** — the address `lv run
+--ip`, a compose file or the IP scanner put there — for every VM whose address
+falls inside the bound prefix. An address outside the prefix is left alone: the
+network's own subnet and the bound prefix need not be identical, and NetBox will
+never offer an address it does not contain. Re-running a bind is safe: an address
+litevirt has already recorded against that prefix is skipped, and issues no
+NetBox request at all.
+
+Some states refuse the bind rather than being adopted around, and every refusal
+names the object so it can be dealt with:
+
+| State | Why it refuses | What to do |
+|---|---|---|
+| the network holds **container** address leases | containers are not supported on a bound network, so an adopted container would hold a lease it could never renegotiate, migrate or recreate | move the containers to another network, or delete them |
+| a **template** holds an address inside the prefix | a template is invisible to the inventory mirror, so its address would be held by nothing and reclaimable by neither the mirror nor the orphan sweep — the same reason converting a bound-network VM to a template is refused | detach that NIC, or revert the template to a VM |
+| the address already exists in NetBox under **another identity** | it belongs to another litevirt installation (or to this one before a fingerprint move); taking it would seize another cluster's object | confirm who owns it; if it is genuinely stale, remove it in NetBox |
+| the address already exists in NetBox with **no litevirt identity** | an operator-created object or a reservation. litevirt will not stamp its identity onto a record it did not create — that identity is exactly what would later authorize the orphan sweep to delete it | remove the object in NetBox and let the bind create it, or move the workload off that address |
+| a lease names a NetBox object in a **different prefix** | the address was recorded against a prefix this network used to be bound to, so the prefix being bound now would never learn about it | retire the stale lease |
+| more than **256** addresses are waiting to be adopted | each one is a separate NetBox request inside a single RPC | bind a smaller prefix, or move workloads off the network |
+
+The cap of 256 covers a fully-populated /24, which is the shape a bound prefix
+has in practice.
+
+#### If the adoption does not finish
+
+A bind whose adoption stops partway — NetBox became unreachable, or one address
+refused — reports the failure and leaves things in a state that is safe and
+finishable, never half-live:
+
+- **the network exists**, and its binding is **suspended**, so it serves no
+  address claims;
+- the addresses that were recorded stay recorded;
+- the failure message names the network and the cause.
+
+Repair the cause, then finish it with the same command that lifts any other
+suspension:
+
+```bash
+lv netbox resume <network>
+```
+
+Resume completes exactly the work the failed pass left — the already-recorded
+addresses cost nothing — and lifts the suspension only once every one of them is
+in NetBox. A resume that still cannot finish refuses and the binding stays
+suspended. Deleting the network is the other way out: that releases the prefix.
+
 ### Suspended bindings
 
 Bind-time validation is re-run continuously, because it goes stale: a prefix can
@@ -256,10 +320,17 @@ Repair the prefix in NetBox, then:
 lv netbox resume <network>
 ```
 
-Resume rewrites nothing. It re-runs every bind-time check against the facts the
-binding pinned and clears the suspension only when all of them agree again; while
-the drift is still present the command is refused, naming the reason, and the
-binding stays suspended.
+Resume rewrites no binding facts. It re-runs every bind-time check against the
+facts the binding pinned and clears the suspension only when all of them agree
+again; while the drift is still present the command is refused, naming the
+reason, and the binding stays suspended.
+
+It also finishes any adoption the bind left owed — see
+[Binding a subnet that already has VMs on it](#binding-a-subnet-that-already-has-vms-on-it).
+That is not a separate mode: the same gate that refuses to lift a suspension over
+unrepaired drift refuses to lift one over an address litevirt has not yet
+recorded in NetBox. On a binding with nothing owed it costs one local read and
+makes no NetBox request.
 
 Repairable in place, by fixing NetBox and running `lv netbox resume`:
 

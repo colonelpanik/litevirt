@@ -249,12 +249,77 @@ func AckSyncItem(ctx context.Context, c *Client, id string) error {
 }
 
 // LeaseRecord is one ip_allocations row with its NetBox join keys.
+//
+// The OWNER triple travels with it because bind-time adoption has to decide
+// whether a lease it found is one it may account for, and every part of that
+// answer is an owner question: a `ct` lease refuses the bind outright (containers
+// are unsupported on a bound network, so adopting one would manufacture a state
+// the rest of the system rejects), and a `vm` lease has to be matched against
+// the NIC whose address it names. A record that carried only the address could
+// not tell those apart.
 type LeaseRecord struct {
-	Network      string
-	IP           string
-	MAC          string
+	Network string
+	IP      string
+	MAC     string
+	// VMName is the owner NAME (the legacy column name; see OwnerKind).
+	VMName       string
+	OwnerKind    string // "vm" | "ct"
+	OwnerHost    string // "" for VMs (names are cluster-global); the host for CTs
 	NetBoxIPID   int
 	NetBoxPrefix int
+}
+
+// leaseCols is every column a LeaseRecord carries, COALESCEd where the schema
+// allows a null. The NetBox columns are nullable — every pre-v51 lease has them
+// empty — so a builtin lease reads back as id 0, which is what tells a release
+// there is no remote object to delete.
+const leaseCols = `network, ip, mac, vm_name,
+	        COALESCE(owner_kind, 'vm') AS owner_kind,
+	        COALESCE(owner_host, '') AS owner_host,
+	        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
+	        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id`
+
+func scanLease(r Row) LeaseRecord {
+	return LeaseRecord{
+		Network:      r.String("network"),
+		IP:           r.String("ip"),
+		MAC:          r.String("mac"),
+		VMName:       r.String("vm_name"),
+		OwnerKind:    r.String("owner_kind"),
+		OwnerHost:    r.String("owner_host"),
+		NetBoxIPID:   r.Int("netbox_ip_id"),
+		NetBoxPrefix: r.Int("netbox_prefix_id"),
+	}
+}
+
+// ListLeasesByNetwork returns every LIVE lease on one litevirt network.
+//
+// LIVE ONLY, and that predicate is load-bearing in BOTH directions. A tombstoned
+// lease RETAINS its netbox_ip_id (ReleaseLease sets deleted_at and leaves the
+// join key alone), so admitting tombstones would let a released address read as
+// "already adopted" and be skipped by the very pass that has to claim it — the
+// address a new guest now holds would stay invisible to NetBox for good. And a
+// tombstoned lease is not evidence anybody holds the address, so treating one as
+// live would also have a bind reserve addresses nothing uses.
+//
+// Owner-BLIND, unlike GetLeaseByIPForOwner: the question here is not "may I
+// retire this owner's row?" but "what does litevirt already believe about the
+// addresses on this network?", and a lease whose owner no longer matches
+// anything is exactly the half-finished state a bind must refuse rather than
+// silently step over.
+func ListLeasesByNetwork(ctx context.Context, c *Client, network string) ([]LeaseRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+leaseCols+`
+		 FROM ip_allocations
+		 WHERE network = ? AND deleted_at IS NULL`, network)
+	if err != nil {
+		return nil, fmt.Errorf("list leases on network %q: %w", network, err)
+	}
+	out := make([]LeaseRecord, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, scanLease(r))
+	}
+	return out, nil
 }
 
 // GetLeaseByIPForOwner reads one lease by its (network, ip) PRIMARY KEY, scoped
@@ -273,9 +338,7 @@ type LeaseRecord struct {
 // release there is no remote object to delete.
 func GetLeaseByIPForOwner(ctx context.Context, c *Client, network, ip, ownerKind, ownerHost, name string) (*LeaseRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT network, ip, mac,
-		        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
-		        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id
+		`SELECT `+leaseCols+`
 		 FROM ip_allocations
 		 WHERE network = ? AND ip = ? AND vm_name = ?
 		   AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,
@@ -286,14 +349,8 @@ func GetLeaseByIPForOwner(ctx context.Context, c *Client, network, ip, ownerKind
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	r := rows[0]
-	return &LeaseRecord{
-		Network:      r.String("network"),
-		IP:           r.String("ip"),
-		MAC:          r.String("mac"),
-		NetBoxIPID:   r.Int("netbox_ip_id"),
-		NetBoxPrefix: r.Int("netbox_prefix_id"),
-	}, nil
+	l := scanLease(rows[0])
+	return &l, nil
 }
 
 // LeaseExistsByIP reports whether ANY live lease references (network, ip).
@@ -329,9 +386,7 @@ func LeaseExistsByIP(ctx context.Context, c *Client, network, ip string) (bool, 
 // and a per-NIC lookup would turn a quiet sweep into thousands of queries.
 func ListNetBoxLeases(ctx context.Context, c *Client) ([]LeaseRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT network, ip, mac,
-		        COALESCE(netbox_ip_id, 0) AS netbox_ip_id,
-		        COALESCE(netbox_prefix_id, 0) AS netbox_prefix_id
+		`SELECT `+leaseCols+`
 		 FROM ip_allocations
 		 WHERE netbox_ip_id IS NOT NULL AND deleted_at IS NULL`)
 	if err != nil {
@@ -339,13 +394,7 @@ func ListNetBoxLeases(ctx context.Context, c *Client) ([]LeaseRecord, error) {
 	}
 	out := make([]LeaseRecord, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, LeaseRecord{
-			Network:      r.String("network"),
-			IP:           r.String("ip"),
-			MAC:          r.String("mac"),
-			NetBoxIPID:   r.Int("netbox_ip_id"),
-			NetBoxPrefix: r.Int("netbox_prefix_id"),
-		})
+		out = append(out, scanLease(r))
 	}
 	return out, nil
 }

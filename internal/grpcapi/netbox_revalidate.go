@@ -514,6 +514,32 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 		return counts, stillDriftedError{reason: reason}
 	}
 
+	// A re-key RESUMES, and every resume has to pass the same gate: a binding
+	// may not go live over an address its guests hold that NetBox has not been
+	// told about. Without this, `lv netbox rekey` would be a second door around
+	// the adoption gate — a bind whose adoption stopped partway leaves the
+	// binding suspended, bindingDrift finds nothing wrong with it (the pin is
+	// current), and this tail would resume it over the un-adopted remainder.
+	//
+	// It ADOPTS rather than merely refusing, so the re-key finishes the job like
+	// the resume does. Under the NEW fingerprint, which is what `next` carries
+	// and what the rewrite above has just stamped on everything else.
+	//
+	// Costs one local read on a binding with nothing owed, which is every re-key
+	// that is only answering a fingerprint move.
+	adopted, aerr := s.adoptExistingAddresses(ctx, next)
+	if aerr != nil {
+		reason := fmt.Sprintf(
+			"identities re-keyed, but the addresses this network's guests already hold are not "+
+				"all recorded in NetBox (adopted %d this pass): %v", adopted, aerr)
+		if serr := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); serr != nil {
+			return counts, fmt.Errorf("suspend binding %d after re-key: %w", b.PrefixID, serr)
+		}
+		slog.Warn("netbox binding re-keyed but its existing addresses are not all adopted",
+			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", aerr)
+		return counts, stillDriftedError{reason: reason}
+	}
+
 	next.Suspended = false
 	next.SuspendReason = ""
 	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
@@ -933,6 +959,33 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 			"network %q stays suspended: %s", req.GetNetwork(), reason)
 	}
 
+	// FINISH ANY OWED ADOPTION before the flag comes off, and refuse the resume
+	// if it cannot be finished.
+	//
+	// This is the other half of the resume GATE, and without it the gate is
+	// fail-OPEN. A bind whose adoption stopped partway leaves the binding
+	// suspended precisely so that the un-adopted remainder cannot be handed to
+	// anybody; a resume that only cleared the flag would make the binding live
+	// over exactly that remainder, and NetBox would offer a running guest's
+	// address to the next VM. It is also what makes "re-run to finish" true:
+	// the resume is the operator's re-run.
+	//
+	// Cheap when there is nothing owed — one local read per network, no NetBox
+	// request — so an ordinary resume of a drift suspension is unchanged.
+	adopted, aerr := s.adoptExistingAddresses(ctx, *b)
+	if aerr != nil {
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d adopted=%d", b.PrefixID, adopted), "error")
+		code := codes.Internal
+		if adoptionRefused(aerr) {
+			code = codes.FailedPrecondition
+		}
+		return nil, status.Errorf(code,
+			"network %q stays suspended: the addresses its guests already hold are not all "+
+				"recorded in NetBox (adopted %d this pass): %v",
+			req.GetNetwork(), adopted, aerr)
+	}
+
 	// Everything the pin records is written back UNCHANGED. Resume clears a
 	// flag; it never re-observes the prefix into the binding, because that would
 	// turn "the drift is gone" into "adopt whatever NetBox says now" — the very
@@ -946,8 +999,9 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 		return nil, status.Errorf(codes.Internal,
 			"resume binding for network %q: %v", req.GetNetwork(), err)
 	}
-	slog.Info("netbox binding resumed", "network", b.Network, "prefix", b.PrefixID)
+	slog.Info("netbox binding resumed", "network", b.Network, "prefix", b.PrefixID,
+		"adopted", adopted)
 	s.audit(ctx, "netbox.resume", req.GetNetwork(),
-		fmt.Sprintf("prefix=%d", b.PrefixID), "ok")
+		fmt.Sprintf("prefix=%d adopted=%d", b.PrefixID, adopted), "ok")
 	return &emptypb.Empty{}, nil
 }

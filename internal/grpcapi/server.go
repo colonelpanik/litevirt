@@ -1509,10 +1509,15 @@ type netboxMetrics interface {
 	IncSweepSkipped(reason string)
 	IncOrphansReclaimed()
 	IncStuckLease()
-	// IncBindingSuspended counts one binding taken out of service by drift.
-	// Suspension is otherwise silent to anything but a log line: it produces no
-	// error, no deletion, and no change a running workload can feel — the first
-	// symptom is a create refusing, long after the fact.
+	// IncBindingSuspended counts one binding taken out of service AND LEFT
+	// THERE — by revalidation drift, or by a bind-time adoption that could not
+	// finish. Suspension is otherwise silent to anything but a log line: it
+	// produces no error, no deletion, and no change a running workload can feel
+	// — the first symptom is a create refusing, long after the fact.
+	//
+	// The suspension a SUCCESSFUL bind takes while it adopts existing addresses
+	// is deliberately not counted here; it is lifted inside the same RPC, and
+	// this counter is one operators alert on the rate of.
 	IncBindingSuspended()
 	// IncAmbiguousClaim counts one claim resolved by lookup because the POST's
 	// outcome could not be read off the response. Emitted by the allocator, not

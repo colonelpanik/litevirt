@@ -112,8 +112,38 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		return nil, status.Errorf(codes.Internal, "provision network: %v", err)
 	}
 
+	// The network row exists, so the event and the audit entry are facts
+	// whatever the adoption below does. Emitted BEFORE it, deliberately: an
+	// adoption that fails still leaves a created network, and a create with no
+	// trail is exactly the shape an operator cannot reconstruct afterwards.
 	s.publish("network.created", req.Name, fmt.Sprintf("type=%s", ntype))
 	s.audit(ctx, "network.create", req.Name, "project="+project, "ok")
+
+	// ADOPT the addresses guests already hold inside the newly-bound prefix, and
+	// resume the binding only if every one of them landed. validateAndBindPrefix
+	// left the binding SUSPENDED when there was anything to adopt, so until this
+	// finishes the network exists and serves no claim — which is the fail-closed
+	// half: an un-adopted address is one NetBox would hand to the next VM.
+	//
+	// It runs HERE, after the network row, rather than inside the bind: a
+	// refusal has to leave a binding an operator can finish with
+	// `lv netbox resume`, and a binding whose network never landed is invisible
+	// to every operator command while still blocking the prefix. The cost of
+	// that ordering is an RPC that reports failure over a network that exists,
+	// so the message has to say so.
+	if def.NetBoxPrefixID != 0 {
+		if aerr := s.finishAdoptionAndResume(ctx, req.Name, def.NetBoxPrefixID); aerr != nil {
+			code := codes.Internal
+			if adoptionRefused(aerr) {
+				code = codes.FailedPrecondition
+			}
+			return nil, status.Errorf(code,
+				"network %q was created and its NetBox binding for prefix %d is SUSPENDED, so it "+
+					"serves no address claims yet: %v. Repair the cause, then finish with "+
+					"`lv netbox resume %s` (or delete the network to release the prefix)",
+				req.Name, def.NetBoxPrefixID, aerr, req.Name)
+		}
+	}
 	return ni, nil
 }
 

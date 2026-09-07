@@ -80,13 +80,33 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		return fmt.Errorf("derive cluster fingerprint: %w", err)
 	}
 
-	won, err := corrosion.ClaimBinding(ctx, s.db, corrosion.BindingRecord{
+	rec := corrosion.BindingRecord{
 		Network:            netName,
 		PrefixID:           prefixID,
 		ObservedCIDR:       p.Prefix,
 		VRFID:              p.VRFID,
 		ClusterFingerprint: fp,
-	})
+	}
+
+	// 7. The addresses litevirt is ALREADY handing to guests inside this prefix.
+	//    Checks 1-6 are all about the prefix; none of them looks at what is
+	//    already inside it, and NetBox has never been told — `/available-ips/`
+	//    means "no ip_address object exists", so every one of those addresses is
+	//    one NetBox will offer to the next VM on this network. See
+	//    netbox_adopt.go.
+	//
+	//    PLANNED here, before the claim, so every refusal it can make from local
+	//    rows alone — a container lease, a template, a lease litevirt cannot
+	//    account for, the per-bind cap — costs a refused bind that claimed
+	//    NOTHING, exactly like checks 1-6. The adoption itself runs after the
+	//    network row lands (see CreateNetwork), because a refusal there has to
+	//    leave a binding an operator can resume.
+	pending, err := s.planAdoption(ctx, rec)
+	if err != nil {
+		return err
+	}
+
+	won, err := corrosion.ClaimBinding(ctx, s.db, rec)
 	if err != nil {
 		return err
 	}
@@ -94,5 +114,49 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		// Another bind won the race between our check above and this insert.
 		return fmt.Errorf("NetBox prefix %d was bound to another network concurrently", prefixID)
 	}
+	if len(pending) == 0 {
+		// Nothing to adopt: the binding is live immediately, which is both the
+		// pre-adoption behaviour and the common case. No NetBox address request
+		// is made at all.
+		return nil
+	}
+
+	// SUSPEND before anything can allocate from it. A binding that served claims
+	// while its existing addresses were still unknown to NetBox would hand one of
+	// them straight out, which is the defect this whole step closes.
+	//
+	// A separate write rather than a suspended ClaimBinding, and the window
+	// between them is provably unusable: this function is reached only from
+	// CreateNetwork, which refuses a network that already exists, so no
+	// `networks` row for netName exists yet — and every allocation path resolves
+	// the network to a host device before it ever asks for an allocator. There is
+	// no VM that can be created on this network until CreateNetwork persists it,
+	// below.
+	if serr := corrosion.SuspendBinding(ctx, s.db, prefixID,
+		adoptionSuspendReason(netName, len(pending))); serr != nil {
+		// The binding is LIVE and un-adopted, which is the one state that must
+		// not survive. Release the prefix so nothing can allocate from it, and
+		// say so if even that fails — a prefix left bound refuses every future
+		// bind of it.
+		if rerr := corrosion.DeleteBinding(ctx, s.db, prefixID); rerr != nil {
+			return fmt.Errorf(
+				"could not suspend the binding for prefix %d while %d existing address(es) are "+
+					"adopted (%v), and releasing it also failed (%v); prefix %d STAYS BOUND and "+
+					"must be released by hand before it can be bound again",
+				prefixID, len(pending), serr, rerr, prefixID)
+		}
+		return fmt.Errorf(
+			"could not suspend the binding for prefix %d while %d existing address(es) are "+
+				"adopted, so the prefix was released and nothing was bound: %w",
+			prefixID, len(pending), serr)
+	}
+	// Deliberately NOT counted on litevirt_netbox_bindings_suspended_total. This
+	// suspension is TRANSIENT by design — the adoption below lifts it within the
+	// same RPC on every successful bind — and an operator alerting on that
+	// counter's rate would be paged by a bind that worked. Only an adoption that
+	// FAILS leaves a binding out of service, and that is where it is counted
+	// (finishAdoptionAndResume). The live gauge,
+	// litevirt_netbox_bindings_suspended, reads the rows directly and so shows
+	// this one for as long as it lasts, which is what a gauge is for.
 	return nil
 }

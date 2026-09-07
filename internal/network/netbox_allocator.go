@@ -19,6 +19,27 @@ import (
 // included, because a 400 "duplicate" can mean our own earlier POST committed.
 var ErrClaimUnknown = errors.New("netbox claim outcome unknown")
 
+// ErrAddressNotOurs is a DEFINITE refusal: an ip_address object for the
+// requested address exists in NetBox and litevirt may not take it, because it
+// does not carry this cluster's identity.
+//
+// It covers both shapes of "not ours", which are one rule and not two:
+//
+//   - it carries ANOTHER identity — another litevirt installation's, or another
+//     cluster's after a fingerprint move. Taking it is the "seize a co-tenant's
+//     objects" failure the re-key design forbids outright.
+//   - it carries NO identity — an operator-created object, a reservation, or a
+//     row some other IPAM tool wrote. Stamping litevirt's identity onto a record
+//     it did not create is not a read-only annotation: the identity is exactly
+//     what authorizes the orphan sweep to DELETE the object under a whole-cluster
+//     negative proof, so adopting one hands somebody else's reservation to a
+//     garbage collector.
+//
+// Deliberately NOT an ErrClaimUnknown. The outcome here is known — NetBox
+// answered, and the answer was no — so a caller must NOT enqueue an orphan
+// follow-up for an object that was never litevirt's.
+var ErrAddressNotOurs = errors.New("netbox address is not litevirt's to claim")
+
 // claimSource records where an IPAddress came from, which decides whether
 // litevirt may DELETE it when local persistence fails.
 type claimSource int
@@ -156,7 +177,26 @@ func (a *netboxAllocator) recover(ctx context.Context, req ClaimRequest) (netbox
 	case len(byIdentity) == 1 && len(byAddress) == 1 && byIdentity[0].ID == byAddress[0].ID:
 		return byIdentity[0], nil
 	case len(byAddress) == 1 && byAddress[0].Identity != "" && byAddress[0].Identity != req.Identity:
-		return netbox.IPAddress{}, fmt.Errorf("address %s is held by another system", req.ExplicitIP)
+		// The foreign identity is NAMED. Without it the operator is told an
+		// address is taken and given nothing to look up: which installation
+		// holds it, and whether it is a co-tenant cluster or this one's own
+		// pre-rekey fingerprint, is the whole of what decides what to do next.
+		return netbox.IPAddress{}, fmt.Errorf(
+			"%w: address %s is object %d in NetBox carrying identity %q, not this cluster's %q",
+			ErrAddressNotOurs, req.ExplicitIP, byAddress[0].ID, byAddress[0].Identity, req.Identity)
+	case len(byAddress) == 1 && byAddress[0].Identity == "":
+		// An object with NO litevirt identity. Refused, not adopted — see
+		// ErrAddressNotOurs. Named separately from the case above because the
+		// remedy is different and specific: an identity-less object is almost
+		// always an operator's own row, and deleting it in NetBox so litevirt can
+		// create it properly is the action that resolves this.
+		return netbox.IPAddress{}, fmt.Errorf(
+			"%w: address %s already exists as NetBox object %d with no litevirt identity — an "+
+				"operator-created object or a reservation. litevirt will not stamp its identity "+
+				"onto a record it did not create, because that identity is what would later "+
+				"authorize the orphan sweep to delete it. Remove that object in NetBox and let "+
+				"litevirt create the address itself, or move the workload off %s",
+			ErrAddressNotOurs, req.ExplicitIP, byAddress[0].ID, req.ExplicitIP)
 	default:
 		return netbox.IPAddress{}, fmt.Errorf("%w: address and identity lookups disagree for %s",
 			ErrClaimUnknown, req.ExplicitIP)

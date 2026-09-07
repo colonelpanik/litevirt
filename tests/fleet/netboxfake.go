@@ -55,6 +55,18 @@ type NetBoxFake struct {
 	// released records every id deleted through the REST API, in order.
 	released []int
 
+	// addrRequests counts EVERY request to the ipam address surface — the
+	// collection, the id-scoped routes and the per-prefix available-ips band —
+	// whatever the method. It is what a "this must not become a slow path"
+	// assertion reads: a bind over a network with no existing addresses must
+	// touch that surface zero times, and a count of writes alone would be
+	// satisfied by a bind that read the whole prefix on every call.
+	addrRequests int
+	// addrPosts counts only the POSTs that CREATE an address object (both the
+	// available-ips band and the explicit collection). Adoption idempotence is
+	// stated in exactly these terms: a re-run must issue none.
+	addrPosts int
+
 	// The hooks below are all set by a test from ITS goroutine and read by the
 	// httptest server from the handler's, so every one of them is unexported and
 	// reached only through its Set*/take* pair under f.mu — the same treatment
@@ -85,6 +97,18 @@ type NetBoxFake struct {
 	// some of a prefix's objects and not the rest.
 	onPatch func(id int) error
 
+	// onClaimSpecific runs before an EXPLICIT address is committed. A non-nil
+	// error fails the request WITHOUT committing it — a definite refusal (403),
+	// not a lost response — which is the only way to reach a bind-time adoption
+	// that claimed some of a network's existing addresses and not the rest.
+	//
+	// It is deliberately the mirror image of onClaim, which commits and then
+	// fails the response: that models a LOST answer, and a caller resolves it
+	// by lookup. Here the object genuinely does not exist, so the adoption is
+	// left partial with nothing to recover — the state the resume gate has to
+	// finish.
+	onClaimSpecific func(address string) error
+
 	// down makes every request fail at the transport layer. A test flips it from
 	// its own goroutine while the httptest server reads it from the handler's,
 	// so it is unexported and reached only through SetDown/IsDown under f.mu.
@@ -112,6 +136,28 @@ func (f *NetBoxFake) SetOnPatch(h func(id int) error) {
 	f.onPatch = h
 }
 
+// SetOnClaimSpecific installs (or, with nil, clears) the explicit-claim hook.
+func (f *NetBoxFake) SetOnClaimSpecific(h func(address string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onClaimSpecific = h
+}
+
+// AddressRequests is how many requests the ipam address surface has served, any
+// method. Zero is the assertion a negative control makes.
+func (f *NetBoxFake) AddressRequests() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addrRequests
+}
+
+// AddressPOSTs is how many address objects have been POSTed into existence.
+func (f *NetBoxFake) AddressPOSTs() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.addrPosts
+}
+
 // takeOnClaim / takeOnBeforeDelete / takeOnPatch read one hook under the lock
 // and return it to be CALLED outside the lock — a hook is free to re-enter the
 // fake (Reassign takes the same mutex), so holding it across the call would
@@ -132,6 +178,12 @@ func (f *NetBoxFake) takeOnPatch() func(int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.onPatch
+}
+
+func (f *NetBoxFake) takeOnClaimSpecific() func(string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.onClaimSpecific
 }
 
 type fakeIP struct {
@@ -213,6 +265,26 @@ func (f *NetBoxFake) noteWrite(r *http.Request) {
 	}
 }
 
+// noteAddressRequest counts one request against the ipam address surface.
+//
+// Counted in handle, not in noteWrite: noteWrite ignores reads, and the
+// negative control this feeds asserts that a bind with nothing to adopt makes
+// NO address request at all — a read included, because a bind that enumerated
+// the whole prefix on every call would be exactly the slow path the control
+// exists to forbid.
+func (f *NetBoxFake) noteAddressRequest(r *http.Request) {
+	if !strings.HasPrefix(r.URL.Path, "/api/ipam/ip-addresses/") &&
+		!strings.HasSuffix(r.URL.Path, "/available-ips/") {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.addrRequests++
+	if r.Method == http.MethodPost {
+		f.addrPosts++
+	}
+}
+
 func (f *NetBoxFake) URL() string { return f.srv.URL }
 func (f *NetBoxFake) Close()      { f.srv.Close() }
 
@@ -270,6 +342,21 @@ func (f *NetBoxFake) Identities() []string {
 	return out
 }
 
+// IDForAddress is the id of the object currently at one address ("ip/len"), or
+// 0 if none. It is what an assertion needs when the point is that a lease names
+// an object that EXISTS — an id compared against a remembered number cannot say
+// that, and the fake reuses ids from a free pool where real NetBox would not.
+func (f *NetBoxFake) IDForAddress(address string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, ip := range f.byID {
+		if ip.Address == address {
+			return id
+		}
+	}
+	return 0
+}
+
 // Released returns the ids deleted through the API, in call order.
 func (f *NetBoxFake) Released() []int {
 	f.mu.Lock()
@@ -299,6 +386,7 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	f.noteWrite(r)
+	f.noteAddressRequest(r)
 	switch {
 	case strings.HasPrefix(r.URL.Path, vmsAPIPath):
 		f.virtualMachines(w, r)
@@ -406,6 +494,15 @@ func (f *NetBoxFake) claimSpecific(w http.ResponseWriter, r *http.Request) {
 	if _, _, err := net.ParseCIDR(body.Address); err != nil {
 		writeErr(w, http.StatusBadRequest, `{"address":["Enter a valid CIDR address."]}`)
 		return
+	}
+
+	// Before the duplicate check and before the commit, so a refusal leaves the
+	// store exactly as it was.
+	if hook := f.takeOnClaimSpecific(); hook != nil {
+		if err := hook(body.Address); err != nil {
+			writeErr(w, http.StatusForbidden, "%v", err)
+			return
+		}
 	}
 
 	f.mu.Lock()

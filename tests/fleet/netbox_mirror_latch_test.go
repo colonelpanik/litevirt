@@ -44,7 +44,7 @@ func unlatchedMirrorCluster(t *testing.T) (*NetBoxFake, *Cluster, map[string]*he
 	t.Cleanup(nb.Close)
 	c := New(t, Options{Nodes: 1, NetBoxURL: nb.URL(), SharedCRDT: true})
 	gates := gateAll(t, c)
-	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork)
+	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork, "")
 	return nb, c, gates
 }
 

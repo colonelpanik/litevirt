@@ -79,10 +79,15 @@ func mustRekeyInventoryOnly(t *testing.T, c *Cluster, n *Node) {
 // "sriov" is the one network type Provision returns from without touching the
 // host. Omitting NetboxPrefixId is the whole difference, and it is what leaves
 // the cluster with no netbox_bindings row.
-func mustCreateUnboundNetwork(t *testing.T, c *Cluster, n *Node, name string) {
+//
+// The subnet is a parameter (pass "" where it does not matter) because the
+// bind-time adoption scenarios need the PRE-LINK shape of the very network they
+// then bind — same name, same subnet, no prefix — and a VM addressed by hand on
+// it needs the subnet to derive its static cloud-init network-config.
+func mustCreateUnboundNetwork(t *testing.T, c *Cluster, n *Node, name, subnet string) {
 	t.Helper()
 	if _, err := c.SelfClient(n).CreateNetwork(context.Background(), &pb.CreateNetworkRequest{
-		Name: name, Type: "sriov", Pf: "ens1f0",
+		Name: name, Type: "sriov", Pf: "ens1f0", Subnet: subnet,
 	}); err != nil {
 		t.Fatalf("CreateNetwork(%s) on %s: %v", name, n.Name, err)
 	}
@@ -129,7 +134,7 @@ func mirrorOnlyClusterNamed(t *testing.T, nb *NetBoxFake, namePrefix, netboxClus
 	// driven here — the config uniformity it requires is satisfied, because
 	// every node of this fixture is NetBox-configured.
 	latchNetBoxIPAM(t, c, gateAll(t, c))
-	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork)
+	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork, "")
 	return c
 }
 

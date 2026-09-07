@@ -25417,14 +25417,30 @@ func (x *FenceHostPosture) GetDetail() string {
 // silently skipped the fence.
 type FenceReadiness struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// capability_latched: shared_storage_fence_v1 is latched cluster-wide.
+	// capability_latched: shared_storage_fence_v1 is latched ON THE RESPONDING
+	// NODE. The latch is per-node state (internal/health.Checker's activated map
+	// plus its marker files), so this is NOT proof every peer has latched: during
+	// a rollout one node can latch before another finishes its own sweep. A peer
+	// that has not latched will take the legacy path however its config flag
+	// reads, and that is not visible from here — see FenceReadiness's
+	// known-limits note.
 	CapabilityLatched bool `protobuf:"varint,1,opt,name=capability_latched,json=capabilityLatched,proto3" json:"capability_latched,omitempty"`
-	// enforced_everywhere: every host is reachable, reported its posture, and is
-	// enforcing. False when ANY host is not enforcing OR its posture is unknown —
-	// "we cannot tell" is never reported as all-clear.
+	// enforced_everywhere: every host is reachable, reported its posture, and has
+	// its enforcement.shared_storage_fence flag ON. False when ANY host is not
+	// enforcing OR its posture is unknown — "we cannot tell" is never reported as
+	// all-clear.
+	//
+	// It covers the per-host CONFIG half only. The other half of
+	// sharedStorageFenceActive — each peer's own latch — has no wire
+	// representation, so true here means "nothing is switched off", not "every
+	// node will fence".
 	EnforcedEverywhere bool `protobuf:"varint,2,opt,name=enforced_everywhere,json=enforcedEverywhere,proto3" json:"enforced_everywhere,omitempty"`
 	// Workloads that would be exposed: a VM with a disk on shared storage
 	// (nfs/ceph/rbd/iscsi), which a second host can open and write.
+	//
+	// Counted from the RESPONDING NODE'S replicated vm_disks rows. A VM created
+	// on a peer whose disk rows have not replicated here yet is not counted, so
+	// a zero is "none that this node knows of", not "none exist".
 	VmsWithSharedDisk int32 `protobuf:"varint,3,opt,name=vms_with_shared_disk,json=vmsWithSharedDisk,proto3" json:"vms_with_shared_disk,omitempty"`
 	// A few affected VM names, for the operator to recognise. Not exhaustive.
 	SampleVms     []string            `protobuf:"bytes,4,rep,name=sample_vms,json=sampleVms,proto3" json:"sample_vms,omitempty"`

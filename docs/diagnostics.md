@@ -412,12 +412,34 @@ silently skips the fence — a state no peer and no operator could observe. This
 command asks every host for its own posture via `PingResponse.not_enforcing`,
 so the answer reflects what each node will actually do.
 
-A host is reported as `unknown` rather than as enforcing when it does not answer,
-or when it runs a binary predating the posture field. Unknown counts against
-readiness exactly as "not enforcing" does — a diagnostic that cannot see a host
-must not report the cluster clear on its behalf.
+A host is reported as `unknown` rather than as enforcing whenever its posture
+cannot be read, which now covers four cases: it did not answer; it runs a binary
+predating the posture field; it advertises nothing because it is self-fenced or
+WAL-quarantined; or the report's overall budget expired before it was probed.
+Unknown counts against readiness exactly as "not enforcing" does — a diagnostic
+that cannot see a host must not report the cluster clear on its behalf.
+
+Witness hosts are excluded. A witness never hosts a workload, so it can never
+perform the fence and its flag will never be on; counting it would pin the
+warning on permanently.
 
 Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
+
+### What it does not establish
+
+Printed on every clean run, because these are the two things that would make a
+clean result wrong:
+
+- **Each host's own capability latch.** The latch is per-node state
+  (`internal/health.Checker`'s `activated` map plus its marker files) with no
+  wire representation, so `capability_latched` is the *queried node's* latch.
+  During a rollout one node can latch before another finishes its sweep, and a
+  host that has not latched takes the legacy path whatever its config flag says.
+  `enforced_everywhere` therefore covers the per-host **config** half only —
+  true means "nothing is switched off", not "every node will fence".
+- **Shared-disk VMs this node has not replicated.** The count comes from the
+  queried node's `vm_disks` rows, so a VM created on a peer whose rows have not
+  arrived is not counted. A zero is "none that this node knows of".
 
 ## Persisted LWW clock & backward-clock protection
 

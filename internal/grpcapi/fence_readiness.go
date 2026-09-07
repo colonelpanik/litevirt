@@ -66,7 +66,12 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 	}
 
 	resp := &pb.FenceReadiness{
-		CapabilityLatched: s.gate != nil && s.gate.Enforced(ctx, capabilities.SharedStorageFenceV1),
+		// Latched, NEVER Enforced. Enforced is a mutator: on an unlatched token it
+		// runs CapabilityActive and then sets activated[token] plus a durable
+		// marker that survives restart — so this read-only diagnostic, run by a
+		// viewer, would permanently latch the capability and then report the
+		// `true` it had just caused. Latched is a pure in-memory marker read.
+		CapabilityLatched: s.gate != nil && s.gate.Latched(capabilities.SharedStorageFenceV1),
 		VmsWithSharedDisk: int32(len(sharedVMs)),
 		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
 	}
@@ -75,6 +80,23 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 	} else {
 		resp.SampleVms = append(resp.SampleVms, sharedVMs...)
 	}
+
+	// Witnesses are excluded, following dualRunProbeTargets: a witness never
+	// hosts a workload, so it can never perform the fence and its operator will
+	// never turn the flag on. Including it would pin enforced_everywhere false on
+	// every cluster that runs one, and the remedy would tell an operator to
+	// reconfigure and restart their quorum arbiter to fix a fence it cannot
+	// perform. Every other state stays IN — a draining, upgrading, offline or
+	// fenced host still has disks, and is exactly where an unfenced second copy
+	// would hide.
+	workloadHosts := make([]corrosion.HostRecord, 0, len(hosts))
+	for _, h := range hosts {
+		if h.IsWitness() {
+			continue
+		}
+		workloadHosts = append(workloadHosts, h)
+	}
+	hosts = workloadHosts
 
 	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Name < hosts[j].Name })
 	resp.Hosts = s.probeFencePostures(ctx, hosts)
@@ -119,6 +141,15 @@ func (s *Server) probeFencePostures(ctx context.Context, hosts []corrosion.HostR
 				out[i] = budgetExpiredPosture(name)
 				return
 			}
+			// select chooses uniformly among ready cases, so once the budget is
+			// spent the sem branch still wins about half the time. Without this
+			// re-check those hosts get dialled on a dead context and come back as
+			// `ping: context deadline exceeded` — rendered to the operator as "did
+			// not answer" about a host nothing ever dialled.
+			if probeCtx.Err() != nil {
+				out[i] = budgetExpiredPosture(name)
+				return
+			}
 			out[i] = s.fenceHostPosture(probeCtx, name)
 		}(i, h.Name)
 	}
@@ -143,6 +174,17 @@ func budgetExpiredPosture(host string) *pb.FenceHostPosture {
 // single-node cluster whose listener is mid-restart.
 func (s *Server) fenceHostPosture(ctx context.Context, host string) *pb.FenceHostPosture {
 	if host == s.hostName {
+		// Self is held to the same standard as a peer. postureFromPing refuses to
+		// call a non-advertising peer enforcing; without this the node an operator
+		// is logged into — the one that just self-fenced — would be the ONLY host
+		// in the fleet given a confident posture while every peer in that state
+		// reads unknown.
+		if !slices.Contains(s.advertisedCapabilities(), capabilities.SharedStorageFenceV1) {
+			return &pb.FenceHostPosture{
+				Host: host, Reachable: true, PostureKnown: false,
+				Detail: "this host advertises nothing (self-fenced or WAL-quarantined), so its posture cannot be read",
+			}
+		}
 		return &pb.FenceHostPosture{
 			Host: host, Reachable: true, PostureKnown: true,
 			Enforcing: s.tokenEnabled(capabilities.SharedStorageFenceV1),
@@ -190,9 +232,14 @@ func postureFromPing(host string, resp *pb.PingResponse) *pb.FenceHostPosture {
 	// prevent. Require the peer to advertise the token before believing it acts
 	// on it.
 	if !slices.Contains(resp.GetCapabilities(), capabilities.SharedStorageFenceV1) {
-		detail := "host does not advertise shared_storage_fence_v1, so its posture cannot be read"
+		// Keyed on what the peer actually said. Reporting a self-fenced node as
+		// "does not advertise the token" reads as version skew and points an
+		// operator at a binary upgrade for a node that is deliberately going down.
+		detail := "host advertises nothing (self-fenced, or too old to carry the token), so its posture cannot be read"
 		if resp.GetWalQuarantined() {
 			detail = "host is WAL-quarantined and advertising nothing"
+		} else if len(resp.GetCapabilities()) > 0 {
+			detail = "host advertises other tokens but not shared_storage_fence_v1, so it cannot be enforcing it"
 		}
 		return &pb.FenceHostPosture{
 			Host: host, Reachable: true, PostureKnown: false, Detail: detail,

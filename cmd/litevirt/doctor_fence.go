@@ -34,7 +34,11 @@ A host advertises the token regardless of its own config flag, so the cluster
 can show the capability fully latched while individual hosts silently skip the
 fence. This command asks every host for its own posture, so that gap is visible.
 
-Exit code: 0 when no shared-disk VM is exposed · 1 when one or more are.`,
+Exit code: 0 when no shared-disk VM is exposed · 1 when one or more are.
+
+Two things this check cannot establish, reported on every run: each host's own
+capability latch is per-node state with no wire representation, and the
+shared-disk count comes from the queried node's replicated rows.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -86,10 +90,20 @@ func printFenceReadiness(r *pb.FenceReadiness) {
 
 	if !fenceHazard(r) {
 		if r.GetVmsWithSharedDisk() == 0 {
-			fmt.Println("\nno VM has a disk on shared storage, so no transfer needs the proof-grade fence")
+			fmt.Println("\nno VM known here has a disk on shared storage, so no transfer needs the")
+			fmt.Println("proof-grade fence (counted from this node's replicated rows — a VM created")
+			fmt.Println("on a peer whose disk rows have not arrived yet is not counted)")
 		} else {
-			fmt.Println("\nevery shared-disk VM is covered: a cross-host transfer will be fenced")
+			fmt.Println("\nnothing is switched off: every host reports the fence enabled")
 		}
+		// Said on the clean path deliberately. The two things this command cannot
+		// see are exactly the two that would make a clean result wrong, and an
+		// operator reading "covered" without them may conclude more than the
+		// check actually establishes.
+		fmt.Println("\nnot established by this check: each host's OWN capability latch (per-node")
+		fmt.Println("state with no wire representation — a host that has not latched takes the")
+		fmt.Println("legacy path whatever its flag says), and shared-disk VMs this node has not")
+		fmt.Println("yet replicated.")
 		return
 	}
 

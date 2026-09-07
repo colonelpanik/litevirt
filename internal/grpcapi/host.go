@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -105,6 +106,14 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 }
 
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
+	// Evaluated ONCE. advertisedCapabilities consults selfFenced() and
+	// walQuarantinedNow(), both written from elsewhere: calling it twice lets the
+	// watchdog trip between them, so Capabilities could carry the full list while
+	// NotEnforcing was computed from an empty one — and a reader would pass the
+	// advertise-check on stale data and conclude the node is enforcing. It is
+	// also not cheap (with enforcement.owner_epoch on it walks the runtime
+	// inventory), and Ping is on the health checker's hot path.
+	advertised := s.advertisedCapabilities()
 	// SchemaVersion here is the BINARY const, deliberately — self-upgrade reads
 	// it to decide "which binary to adopt" (a binary question), not "do my
 	// columns exist" (the DB-applied question the replication handshake uses).
@@ -117,7 +126,7 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		SchemaVersion: int32(corrosion.CurrentSchemaVersion),
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
-		Capabilities: s.advertisedCapabilities(),
+		Capabilities: advertised,
 		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
 		// HLC value would compare against its own wall clock as nonsense skew.
 		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
@@ -128,7 +137,7 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// The other self-report: tokens advertised above but NOT acted on,
 		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
 		// PingResponse.not_enforcing and notEnforcingTokens.
-		NotEnforcing: s.notEnforcingTokens(),
+		NotEnforcing: notEnforcingFrom(advertised, s.tokenEnabled),
 		// Always true on this binary, so an empty NotEnforcing above reads as
 		// "nothing unenforced" rather than "too old to say".
 		PostureReported: true,
@@ -164,10 +173,29 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // decisions it actually gates — so every supported token with no kill-switch
 // case (hardware_v2 today) would be reported unenforced on every node forever.
 func (s *Server) notEnforcingTokens() []string {
-	advertised := s.advertisedCapabilities()
+	return notEnforcingFrom(s.advertisedCapabilities(), s.tokenEnabled)
+}
+
+// tokensWithoutKillSwitch have no enforcement.* flag at all, so tokenEnabled
+// returns its fail-closed default for them — correct for the decisions it gates,
+// wrong as a posture claim. Reporting them would put a permanent, unactionable
+// entry in every node's list and teach operators to skim past the field.
+//
+// hardware_v2 is documented as "the one capability with no kill switch"
+// (docs/diagnostics.md); token_enabled_test.go pins the same gap.
+var tokensWithoutKillSwitch = map[string]bool{
+	capabilities.HardwareV2: true,
+}
+
+// notEnforcingFrom is the pure half of notEnforcingTokens, taking the advertised
+// set so a caller that already computed it does not evaluate it twice.
+func notEnforcingFrom(advertised []string, enabled func(string) bool) []string {
 	out := make([]string, 0, len(advertised))
 	for _, token := range advertised {
-		if !s.tokenEnabled(token) {
+		if tokensWithoutKillSwitch[token] {
+			continue
+		}
+		if !enabled(token) {
 			out = append(out, token)
 		}
 	}

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -295,9 +296,153 @@ func TestProbeFencePostures_ExpiredBudgetYieldsUnknown(t *testing.T) {
 			t.Errorf("posture %d is for %q, want %q — results must stay aligned with the hosts asked",
 				i, p.GetHost(), hosts[i].Name)
 		}
-		if p.GetEnforcing() || p.GetPostureKnown() {
-			t.Errorf("%s: unprobed host reported enforcing=%v posture_known=%v, want both false",
-				p.GetHost(), p.GetEnforcing(), p.GetPostureKnown())
+		if p.GetEnforcing() || p.GetPostureKnown() || p.GetReachable() {
+			t.Errorf("%s: unprobed host reported enforcing=%v posture_known=%v reachable=%v, want all false",
+				p.GetHost(), p.GetEnforcing(), p.GetPostureKnown(), p.GetReachable())
 		}
+		// Without this the assertions above are satisfied by ANY failure — a
+		// dial error looks identical — so budgetExpiredPosture could be deleted
+		// and the test would stay green while the operator was told a host "did
+		// not answer" about one nothing ever dialled.
+		if !strings.Contains(p.GetDetail(), "budget expired") {
+			t.Errorf("%s: detail = %q, want it to say the budget expired rather than "+
+				"blaming the host for not answering", p.GetHost(), p.GetDetail())
+		}
+	}
+}
+
+// fenceLatchGate distinguishes the two gate reads that fakeServerGate collapses:
+// it answers Latched from the map and RECORDS any call to Enforced.
+type fenceLatchGate struct {
+	fakeServerGate
+	enforcedCalls *int
+}
+
+func (g fenceLatchGate) Enforced(ctx context.Context, token string) bool {
+	*g.enforcedCalls++
+	return g.fakeServerGate.Enforced(ctx, token)
+}
+
+// TestGetFenceReadiness_NeverLatchesTheCapability is the guard for the worst
+// thing this command could do.
+//
+// Checker.Enforced is a MUTATOR: on a token that has not latched it runs
+// CapabilityActive and then sets activated[token] and writes a durable marker
+// that survives restart. A viewer running a read-only diagnostic would thereby
+// latch shared_storage_fence_v1 permanently — and then report the `true` it had
+// just caused, an answer manufactured by the act of asking. Latched is the pure
+// in-memory read, and nothing on this path may call anything else.
+//
+// The shared fakeServerGate answers Latched and Enforced identically, so no
+// assertion on the RESULT can catch a regression here; only counting the calls
+// can.
+func TestGetFenceReadiness_NeverLatchesTheCapability(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	calls := 0
+	s.SetGate(fenceLatchGate{
+		fakeServerGate: fakeServerGate{
+			execOK:      true,
+			enforcedTok: map[string]bool{capabilities.SharedStorageFenceV1: true},
+		},
+		enforcedCalls: &calls,
+	})
+
+	r, err := s.GetFenceReadiness(adminCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("GetFenceReadiness: %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("gate.Enforced called %d time(s) by a read-only diagnostic; it latches the "+
+			"capability durably, so the report would be manufacturing its own answer", calls)
+	}
+	if !r.GetCapabilityLatched() {
+		t.Error("capability_latched is false though the gate reports it latched")
+	}
+}
+
+// TestFenceHostPosture_SelfFencedLocalHostIsUnknown holds the LOCAL node to the
+// same standard as a peer.
+//
+// postureFromPing refuses to call a non-advertising peer enforcing, but the self
+// branch short-circuits before that check. Without this the node an operator is
+// logged into — the one that just self-fenced, and so is advertising nothing —
+// would be the only host in the fleet handed a confident posture, while every
+// peer in exactly that state correctly reads unknown.
+func TestFenceHostPosture_SelfFencedLocalHostIsUnknown(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+
+	if p := s.fenceHostPosture(context.Background(), s.hostName); !p.GetPostureKnown() {
+		t.Fatalf("fixture: a healthy local host should report a posture, got detail %q", p.GetDetail())
+	}
+
+	fenced := func() bool { return true }
+	s.watchdogFenced.Store(&fenced)
+
+	p := s.fenceHostPosture(context.Background(), s.hostName)
+	if p.GetPostureKnown() || p.GetEnforcing() {
+		t.Errorf("a self-fenced local host reports posture_known=%v enforcing=%v detail=%q; "+
+			"it advertises nothing, so its posture is no more readable than a peer's",
+			p.GetPostureKnown(), p.GetEnforcing(), p.GetDetail())
+	}
+}
+
+// TestNotEnforcingTokens_OmitsTokensWithNoKillSwitch keeps the field
+// actionable. hardware_v2 has no enforcement.* flag, so tokenEnabled returns its
+// fail-closed default for it — right for the decisions it gates, wrong as a
+// posture claim. Reporting it would put a permanent, unfixable entry in every
+// node's list, and a field that always names something is one operators learn to
+// skim past.
+func TestNotEnforcingTokens_OmitsTokensWithNoKillSwitch(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	enforceEveryToken(s)
+	// hardware_v2 is advertised only once the backfill audit has completed AND
+	// operation_protocol_v1 has latched (see hardwareV2Ready). Both are needed
+	// or the token never appears and this test would pass without observing
+	// anything.
+	s.hwV2Ready.Store(true)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{
+		capabilities.SharedStorageFenceV1: true,
+		capabilities.OperationProtocolV1:  true,
+	}})
+
+	if !slices.Contains(s.advertisedCapabilities(), capabilities.HardwareV2) {
+		t.Fatal("fixture does not advertise hardware_v2, so the exclusion is not being observed")
+	}
+	if got := s.notEnforcingTokens(); slices.Contains(got, capabilities.HardwareV2) {
+		t.Errorf("not_enforcing = %v; hardware_v2 has no kill switch, so it can never be "+
+			"switched on and would sit there on every node forever", got)
+	}
+}
+
+// TestGetFenceReadiness_WitnessIsNotCounted keeps the check usable on any
+// cluster that runs a quorum arbiter.
+//
+// A witness never hosts a workload, so it can never perform the fence and its
+// flag will never be turned on. Counting it would pin enforced_everywhere false
+// forever, and the remedy would tell an operator to reconfigure and restart
+// their arbiter to fix a fence it cannot perform — a permanent false positive,
+// which is how a diagnostic gets ignored.
+func TestGetFenceReadiness_WitnessIsNotCounted(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	addSharedDiskVM(t, s, "vm1")
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{
+		Name: "arbiter", Address: "10.0.0.9", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", Role: "witness",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	r, err := s.GetFenceReadiness(adminCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("GetFenceReadiness: %v", err)
+	}
+	for _, p := range r.GetHosts() {
+		if p.GetHost() == "arbiter" {
+			t.Errorf("witness %q appears in the report (detail %q); it cannot fence, so it can "+
+				"only ever be reported as a problem the operator cannot fix", p.GetHost(), p.GetDetail())
+		}
+	}
+	if !r.GetEnforcedEverywhere() {
+		t.Error("enforced_everywhere = false because of a witness; every workload host enforces")
 	}
 }

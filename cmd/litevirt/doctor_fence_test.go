@@ -32,18 +32,32 @@ func runDoctorFence(t *testing.T, resp *pb.FenceReadiness) (string, int) {
 	t.Cleanup(func() { withClient = orig })
 
 	cmd := newDoctorFenceCmd()
+	// Without SetArgs the command parses the TEST BINARY's os.Args, so any -args
+	// passed to `go test` becomes a positional argument and fails cobra's
+	// NoArgs.
+	cmd.SetArgs(nil)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
 	code := 0
+	var runErr error
+	// captureStdout restores os.Stdout only on the normal return path, so a
+	// t.Fatalf inside this closure would leave every later test in the package
+	// writing into a dead pipe — broken-pipe failures, or a hang once one of
+	// them fills the 64KiB buffer. Carry the error out and fail after it
+	// returns.
 	out := captureStdout(t, func() {
 		if err := cmd.Execute(); err != nil {
 			c, silent := exitCodeOf(err)
 			if !silent {
-				t.Fatalf("lv doctor fence: %v", err)
+				runErr = err
+				return
 			}
 			code = c
 		}
 	})
+	if runErr != nil {
+		t.Fatalf("lv doctor fence: %v", runErr)
+	}
 	return out, code
 }
 
@@ -142,6 +156,18 @@ func TestDoctorFence_UnknownPostureIsNotReportedAsEnforcing(t *testing.T) {
 	if !strings.Contains(out, "cannot report its posture") {
 		t.Errorf("an old binary is not distinguished from one that answered; got:\n%s", out)
 	}
+	// The assertions above are all satisfied by the OTHER host's unreachable
+	// case and by the remedy lines, so without these the posture column for a
+	// reachable-but-unreadable host could read "enforcing" and stay green.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "old") {
+			continue
+		}
+		if !strings.Contains(line, "unknown") || strings.Contains(line, "enforcing") {
+			t.Errorf("host row for a posture-less host reads %q; want it marked unknown "+
+				"and never as enforcing", strings.TrimSpace(line))
+		}
+	}
 }
 
 // TestDoctorFence_CoveredClusterSaysSo guards the quiet path: a cluster with
@@ -156,8 +182,11 @@ func TestDoctorFence_CoveredClusterSaysSo(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(out, "will be fenced") {
+	if !strings.Contains(out, "nothing is switched off") {
 		t.Errorf("a covered cluster does not say so; got:\n%s", out)
+	}
+	if !strings.Contains(out, "not established by this check") {
+		t.Errorf("the clean path hides what it could not check; got:\n%s", out)
 	}
 	if strings.Contains(out, "WARNING") {
 		t.Errorf("a covered cluster warns anyway; got:\n%s", out)

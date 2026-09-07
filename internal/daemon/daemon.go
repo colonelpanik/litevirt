@@ -1456,23 +1456,6 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 	})
 }
 
-// reconcileHostAddress rewrites this host's address when the row disagrees with
-// what the daemon now believes its address to be.
-//
-// registerHost cannot do it: InsertHost is a plain INSERT, so on every start
-// after the first it is a no-op and the address recorded at bootstrap is
-// permanent. That address comes from getOutboundIP() when advertise_address is
-// unset — the source IP toward the DEFAULT route, which on a multi-homed host is
-// the wrong interface. Setting advertise_address afterwards is the documented fix
-// for exactly that, and without this it changed nothing.
-//
-// It matters beyond this node. Peers dial hosts.address, and `lv host add` seeds
-// the new node's join_peers from ListHosts, so one wrong row is copied into the
-// gossip configuration of every host added after it. In the lab that produced four
-// nodes advertising the same NAT address, each dialling itself.
-//
-// Only on a real change, so an unchanged address cannot restamp updated_at on
-// every restart and win LWW against a genuine concurrent write from another node.
 // ensureClusterRecord derives the replicated `cluster` row from this node's CA
 // certificate when the cluster does not have one yet.
 //
@@ -1494,6 +1477,23 @@ func (d *Daemon) ensureClusterRecord(ctx context.Context) {
 	}
 }
 
+// reconcileHostAddress rewrites this host's address when the row disagrees with
+// what the daemon now believes its address to be.
+//
+// registerHost cannot do it: InsertHost is a plain INSERT, so on every start
+// after the first it is a no-op and the address recorded at bootstrap is
+// permanent. That address comes from getOutboundIP() when advertise_address is
+// unset — the source IP toward the DEFAULT route, which on a multi-homed host is
+// the wrong interface. Setting advertise_address afterwards is the documented fix
+// for exactly that, and without this it changed nothing.
+//
+// It matters beyond this node. Peers dial hosts.address, and `lv host add` seeds
+// the new node's join_peers from ListHosts, so one wrong row is copied into the
+// gossip configuration of every host added after it. In the lab that produced four
+// nodes advertising the same NAT address, each dialling itself.
+//
+// Only on a real change, so an unchanged address cannot restamp updated_at on
+// every restart and win LWW against a genuine concurrent write from another node.
 func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 	want := d.hostAddress()
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)

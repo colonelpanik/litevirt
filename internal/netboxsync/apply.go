@@ -145,6 +145,10 @@ type Reconciler struct {
 	// holds no lease and writes nothing (see holdsLeader).
 	acquireLease func(context.Context) bool
 	holdsLease   func(context.Context) bool
+
+	// latched is the cluster-wide capability predicate, re-read on every pass.
+	// See Options.Latched.
+	latched func(context.Context) bool
 }
 
 // sink returns the metrics sink, never nil.

@@ -80,6 +80,18 @@ type Options struct {
 	// an ungated second writer.
 	AcquireLease func(context.Context) bool
 	HoldsLease   func(context.Context) bool
+	// Latched reports whether the cluster-wide capability contract this mirror
+	// depends on has DURABLY formed.
+	//
+	// It is a function, not a bool, because it is asked ONCE PER PASS: a latch
+	// closes while the daemon runs — it is what the last node of a rolling
+	// upgrade completes — and nothing restarts this loop when it does. Sampling
+	// it at construction would leave a correctly-configured mirror inert for the
+	// life of the process.
+	//
+	// Nil is "not latched", matching the lease functions above: an incomplete
+	// wiring must be inert rather than an ungated writer.
+	Latched func(context.Context) bool
 }
 
 // New builds a Reconciler.
@@ -103,6 +115,7 @@ func New(o Options) *Reconciler {
 		pollInterval: poll,
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
+		latched:      o.Latched,
 	}
 }
 
@@ -172,6 +185,9 @@ func (r *Reconciler) run(ctx context.Context, sweepTick, pollTick <-chan time.Ti
 // everything the queue could have named, so a failed peek is logged and the poll
 // simply does nothing this minute.
 func (r *Reconciler) pollQueue(ctx context.Context) error {
+	if !r.capabilityLatched(ctx) {
+		return nil
+	}
 	if !r.holdsLeader(ctx) {
 		return nil
 	}
@@ -198,10 +214,28 @@ func (r *Reconciler) pollQueue(ctx context.Context) error {
 // It exists as its own method so a test can drive a pass deterministically
 // instead of waiting on the ticker, through the SAME gate the loop uses.
 func (r *Reconciler) SyncOnce(ctx context.Context) error {
+	// The capability gate comes FIRST, ahead of the lease. Acquiring the lease
+	// is itself a replicated write and it enters the cluster's leadership race,
+	// and a node that may not mirror has no business doing either.
+	if !r.capabilityLatched(ctx) {
+		return nil
+	}
 	if !r.acquireLeader(ctx) {
 		return nil
 	}
 	return r.Sync(ctx)
+}
+
+// capabilityLatched reports whether the cluster-wide contract that authorizes
+// mirroring has durably formed. An unwired predicate never authorizes anything.
+//
+// Read on EVERY pass. A latch closes while the daemon runs — it is the last act
+// of a rolling upgrade — and nothing restarts this loop when it does, so a
+// value sampled at construction would leave a correctly-configured mirror inert
+// for the life of the process. The read is a cheap in-memory one; it dials no
+// peer.
+func (r *Reconciler) capabilityLatched(ctx context.Context) bool {
+	return r.latched != nil && r.latched(ctx)
 }
 
 // acquireLeader takes or renews the lease. An unwired reconciler never leads.
@@ -228,6 +262,11 @@ func (r *Reconciler) holdsLeader(ctx context.Context) bool {
 // in place and the next poll retries immediately. Acking first would throw the
 // trigger away on exactly the passes that did not do the work, and the change
 // would then wait out a full sweep interval.
+//
+// The capability gate is NOT re-read here. Both entry points — SyncOnce and
+// pollQueue — ask before they call this, exactly once per pass, and asking
+// twice would make "the latch formed between these two passes" mean something
+// different depending on which read observed the flip.
 //
 // Both counters are emitted HERE rather than in SyncOnce, so a node that never
 // took the lease records nothing at all: every configured node runs the loop,
@@ -293,7 +332,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 
 	actions := Diff(desired, actual, fp)
 	converged := true
-	if why := deleteBlocker(desired, skipped, actual); why != "" {
+	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
 		kept, withheld := withoutDeletes(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
 			"reason", why, "withheld_deletes", withheld,
@@ -319,12 +358,17 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 //
 //  1. An EMPTY read. corrosion.ListVMs answers ([], nil) for a table that is
 //     empty because this node is hydrating after a database loss or a fresh
-//     join, exactly as it does for a cluster that genuinely holds no VMs.
-//     Nothing here can tell those apart — but against a NetBox that still holds
-//     objects for this cluster only one of them is plausible, and acting on the
-//     wrong one deletes the operator's inventory. P1's orphan sweeper states
-//     the same rule about proofs: an empty universe makes every proof vacuously
-//     complete, which is the one shape that must never authorize a delete.
+//     join, exactly as it does for a cluster that genuinely holds no VMs. Left
+//     there the two are indistinguishable, and acting on the wrong one deletes
+//     the operator's inventory — P1's orphan sweeper states the same rule about
+//     proofs: an empty universe makes every proof vacuously complete, which is
+//     the one shape that must never authorize a delete.
+//
+//     So an empty read must be CORROBORATED, and corrosion.HasVMRecords is what
+//     corroborates it: a VM that was deleted leaves a tombstone behind, and a
+//     database that has never been read holds no row of any kind. That keeps the
+//     ordinary case working — deleting the last VM in a cluster still retires
+//     its NetBox object — while an unhydrated node still deletes nothing.
 //
 //  2. A SKIPPED record. A VM whose spec carries no uuid, or a NIC with no MAC,
 //     is dropped by the reader with a warning. For an object that has never
@@ -335,12 +379,23 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 //
 // Non-delete work is unaffected: this is about never deleting on thin evidence,
 // not about halting the mirror.
-func deleteBlocker(desired []DesiredVM, skipped int, actual Actual) string {
+func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, skipped int, actual Actual) string {
 	if skipped > 0 {
 		return fmt.Sprintf("%d local record(s) could not be read", skipped)
 	}
-	if len(desired) == 0 && (len(actual.VMs) > 0 || len(actual.NICs) > 0) {
-		return "the local inventory read returned no VMs while NetBox still holds objects for this cluster"
+	if len(desired) != 0 || (len(actual.VMs) == 0 && len(actual.NICs) == 0) {
+		return "" // nothing to corroborate: either side is non-empty
+	}
+	// Desired is empty and NetBox is not. Only positive local evidence that
+	// this database holds VM history can tell an empty cluster from an empty
+	// read, and a read that FAILS is no evidence at all.
+	seen, err := corrosion.HasVMRecords(ctx, r.db)
+	if err != nil {
+		return fmt.Sprintf("the local VM history could not be read: %v", err)
+	}
+	if !seen {
+		return "the local database holds no VM record of any kind, tombstones included, " +
+			"while NetBox still holds objects for this cluster"
 	}
 	return ""
 }

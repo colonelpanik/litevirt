@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -410,6 +411,24 @@ func GetDeletedVM(ctx context.Context, c *Client, name string) (*VMRecord, error
 		HostName: r.String("host_name"),
 		State:    r.String("state"),
 	}, nil
+}
+
+// HasVMRecords reports whether the local `vms` table holds ANY row, TOMBSTONES
+// INCLUDED.
+//
+// It is the difference between "this cluster has no VMs" and "this database has
+// not been read yet". ListVMs filters tombstones and so answers the same empty
+// list to both, but a VM that was deleted leaves its soft-deleted row behind
+// (nothing prunes vms tombstones), while a node hydrating after a database loss
+// or a fresh join has no row of any kind. Consumers that must not act on an
+// empty read — the NetBox inventory mirror's delete half — use this as the
+// corroborating evidence that the empty answer is a real one.
+func HasVMRecords(ctx context.Context, c *Client) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT name FROM vms LIMIT 1`)
+	if err != nil {
+		return false, fmt.Errorf("check for local VM records: %w", err)
+	}
+	return len(rows) > 0, nil
 }
 
 // GetVMInterfaces returns all interfaces for a VM.

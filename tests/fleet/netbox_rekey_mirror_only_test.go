@@ -112,7 +112,12 @@ func assertNoBindings(t *testing.T, n *Node) {
 func mirrorOnlyClusterOn(t *testing.T, nb *NetBoxFake, namePrefix string) *Cluster {
 	t.Helper()
 	c := New(t, Options{Nodes: 1, NetBoxURL: nb.URL(), NamePrefix: namePrefix})
-	gateAll(t, c)
+	// The mirror is gated on netbox_ipam_v1 exactly as a prefix binding is: its
+	// statements are replicated, and an older peer carries neither of its
+	// tables. A mirror-only cluster has no binding to latch it, so the latch is
+	// driven here — the config uniformity it requires is satisfied, because
+	// every node of this fixture is NetBox-configured.
+	latchNetBoxIPAM(t, c, gateAll(t, c))
 	mustCreateUnboundNetwork(t, c, c.Nodes[0], mirrorOnlyNetwork)
 	return c
 }

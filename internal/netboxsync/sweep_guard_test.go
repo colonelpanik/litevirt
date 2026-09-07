@@ -181,6 +181,39 @@ func TestSweepStillDeletesOnWholeEvidence(t *testing.T) {
 	}
 }
 
+// TestSweepRetiresTheLastVMOnItsTombstone is the case an unqualified
+// empty-desired refusal would strand forever.
+//
+// Deleting the last VM in a cluster leaves desired EMPTY and NetBox holding the
+// object — the same shape a hydrating node presents. The two are told apart by
+// evidence, not by shape: a delete leaves a `vms` tombstone behind and nothing
+// prunes it, while a database that has never been read holds no row of any
+// kind. Without this the mirror would advertise a destroyed VM for as long as
+// the cluster stayed empty, and no later sweep could ever retire it.
+func TestSweepRetiresTheLastVMOnItsTombstone(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-1","cpu":2,"memory_mib":1024}`, macGuard)
+	if err := corrosion.DeleteVM(ctx, r.db, "vm-1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 1 || vms[0] != 11 {
+		t.Fatalf("a deleted last VM must be retired from NetBox, deleted %v", vms)
+	}
+	if len(ifaces) != 1 || ifaces[0] != 21 {
+		t.Fatalf("its interface must go with it, deleted %v", ifaces)
+	}
+	if ts := mirrorSink(t, r).lastSuccess(); ts.IsZero() {
+		t.Fatal("a sweep on corroborated evidence converged and must stamp the staleness gauge")
+	}
+}
+
 // TestSuppressedSweepRecordsNoSuccess pins the reporting half.
 //
 // litevirt_netbox_mirror_last_success_seconds is the staleness signal an

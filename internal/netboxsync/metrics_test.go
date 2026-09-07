@@ -200,7 +200,7 @@ func TestNilMetricsSinkNeverPanics(t *testing.T) {
 	}
 	r := New(Options{
 		NetBox: nb, DB: newMirrorDB(t), Metrics: nil,
-		AcquireLease: leaseHeld, HoldsLease: leaseHeld,
+		AcquireLease: leaseHeld, HoldsLease: leaseHeld, Latched: leaseHeld,
 	})
 	seedMirrorableVM(t, r, "vm-1", "uuid-1", macChurn)
 	ctx := context.Background()

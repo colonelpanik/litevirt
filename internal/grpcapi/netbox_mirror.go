@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netboxsync"
 )
@@ -39,7 +40,32 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// leadership away between its own passes.
 		AcquireLease: func(ctx context.Context) bool { return s.acquireNetBoxLease(ctx, interval) },
 		HoldsLease:   s.netboxMirrorHoldsLease,
+		// A closure, so the latch is re-read on EVERY pass. See
+		// netboxMirrorAuthorized.
+		Latched: func(context.Context) bool { return s.netboxMirrorAuthorized() },
 	})
+}
+
+// netboxMirrorAuthorized reports whether this cluster has authorized inventory
+// mirroring, which is the netbox_ipam_v1 latch in its DURABLE form.
+//
+// The mirror's statements are the reason. It writes `netbox_objects` and
+// `netbox_sync_queue`, and a build that predates them carries neither table in
+// either of its ledgers — a statement the LWW apply path cannot place does not
+// fail on that peer, it BACK-PRESSURES, which stalls the replication watermark
+// for the whole stream rather than for those rows. So one node upgraded and
+// configured ahead of its peers must write nothing, which is precisely the
+// cluster-wide contract this token carries: the latch requires config
+// uniformity, so enabling NetBox on one node changes nothing.
+//
+// DURABLY latched, the same form a prefix binding requires. A latch held only
+// in memory does not survive a restart, and the node that restarts mid-rolling-
+// upgrade is the one still replicating with an old peer.
+//
+// It is a method rather than a captured bool so every pass asks again: a latch
+// closes while the daemon runs, and nothing restarts the mirror when it does.
+func (s *Server) netboxMirrorAuthorized() bool {
+	return s.gate != nil && s.gate.DurablyLatched(capabilities.NetBoxIPAMV1)
 }
 
 // netboxMirrorHoldsLease is the lease READ — no write, no renewal — the mirror
@@ -58,6 +84,12 @@ func (s *Server) netboxMirrorHoldsLease(ctx context.Context) bool {
 // reason: a node with no NetBox client has nothing to mirror into, and the loop
 // it would run could only ever be a goroutine taking no decisions. Every
 // configured node runs it; the lease decides which one writes.
+//
+// The CAPABILITY latch is deliberately not checked here. It is checked once per
+// pass instead (netboxMirrorAuthorized), because a latch forms while the daemon
+// runs — it is the last act of a rolling upgrade — and a check made here would
+// leave the mirror inert for the life of a process that started a moment too
+// early, with nothing to say so.
 func (s *Server) StartNetBoxMirror(ctx context.Context, interval time.Duration) bool {
 	if s.netbox == nil || s.db == nil {
 		return false
@@ -98,8 +130,17 @@ const (
 // Gated on a wired NetBox client. Without one nothing ever drains this queue,
 // and every VM lifecycle operation on a cluster that does not use NetBox would
 // leave a row behind forever.
+//
+// Gated on the capability latch as well, and for a different reason: the INSERT
+// itself is a replicated statement against a table an older peer does not
+// carry. The mirror loop's own gate cannot cover this one — it is a second
+// producer, on the lifecycle paths, and a sweep that never runs still leaves
+// these rows on the wire.
 func (s *Server) enqueueMirrorSync(ctx context.Context, vmName, op string) {
 	if s.netbox == nil || s.db == nil {
+		return
+	}
+	if !s.netboxMirrorAuthorized() {
 		return
 	}
 	if err := corrosion.EnqueueSync(ctx, s.db, netboxsync.QueueKind, vmName, op); err != nil {

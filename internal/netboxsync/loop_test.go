@@ -570,6 +570,14 @@ func pollingReconciler(t *testing.T, nb netboxWriter, o Options) *Reconciler {
 			return true
 		}
 	}
+	if o.Latched == nil {
+		// Latched by default: every scenario here is about something other than
+		// the capability gate, and an unwired predicate is fail-closed, so
+		// leaving it nil would make each of them pass vacuously. The gate's own
+		// scenarios (latch_test.go) set it explicitly, and the nil default is
+		// pinned there against a bare New.
+		o.Latched = leaseHeld
+	}
 	return New(o)
 }
 

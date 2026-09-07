@@ -534,8 +534,11 @@ func newTestReconciler(t *testing.T, nb netboxWriter) *Reconciler {
 		nb: nb, db: newMirrorDB(t), clusterID: 5, metrics: &countingMetrics{},
 		// Supplied EXPLICITLY. An unwired lease reads as "not the leader" (the
 		// fail-closed direction), so applyPhases would write nothing at all and
-		// every ordering assertion would pass vacuously.
+		// every ordering assertion would pass vacuously. The capability
+		// predicate is fail-closed for the same reason and supplied for the
+		// same one.
 		holdsLease: func(context.Context) bool { return true },
+		latched:    func(context.Context) bool { return true },
 	}
 }
 

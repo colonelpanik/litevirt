@@ -394,12 +394,31 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
 		actions, converged = kept, false
-	} else if kept, withheld := r.withoutUnprovenDeletes(ctx, actions, actual); withheld > 0 {
+	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual); unprovenDeletes+unprovenClears > 0 {
 		// The whole-pass gate above answers "is this read whole?", which a
 		// PARTIALLY hydrated database passes: some of the cluster's rows are
 		// here, so the read is neither empty nor short of a record it tried to
 		// parse. The per-object rule below is what covers that — see
-		// withoutUnprovenDeletes.
+		// withoutUnprovenRemovals.
+		if unprovenDeletes > 0 {
+			// A withheld DELETE is positive proof that this node's INVENTORY
+			// read is partial: NetBox holds an object whose VM or NIC the local
+			// database has no row for, tombstone included. The clear branch
+			// resolves its addresses through that same inventory read — a NIC
+			// the read has not caught up on resolves to address 0, which reads
+			// as "holds no address" — so a pass that has just proven the read
+			// partial may not run the destructive half of it on the strength of
+			// the address evidence alone. Withholding the delete and clearing
+			// anyway is the contradiction: the pass would detach addressing on
+			// exactly the sweep that admitted it could not be trusted to.
+			//
+			// A withheld CLEAR does NOT reach here. That one is proven per
+			// object and its blast radius is one address; escalating it to the
+			// whole list would let a single unprovable address — an object an
+			// operator hand-copied, say — withhold every clear in the cluster
+			// for as long as it exists.
+			kept, _ = withoutDestructive(kept)
+		}
 		actions, converged = kept, false
 	}
 
@@ -462,8 +481,8 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 	return ""
 }
 
-// withoutUnprovenDeletes drops the deletes this pass cannot PROVE, and reports
-// how many it dropped.
+// withoutUnprovenRemovals drops the deletes AND clears this pass cannot PROVE,
+// and reports how many of each it dropped.
 //
 // deleteBlocker asks whether the desired read is WHOLE, and a partially
 // hydrated database answers yes to every question it poses: the table is not
@@ -480,11 +499,22 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 // only remaining brake is the first sweep tick, which is a delay and not a
 // proof.
 //
-// So the rule the empty read already obeys is applied PER OBJECT: a delete needs
-// positive local evidence that the thing it removes is genuinely gone, and the
+// So the rule the empty read already obeys is applied PER OBJECT: a removal needs
+// positive local evidence that the thing it takes away is genuinely gone, and the
 // evidence is the record the local database holds for it — live or TOMBSTONED.
 // litevirt soft-deletes, so a destroyed workload leaves one; a row that has not
 // replicated leaves nothing. See corrosion.MirrorEvidence.
+//
+// BOTH destructive ops are covered, not just the delete. A `clear` unassigns an
+// address rather than destroying it, but it is reached by the same partial read
+// and by a shape the repair mechanism itself produces: anti-entropy repairs per
+// TABLE, so "`vms` and `vm_interfaces` repaired, `ip_allocations` not yet" is
+// ordinary. In that state every NIC resolves to address 0 — "this NIC holds no
+// address" — and every litevirt-owned address in the cluster routes into the
+// clear branch. Its evidence is a lease row of any kind naming the address
+// (MirrorEvidence.KnowsAddress), which is complete because nothing hard-deletes
+// one: ReleaseLease tombstones the row and retains netbox_ip_id, so requiring
+// the proof cannot strand a genuinely stale assignment.
 //
 // This is deliberately NOT a replication-freshness gate, which is what it might
 // look like it should be. There is no local signal in this tree that proves a
@@ -499,21 +529,24 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 //
 // A partial pass is NOT an error. It reports unconverged — the caller withholds
 // the success stamp — and the next sweep re-derives everything from scratch.
-func (r *Reconciler) withoutUnprovenDeletes(ctx context.Context, actions []Action, actual Actual) ([]Action, int) {
-	if !hasDeletes(actions) {
-		// The evidence read costs three table scans, so a pass with nothing to
+func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Action, actual Actual) ([]Action, int, int) {
+	if !hasRemovals(actions) {
+		// The evidence read costs four table scans, so a pass with nothing to
 		// prove does not pay for them.
-		return actions, 0
+		return actions, 0, 0
 	}
 	known, err := corrosion.ReadMirrorEvidence(ctx, r.db)
 	if err != nil {
 		// A read that FAILED is no evidence at all, so nothing is proven and
-		// every delete goes. Same direction as deleteBlocker's own failed read.
+		// every removal goes. Same direction as deleteBlocker's own failed read.
 		kept, withheld := withoutDestructive(actions)
-		slog.Warn("netbox mirror: withholding this sweep's deletes — the local record history "+
-			"could not be read, so no delete can be proven",
+		slog.Warn("netbox mirror: withholding this sweep's deletes and clears — the local "+
+			"record history could not be read, so neither can be proven",
 			"error", err, "withheld_actions", withheld)
-		return kept, withheld
+		// Counted as withheld DELETES: nothing at all is proven here, which is
+		// the whole-read failure the escalation in sweep exists for, not the
+		// one-address case.
+		return kept, withheld, 0
 	}
 
 	// The owning VM's NAME, by NetBox object id: a nic delete carries its
@@ -526,20 +559,23 @@ func (r *Reconciler) withoutUnprovenDeletes(ctx context.Context, actions []Actio
 
 	kept := make([]Action, 0, len(actions))
 	var unprovenVMs, unprovenNICs []string
+	var unprovenAddrs []int
 	for _, a := range actions {
-		if a.Op != "delete" || provenGone(a, actual, nameByID, known) {
+		if !destructive(a) || provenRemovable(a, actual, nameByID, known) {
 			kept = append(kept, a)
 			continue
 		}
-		switch a.Kind {
-		case "vm":
+		switch {
+		case a.Op == "clear":
+			unprovenAddrs = append(unprovenAddrs, a.IPID)
+		case a.Kind == "vm":
 			unprovenVMs = append(unprovenVMs, actual.VMs[a.Key].Name)
 		default:
 			unprovenNICs = append(unprovenNICs, actual.NICs[a.Key].MAC)
 		}
 	}
-	withheld := len(unprovenVMs) + len(unprovenNICs)
-	if withheld > 0 {
+	deletes := len(unprovenVMs) + len(unprovenNICs)
+	if deletes > 0 {
 		// Sorted, so a condition that lasts several sweeps logs the same list
 		// each time instead of reshuffling it.
 		sort.Strings(unprovenVMs)
@@ -549,18 +585,45 @@ func (r *Reconciler) withoutUnprovenDeletes(ctx context.Context, actions []Actio
 			"they belong to a workload it has never seen; the next sweep re-evaluates",
 			"vms", unprovenVMs, "interface_macs", unprovenNICs,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs),
-			"withheld_deletes", withheld)
+			"withheld_deletes", deletes)
 	}
-	return kept, withheld
+	if len(unprovenAddrs) > 0 {
+		sort.Ints(unprovenAddrs)
+		slog.Warn("netbox mirror: withholding address detachments this node holds no lease "+
+			"record of, tombstone included — `ip_allocations` has not replicated them, or the "+
+			"address belongs to something this cluster has never leased; the next sweep "+
+			"re-evaluates. A condition that persists is an object to remove in NetBox by hand",
+			"netbox_address_ids", unprovenAddrs,
+			"netbox_interfaces", len(actual.NICs),
+			"withheld_clears", len(unprovenAddrs))
+	}
+	return kept, deletes, len(unprovenAddrs)
 }
 
-// provenGone reports whether the local database holds a record — live or
-// tombstoned — of the object this delete would remove.
+// destructive reports whether an action TAKES something away. The two ops are
+// the delete and the clear; withoutDestructive filters on the same pair.
+func destructive(a Action) bool { return a.Op == "delete" || a.Op == "clear" }
+
+// provenRemovable reports whether the local database holds a record — live or
+// tombstoned — of the thing this destructive action would take away.
 //
-// A Kind it does not recognise is NOT proven. There are two of them today, and a
-// third added without a matching evidence question must fail closed rather than
-// inherit a permissive default.
-func provenGone(a Action, actual Actual, nameByID map[int]string, known corrosion.MirrorEvidence) bool {
+// A CLEAR asks about the ADDRESS, not the interface. The interface is in the
+// desired set by construction (Diff only computes a clear for a NIC it is
+// mirroring), so a NIC-keyed question here would be answered yes every time and
+// would prove nothing at all. What is unproven is the claim "no lease of ours
+// names this address", and the lease row — live or tombstoned — is the evidence
+// for it.
+//
+// An op or Kind it does not recognise is NOT proven. A third of either added
+// without a matching evidence question must fail closed rather than inherit a
+// permissive default.
+func provenRemovable(a Action, actual Actual, nameByID map[int]string, known corrosion.MirrorEvidence) bool {
+	if a.Op == "clear" {
+		return known.KnowsAddress(a.IPID)
+	}
+	if a.Op != "delete" {
+		return false
+	}
 	switch a.Kind {
 	case "vm":
 		return known.KnowsVM(actual.VMs[a.Key].Name)
@@ -572,10 +635,10 @@ func provenGone(a Action, actual Actual, nameByID map[int]string, known corrosio
 	}
 }
 
-// hasDeletes reports whether the list holds any delete at all.
-func hasDeletes(actions []Action) bool {
+// hasRemovals reports whether the list holds any destructive action at all.
+func hasRemovals(actions []Action) bool {
 	for _, a := range actions {
-		if a.Op == "delete" {
+		if destructive(a) {
 			return true
 		}
 	}

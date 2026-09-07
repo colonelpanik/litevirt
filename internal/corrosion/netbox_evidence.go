@@ -27,8 +27,8 @@ import (
 // about the object, and no record at all means it has not.
 //
 // The reads are per SWEEP, not per candidate: the mirror diffs the whole fleet
-// on a 15-minute cadence, and a query per delete candidate would turn one pass
-// into thousands of round trips against the same three tables.
+// on a 15-minute cadence, and a query per candidate would turn one pass into
+// thousands of round trips against the same four tables.
 //
 // It is evidence of a RECORD, never of intent. Nothing here says the object
 // should be deleted; the diff decides that. This only says whether the local
@@ -36,6 +36,7 @@ import (
 type MirrorEvidence struct {
 	vmNames map[string]bool
 	nicKeys map[string]bool
+	addrIDs map[int]bool
 }
 
 // KnowsVM reports whether the local database holds a `vms` row of ANY kind for
@@ -80,6 +81,31 @@ func (e MirrorEvidence) KnowsNIC(vmName, mac string) bool {
 	return e.nicKeys[nicEvidenceKey(vmName, mac)]
 }
 
+// KnowsAddress reports whether the local `ip_allocations` table holds a lease
+// row of ANY kind — live or tombstoned — that references this NetBox address
+// object.
+//
+// It is what authorizes the mirror's `clear`, which unassigns an address from an
+// interface. A clear is bounded where a delete is not, but it is reached by the
+// SAME unhydrated read: `ip_allocations` empty resolves every NIC to address 0,
+// which reads as "this NIC holds no address" and routes every litevirt-owned
+// address in the cluster into the clear branch. Anti-entropy repairs per table,
+// so "`vms` repaired, `ip_allocations` not yet" is a state the repair mechanism
+// itself produces.
+//
+// The evidence is complete because nothing hard-deletes an `ip_allocations` row:
+// ReleaseLease tombstones it and RETAINS netbox_ip_id, so a genuinely released
+// address still has a row naming it. Requiring evidence therefore cannot strand
+// a stale assignment — it can only defer one to a sweep that can prove it.
+// (DiscardReplicatedStateForReseed truncates the table, and the merge behind it
+// restores the rows; the window in between costs withheld clears.)
+//
+// Address 0 is never evidence: it is what a builtin, non-NetBox lease reads back
+// as, and what an unresolved lookup returns.
+func (e MirrorEvidence) KnowsAddress(id int) bool {
+	return id != 0 && e.addrIDs[id]
+}
+
 // nicEvidenceKey keys one interface record. Lower-cased because NetBox echoes
 // MACs upper-cased and litevirt records them either way; NUL-separated so no
 // (name, MAC) pair can be spelled two ways.
@@ -87,7 +113,7 @@ func nicEvidenceKey(vmName, mac string) string {
 	return vmName + "\x00" + strings.ToLower(mac)
 }
 
-// ReadMirrorEvidence collects the record evidence in one pass over the three
+// ReadMirrorEvidence collects the record evidence in one pass over the four
 // tables that carry it.
 //
 // Every read failure is RETURNED. This is the evidence a delete rests on, so a
@@ -99,6 +125,7 @@ func ReadMirrorEvidence(ctx context.Context, c *Client) (MirrorEvidence, error) 
 	out := MirrorEvidence{
 		vmNames: map[string]bool{},
 		nicKeys: map[string]bool{},
+		addrIDs: map[int]bool{},
 	}
 
 	rows, err := c.Query(ctx, `SELECT name FROM vms`)
@@ -125,6 +152,21 @@ func ReadMirrorEvidence(ctx context.Context, c *Client) (MirrorEvidence, error) 
 				continue
 			}
 			out.nicKeys[nicEvidenceKey(vmName, mac)] = true
+		}
+	}
+
+	// NO `deleted_at` predicate here either, and for the same reason: a released
+	// lease keeps its netbox_ip_id, so the tombstone IS the proof that the
+	// address the mirror wants to unassign is genuinely unclaimed. Filtering to
+	// live rows would make every correct clear unprovable.
+	rows, err = c.Query(ctx,
+		`SELECT netbox_ip_id FROM ip_allocations WHERE netbox_ip_id IS NOT NULL`)
+	if err != nil {
+		return MirrorEvidence{}, fmt.Errorf("read local NetBox lease records: %w", err)
+	}
+	for _, r := range rows {
+		if id := r.Int("netbox_ip_id"); id != 0 {
+			out.addrIDs[id] = true
 		}
 	}
 	return out, nil

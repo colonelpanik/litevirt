@@ -6,6 +6,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // How a NIC finds the NetBox address object it holds.
@@ -25,6 +26,9 @@ const (
 	joinNetwork = "bound"
 	leasedIP    = "10.0.5.100"
 	recordedIP  = "10.0.5.200"
+	// The address a lease of ours once claimed and has since released — the
+	// genuinely stale assignment the clear half exists for.
+	releasedIP = "10.0.5.201"
 )
 
 // addressJoinReconciler is one mirrored VM with one NIC that holds one
@@ -126,15 +130,28 @@ func TestMatchingRecordedIPKeepsTheAssignment(t *testing.T) {
 //
 // Without it, both scenarios above are satisfied by a mirror that never clears
 // anything — and the clear half is what stops an interface accumulating every
-// address it has ever held. A litevirt-owned address on this interface that NO
-// lease of ours names is stale by construction, and must go.
+// address it has ever held. A litevirt-owned address on this interface that no
+// LIVE lease of ours names is stale, and must go.
+//
+// The fixture models how one actually arises. A litevirt-owned address assigned
+// to a litevirt interface got there because the mirror assigned it, from a lease
+// this cluster held; what makes it stale afterwards is the RELEASE, and
+// network.ReleaseLease tombstones the `ip_allocations` row while retaining
+// netbox_ip_id. So the local database still holds a record naming the address,
+// which is exactly the evidence the clear rule asks for.
+//
+// An `ip_allocations` row simply ABSENT is a different state and not this one:
+// that is what an unreplicated table looks like, and those clears are withheld
+// (clear_evidence_test.go). Using it here would have made this control pass on a
+// shape production cannot produce.
 func TestGenuinelyStaleAddressIsStillCleared(t *testing.T) {
 	nb, r := addressJoinReconciler(t, leasedIP)
 	fingerprint := mustFingerprint(t, r)
 	nb.listIPs = append(nb.listIPs, netbox.IPAddress{
-		ID: 42, Address: "10.0.5.201/24", AssignedObjectID: 21,
+		ID: 42, Address: releasedIP + "/24", AssignedObjectID: 21,
 		Identity: netbox.Identity(fingerprint, "uuid-1", macGuard),
 	})
+	seedReleasedJoinLease(t, r, releasedIP, 42)
 
 	if err := r.SyncOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -142,6 +159,29 @@ func TestGenuinelyStaleAddressIsStillCleared(t *testing.T) {
 
 	got := cleared(nb)
 	if len(got) != 1 || got[0] != 42 {
-		t.Fatalf("cleared %v, want exactly the address no lease names", got)
+		t.Fatalf("cleared %v, want exactly the address whose lease this cluster released", got)
+	}
+}
+
+// seedReleasedJoinLease claims an address on the bound network for this
+// fixture's VM and then releases it through the PRODUCTION path.
+//
+// network.ReleaseLease, not a hand-written tombstone: what this fixture rests on
+// is that a release retains netbox_ip_id on the row it tombstones, and writing
+// the row by hand would assert that instead of exercising it.
+func seedReleasedJoinLease(t *testing.T, r *Reconciler, ip string, netboxIPID int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := r.db.Execute(ctx,
+		`INSERT INTO ip_allocations
+		   (network, ip, mac, vm_name, owner_kind, owner_host,
+		    netbox_ip_id, netbox_prefix_id, allocated_at, updated_at)
+		 VALUES (?, ?, ?, 'vm-1', 'vm', 'host-a', ?, 7, ?, ?)`,
+		joinNetwork, ip, macGuard, netboxIPID, r.db.NowWall(), r.db.NowTS()); err != nil {
+		t.Fatalf("seed ip_allocations(%s): %v", ip, err)
+	}
+	if err := network.ReleaseLease(ctx, r.db,
+		joinNetwork, ip, macGuard, "vm", "host-a", "vm-1"); err != nil {
+		t.Fatalf("ReleaseLease(%s): %v", ip, err)
 	}
 }

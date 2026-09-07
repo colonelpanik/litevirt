@@ -14,8 +14,26 @@ type BindingRecord struct {
 	ObservedCIDR       string
 	VRFID              int
 	ClusterFingerprint string
-	Suspended          bool
-	SuspendReason      string
+	// NetBoxCluster is the NetBox virtualization.cluster name the FIRST bind
+	// resolved, pinned here so a node whose own netbox.cluster_name resolves to
+	// a different one can discover the disagreement and refuse to mirror.
+	//
+	// It belongs on this row for the same reason ClusterFingerprint does: the
+	// row replicates, and a node has no other way to learn what a peer's config
+	// says. Unlike every enforcement.* flag this setting has no latch to make it
+	// uniform — a capability token carries a name, not a value — and the mirror
+	// sweep runs on whichever node holds the netbox leader lease, so a
+	// non-uniform value would move the whole inventory between two cluster
+	// objects as leadership moved.
+	//
+	// EMPTY means "not pinned", not "the empty name": the resolution always
+	// yields a non-empty string (the override, the local cluster name, or the
+	// placeholder), so the only row that reads back empty is one written before
+	// this column existed. Such a row cannot disagree with anything, so the
+	// mismatch check passes it over rather than refusing on it.
+	NetBoxCluster string
+	Suspended     bool
+	SuspendReason string
 }
 
 // ClaimBinding inserts a binding ONLY if the prefix is unbound, then confirms
@@ -36,13 +54,14 @@ func ClaimBinding(ctx context.Context, c *Client, r BindingRecord) (bool, error)
 	if err := c.Execute(ctx,
 		`INSERT INTO netbox_bindings
 		   (prefix_id, network, observed_cidr, vrf_id, cluster_fingerprint,
-		    suspended, suspend_reason, validated_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, 0, '', ?, ?, ?)
+		    netbox_cluster, suspended, suspend_reason, validated_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, 0, '', ?, ?, ?)
 		 ON CONFLICT(prefix_id) DO UPDATE SET
 		   network = excluded.network,
 		   observed_cidr = excluded.observed_cidr,
 		   vrf_id = excluded.vrf_id,
 		   cluster_fingerprint = excluded.cluster_fingerprint,
+		   netbox_cluster = excluded.netbox_cluster,
 		   suspended = 0,
 		   suspend_reason = '',
 		   validated_at = excluded.validated_at,
@@ -50,7 +69,7 @@ func ClaimBinding(ctx context.Context, c *Client, r BindingRecord) (bool, error)
 		   deleted_at = NULL
 		 WHERE netbox_bindings.deleted_at IS NOT NULL`,
 		r.PrefixID, r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint,
-		c.NowWall(), c.NowWall(), c.NowTS()); err != nil {
+		r.NetBoxCluster, c.NowWall(), c.NowWall(), c.NowTS()); err != nil {
 		return false, fmt.Errorf("claim binding: %w", err)
 	}
 	got, err := GetBindingByPrefix(ctx, c, r.PrefixID)
@@ -78,13 +97,14 @@ func UpsertBinding(ctx context.Context, c *Client, r BindingRecord) error {
 		   observed_cidr = ?,
 		   vrf_id = ?,
 		   cluster_fingerprint = ?,
+		   netbox_cluster = ?,
 		   suspended = ?,
 		   suspend_reason = ?,
 		   validated_at = ?,
 		   updated_at = ?,
 		   deleted_at = NULL
 		 WHERE prefix_id = ?`,
-		r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint,
+		r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint, r.NetBoxCluster,
 		susp, r.SuspendReason, c.NowWall(), c.NowTS(), r.PrefixID)
 	if err != nil {
 		return fmt.Errorf("update binding: %w", err)
@@ -121,7 +141,12 @@ func DeleteBinding(ctx context.Context, c *Client, prefixID int) error {
 	return nil
 }
 
+// bindingCols is every column a BindingRecord carries, COALESCEd where a row an
+// older peer wrote could leave one null. netbox_cluster is among them: it is
+// v51-and-later, and a row that predates it reads back as "" — which the
+// mismatch check treats as "not pinned" rather than as a disagreement.
 const bindingCols = `prefix_id, network, observed_cidr, vrf_id, cluster_fingerprint,
+	 COALESCE(netbox_cluster, '') AS netbox_cluster,
 	 COALESCE(suspended, 0) AS suspended, COALESCE(suspend_reason, '') AS suspend_reason`
 
 func scanBinding(r Row) BindingRecord {
@@ -131,6 +156,7 @@ func scanBinding(r Row) BindingRecord {
 		ObservedCIDR:       r.String("observed_cidr"),
 		VRFID:              r.Int("vrf_id"),
 		ClusterFingerprint: r.String("cluster_fingerprint"),
+		NetBoxCluster:      r.String("netbox_cluster"),
 		Suspended:          r.Int("suspended") == 1,
 		SuspendReason:      r.String("suspend_reason"),
 	}

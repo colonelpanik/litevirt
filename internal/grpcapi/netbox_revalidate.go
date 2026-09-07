@@ -52,6 +52,20 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list bindings: %w", err)
 	}
+	// The `netbox.cluster_name` uniformity finding, from the rows just read.
+	//
+	// HERE rather than in the sweep, because this pass runs on every configured
+	// node and the sweep runs only on the leader — and the node whose config
+	// disagrees is precisely the one that may never lead. It raises a health
+	// condition and nothing else: the refusal itself lives at the mirror's
+	// per-pass gate, and suspending a BINDING over it would be wrong in both
+	// directions (it would stop allocation, which the mismatch does not
+	// endanger, and it would do so cluster-wide over one node's config).
+	//
+	// Before the drift loop, so a node that cannot mirror says so on the same
+	// pass whatever the drift check goes on to decide.
+	s.evaluateNetBoxClusterPin(ctx, bindings)
+
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("derive cluster fingerprint: %w", err)
@@ -178,6 +192,22 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 				"nothing was rewritten; the pass ends on its own — run the re-key again in a moment")
 	}
 	defer s.nbPassMu.Unlock()
+	// `netbox.cluster_name` agreement, before either form does anything.
+	//
+	// A re-key resolves the SAME NetBox cluster object the mirror writes into and
+	// then rewrites every identity under it. Run on a node whose configuration
+	// disagrees with the cluster's pinned name, it would re-stamp objects in the
+	// wrong cluster — or create that cluster and strand the real inventory — and
+	// report success while doing it. That is strictly worse than a sweep, which
+	// is why this refuses LOUDLY where the mirror declines in silence: an
+	// operator is waiting on the answer and is the only one who can fix it.
+	//
+	// Both forms, including the inventory-only one. It resolves the same name and
+	// enumerates the same cluster; a mirror-only installation simply has no
+	// binding to compare against, so the check passes there and says so.
+	if err := s.requireNetBoxClusterAgreement(ctx); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
 	if req.GetNetwork() == "" {
 		return s.rekeyInventoryOnly(ctx)
 	}

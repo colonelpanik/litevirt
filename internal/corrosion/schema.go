@@ -2120,6 +2120,13 @@ var schemaDDL = []string{
 		observed_cidr       TEXT NOT NULL,
 		vrf_id              INTEGER NOT NULL,
 		cluster_fingerprint TEXT NOT NULL,
+		-- The NetBox virtualization.cluster name the FIRST bind resolved, pinned
+		-- so a node whose netbox.cluster_name resolves to something else can
+		-- discover the disagreement and refuse to mirror. It has to be uniform
+		-- cluster-wide and, unlike an enforcement.* flag, has no latch to make it
+		-- so: a capability token cannot express a string. Defaulted rather than
+		-- NOT NULL-without-default so an older peer's writes still land.
+		netbox_cluster      TEXT NOT NULL DEFAULT '',
 		suspended           INTEGER NOT NULL DEFAULT 0,
 		suspend_reason      TEXT NOT NULL DEFAULT '',
 		validated_at        TEXT NOT NULL,
@@ -2533,6 +2540,15 @@ var schemaMigrations = []string{
 	// v51: NetBox join keys on the lease.
 	`ALTER TABLE ip_allocations ADD COLUMN netbox_ip_id INTEGER`,
 	`ALTER TABLE ip_allocations ADD COLUMN netbox_prefix_id INTEGER`,
+	// v51: the pinned NetBox cluster name on a binding. Also present in the
+	// netbox_bindings CREATE TABLE above, which is where a fresh database gets
+	// it — this unit exists because the ledger's presence predicate is what
+	// heals a database created by an EARLIER v51 build, whose table already
+	// exists and whose CREATE TABLE IF NOT EXISTS is therefore a no-op. On a
+	// fresh database the column is already there, so the unit is recorded
+	// mark-only and this ALTER never runs. Same belt-and-braces shape as every
+	// other column here.
+	`ALTER TABLE netbox_bindings ADD COLUMN netbox_cluster TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2621,6 +2637,7 @@ var alterVersions = []int{
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
+	51, // netbox_bindings.netbox_cluster
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

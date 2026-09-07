@@ -333,8 +333,19 @@ netbox:
                             # into a second virtualization.cluster at the first
                             # leadership handover, and no sweep can then see the
                             # objects written under the other name. Nothing
-                            # detects it; the mirror logs the name it resolved
-                            # at startup, so compare that line across nodes.
+                            # ENFORCED from the first bind onward: the bind
+                            # PINS the name it resolved onto the
+                            # netbox_bindings row, and any node whose own
+                            # config resolves to a different one refuses to
+                            # mirror and refuses `lv netbox rekey`, raising a
+                            # netbox_cluster_name_mismatch health condition
+                            # naming both values. Address allocation is
+                            # unaffected. Unset on every node agrees (it
+                            # resolves to the local cluster name); set on some
+                            # nodes only does not. NOT enforced on a cluster
+                            # with no bound network — there is no binding row
+                            # to pin — so compare the mirror's startup log line
+                            # across nodes there.
   mirror_inventory: false   # opt into the INVENTORY MIRROR — the half that
                             # creates NetBox virtual_machine / vminterface
                             # objects and assigns addresses to them. Default

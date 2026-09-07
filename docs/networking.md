@@ -445,6 +445,30 @@ against the new range.
 
 ### The inventory mirror
 
+`netbox.cluster_name` is **enforced uniform** from the first bind onward. It
+names the `virtualization.cluster` the mirror writes into, and the sweep runs on
+whichever node holds the `netbox` leader lease — so set it on some nodes only and
+whichever node leads decides that sweep: objects appear under one cluster and are
+deleted under another as leadership moves, and the ones left behind are invisible
+to every later sweep that resolves the other name, so nothing reaps them. Unlike
+an `enforcement.*` flag it has no latch, because a capability token carries a
+name and not a value.
+
+Instead, the first bind **pins** the name it resolved onto the `netbox_bindings`
+row, alongside the CIDR, the VRF and the cluster fingerprint. Any node whose own
+configuration resolves to a different name refuses to mirror and refuses
+`lv netbox rekey`, and raises a `netbox_cluster_name_mismatch` health condition
+about itself naming both values (see `docs/diagnostics.md`). Address allocation
+is unaffected — the mismatch endangers the inventory, not the addresses. Leaving
+the key unset on every node is fine and is the default: unset resolves to the
+local cluster name, so every node resolves the same thing and agrees. Setting it
+on one node and not another does not agree, and is refused.
+
+One shape is **not** covered: a cluster running the mirror with no bound network
+has no binding row, so it has no pin and nothing to compare against. Set
+`netbox.cluster_name` identically by hand there, and compare the
+`netbox mirror: starting` log line across the fleet.
+
 The inventory mirror is **opt-in**, and off by default. `netbox.enabled` alone
 makes NetBox litevirt's address authority and nothing more: the addresses
 litevirt claims exist as `ip_address` objects carrying this cluster's identity in

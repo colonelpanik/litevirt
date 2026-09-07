@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netboxsync"
 )
 
 // NetBox health findings.
@@ -38,6 +39,17 @@ const (
 	// condNetBoxSweepBlocked: reclamation has been impossible for several
 	// consecutive passes because a host would not answer the proof.
 	condNetBoxSweepBlocked = "netbox_sweep_blocked"
+	// condNetBoxClusterNameMismatch: THIS node's netbox.cluster_name resolves to
+	// a different NetBox cluster than the one the cluster's bindings are pinned
+	// to, so this node refuses to mirror.
+	//
+	// Subject is the HOST, unlike the two above, and that is load-bearing. The
+	// finding is about one node's configuration; every configured node evaluates
+	// it for itself from its OWN config, which no peer can read. A finding keyed
+	// on the network would have the agreeing nodes and the disagreeing one
+	// writing one row under LWW, so the last writer would decide whether the
+	// cluster has a problem.
+	condNetBoxClusterNameMismatch = "netbox_cluster_name_mismatch"
 )
 
 // netboxSweepSubject is the single subject of condNetBoxSweepBlocked. The
@@ -140,14 +152,62 @@ func (s *Server) evaluateNetBoxHealth(ctx context.Context, unreachableStreak int
 	s.applyNetBoxConditions(ctx, condNetBoxSweepBlocked, "cluster", blocked)
 }
 
-// applyNetBoxConditions advances one condition CODE against this pass's positive
-// subjects: observe, confirm on the second consecutive pass, resolve after
-// netboxCleanPasses consecutive clean ones.
+// evaluateNetBoxClusterPin advances condNetBoxClusterNameMismatch for THIS host
+// against binding rows the caller has already read.
 //
-// Both findings are WARNING severity, observed and confirmed alike. Neither is
-// corruption — one refuses new work, the other stops a garbage collector — and
-// severity critical is reserved here for a workload running in two places.
+// Called from revalidation rather than from the sweep, and that is the point:
+// the sweep runs under the `netbox` leader lease, so a finding raised there
+// would only ever describe the leader's configuration — and the misconfigured
+// node is precisely the one that may never lead. Revalidation runs on every
+// configured node, so each one reports its own.
+//
+// Scoped to this host's subject on the way out as well as in. Every node
+// evaluates this code, so a node that AGREES must not clean-count a peer's
+// subject: it would resolve the disagreeing node's finding within two passes
+// while the misconfiguration stood, which is worse than no finding at all
+// because the row would appear and then vanish.
+func (s *Server) evaluateNetBoxClusterPin(ctx context.Context, bindings []corrosion.BindingRecord) {
+	positive := map[string]string{}
+	resolved, err := netboxsync.ClusterName(ctx, s.db, s.netboxClusterName)
+	if err != nil {
+		// Neither agreement nor disagreement. The mirror declines a pass it
+		// cannot verify (netboxClusterPinAgrees); raising a MISMATCH here would
+		// name a value this node could not read.
+		slog.Warn("netbox health: could not resolve this node's NetBox cluster name", "error", err)
+		return
+	}
+	if m, bad, _ := firstClusterPinMismatch(resolved, bindings); bad {
+		positive[s.hostName] = m.String()
+	}
+	s.applyNetBoxConditionsScoped(ctx, condNetBoxClusterNameMismatch, "host", positive,
+		func(subject string) bool { return subject == s.hostName })
+}
+
+// applyNetBoxConditions advances one condition CODE against this pass's positive
+// subjects, over EVERY subject of that code.
+//
+// Correct for the two sweep-written findings and only for those: the sweep runs
+// under the `netbox` leader lease, so the cluster has one writer at a time and a
+// pass that saw no problem has the standing to say every subject is clean. A
+// per-node finding does not — see applyNetBoxConditionsScoped.
 func (s *Server) applyNetBoxConditions(ctx context.Context, code, subjectKind string, positive map[string]string) {
+	s.applyNetBoxConditionsScoped(ctx, code, subjectKind, positive, func(string) bool { return true })
+}
+
+// applyNetBoxConditionsScoped is applyNetBoxConditions restricted to the
+// subjects this pass has authority over: observe, confirm on the second
+// consecutive pass, resolve after netboxCleanPasses consecutive clean ones.
+//
+// `owns` decides which EXISTING subjects a clean pass may clean-count. It cannot
+// be inferred from `positive`, because an empty positive set is exactly the
+// ambiguous case: for a leader-written finding it means "nothing is wrong
+// anywhere", and for a per-host one it means only "nothing is wrong here".
+//
+// All three findings are WARNING severity, observed and confirmed alike. None is
+// corruption — one refuses new work, one stops a garbage collector, one stops an
+// inventory mirror — and severity critical is reserved here for a workload
+// running in two places.
+func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectKind string, positive map[string]string, owns func(subject string) bool) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	active, err := corrosion.ListHealthConditions(ctx, s.db, false)
@@ -193,6 +253,11 @@ func (s *Server) applyNetBoxConditions(ctx context.Context, code, subjectKind st
 
 	for subject, row := range existing {
 		if _, still := positive[subject]; still {
+			continue
+		}
+		if !owns(subject) {
+			// Another node's subject. This pass observed nothing about it, and
+			// silence is not a clean pass.
 			continue
 		}
 		row.CleanCount++

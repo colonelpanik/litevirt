@@ -7,6 +7,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
+	"github.com/litevirt/litevirt/internal/netboxsync"
 )
 
 // validateAndBindPrefix runs every bind-time precondition and records the
@@ -80,12 +81,38 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		return fmt.Errorf("derive cluster fingerprint: %w", err)
 	}
 
+	// 6b. Pin the NetBox CLUSTER NAME this node resolves, for the same reason and
+	//     in the same place. `netbox.cluster_name` has to be identical on every
+	//     node — the mirror sweep runs on whichever node holds the `netbox`
+	//     leader lease, so a disagreement moves the whole inventory between two
+	//     `virtualization.cluster` objects as leadership moves — and it is the
+	//     one setting no capability latch can make uniform, because a token
+	//     carries a name and not a value. Pinning it here is what lets every
+	//     other node discover that its own configuration disagrees (see
+	//     netbox_cluster_pin.go).
+	//
+	//     The RESOLVED name, not the raw config value: unset resolves to the
+	//     local cluster name, so pinning "" would make "every node left it
+	//     unset" (agreement) indistinguishable from "this node set it and that
+	//     one did not" (the hazard).
+	//
+	//     A resolution failure REFUSES the bind. It is one local read of the
+	//     `cluster` row — the same row step 6 just read a fingerprint from — so
+	//     failing here means the row is unreadable, and a binding pinned to no
+	//     name would silently opt out of the uniformity check for the life of
+	//     the cluster.
+	nbCluster, err := netboxsync.ClusterName(ctx, s.db, s.netboxClusterName)
+	if err != nil {
+		return fmt.Errorf("resolve the NetBox cluster name to pin on the binding: %w", err)
+	}
+
 	rec := corrosion.BindingRecord{
 		Network:            netName,
 		PrefixID:           prefixID,
 		ObservedCIDR:       p.Prefix,
 		VRFID:              p.VRFID,
 		ClusterFingerprint: fp,
+		NetBoxCluster:      nbCluster,
 	}
 
 	// 7. The addresses litevirt is ALREADY handing to guests inside this prefix.

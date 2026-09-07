@@ -39,9 +39,9 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// leadership away between its own passes.
 		AcquireLease: func(ctx context.Context) bool { return s.acquireNetBoxLease(ctx, interval) },
 		HoldsLease:   s.netboxMirrorHoldsLease,
-		// A closure, so the latch is re-read on EVERY pass. See
-		// netboxMirrorAuthorized.
-		Latched: func(context.Context) bool { return s.netboxMirrorAuthorized() },
+		// A closure, so both latches AND the cluster-name pin are re-read on
+		// EVERY pass. See netboxMirrorPassAuthorized.
+		Latched: s.netboxMirrorPassAuthorized,
 		// The intra-node half of the exclusion the leader lease only covers
 		// across nodes. See netboxExclusivePass.
 		Exclusive: s.netboxExclusivePass,

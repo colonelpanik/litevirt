@@ -145,7 +145,22 @@ type adoptCandidate struct {
 // The count is returned ALONGSIDE an error, never instead of one: a pass that
 // failed partway has still created objects in NetBox, and the caller has to be
 // able to say so in the audit trail rather than imply nothing happened.
-func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.BindingRecord) (int, error) {
+//
+// LEASE. `lease` is the `netbox` leader lease when the caller holds one, and it
+// is re-proved before EVERY claim — one HTTP round trip each, against a lease
+// whose TTL is a minute, so a pass that proved it once at the top would go on
+// writing under a lease another node had taken. That is the discipline the
+// re-key's address-rewrite loop already keeps, and this is the same kind of step
+// sitting inside the same operation.
+//
+// A NIL lease is not a relaxation of that rule; it means the caller holds no
+// leader lease AT ALL, and only two callers may be in that position:
+// CreateNetwork's bind and `lv netbox resume`. Neither may require cluster
+// leadership — the mirror and the sweeper are periodic passes that can wait for
+// their next tick, an operator binding or resuming a network cannot, and a bind
+// refused because some other node leads would be unusable. Their exclusion is
+// nbPassMu, taken by each of those doors.
+func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.BindingRecord, lease *rekeyLease) (int, error) {
 	cands, err := s.planAdoption(ctx, b)
 	if err != nil {
 		return 0, err
@@ -172,6 +187,19 @@ func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.Binding
 
 	adopted := 0
 	for _, c := range cands {
+		if lease != nil {
+			// Before the WRITE, not after it, and before each one. A lease lost
+			// for any reason — a peer that took an expired row, a hand-edited
+			// row, a clock that moved — stops the pass at the very next address
+			// rather than at the next renewal, and the caller's own error
+			// handling leaves the binding suspended and the operation
+			// re-runnable.
+			if lerr := lease.check(ctx); lerr != nil {
+				return adopted, fmt.Errorf(
+					"adopt %s (held by %s) into NetBox prefix %d after adopting %d of %d: %w",
+					c.IP, c.VMName, b.PrefixID, adopted, len(cands), lerr)
+			}
+		}
 		if _, cerr := alloc.Claim(ctx, network.ClaimRequest{
 			Network:    b.Network,
 			MAC:        c.MAC,
@@ -317,6 +345,10 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	if err != nil {
 		return nil, fmt.Errorf("list VMs to find existing addresses on network %q: %w", b.Network, err)
 	}
+	if len(vms) == 0 {
+		s.reportUncorroboratedVMRead(ctx, b)
+	}
+
 	var cands []adoptCandidate
 	seen := make(map[string]string) // bare address -> the VM already claiming it
 	for _, vm := range vms {
@@ -461,6 +493,54 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) ([
 	return cands, nil
 }
 
+// reportUncorroboratedVMRead names the ONE empty read this function cannot fail
+// closed on.
+//
+// corrosion.ListVMs answers ([], nil) for a node hydrating after a database loss
+// or a fresh join exactly as it does for a cluster that genuinely holds no VMs,
+// and the inventory mirror documents that shape as forbidden — it corroborates
+// its own empty read with corrosion.HasVMRecords, which counts TOMBSTONES too,
+// because a VM that was deleted leaves one behind and a row that never
+// replicated leaves nothing.
+//
+// THAT CORROBORATION DOES NOT TRANSFER TO A REFUSAL HERE, and the reason is the
+// mirror's own precondition rather than anything about the helper: the mirror
+// only asks when NetBox still holds objects for this cluster, which is
+// INDEPENDENT proof the cluster once had VMs — so "no VM row of any kind" is
+// proof that node has not hydrated. A bind has no such precondition. `vms` empty
+// with no tombstones is the state of every cluster that has not created a VM
+// yet, which is the documented order of operations (build the cluster, create
+// the networks, then the VMs) and the state of the FIRST bind on every
+// installation. Refusing it would refuse exactly that bind, with no override,
+// and there is no second local signal that separates the two states: a
+// rebuilt node's `hosts` rows are re-seeded by the operator, and "wait a while"
+// is not a proof — the same argument the mirror makes about grace periods.
+//
+// So it is REPORTED rather than refused, at WARN with both counts, and the
+// residual is documented (docs/networking.md, "Binding from a node that is
+// still replicating"). The convergent fix — re-running adoption from the
+// periodic revalidation pass, so rows that arrive after the bind are adopted
+// then — is a change to a background pass's blast radius and is deliberately
+// not made here.
+//
+// The read itself still fails closed in the direction it can: an unreadable
+// answer is logged as unreadable rather than as an empty cluster.
+func (s *Server) reportUncorroboratedVMRead(ctx context.Context, b corrosion.BindingRecord) {
+	seen, err := corrosion.HasVMRecords(ctx, s.db)
+	switch {
+	case err != nil:
+		slog.Warn("netbox: could not corroborate an empty VM list while binding a prefix; "+
+			"if this node is still replicating, addresses its guests hold may be invisible to this bind",
+			"network", b.Network, "prefix", b.PrefixID, "error", err)
+	case !seen:
+		slog.Warn("netbox: binding a prefix on an uncorroborated empty VM inventory — this "+
+			"node's local database holds no VM record of any kind, which a node that has not "+
+			"finished replicating looks exactly like; bind from a node that has been up and "+
+			"replicating, or re-check the prefix once this one has caught up",
+			"network", b.Network, "prefix", b.PrefixID)
+	}
+}
+
 // adoptionSuspendReason is the reason a binding carries while adoption is owed.
 // It names the count, so an operator reading the row knows what is outstanding
 // rather than only that something is.
@@ -497,7 +577,32 @@ func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, pr
 		return nil
 	}
 
-	adopted, aerr := s.adoptExistingAddresses(ctx, *b)
+	// THE INTRA-NODE EXCLUSION, and only now that there is provably something
+	// to adopt. Past this point the pass POSTs to NetBox, and nbPassMu is what
+	// admits one NetBox write pass at a time on this node (see server.go) — the
+	// same gate its two siblings take, the maintenance pass and RekeyBinding.
+	//
+	// Taken AFTER the suspended check, deliberately. A bind with nothing owed
+	// makes no NetBox request at all, so gating it would refuse an ordinary
+	// `lv network create` whenever a 15-minute mirror sweep happened to overlap
+	// it — a refusal over an operation that was never going to write.
+	//
+	// A refusal, not a wait: an operator queued behind a sweep would see a hang
+	// with nothing to read, and the binding is left suspended and resumable, so
+	// the retry this advises is a real one.
+
+	if !s.nbPassMu.TryLock() {
+		return adoptRefusef(
+			"a NetBox maintenance or inventory pass is already running on this node, so the "+
+				"existing addresses on network %s were not adopted and the binding stays "+
+				"suspended; the pass ends on its own — finish with `lv netbox resume %s` in a moment",
+			netName, netName)
+	}
+	defer s.nbPassMu.Unlock()
+
+	// No leader lease. Neither of the two doors that reach this function may
+	// require cluster leadership — see adoptExistingAddresses.
+	adopted, aerr := s.adoptExistingAddresses(ctx, *b, nil)
 	detail := fmt.Sprintf("prefix=%d adopted=%d", prefixID, adopted)
 	if aerr != nil {
 		// Audited on BOTH outcomes, the way a re-key is: a pass that failed

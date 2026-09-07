@@ -479,12 +479,18 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 		return counts, err
 	}
 
-	// One last proof, before the tail below writes the binding row. Everything
-	// after this point is the RESUME, and resuming is the one step that makes a
-	// half-rewritten cluster live again — it may not rest on a lease this node
-	// stopped holding somewhere in the rewrite above. Returning here leaves the
-	// binding suspended and the operation re-runnable, which is the contract
-	// every error in this function already promises.
+	// A proof before the tail below starts writing. What follows is the drift
+	// re-check (which can SUSPEND), the adoption (which can POST up to 256
+	// times), and finally the resume — and each of those is a write that may not
+	// rest on a lease this node stopped holding somewhere in the rewrite above.
+	// Returning here leaves the binding suspended and the operation re-runnable,
+	// which is the contract every error in this function already promises.
+	//
+	// It is the FIRST of three proofs in this tail, not the only one: the
+	// adoption re-proves before every claim of its own, and the resume re-proves
+	// again immediately before it writes. One proof here would cover the drift
+	// check and then be separated from the resume by every one of those round
+	// trips.
 	if err := lease.check(ctx); err != nil {
 		return counts, fmt.Errorf("re-validate before resuming the binding for prefix %d; "+
 			"it stays suspended, re-run to finish: %w", b.PrefixID, err)
@@ -525,9 +531,15 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// the resume does. Under the NEW fingerprint, which is what `next` carries
 	// and what the rewrite above has just stamped on everything else.
 	//
-	// Costs one local read on a binding with nothing owed, which is every re-key
-	// that is only answering a fingerprint move.
-	adopted, aerr := s.adoptExistingAddresses(ctx, next)
+	// UNDER THE LEASE, which the loop inside re-proves before every claim. This
+	// step is up to 256 NetBox round trips against a one-minute lease, so it is
+	// the longest stretch in the whole re-key and the one most likely to outlive
+	// a handover; leaving it unproven would also separate the resume below from
+	// its last proof by all of them.
+	//
+	// Costs a few local reads on a binding with nothing owed, which is every
+	// re-key that is only answering a fingerprint move.
+	adopted, aerr := s.adoptExistingAddresses(ctx, next, lease)
 	if aerr != nil {
 		reason := fmt.Sprintf(
 			"identities re-keyed, but the addresses this network's guests already hold are not "+
@@ -538,6 +550,24 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 		slog.Warn("netbox binding re-keyed but its existing addresses are not all adopted",
 			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", aerr)
 		return counts, stillDriftedError{reason: reason}
+	}
+
+	// THE LAST PROOF, immediately before the resume itself.
+	//
+	// Everything after this line is the RESUME, and it is the one step that makes
+	// a half-rewritten cluster live again. The adoption above may have spent tens
+	// of seconds in NetBox against a lease with a one-minute TTL, so the proof
+	// taken before it is no longer a statement about now — and a binding resumed
+	// under a lease another node holds is live while that node may be partway
+	// through a rewrite of its own. Nothing here is lost by stopping: the
+	// addresses adopted stay adopted and recorded, and the binding stays
+	// suspended and re-runnable.
+
+	if err := lease.check(ctx); err != nil {
+		return counts, fmt.Errorf(
+			"the addresses on network %s were adopted (%d this pass) but the binding for "+
+				"prefix %d was not resumed; it stays suspended, re-run to finish: %w",
+			b.Network, adopted, b.PrefixID, err)
 	}
 
 	next.Suspended = false
@@ -946,6 +976,30 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 		return &emptypb.Empty{}, nil
 	}
 
+	// THE INTRA-NODE EXCLUSION. A resume finishes any owed adoption below, which
+	// POSTs to NetBox, so this RPC is a NetBox WRITE PASS — and nbPassMu admits
+	// one at a time on this node (server.go). It was a read-and-clear-a-flag call
+	// when that rule was written and is not any more; without this it could run
+	// its claims straight through a re-key rewriting the very identities those
+	// claims are stamped with, on this same node, where the `netbox` leader lease
+	// cannot separate them because it names the node.
+	//
+	// Taken AFTER the idempotent early-out above, so resuming an already-live
+	// binding never contends, and held for the whole of the rest of the call: the
+	// drift re-check, the adoption, and the write that lifts the flag.
+	//
+	// A refusal, not a wait — an operator queued behind a sweep would see a hang
+	// with nothing to read, and the suspension is sticky, so retrying costs
+	// nothing.
+
+	if !s.nbPassMu.TryLock() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"a NetBox maintenance or inventory pass is already running on this node, so "+
+				"network %q stays suspended and nothing was written; the pass ends on its own "+
+				"— run the resume again in a moment", req.GetNetwork())
+	}
+	defer s.nbPassMu.Unlock()
+
 	// The LIVE fingerprint, so a moved fingerprint is still caught here and routed
 	// to the re-key that actually fixes it — the reason string already names it.
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
@@ -970,9 +1024,13 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 	// address to the next VM. It is also what makes "re-run to finish" true:
 	// the resume is the operator's re-run.
 	//
-	// Cheap when there is nothing owed — one local read per network, no NetBox
-	// request — so an ordinary resume of a drift suspension is unchanged.
-	adopted, aerr := s.adoptExistingAddresses(ctx, *b)
+	// Cheap when there is nothing owed — no NetBox request — so an ordinary
+	// resume of a drift suspension is unchanged.
+	//
+	// No leader lease: a resume must not require cluster leadership, so this
+	// door's exclusion is the nbPassMu above and nothing else. See
+	// adoptExistingAddresses.
+	adopted, aerr := s.adoptExistingAddresses(ctx, *b, nil)
 	if aerr != nil {
 		s.audit(ctx, "netbox.resume", req.GetNetwork(),
 			fmt.Sprintf("prefix=%d adopted=%d", b.PrefixID, adopted), "error")

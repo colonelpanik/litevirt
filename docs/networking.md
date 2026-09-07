@@ -290,6 +290,22 @@ being explicit about the rest matters more than the happy path:
   out of `/available-ips/`. If you have raw-bridge containers or external hosts
   sharing a bound prefix, record them in NetBox.
 
+#### Bind from a node that has finished replicating
+
+Adoption reads **this node's** copy of the replicated database, and an empty
+answer is not proof: a node that has just joined, or one rebuilt after a database
+loss, reports no VMs in exactly the same way as a cluster that genuinely has
+none. Bind from a node that has been up and replicating.
+
+litevirt cannot tell those two apart locally — a deleted VM leaves a tombstone
+behind, so a database with *no VM record of any kind* is suspicious, but that is
+also the state of every cluster before its first VM, which is when most prefixes
+get bound. So the bind proceeds and logs a `WARN` naming the situation
+(`uncorroborated empty VM inventory`) rather than refusing an ordinary first
+bind. If you see that line on a node that should have inventory, treat the
+binding as unverified: the addresses its guests hold were not adopted, and
+nothing adopts them later.
+
 Some states refuse the bind rather than being adopted around, and every refusal
 names the object so it can be dealt with:
 
@@ -392,8 +408,15 @@ It also finishes any adoption the bind left owed — see
 [Binding a subnet that already has VMs on it](#binding-a-subnet-that-already-has-vms-on-it).
 That is not a separate mode: the same gate that refuses to lift a suspension over
 unrepaired drift refuses to lift one over an address litevirt has not yet
-recorded in NetBox. On a binding with nothing owed it costs one local read and
-makes no NetBox request.
+recorded in NetBox. On a binding with nothing owed it makes no NetBox request.
+
+Because finishing an adoption writes to NetBox, a resume is a NetBox **write
+pass** and only one of those runs on a node at a time — the same rule the
+maintenance pass and `lv netbox rekey` follow. If a mirror or maintenance pass is
+in flight the resume is refused, saying so, having written nothing; those passes
+end on their own, so run it again in a moment (or from another configured node).
+Bind-time adoption is excluded the same way, and neither requires cluster
+leadership: binding or resuming a network must work from any configured node.
 
 Repairable in place, by fixing NetBox and running `lv netbox resume`:
 

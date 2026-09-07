@@ -1,11 +1,17 @@
 package grpcapi
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/network"
 )
@@ -461,5 +467,220 @@ func TestBindIgnoresAnUnrecordedNICOnAnotherNetwork(t *testing.T) {
 	}
 	if b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix); err != nil || b == nil || b.Suspended {
 		t.Fatalf("the binding must be live, got %+v (err %v)", b, err)
+	}
+}
+
+// ── the resume doors as NetBox WRITE passes ─────────────────────────────────
+//
+// Adoption made both of them POST to NetBox, and `nbPassMu` is the rule that
+// admits ONE NetBox write pass at a time on a node (server.go). RekeyBinding
+// has taken it since it was written; these two were reading and clearing a flag
+// when the rule was made, and they are not any more.
+
+// suspendedBindingServer is a server holding ONE bound, SUSPENDED binding whose
+// prefix still validates — so a resume of it is refused by nothing except the
+// gates under test.
+func suspendedBindingServer(t *testing.T) *Server {
+	t.Helper()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: adoptTestPrefix, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	ctx := context.Background()
+	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if err := corrosion.SuspendBinding(ctx, s.db, adoptTestPrefix, "suspended by a test"); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	return s
+}
+
+func bindingIsSuspended(t *testing.T, s *Server) bool {
+	t.Helper()
+	b, err := corrosion.GetBindingByPrefix(context.Background(), s.db, adoptTestPrefix)
+	if err != nil || b == nil {
+		t.Fatalf("read binding: %v (%+v)", err, b)
+	}
+	return b.Suspended
+}
+
+// TestResumeBindingRefusesWhileAnotherNetBoxPassRuns.
+//
+// ResumeBinding now finishes an owed adoption, which POSTs to NetBox — so it is
+// a NetBox write pass, and an unexcluded one is the single thing `nbPassMu`
+// exists to prevent. Its two siblings (the revalidate/sweep maintenance pass and
+// RekeyBinding) both take it; a resume that did not could run its claims
+// straight through a re-key that is rewriting the identities those claims are
+// stamped with.
+func TestResumeBindingRefusesWhileAnotherNetBoxPassRuns(t *testing.T) {
+	s := suspendedBindingServer(t)
+
+	// A pass in flight on this node.
+	if !s.nbPassMu.TryLock() {
+		t.Fatal("a fresh server's pass gate must be free")
+	}
+	_, err := s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "bound"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("resume during another NetBox pass = %v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "already running on this node") {
+		t.Fatalf("the refusal must say a NetBox pass is already in flight on this node, got: %v", err)
+	}
+	if !bindingIsSuspended(t, s) {
+		t.Fatal("a refused resume must leave the binding suspended")
+	}
+
+	// The other side, so this cannot pass against a resume that refuses
+	// unconditionally: with the gate free the same call goes through.
+	s.nbPassMu.Unlock()
+	if _, err := s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "bound"}); err != nil {
+		t.Fatalf("resume with the gate free: %v", err)
+	}
+	if bindingIsSuspended(t, s) {
+		t.Fatal("the resume did not lift the suspension — the exclusion is refusing more than the overlap")
+	}
+}
+
+// TestBindTimeAdoptionRefusesWhileAnotherNetBoxPassRuns is the same rule at the
+// THIRD resume door: the adoption CreateNetwork runs after the network row
+// lands.
+//
+// It gets the pass gate and deliberately NOT the leader lease. A bind must not
+// require cluster leadership — the mirror and the sweeper are periodic passes
+// that can wait for their next tick, an operator creating a network cannot — and
+// binding a prefix from a non-leader node is an ordinary thing to do.
+func TestBindTimeAdoptionRefusesWhileAnotherNetBoxPassRuns(t *testing.T) {
+	s := suspendedBindingServer(t)
+
+	if !s.nbPassMu.TryLock() {
+		t.Fatal("a fresh server's pass gate must be free")
+	}
+	err := s.finishAdoptionAndResume(context.Background(), "bound", adoptTestPrefix)
+	if err == nil {
+		t.Fatal("a bind-time adoption must not run inside another NetBox pass on this node")
+	}
+	if !strings.Contains(err.Error(), "already running on this node") {
+		t.Fatalf("the refusal must say a NetBox pass is already in flight on this node, got: %v", err)
+	}
+	if !bindingIsSuspended(t, s) {
+		t.Fatal("a refused adoption must leave the binding suspended, so `lv netbox resume` can finish it")
+	}
+
+	s.nbPassMu.Unlock()
+	if err := s.finishAdoptionAndResume(context.Background(), "bound", adoptTestPrefix); err != nil {
+		t.Fatalf("adoption with the gate free: %v", err)
+	}
+	if bindingIsSuspended(t, s) {
+		t.Fatal("the adoption did not lift the suspension once the gate was free")
+	}
+}
+
+// TestBindWithNothingOwedDoesNotContendForThePassGate is the control that keeps
+// the gate off the ordinary path.
+//
+// A bind of a network with nothing to adopt leaves the binding LIVE, and
+// finishAdoptionAndResume is then a no-op that makes no NetBox request at all.
+// Taking the gate before establishing that would make every `lv network create`
+// on a bound prefix fail whenever a 15-minute mirror sweep happened to be
+// running — a refusal over an operation that was never going to write anything.
+func TestBindWithNothingOwedDoesNotContendForThePassGate(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: adoptTestPrefix, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	ctx := context.Background()
+	if err := s.validateAndBindPrefix(ctx, "bound", adoptTestPrefix); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	// Live, because nothing was owed.
+	if bindingIsSuspended(t, s) {
+		t.Fatal("precondition: a bind with nothing to adopt must leave the binding live")
+	}
+
+	if !s.nbPassMu.TryLock() {
+		t.Fatal("a fresh server's pass gate must be free")
+	}
+	defer s.nbPassMu.Unlock()
+	if err := s.finishAdoptionAndResume(ctx, "bound", adoptTestPrefix); err != nil {
+		t.Fatalf("a no-op adoption must not contend for the pass gate: %v", err)
+	}
+}
+
+// ── the empty VM read ───────────────────────────────────────────────────────
+
+// bindAndCaptureLogs binds the adoption prefix and returns everything logged
+// while it ran.
+func bindAndCaptureLogs(t *testing.T, s *Server) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	if err := s.validateAndBindPrefix(context.Background(), "shared", adoptTestPrefix); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	return buf.String()
+}
+
+// TestBindReportsAnUncorroboratedEmptyVMRead.
+//
+// corrosion.ListVMs answers ([], nil) for a node that is hydrating after a
+// database loss or a fresh join exactly as it does for a cluster that genuinely
+// holds no VMs — and on the first of those, every address the cluster's guests
+// hold inside the prefix is invisible to this bind, which then goes LIVE
+// un-suspended over all of them.
+//
+// It cannot be refused: `vms` empty with no tombstones is also the state of
+// every cluster that has not created a VM yet, which is the first bind on every
+// installation (see reportUncorroboratedVMRead). What it must not be is silent.
+func TestBindReportsAnUncorroboratedEmptyVMRead(t *testing.T) {
+	s := newAdoptTestServer(t)
+
+	logs := bindAndCaptureLogs(t, s)
+
+	if !strings.Contains(logs, "uncorroborated empty VM inventory") {
+		t.Fatalf("a bind over an uncorroborated empty VM read logged nothing about it: %q", logs)
+	}
+	if !strings.Contains(logs, "level=WARN") {
+		t.Fatalf("the report must be a WARN, not a debug aside: %q", logs)
+	}
+	// The bind still went through — this is a report, not a refusal, and a
+	// cluster with no VMs must be bindable.
+	b, err := corrosion.GetBindingByPrefix(context.Background(), s.db, adoptTestPrefix)
+	if err != nil || b == nil || b.Suspended {
+		t.Fatalf("the bind must still succeed and go live, got %+v (err %v)", b, err)
+	}
+}
+
+// TestBindDoesNotReportAnEmptyVMReadItCanCorroborate is the control that keeps
+// the report meaningful.
+//
+// A cluster that deleted its last VM has TOMBSTONES, and a tombstone is exactly
+// the positive evidence corrosion.HasVMRecords exists to find: this database has
+// been told about VMs, so its empty live read is its own answer and not a
+// replication gap. Reporting that case would put the warning on the ordinary
+// lifecycle of every cluster and make it worth ignoring.
+func TestBindDoesNotReportAnEmptyVMReadItCanCorroborate(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	// A VM, then the production delete — which tombstones rather than removing.
+	seedVMInState(t, s, "was-here", "other-net", "aa:bb:cc:00:02:01", "",
+		"99999999-9999-9999-9999-999999999999", "stopped")
+	if err := corrosion.DeleteVM(ctx, s.db, "was-here"); err != nil {
+		t.Fatalf("delete VM: %v", err)
+	}
+	// Precondition: the live read is empty, so the branch under test is reached.
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil || len(vms) != 0 {
+		t.Fatalf("precondition: the live VM list must be empty, got %d (err %v)", len(vms), err)
+	}
+
+	logs := bindAndCaptureLogs(t, s)
+
+	if strings.Contains(logs, "uncorroborated empty VM inventory") {
+		t.Fatalf("an empty read backed by a tombstone must not be reported as uncorroborated: %q", logs)
 	}
 }

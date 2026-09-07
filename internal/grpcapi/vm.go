@@ -1909,6 +1909,12 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 
 	slog.Info("VM deleted", "name", req.Name)
+	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
+	// gone from the cluster state, so a sweep that reads this item finds no
+	// desired VM and removes the NetBox object. Never before it — a delete queued
+	// while the row is still live would name an object the very next sweep
+	// re-creates.
+	s.enqueueMirrorSync(ctx, req.Name, mirrorOpDelete)
 	s.recordVMEvent(ctx, req.Name, "vm.deleted", "ok", "")
 	s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project)+" keep_disks="+fmt.Sprintf("%t", req.KeepDisks), "ok")
 	if s.tenancy != nil {
@@ -2759,6 +2765,12 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if err := corrosion.RenameVM(ctx, s.db, nextName, req.VmName); err != nil {
 		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
 	}
+	// BOTH names go to the mirror. The replaced VM was tombstoned above and its
+	// object has to go; the surviving one now carries a name NetBox has never
+	// seen. They are separate incarnations with separate identities, so naming
+	// only one leaves the other stale until the next full sweep.
+	s.enqueueMirrorSync(ctx, nextName, mirrorOpUpsert)
+	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
 	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
 	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal

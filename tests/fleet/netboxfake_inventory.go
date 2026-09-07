@@ -621,6 +621,41 @@ func (f *NetBoxFake) InterfaceCount() int {
 	return len(f.ifaces)
 }
 
+// InterfaceIDs returns every interface's NetBox id, sorted.
+//
+// The IDS, not the count: a rename or a migration must UPDATE the interface it
+// already has, and an object deleted and re-created keeps the count at one while
+// silently dropping everything that referenced the old id.
+func (f *NetBoxFake) InterfaceIDs() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []int{}
+	for id := range f.ifaces {
+		out = append(out, id)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// VMDevice is the DCIM device the named virtual machine is linked to, or 0 when
+// it carries no link. It returns -1 when the name matches anything other than
+// exactly one object, so a scenario cannot read "no link" out of "no VM".
+func (f *NetBoxFake) VMDevice(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	found := -1
+	for _, vm := range f.vms {
+		if vm.Name != name {
+			continue
+		}
+		if found != -1 {
+			return -1 // duplicated; a device assertion would be arbitrary
+		}
+		found = vm.DeviceID
+	}
+	return found
+}
+
 // InterfaceNames returns every interface's name, sorted.
 //
 // The names, not just the count: NetBox rejects two interfaces sharing a name

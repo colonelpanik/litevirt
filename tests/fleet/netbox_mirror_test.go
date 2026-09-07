@@ -24,6 +24,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/netboxsync"
 )
 
@@ -198,6 +199,20 @@ func vmName(i int) string { return fmt.Sprintf("vm-%02d", i) }
 // is one row the whole fleet contends for. See the file comment.
 func boundMirrorCluster(t *testing.T, nodes int) (*NetBoxFake, *Cluster) {
 	t.Helper()
+	nb, c, _ := boundMirrorClusterGated(t, nodes)
+	return nb, c
+}
+
+// boundMirrorClusterGated is boundMirrorCluster that also hands back the
+// capability gates.
+//
+// A scenario driving a QUORUM-gated operation — a migration re-checks the
+// split-brain execution gate twice on the source — has to reach the gate it
+// wants to steer, and it must steer the one already wired rather than build a
+// second Checker: the netbox_ipam_v1 latch these fixtures depend on lives in
+// that value.
+func boundMirrorClusterGated(t *testing.T, nodes int) (*NetBoxFake, *Cluster, map[string]*health.Checker) {
+	t.Helper()
 	nb := NewNetBoxFake()
 	t.Cleanup(nb.Close)
 	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
@@ -206,7 +221,7 @@ func boundMirrorCluster(t *testing.T, nodes int) (*NetBoxFake, *Cluster) {
 	gates := gateAll(t, c)
 	latchNetBoxIPAM(t, c, gates)
 	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
-	return nb, c
+	return nb, c, gates
 }
 
 // mustCreateVM creates a one-NIC VM pinned to n.

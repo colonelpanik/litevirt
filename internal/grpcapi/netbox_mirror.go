@@ -2,8 +2,10 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netboxsync"
 )
 
@@ -73,6 +75,37 @@ func (s *Server) RunNetBoxMirrorOnce(ctx context.Context) error {
 		return nil
 	}
 	return s.netboxMirror(defaultNetBoxSweepInterval).SyncOnce(ctx)
+}
+
+// The netbox_sync_queue ops the lifecycle paths record. The mirror resolves
+// NOTHING from a queued item — the full sweep covers every object one could name
+// — so these are for the operator reading the table, and for any future consumer
+// that wants to act on one item without diffing the fleet.
+const (
+	mirrorOpUpsert = "upsert"
+	mirrorOpDelete = "delete"
+)
+
+// enqueueMirrorSync names one VM for the inventory mirror's next pass.
+//
+// LATENCY ONLY. Every caller has already committed the operation locally, and
+// the periodic full sweep converges the mirror whether or not anything was
+// queued — which it has to, because a node that dies mid-operation never
+// enqueues at all. So a failure here is logged and the operation continues:
+// failing an operator's delete over a queue row would report a delete that
+// genuinely happened as an error.
+//
+// Gated on a wired NetBox client. Without one nothing ever drains this queue,
+// and every VM lifecycle operation on a cluster that does not use NetBox would
+// leave a row behind forever.
+func (s *Server) enqueueMirrorSync(ctx context.Context, vmName, op string) {
+	if s.netbox == nil || s.db == nil {
+		return
+	}
+	if err := corrosion.EnqueueSync(ctx, s.db, netboxsync.QueueKind, vmName, op); err != nil {
+		slog.Warn("netbox mirror: could not queue a VM for the mirror; the next full sweep covers it",
+			"vm", vmName, "op", op, "error", err)
+	}
 }
 
 // SetNetBoxLeaseProbe replaces the lease read the mirror re-validates before

@@ -226,6 +226,17 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		if !ok {
 			return
 		}
+		// The same identity-rewrite hook the address path fires, and for the
+		// same reason: the CA re-key rewrites inventory identities too, and a
+		// refusal HERE — definite, and without applying the change — is the only
+		// way to reach a re-key that rewrote some of a cluster's objects and not
+		// the rest.
+		if h := f.takeOnPatch(); h != nil {
+			if err := h(id); err != nil {
+				writeErr(w, http.StatusForbidden, `{"detail":%q}`, err.Error())
+				return
+			}
+		}
 		f.mu.Lock()
 		vm, known := f.vms[id]
 		var out vmView
@@ -458,6 +469,12 @@ func (f *NetBoxFake) ifaceObject(w http.ResponseWriter, r *http.Request, id int)
 		if !ok {
 			return
 		}
+		if h := f.takeOnPatch(); h != nil {
+			if err := h(id); err != nil {
+				writeErr(w, http.StatusForbidden, `{"detail":%q}`, err.Error())
+				return
+			}
+		}
 		f.mu.Lock()
 		iface, known := f.ifaces[id]
 		var out ifaceView
@@ -619,6 +636,55 @@ func (f *NetBoxFake) InterfaceCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.ifaces)
+}
+
+// VMIdentities returns every virtual_machine's identity custom field, sorted.
+//
+// The counterpart of Identities(), which covers ADDRESSES only. A re-key
+// assertion needs both: rewriting addresses while leaving inventory behind is
+// exactly the bug, and an assertion that could not see inventory identities
+// would pass through it.
+func (f *NetBoxFake) VMIdentities() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for _, vm := range f.vms {
+		if vm.Identity != "" {
+			out = append(out, vm.Identity)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// InterfaceIdentities returns every vminterface's identity custom field, sorted.
+func (f *NetBoxFake) InterfaceIdentities() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []string{}
+	for _, iface := range f.ifaces {
+		if iface.Identity != "" {
+			out = append(out, iface.Identity)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// VMIDs returns every virtual_machine's NetBox id, sorted.
+//
+// A scenario that has to refuse ONE object's rewrite needs its id: the patch
+// hook is passed an id, and picking one out of the fake's disjoint bands by
+// arithmetic would silently target the wrong kind the moment a band moved.
+func (f *NetBoxFake) VMIDs() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []int{}
+	for id := range f.vms {
+		out = append(out, id)
+	}
+	sort.Ints(out)
+	return out
 }
 
 // InterfaceIDs returns every interface's NetBox id, sorted.

@@ -331,8 +331,11 @@ on every NetBox object litevirt owns — is replaced. New allocations then refus
 while running VMs continue untouched.
 
 `lv netbox rekey` is the CA case: it rewrites those identities under the current
-fingerprint and resumes the binding, and is safe to re-run. It resumes nothing
-while another drift is still present.
+fingerprint and resumes the binding, and is safe to re-run. It covers the bound
+prefix's addresses, the mirrored VM and interface objects, and litevirt's local
+identity index — in that order. It resumes nothing while another drift is still
+present. See `docs/networking.md#recovering-from-a-ca-replacement` for what the
+order buys and the two cases it does not cover.
 
 `lv netbox resume` is every other case: repair the prefix in NetBox, then run it
 to re-check the bind-time preconditions and clear the suspension. It refuses

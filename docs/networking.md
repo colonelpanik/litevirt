@@ -286,11 +286,33 @@ suspend and new allocations refuse until the existing objects are re-stamped:
 lv netbox rekey <network>
 ```
 
-Running VMs are unaffected by the suspension. The command rewrites the identity
-on every address the binding owns and then resumes the binding — in that order,
-so a run that fails partway leaves the binding suspended rather than live with
-half its objects unrecognisable. Re-running finishes the job; objects already
+Running VMs are unaffected by the suspension. The command re-stamps every object
+carrying the old fingerprint and then resumes the binding — in that order, so a
+run that fails partway leaves the binding suspended rather than live with half
+its objects unrecognisable. Re-running finishes the job; objects already
 rewritten are skipped. Complete a re-key before replacing the CA again.
+
+Three sets of objects are re-stamped, in this order:
+
+1. the `ipam.ip-address` objects the bound prefix holds;
+2. the `virtual_machine` and `vminterface` objects the inventory mirror writes —
+   cluster-wide, not just this network's, because inventory is not per-prefix;
+3. litevirt's own local identity index, which is keyed on the identity string.
+
+The order is a safety property, not an implementation detail. NetBox re-stamped
+with the local index still stale is recoverable — the mirror resolves the object
+from live state and repairs the index on its next pass. The reverse is not: the
+mirror would look for objects under an identity NetBox does not carry yet, find
+nothing, and try to create inventory NetBox already holds — which it refuses,
+because a VM name is unique within a cluster.
+
+Two limits follow from re-stamping being filtered on the fingerprint the binding
+recorded. A cluster with **no bound networks** has nothing to run `lv netbox
+rekey` against, so a mirror-only cluster has no re-key path today. And a binding
+whose pin was already advanced by an older build — one that rewrote addresses
+only — cannot be repaired through this command: the fingerprint its inventory
+carries is no longer recorded anywhere, and re-stamping everything that is not
+the current value would seize a second cluster's objects out of a shared NetBox.
 
 A re-key answers the fingerprint pin and nothing else. If the prefix had ALSO
 drifted — re-CIDRed, say — the rewrite still happens, but the binding is left

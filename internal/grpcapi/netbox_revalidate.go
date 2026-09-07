@@ -13,6 +13,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
+	"github.com/litevirt/litevirt/internal/netboxsync"
 )
 
 // RevalidateBindingsOnce runs exactly one revalidation pass. It exists so a
@@ -155,8 +156,9 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 		return nil, status.Errorf(codes.NotFound,
 			"network %q is not bound to a NetBox prefix", req.GetNetwork())
 	}
-	rewritten, err := s.rekeyBinding(ctx, *b)
-	detail := fmt.Sprintf("prefix=%d rewritten=%d", b.PrefixID, rewritten)
+	counts, err := s.rekeyBinding(ctx, *b)
+	detail := fmt.Sprintf("prefix=%d rewritten=%d vms=%d interfaces=%d refs=%d",
+		b.PrefixID, counts.addresses, counts.vms, counts.interfaces, counts.refs)
 	if err != nil {
 		// Audited on BOTH outcomes: a re-key that failed partway has still
 		// rewritten objects in NetBox, so "nothing happened" is exactly the
@@ -189,14 +191,35 @@ func (e stillDriftedError) Error() string {
 		" — repair it in NetBox, then run `lv netbox rekey` again once the drift is repaired", e.reason)
 }
 
+// rekeyCounts is what one re-key touched, for the audit trail. A re-key that
+// failed partway has still rewritten some of it, so the numbers are recorded on
+// both outcomes.
+type rekeyCounts struct {
+	addresses  int // ipam.ip-address objects
+	vms        int // virtualization.virtual_machine objects
+	interfaces int // virtualization.vminterface objects
+	refs       int // local netbox_objects index rows
+}
+
 // rekeyBinding is the re-key itself: rewrite, then re-validate, then resume —
 // never any other order.
 //
-// SCOPE: this rewrites identities on `ipam.ip-address` objects only. P2 extends
-// this function to `virtual_machine` and `vminterface` objects; until then, do
-// not enable the P2 mirror on a cluster whose CA has rotated. Rewriting only
-// addresses leaves inventory objects carrying the old fingerprint, and P2's
-// sweep would fail to find them by identity and create DUPLICATES.
+// SCOPE: every object whose identity carries the cluster fingerprint. That is
+// the bound prefix's `ipam.ip-address` objects, and — cluster-wide — the
+// `virtual_machine` and `vminterface` objects the inventory mirror writes, and
+// the local `netbox_objects` index whose litevirt_key IS the identity string.
+// Leaving any of them behind strands it under a fingerprint this cluster no
+// longer recognises as its own: the next sweep would find no inventory, emit a
+// create for all of it, and be refused by NetBox's per-cluster VM-name
+// uniqueness.
+//
+// ORDER, and it is not interchangeable: NetBox first, the local index second.
+// NetBox rewritten with a stale local index is a LEAK — parentVMID prefers the
+// parent id read from actual state, so parenting still resolves and the next
+// adopt re-records the row under the new identity. The other way round is a
+// COLLISION: the sweep looks for objects under an identity NetBox does not carry
+// yet, finds nothing, and its create is refused by a name the cluster already
+// holds. Leak over collision, every time.
 //
 // It is idempotent and RESUMABLE. Objects already carrying the new fingerprint
 // no longer match the binding's (old) pin and are skipped, so a re-run finishes
@@ -204,10 +227,11 @@ func (e stillDriftedError) Error() string {
 // a SECOND CA replacement: objects stamped with an intermediate fingerprint
 // match neither the old pin nor the new one. Finish a re-key before rotating
 // again.
-func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (int, error) {
+func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (rekeyCounts, error) {
+	var counts rekeyCounts
 	newFP, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
-		return 0, fmt.Errorf("derive cluster fingerprint: %w", err)
+		return counts, fmt.Errorf("derive cluster fingerprint: %w", err)
 	}
 
 	// Suspend FIRST when the pin is already stale. Every claim stamps the LIVE
@@ -218,7 +242,7 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (i
 	if b.ClusterFingerprint != newFP && !b.Suspended {
 		reason := fmt.Sprintf("cluster CA changed; re-key in progress for %s", b.Network)
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
-			return 0, fmt.Errorf("suspend binding %d before re-key: %w", b.PrefixID, err)
+			return counts, fmt.Errorf("suspend binding %d before re-key: %w", b.PrefixID, err)
 		}
 	}
 
@@ -226,10 +250,9 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (i
 	if err != nil {
 		// A partial enumeration would resume the binding with objects still
 		// carrying the old fingerprint — invisible to this cluster ever after.
-		return 0, fmt.Errorf("enumerate prefix %d: %w", b.PrefixID, err)
+		return counts, fmt.Errorf("enumerate prefix %d: %w", b.PrefixID, err)
 	}
 
-	rewritten := 0
 	for _, ip := range addrs {
 		cf, uuid, mac, ok := parseIdentity(ip.Identity)
 		if !ok || cf != b.ClusterFingerprint {
@@ -239,11 +262,22 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (i
 		}
 		if err := s.netbox.SetIPIdentity(ctx, ip.ID, netbox.Identity(newFP, uuid, mac)); err != nil {
 			s.nbMetrics().IncAPIError(netbox.Classify(err))
-			return rewritten, fmt.Errorf("rewrite identity on address %s (id %d) after %d rewrites; "+
+			return counts, fmt.Errorf("rewrite identity on address %s (id %d) after %d rewrites; "+
 				"the binding stays suspended, re-run to finish: %w",
-				ip.Address, ip.ID, rewritten, err)
+				ip.Address, ip.ID, counts.addresses, err)
 		}
-		rewritten++
+		counts.addresses++
+	}
+
+	// The inventory objects the mirror owns, then the local index — in that
+	// order, and both BEFORE the resume below. See the ordering note on this
+	// function: a binding resumed over a half-rewritten inventory is live with
+	// objects it can no longer name.
+	if err := s.rekeyInventory(ctx, b.ClusterFingerprint, newFP, &counts); err != nil {
+		return counts, err
+	}
+	if err := s.rekeyObjectIndex(ctx, b.ClusterFingerprint, newFP, &counts); err != nil {
+		return counts, err
 	}
 
 	// A re-key answers exactly ONE reason a binding suspends: the fingerprint
@@ -261,21 +295,195 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (i
 	next.ClusterFingerprint = newFP
 	if reason := s.bindingDrift(ctx, next, newFP); reason != "" {
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
-			return rewritten, fmt.Errorf("suspend binding %d after re-key: %w", b.PrefixID, err)
+			return counts, fmt.Errorf("suspend binding %d after re-key: %w", b.PrefixID, err)
 		}
 		slog.Warn("netbox binding re-keyed but still drifted", "network", b.Network,
-			"prefix", b.PrefixID, "addresses_rewritten", rewritten, "reason", reason)
-		return rewritten, stillDriftedError{reason: reason}
+			"prefix", b.PrefixID, "addresses_rewritten", counts.addresses,
+			"vms_rewritten", counts.vms, "interfaces_rewritten", counts.interfaces,
+			"index_rows_rewritten", counts.refs, "reason", reason)
+		return counts, stillDriftedError{reason: reason}
 	}
 
 	next.Suspended = false
 	next.SuspendReason = ""
 	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
-		return rewritten, fmt.Errorf("resume binding for prefix %d: %w", b.PrefixID, err)
+		return counts, fmt.Errorf("resume binding for prefix %d: %w", b.PrefixID, err)
 	}
 	slog.Info("netbox binding re-keyed", "network", b.Network, "prefix", b.PrefixID,
-		"addresses_rewritten", rewritten, "fingerprint", newFP)
-	return rewritten, nil
+		"addresses_rewritten", counts.addresses, "vms_rewritten", counts.vms,
+		"interfaces_rewritten", counts.interfaces, "index_rows_rewritten", counts.refs,
+		"fingerprint", newFP)
+	return counts, nil
+}
+
+// ── the inventory half ──────────────────────────────────────────────────────
+
+// The netbox_objects kinds the inventory mirror records under. They are a
+// REPLICATED column value, so they live here as literals matching
+// internal/netboxsync's rather than as an import that could be renamed on one
+// side of a mixed-version cluster.
+const (
+	rekeyRefKindVM  = "vm"
+	rekeyRefKindNIC = "nic"
+)
+
+// rekeyInventory re-stamps this cluster's `virtual_machine` and `vminterface`
+// objects, which carry the same fingerprint every address does.
+//
+// CLUSTER-SCOPED inside a PER-BINDING operation, deliberately. The resume gate
+// is what makes a partial re-key visible and re-runnable, and that gate lives on
+// the binding — so the inventory rewrite has to sit inside it, before the
+// re-validate. Running it once per bound network costs two extra list calls per
+// network after the first, because the old-fingerprint pin filter then matches
+// nothing; that is cheap, and the alternative — resuming a binding while the
+// inventory it shares with every other binding is half-rewritten — is not.
+//
+// The pin filter is `== oldFP`, never `!= newFP`. Two litevirt installations can
+// share one NetBox and, mirroring under the same cluster name, one NetBox
+// cluster object — so this enumeration hands one cluster's re-key the OTHER
+// cluster's inventory, and only the fingerprint says which rows are ours.
+func (s *Server) rekeyInventory(ctx context.Context, oldFP, newFP string, counts *rekeyCounts) error {
+	if oldFP == newFP {
+		// Nothing to match. Without this a redundant re-key would PATCH every
+		// object in the cluster to the value it already holds.
+		//
+		// It also means a binding whose pin was already advanced by a re-key
+		// that did NOT rewrite inventory (a pre-P2 build) can never be repaired
+		// through this path: the fingerprint those objects carry is no longer
+		// recorded anywhere, and rewriting whatever is not newFP would stamp a
+		// second installation's objects with this cluster's identity.
+		return nil
+	}
+	clusterID, err := s.netboxClusterID(ctx)
+	if err != nil {
+		return err
+	}
+	if clusterID == 0 {
+		// No cluster object means no inventory in it. Not an error, and not a
+		// reason to refuse the re-key of the addresses that did get rewritten.
+		slog.Info("netbox re-key: no cluster object, so no inventory to re-stamp")
+		return nil
+	}
+
+	vms, err := s.netbox.ListVMsByCluster(ctx, clusterID)
+	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
+		// A partial enumeration would resume the binding over inventory still
+		// carrying the old fingerprint, which is the whole failure this exists
+		// to prevent.
+		return fmt.Errorf("enumerate VMs in cluster %d for re-key; the binding stays suspended, "+
+			"re-run to finish: %w", clusterID, err)
+	}
+	for _, vm := range vms {
+		cf, uuid, _, ok := splitIdentity(vm.Identity)
+		if !ok || cf != oldFP {
+			continue
+		}
+		// The VM form of an identity carries NO MAC. Rebuilding it with the one
+		// splitIdentity returned would work only because it is empty; passing ""
+		// says so.
+		if err := s.netbox.SetVMIdentity(ctx, vm.ID, netbox.Identity(newFP, uuid, "")); err != nil {
+			s.nbMetrics().IncAPIError(netbox.Classify(err))
+			return fmt.Errorf("rewrite identity on VM %d after %d addresses and %d VMs; "+
+				"the binding stays suspended, re-run to finish: %w",
+				vm.ID, counts.addresses, counts.vms, err)
+		}
+		counts.vms++
+	}
+
+	ifaces, err := s.netbox.ListInterfacesByCluster(ctx, clusterID)
+	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
+		return fmt.Errorf("enumerate interfaces in cluster %d for re-key; the binding stays "+
+			"suspended, re-run to finish: %w", clusterID, err)
+	}
+	for _, i := range ifaces {
+		cf, uuid, mac, ok := splitIdentity(i.Identity)
+		if !ok || cf != oldFP {
+			continue
+		}
+		if err := s.netbox.SetInterfaceIdentity(ctx, i.ID, netbox.Identity(newFP, uuid, mac)); err != nil {
+			s.nbMetrics().IncAPIError(netbox.Classify(err))
+			return fmt.Errorf("rewrite identity on interface %d after %d VMs and %d interfaces; "+
+				"the binding stays suspended, re-run to finish: %w",
+				i.ID, counts.vms, counts.interfaces, err)
+		}
+		counts.interfaces++
+	}
+	return nil
+}
+
+// netboxClusterID resolves the NetBox cluster this litevirt cluster mirrors
+// into, WITHOUT creating it — see netbox.FindCluster.
+//
+// The name comes from netboxsync, which owns it. Deriving it here instead would
+// put a second copy of the placeholder fallback in the tree, and a re-key
+// looking at a different cluster than the mirror writes to would report zero
+// objects rewritten and resume the binding over inventory it never touched.
+func (s *Server) netboxClusterID(ctx context.Context) (int, error) {
+	name, err := netboxsync.ClusterName(ctx, s.db)
+	if err != nil {
+		return 0, fmt.Errorf("read cluster name for re-key: %w", err)
+	}
+	id, err := s.netbox.FindCluster(ctx, name)
+	if err != nil {
+		s.nbMetrics().IncAPIError(netbox.Classify(err))
+		return 0, fmt.Errorf("resolve NetBox cluster %q for re-key; the binding stays suspended, "+
+			"re-run to finish: %w", name, err)
+	}
+	return id, nil
+}
+
+// rekeyObjectIndex re-stamps the LOCAL identity map, whose litevirt_key is the
+// identity string itself.
+//
+// Stranded rows here are not cosmetic. GetObjectRef is keyed on that string, so
+// a NIC's parent lookup finds nothing under the new identity, and every adopt
+// re-searches NetBox instead of resolving the id it already recorded.
+//
+// LAST, after NetBox. A row rewritten ahead of the object it names points at an
+// identity NetBox does not carry, and the sweep that trusts it then behaves as
+// if the object were absent.
+//
+// Each row is written under its NEW key BEFORE the old one is tombstoned,
+// keeping the netbox_id mapped throughout: the crash window leaves a harmless
+// duplicate pointing at the same object rather than a moment with no row at all.
+// Both writes are the same replicated statements the mirror already uses — the
+// key is part of the primary key, so this is an insert and a tombstone, never an
+// update of it.
+func (s *Server) rekeyObjectIndex(ctx context.Context, oldFP, newFP string, counts *rekeyCounts) error {
+	if oldFP == newFP {
+		return nil
+	}
+	for _, kind := range []string{rekeyRefKindVM, rekeyRefKindNIC} {
+		refs, err := corrosion.ListObjectRefs(ctx, s.db, kind)
+		if err != nil {
+			return fmt.Errorf("list %s index rows for re-key; the binding stays suspended, "+
+				"re-run to finish: %w", kind, err)
+		}
+		for _, ref := range refs {
+			cf, uuid, mac, ok := splitIdentity(ref.LitevirtKey)
+			if !ok || cf != oldFP {
+				// Same pin as the NetBox side, and for the same reason: a row
+				// under an intermediate fingerprint belongs to a re-key that was
+				// interrupted by a second CA replacement, and guessing at it
+				// would orphan the object it names.
+				continue
+			}
+			next := ref
+			next.LitevirtKey = netbox.Identity(newFP, uuid, mac)
+			if err := corrosion.PutObjectRef(ctx, s.db, next); err != nil {
+				return fmt.Errorf("re-key %s index row after %d rows; the binding stays "+
+					"suspended, re-run to finish: %w", kind, counts.refs, err)
+			}
+			if err := corrosion.DeleteObjectRef(ctx, s.db, kind, ref.LitevirtKey); err != nil {
+				return fmt.Errorf("retire the old %s index row after %d rows; the binding stays "+
+					"suspended, re-run to finish: %w", kind, counts.refs, err)
+			}
+			counts.refs++
+		}
+	}
+	return nil
 }
 
 // ── the resume ──────────────────────────────────────────────────────────────

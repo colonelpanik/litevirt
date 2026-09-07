@@ -643,19 +643,40 @@ func olderThan(created, cutoff time.Time) bool {
 	return !created.IsZero() && created.Before(cutoff)
 }
 
-// parseIdentity is the inverse of netbox.Identity ("lv:<fp>:<uuid>:<mac>").
+// parseIdentity is the inverse of netbox.Identity ("lv:<fp>:<uuid>:<mac>") for
+// an object that must name a NIC.
+//
+// A MISSING MAC is refused. Every caller here is reasoning about an address, and
+// an address whose identity names no NIC is not one the reclaim proof can ask a
+// question about — treating it as parseable would put it on a path that then
+// compares against the empty MAC.
+func parseIdentity(identity string) (fingerprint, vmUUID, mac string, ok bool) {
+	fingerprint, vmUUID, mac, ok = splitIdentity(identity)
+	if !ok || mac == "" {
+		return "", "", "", false
+	}
+	return fingerprint, vmUUID, mac, true
+}
+
+// splitIdentity is parseIdentity WITHOUT the MAC requirement.
+//
+// The VM form of an identity is netbox.Identity(fp, uuid, "") — "lv:<fp>:<uuid>:"
+// — so a virtual_machine object legitimately carries no MAC. The CA re-key walks
+// VM and interface objects through one loop and must parse both; running them
+// through parseIdentity instead would make every virtual_machine unparseable and
+// the re-key would skip the whole inventory while reporting success.
 //
 // The MAC is the REMAINING fields rejoined, not the fourth field: a MAC contains
 // colons, so a naive four-way split silently truncates it to its first octet and
 // every proof would then ask about the wrong NIC.
-func parseIdentity(identity string) (fingerprint, vmUUID, mac string, ok bool) {
+func splitIdentity(identity string) (fingerprint, vmUUID, mac string, ok bool) {
 	parts := strings.Split(identity, ":")
 	if len(parts) < 4 || parts[0] != "lv" {
 		return "", "", "", false
 	}
 	fingerprint, vmUUID = parts[1], parts[2]
 	mac = strings.Join(parts[3:], ":")
-	if fingerprint == "" || vmUUID == "" || mac == "" {
+	if fingerprint == "" || vmUUID == "" {
 		return "", "", "", false
 	}
 	return fingerprint, vmUUID, mac, true

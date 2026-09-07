@@ -51,6 +51,17 @@ func (f fakeNetBox) handler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"id":%d,"prefix":%q,"vrf":{"id":%d}}`, f.prefix.ID, f.prefix.Prefix, f.prefix.VRFID)
 	case strings.HasPrefix(r.URL.Path, "/api/ipam/vrfs/"):
 		fmt.Fprintf(w, `{"id":%d,"enforce_unique":%v}`, f.prefix.VRFID, f.enforceUnique)
+	case r.URL.Path == "/api/virtualization/clusters/":
+		// A re-key resolves the cluster the inventory mirror writes into, then
+		// enumerates it. Answering with a real id keeps the enumeration on the
+		// production code path; answering 0 would short-circuit it, and the
+		// re-key's inventory half would then be exercised by nothing here.
+		fmt.Fprint(w, `{"count":1,"results":[{"id":77}]}`)
+	case strings.HasPrefix(r.URL.Path, "/api/virtualization/virtual-machines/"),
+		strings.HasPrefix(r.URL.Path, "/api/virtualization/interfaces/"):
+		// Empty, like the address list above: the honest answer from a fake that
+		// never mirrored anything, and it keeps the walk real.
+		fmt.Fprint(w, `{"results":[],"next":""}`)
 	default:
 		http.Error(w, "fakeNetBox: unsupported path "+r.URL.Path, http.StatusNotFound)
 	}

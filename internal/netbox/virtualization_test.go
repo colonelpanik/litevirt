@@ -430,3 +430,125 @@ func TestAssignAndClearIPAssignment(t *testing.T) {
 		}
 	}
 }
+
+// TestSetVMIdentityAndSetInterfaceIdentity pins the CA re-key's INVENTORY wire
+// shape, the counterpart of TestSetIPIdentity.
+//
+// Every part is load-bearing in the same way. PATCH, not PUT: NetBox's PUT is a
+// full replace, so an omitted `name` or `cluster` would be blanked and a re-key
+// would destroy the objects it exists to preserve. The id-scoped path is what
+// makes this an update rather than a create. And a body carrying anything
+// besides the custom field would let a re-key silently rename a VM or move it
+// between clusters.
+func TestSetVMIdentityAndSetInterfaceIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		call func(*Client) error
+	}{
+		{
+			name: "vm",
+			path: "/api/virtualization/virtual-machines/11/",
+			call: func(c *Client) error {
+				return c.SetVMIdentity(context.Background(), 11, "lv:new:uuid:")
+			},
+		},
+		{
+			name: "interface",
+			path: "/api/virtualization/interfaces/21/",
+			call: func(c *Client) error {
+				return c.SetInterfaceIdentity(context.Background(), 21, "lv:new:uuid:aa:bb")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			var gotBody map[string]any
+			c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotMethod, gotPath = r.Method, r.URL.Path
+				decodeBody(t, r, &gotBody)
+				_, _ = w.Write([]byte(`{"id":11}`))
+			})
+			if err := tc.call(c); err != nil {
+				t.Fatal(err)
+			}
+			if gotMethod != http.MethodPatch {
+				t.Errorf("method = %q, want PATCH — a PUT would blank every omitted field", gotMethod)
+			}
+			if gotPath != tc.path {
+				t.Errorf("path = %q, want the id-scoped %s path", gotPath, tc.name)
+			}
+			if len(gotBody) != 1 {
+				t.Fatalf("body = %v, want ONLY custom_fields — anything else can rename or "+
+					"re-parent a live object", gotBody)
+			}
+			cf, ok := gotBody["custom_fields"].(map[string]any)
+			if !ok {
+				t.Fatalf("body = %v, want a custom_fields object", gotBody)
+			}
+			if cf[IdentityField] == "" || cf[IdentityField] == nil {
+				t.Fatalf("custom_fields = %v, want %s set to the new identity", cf, IdentityField)
+			}
+		})
+	}
+}
+
+// TestSetInventoryIdentityPropagatesFailure pins that a refused PATCH is an
+// ERROR the caller sees. A re-key that swallowed one failed rewrite would resume
+// the binding with objects still carrying the old fingerprint — unfindable by
+// identity, and duplicated by the next sweep.
+func TestSetInventoryIdentityPropagatesFailure(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":"no write permission"}`))
+	})
+	if err := c.SetVMIdentity(context.Background(), 11, "lv:new:uuid:"); err == nil {
+		t.Error("a refused VM PATCH must be an error")
+	} else if Classify(err) != ClassClient {
+		t.Errorf("Classify = %v, want ClassClient", Classify(err))
+	}
+	if err := c.SetInterfaceIdentity(context.Background(), 21, "lv:new:uuid:aa:bb"); err == nil {
+		t.Error("a refused interface PATCH must be an error")
+	}
+}
+
+// TestFindCluster resolves a cluster id by name WITHOUT creating one.
+//
+// EnsureCluster would do, and is wrong here: the CA re-key must not bring a
+// NetBox object into existence as a side effect of asking what inventory this
+// cluster owns. An absent cluster resolves to 0 — there is then no inventory to
+// re-key — rather than to an error.
+func TestFindCluster(t *testing.T) {
+	var gotQuery url.Values
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %q, want GET — a lookup must never create", r.Method)
+		}
+		if r.URL.Path != "/api/virtualization/clusters/" {
+			t.Errorf("path = %q, want the clusters collection", r.URL.Path)
+		}
+		gotQuery = r.URL.Query()
+		if gotQuery.Get("name") == "absent" {
+			_, _ = w.Write([]byte(`{"count":0,"results":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"count":1,"results":[{"id":9}]}`))
+	})
+	got, err := c.FindCluster(context.Background(), "a-cluster")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 9 {
+		t.Fatalf("FindCluster = %d, want 9", got)
+	}
+	if gotQuery.Get("name") != "a-cluster" {
+		t.Errorf("name filter = %q, want the exact cluster name", gotQuery.Get("name"))
+	}
+	absent, err := c.FindCluster(context.Background(), "absent")
+	if err != nil {
+		t.Fatalf("an absent cluster must not be an error: %v", err)
+	}
+	if absent != 0 {
+		t.Fatalf("FindCluster on an absent cluster = %d, want 0", absent)
+	}
+}

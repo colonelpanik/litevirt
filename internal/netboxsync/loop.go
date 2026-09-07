@@ -342,17 +342,33 @@ func (r *Reconciler) applyPhases(ctx context.Context, actions []Action, idx desi
 // one. Two installations sharing a name therefore share a cluster object, which
 // is harmless — every object is still scoped by the identity fingerprint, and
 // that is what BuildActual and Diff filter on.
+// ClusterName is the NetBox cluster name this litevirt cluster mirrors under,
+// placeholder included.
+//
+// Exported because the CA re-key — in internal/grpcapi, which owns the operation
+// but not the mirror — has to resolve the SAME cluster object the mirror writes
+// into, to enumerate the inventory it must re-stamp. A second copy of the
+// fallback would strand every object a mirror wrote under the placeholder the
+// moment the two strings diverged, with nothing failing to say so.
+func ClusterName(ctx context.Context, db *corrosion.Client) (string, error) {
+	name, err := corrosion.ClusterName(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	if name == "" {
+		return fallbackClusterName, nil
+	}
+	return name, nil
+}
+
 func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
 	typeID, err := r.nb.EnsureClusterType(ctx, clusterTypeName)
 	if err != nil {
 		return 0, fmt.Errorf("cluster type %q: %w", clusterTypeName, err)
 	}
-	name, err := corrosion.ClusterName(ctx, r.db)
+	name, err := ClusterName(ctx, r.db)
 	if err != nil {
 		return 0, err
-	}
-	if name == "" {
-		name = fallbackClusterName
 	}
 	id, err := r.nb.EnsureCluster(ctx, name, typeID)
 	if err != nil {

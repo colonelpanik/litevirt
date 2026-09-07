@@ -265,6 +265,40 @@ func (c *Client) UpdateInterface(ctx context.Context, id int, i VMInterface) err
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", id), body, nil)
 }
 
+// SetVMIdentity rewrites ONE virtual machine's litevirt identity custom field.
+//
+// It is the CA re-key's inventory write, and the exact counterpart of
+// SetIPIdentity. PATCH, not PUT: NetBox's PUT is a full replace, so an omitted
+// `name` or `cluster` would be blanked and the re-key would destroy the objects
+// it exists to preserve. The body carries nothing but the custom field for the
+// same reason — anything else could rename a VM or move it between clusters
+// while re-stamping it.
+//
+// It deliberately does NOT reuse UpdateVM. That sends the whole mirrored field
+// set, so a re-key would have to know a VM's desired name, size and status to
+// rewrite its identity — and would silently reconcile them on the way past, in
+// an operation whose whole contract is that it changes one field.
+func (c *Client) SetVMIdentity(ctx context.Context, id int, identity string) error {
+	body := map[string]any{
+		"custom_fields": map[string]string{IdentityField: identity},
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", id), body, nil)
+}
+
+// SetInterfaceIdentity rewrites ONE VM interface's litevirt identity custom
+// field. Same shape, same reasons, as SetVMIdentity.
+//
+// UpdateInterface is not it: that one deliberately never touches the identity,
+// because a NIC whose MAC changed is a different object rather than an update.
+// The re-key is the one caller that rewrites the identity while the MAC stays
+// put, so it needs a write of its own.
+func (c *Client) SetInterfaceIdentity(ctx context.Context, id int, identity string) error {
+	body := map[string]any{
+		"custom_fields": map[string]string{IdentityField: identity},
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", id), body, nil)
+}
+
 // DeleteInterface removes one VM interface. Without it a hotplug detach never
 // converges in NetBox.
 func (c *Client) DeleteInterface(ctx context.Context, id int) error {
@@ -302,6 +336,17 @@ func (c *Client) ClearIPAssignment(ctx context.Context, ipID int) error {
 // operator who does not model hosts in NetBox must still get a working mirror.
 func (c *Client) FindDeviceByName(ctx context.Context, name string) (int, error) {
 	return c.firstIDByName(ctx, devicesPath, name)
+}
+
+// FindCluster resolves a cluster id by exact name, returning 0 when absent.
+//
+// The READ half of EnsureCluster, for the callers that must not create. The CA
+// re-key enumerates a cluster's inventory to re-stamp it; bringing the cluster
+// object into existence as a side effect of that question would have a re-key on
+// a cluster that never mirrored anything leave a NetBox object behind. Absence
+// is not an error — an absent cluster holds no inventory to re-key.
+func (c *Client) FindCluster(ctx context.Context, name string) (int, error) {
+	return c.firstIDByName(ctx, clustersPath, name)
 }
 
 // EnsureClusterType creates the litevirt cluster type if absent, returning its id.

@@ -332,9 +332,15 @@ import (
 //	     object identity map, PK (litevirt_kind, litevirt_key)), and
 //	     netbox_sync_queue (work queue for the P2 inventory mirror; a latency
 //	     optimisation only, since the periodic full sweep is the correctness
-//	     mechanism). Also ip_allocations.netbox_ip_id / netbox_prefix_id — the
-//	     join keys linking a lease back to its NetBox IP/prefix. Three new
-//	     tables + two ADD COLUMNs.
+//	     mechanism), and netbox_host_config (each node's published NetBox cluster
+//	     name — a value no capability token can carry, so uniformity is checked
+//	     by comparing what live hosts published; a table rather than a `hosts`
+//	     column because a peer that has not migrated discards a whole dump whose
+//	     column set it does not recognise, and `hosts` is the wrong table to do
+//	     that to). Also ip_allocations.netbox_ip_id / netbox_prefix_id — the
+//	     join keys linking a lease back to its NetBox IP/prefix — and
+//	     netbox_bindings.netbox_cluster, the cluster name the first bind pinned.
+//	     Four new tables + three ADD COLUMNs.
 const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2164,6 +2170,27 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+
+	// Per-host publication of the one NetBox setting no capability latch can
+	// make uniform: the virtualization.cluster name this node resolves. A token
+	// is a name that is advertised or not and cannot carry a VALUE, so
+	// uniformity of `netbox.cluster_name` has to be checked by comparing what
+	// each node published. host_name is the PK and only that host writes its own
+	// row — the same ownership shape as host_networks.
+	//
+	// A TABLE rather than a column on `hosts`, deliberately: a receiver discards
+	// a whole table dump whose column set it does not recognise, so a new `hosts`
+	// column makes a not-yet-migrated peer drop the entire `hosts` dump for the
+	// length of the upgrade window — and `hosts` is the table whose divergence
+	// takes the control plane with it. A table the older peer does not have is
+	// just a table it does not have. See internal/corrosion/netbox_host_config.go.
+	`CREATE TABLE IF NOT EXISTS netbox_host_config (
+		host_name      TEXT PRIMARY KEY,
+		netbox_cluster TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2322,6 +2349,7 @@ var tablePrimaryKeys = map[string][]string{
 	"netbox_bindings":         {"prefix_id"},
 	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
 	"netbox_sync_queue":       {"id"},
+	"netbox_host_config":      {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2668,6 +2696,7 @@ var createTableUnits = []struct {
 	{50, "host_capacity_observations"},
 	{50, "quota_reservations"},
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
+	{51, "netbox_host_config"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

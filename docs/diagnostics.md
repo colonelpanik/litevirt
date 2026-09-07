@@ -667,17 +667,18 @@ Three NetBox failures are silent to everything else litevirt reports, so they
 are also durable `health_conditions` rows and appear in `lv health` (see
 [Cluster health](#cluster-health-durable-conditions-and-the-admission-gate-v50)).
 The first two are raised by the orphan sweep, which runs under the `netbox`
-leader lease, so the cluster has exactly one writer. The third is per-node — it
-is about one node's own configuration, which no peer can read — so every
-configured node raises it for itself, keyed on its own host name, and a node that
-agrees never clears a peer's finding. All three are **warning** severity, so they
-show as DEGRADED and never as CRITICAL, and none gates admission.
+leader lease, so the cluster has exactly one writer. The last two are per-node —
+they are about one node's own configuration, which no peer can read — so every
+configured node raises them for itself, keyed on its own host name, and a node
+that agrees never clears a peer's finding. All four are **warning** severity, so
+they show as DEGRADED and never as CRITICAL, and none gates admission.
 
 | Code | Subject | Raised when | Clears when |
 |---|---|---|---|
 | `netbox_binding_suspended` | the network | A `netbox_bindings` row is suspended. The evidence names the network, the prefix, and the drift reason. New allocations on that network refuse until an operator runs `lv netbox resume` (or `lv netbox rekey` if the cluster fingerprint moved); running workloads are untouched. | Two consecutive sweeps see the binding un-suspended. |
 | `netbox_sweep_blocked` | `netbox` (cluster) | Three consecutive sweeps declined every reclamation because a host would not answer the absence proof. One unreachable host is ordinary — a reboot, a restart — but while it is away NOT ONE address can be reclaimed, and the pool fills with orphans in silence. | Two consecutive sweeps complete without a `host_unreachable` skip. |
 | `netbox_cluster_name_mismatch` | the host | This node's `netbox.cluster_name` resolves to a different NetBox `virtualization.cluster` than the one the cluster's bindings are pinned to, so this node refuses to mirror inventory and refuses `lv netbox rekey`. The evidence names both values and the binding holding the pin. `netbox.cluster_name` must be identical on every node (or unset on every node): the mirror sweep runs on whichever node holds the `netbox` leader lease, so a disagreement moves the whole inventory between two cluster objects as leadership moves. Address allocation is unaffected. Fix the config on the node that is wrong and restart it. | Two consecutive revalidation passes on **that node** resolve the same name the pin holds. |
+| `netbox_cluster_name_disagreement` | the host | A **live** peer published a different resolved `netbox.cluster_name` than this node resolves, so this node refuses to mirror inventory. The evidence names both values and the peers holding the other one. This is the check a cluster with **no bound network** has — there is no binding row to pin, and mirroring is the only thing such a cluster does with NetBox — and it is raised on **every** disagreeing node, because with two nodes holding two values neither is authoritative. Only voting-eligible hosts count (`health.VotingEligible`), so a host that is offline, in maintenance, fenced or decommissioned cannot block mirroring with a stale published value. Address allocation is unaffected. Fix the config on the node that is wrong and restart it. | Two consecutive revalidation passes on **that node** see every live host publishing the same name. |
 
 The three-pass threshold is deliberately per-process state held by the lease
 holder: a daemon restart or a lease handover re-arms it, and three fresh passes

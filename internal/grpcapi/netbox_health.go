@@ -50,6 +50,15 @@ const (
 	// writing one row under LWW, so the last writer would decide whether the
 	// cluster has a problem.
 	condNetBoxClusterNameMismatch = "netbox_cluster_name_mismatch"
+	// condNetBoxClusterNameDisagreement: a LIVE PEER published a different
+	// netbox.cluster_name than this node resolves, so this node refuses to
+	// mirror. The other half of the same enforcement, and a separate code
+	// because it catches a different fault and carries different evidence: the
+	// mismatch above is this node against the cluster's PIN, which needs a bound
+	// network to exist; this one is this node against its live peers, which is
+	// the only check a mirror-only cluster has. Subject is the HOST, for the
+	// reason above, and the evidence carries the peers holding the other value.
+	condNetBoxClusterNameDisagreement = "netbox_cluster_name_disagreement"
 )
 
 // netboxSweepSubject is the single subject of condNetBoxSweepBlocked. The
@@ -203,11 +212,18 @@ func (s *Server) applyNetBoxConditions(ctx context.Context, code, subjectKind st
 // ambiguous case: for a leader-written finding it means "nothing is wrong
 // anywhere", and for a per-host one it means only "nothing is wrong here".
 //
-// All three findings are WARNING severity, observed and confirmed alike. None is
-// corruption — one refuses new work, one stops a garbage collector, one stops an
+// All four findings are WARNING severity, observed and confirmed alike. None is
+// corruption — one refuses new work, one stops a garbage collector, two stop an
 // inventory mirror — and severity critical is reserved here for a workload
 // running in two places.
-func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectKind string, positive map[string]string, owns func(subject string) bool) {
+//
+// `hosts` is the optional structured host list of conditionEvidence, for a
+// finding that is ABOUT other hosts rather than only reported by this one: the
+// live cluster-name disagreement names the peers holding the other value. It is
+// variadic so the three findings that have no such list keep their call sites
+// unchanged, and it applies to every subject of one call because a per-host
+// finding writes exactly one subject.
+func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectKind string, positive map[string]string, owns func(subject string) bool, hosts ...string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	active, err := corrosion.ListHealthConditions(ctx, s.db, false)
@@ -242,7 +258,7 @@ func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectK
 			}
 		}
 		row.Severity = corrosion.SeverityWarning
-		row.Evidence = encodeEvidence(detail, nil)
+		row.Evidence = encodeEvidence(detail, hosts)
 		row.LastSeen = now
 		row.ResolvedAt = ""
 		row.Reporter = s.hostName

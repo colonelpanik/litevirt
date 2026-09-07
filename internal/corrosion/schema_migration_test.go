@@ -362,12 +362,12 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		t.Fatalf("stored version after migration = %d, want %d", v, CurrentSchemaVersion)
 	}
 	// Every post-42 table healed, including the three v50 health tables and the
-	// three v51 NetBox IPAM tables.
+	// four v51 NetBox tables.
 	for _, table := range []string{
 		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 		"cluster_crl", "host_networks",
 		"health_conditions", "health_evaluator_status", "host_capacity_observations",
-		"netbox_bindings", "netbox_objects", "netbox_sync_queue",
+		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config",
 	} {
 		if ok, _ := tableExists(ctx, c, table); !ok {
 			t.Errorf("table %s missing after v42→v51 migration", table)
@@ -381,6 +381,7 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		{"containers", "owner_epoch"},          // v44
 		{"ip_allocations", "netbox_ip_id"},     // v51
 		{"ip_allocations", "netbox_prefix_id"}, // v51
+		{"netbox_bindings", "netbox_cluster"},  // v51
 	} {
 		if ok, _ := columnExists(ctx, c.db, tc.table, tc.col); !ok {
 			t.Errorf("column %s.%s missing after migration", tc.table, tc.col)

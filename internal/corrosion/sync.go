@@ -270,6 +270,11 @@ var tableNames = []string{
 	// prefixes are bound and which litevirt objects have a NetBox counterpart
 	// from peers, same as any other cluster-fact table.
 	"netbox_bindings", "netbox_objects",
+	// v51 per-host published NetBox cluster name — operator-facing config the
+	// uniformity check reads from every live peer, so a node that lost its DB
+	// must re-learn its peers' published values rather than conclude they
+	// published nothing. Host-owned (host_name PK, only that host writes it).
+	"netbox_host_config",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

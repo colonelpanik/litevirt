@@ -66,6 +66,12 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 	// pass whatever the drift check goes on to decide.
 	s.evaluateNetBoxClusterPin(ctx, bindings)
 
+	// The other half of the same enforcement: what this node's LIVE PEERS
+	// published, which is the only uniformity evidence a cluster with no bound
+	// network has. Also where this node PUBLISHES its own resolved name, so a
+	// configured node contributes its opinion whether or not it ever mirrors.
+	s.evaluateNetBoxClusterUniformity(ctx)
+
 	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
 	if err != nil {
 		return fmt.Errorf("derive cluster fingerprint: %w", err)

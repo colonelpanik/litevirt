@@ -516,6 +516,42 @@ invisible to the reclaim proof. Either revert the CIDR in NetBox, or delete and
 recreate the litevirt network, which releases the binding and re-claims it
 against the new range.
 
+#### `netbox.cluster_name` must be identical on every node
+
+`netbox.cluster_name` names the NetBox `virtualization.cluster` the inventory
+mirror writes into. The mirror sweep runs on whichever node holds the `netbox`
+leader lease, so the value is a **cluster-wide** fact even though each node reads
+it from its own config file: set it non-uniformly and whichever node leads
+decides that sweep. Objects get created under one cluster and deleted under
+another as leadership moves, and the ones left behind are invisible to every
+sweep resolving the other name, so nothing reaps them.
+
+Unlike every `enforcement.*` flag it has no capability latch to make it uniform,
+because a capability token is a name that is advertised or not and cannot carry a
+value. Two checks enforce it instead, and both are needed:
+
+- **The binding pin.** The first bind records the resolved name on the
+  `netbox_bindings` row. A node whose own configuration resolves to something
+  else refuses to mirror and refuses `lv netbox rekey`, and raises
+  `netbox_cluster_name_mismatch`. This catches a cluster-wide change *away from
+  what was pinned* — every live node agreeing with each other but not with the
+  binding, which would silently re-home an existing inventory.
+- **The per-host publication.** Each node publishes the name it resolves, and
+  the mirror compares across live hosts. Any disagreement makes **every**
+  disagreeing node refuse to mirror and raise
+  `netbox_cluster_name_disagreement`, naming both values and the peers holding
+  the other one. This catches live disagreement *between nodes*, which is what
+  makes inventory flap — and it is the only check a cluster with **no bound
+  network** has, since there is no binding row to pin.
+
+Only live hosts count. A host that is offline, in maintenance, fenced or
+decommissioned keeps its published row but is not compared, so it cannot stop
+mirroring forever by holding a stale value.
+
+Both refusals are mirror-only: address allocation, binds and the orphan sweep
+are unaffected. `lv health` shows the condition; the fix is to correct
+`netbox.cluster_name` on the node that is wrong and restart it.
+
 ### The inventory mirror
 
 `netbox.cluster_name` is **enforced uniform** from the first bind onward. It

@@ -469,6 +469,12 @@ var capabilityMap = map[string]tableResolver{
 	// ip_allocations/resource_mappings: tombstone-first, then content-max.
 	"netbox_bindings": {category: "content", chain: contentDefaultChain()},
 	"netbox_objects":  {category: "content", chain: contentDefaultChain()},
+	// netbox_host_config is one scalar per host, written only by that host, so a
+	// tie can only be that host racing itself — the default chain settles it.
+	// Deliberately NOT ruleAnyColUnresolved: a tie left unresolved would stop
+	// the mirror on a value the owning node is the only writer of, which is a
+	// worse answer than picking one of two values that node itself produced.
+	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

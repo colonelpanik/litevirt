@@ -42,12 +42,16 @@ import (
 // never raises, because a pin is a fact about the cluster rather than about a
 // peer that may or may not be reachable.
 //
-// WHAT IT DOES NOT COVER. A cluster running the inventory mirror with NO bound
-// network has no binding row, so it has no pin and gets no enforcement. That
-// shape is supported (StartNetBoxMirror asks for a NetBox client and nothing
-// else) and it is exactly where the hazard is undiluted, since the mirror is all
-// such a cluster does. Closing it needs the per-host publication above, and is
-// left as follow-up rather than half-built here.
+// WHAT IT DOES NOT COVER, AND WHAT DOES. A cluster running the inventory mirror
+// with NO bound network has no binding row, so it has no pin and this check
+// alone gives it no enforcement — and that shape is exactly where the hazard is
+// undiluted, since the mirror is all such a cluster does. That gap is closed by
+// the per-host publication in netbox_cluster_uniformity.go, which compares what
+// each LIVE host published rather than what a binding recorded.
+//
+// Both checks stay. This one catches a cluster-wide RE-HOME, where every live
+// node agrees with each other but not with the binding; the other catches LIVE
+// DISAGREEMENT between nodes. Neither subsumes the other.
 
 // netboxClusterMismatch is one node's disagreement with the cluster's pin.
 type netboxClusterMismatch struct {
@@ -162,7 +166,9 @@ func (s *Server) netboxClusterPinAgrees(ctx context.Context) bool {
 // importantly a cluster with no NetBox latch must reach the end of a pass having
 // touched nothing at all.
 func (s *Server) netboxMirrorPassAuthorized(ctx context.Context) bool {
-	return s.netboxMirrorAuthorized() && s.netboxClusterPinAgrees(ctx)
+	return s.netboxMirrorAuthorized() &&
+		s.netboxClusterPinAgrees(ctx) &&
+		s.netboxClusterUniformityAgrees(ctx)
 }
 
 // requireNetBoxClusterAgreement is the LOUD form, for an operator-initiated

@@ -49,9 +49,30 @@ const clusterRecordID = "default"
 //     value for it (nothing takes a cluster name — the mirror falls back to its
 //     own configured one), so healing over a row would silently blank a name
 //     somebody set;
-//   - a node whose `ca.crt` genuinely differs is mid CA-replacement, and the
-//     right answer there is for revalidation to notice the fingerprint moved and
-//     SUSPEND the bindings, not for two nodes to fight over the row.
+//   - a node whose `ca.crt` genuinely differs is mid CA-replacement, and two
+//     nodes writing the row in turn would make the cluster's identity namespace
+//     depend on which of them restarted last. Which one "wins" is not the
+//     question — the row must not move at all.
+//
+// THE INVARIANT, POSITIVELY: the cluster fingerprint is a stable NAMESPACE, not
+// a liveness check on the CA. It is minted ONCE, from whatever `ca.crt` the
+// first node to heal held, and it deliberately never tracks `ca.crt` again.
+// Nothing in production rewrites `cluster.ca_cert` — the INSERT below is that
+// column's only non-test writer — so on a live cluster the fingerprint does not
+// move, and no code may be written as though it might.
+//
+// That is the intended behaviour, not a gap. A fingerprint that tracked the live
+// CA would, the moment one was replaced, make the inventory mirror's
+// actual-state read see zero objects it owns: it would duplicate the entire
+// inventory into NetBox under fresh ids while revalidation suspended every
+// binding fleet-wide, and the re-key that repairs a fingerprint move would have
+// two states to reconcile instead of one.
+//
+// A CA-rotation path, if one is built, must move the fingerprint EXPLICITLY and
+// re-key the objects still carrying the old one (`lv netbox rekey` is the
+// re-stamping half; the deliberate move is the part that does not exist yet). It
+// must NOT be built by relaxing this heal into an upsert — that gives the move
+// no ordering, no operator, and no re-key between the two namespaces.
 //
 // A missing or empty `ca.crt` writes NOTHING and is not an error. A node can be
 // running before it has been enrolled, and the daemon must still come up; the

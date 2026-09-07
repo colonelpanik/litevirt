@@ -321,17 +321,20 @@ for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 ## NetBox IPAM
 
 ```bash
-lv netbox rekey <network>                         # re-stamp a bound network's identities after a CA replacement
+lv netbox rekey <network>                         # re-stamp a bound network's identities under the current fingerprint
 lv netbox rekey                                   # re-stamp the mirrored inventory, cluster-wide
 lv netbox resume <network>                        # lift a suspension once the drift is repaired
 ```
 
 A bound network's binding is suspended when the NetBox prefix drifts out of what
-the bind validated, or when the cluster CA — and with it the fingerprint stamped
-on every NetBox object litevirt owns — is replaced. New allocations then refuse
-while running VMs continue untouched.
+the bind validated, or when the cluster fingerprint stamped on every NetBox
+object litevirt owns no longer matches the one the binding recorded. New
+allocations then refuse while running VMs continue untouched. Replacing the
+cluster CA on disk does **not** move that fingerprint — it is minted once from
+the replicated `cluster` row, which nothing rewrites — so it does not produce
+this suspension.
 
-`lv netbox rekey <network>` is the CA case: it rewrites those identities under
+`lv netbox rekey <network>` is the moved-fingerprint case: it rewrites those identities under
 the current fingerprint and resumes the binding, and is safe to re-run. It covers
 the bound prefix's addresses, the mirrored VM and interface objects, and
 litevirt's local identity index — in that order. It resumes nothing while another
@@ -342,7 +345,7 @@ mirrors inventory without binding a prefix, where there is no binding row to tak
 the old fingerprint from. It re-stamps the mirrored objects and the local index
 only, deriving its pin from that index, and resumes nothing. With no old
 fingerprint recorded anywhere it refuses rather than re-stamping by any other
-rule. See `docs/networking.md#recovering-from-a-ca-replacement` for what the
+rule. See `docs/networking.md#recovering-from-a-moved-cluster-fingerprint` for what the
 order buys and why the refusal matters.
 
 `lv netbox resume` is every other case: repair the prefix in NetBox, then run it
@@ -350,7 +353,7 @@ to re-check the bind-time preconditions and clear the suspension. It refuses
 while the drift is still there, and it never accepts a changed CIDR — re-CIDRing
 a bound prefix is unsupported. See
 `docs/networking.md#resuming-a-suspended-binding` and
-`docs/networking.md#recovering-from-a-ca-replacement`.
+`docs/networking.md#recovering-from-a-moved-cluster-fingerprint`.
 
 ## Storage pools
 

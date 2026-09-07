@@ -423,6 +423,16 @@ func GetDeletedVM(ctx context.Context, c *Client, name string) (*VMRecord, error
 // or a fresh join has no row of any kind. Consumers that must not act on an
 // empty read — the NetBox inventory mirror's delete half — use this as the
 // corroborating evidence that the empty answer is a real one.
+//
+// The MIRROR'S CORRECTNESS THEREFORE DEPENDS ON `vms` TOMBSTONES SURVIVING.
+// Retiring the last VM in a cluster is told apart from a database that has not
+// hydrated by nothing else, and the same evidence keyed per name
+// (ReadMirrorEvidence) is what authorizes every individual delete. deleteVM's
+// same-name-re-create cleanup is the only thing in the tree that removes a `vms`
+// tombstone, and that case is safe because it leaves a live row under the same
+// name. A general tombstone GC would not be: it would take the evidence away
+// while leaving the NetBox objects behind, and the mirror would stop being able
+// to distinguish "unhydrated" from "deleted" at all.
 func HasVMRecords(ctx context.Context, c *Client) (bool, error) {
 	rows, err := c.Query(ctx, `SELECT name FROM vms LIMIT 1`)
 	if err != nil {

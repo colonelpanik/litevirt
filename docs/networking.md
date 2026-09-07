@@ -269,9 +269,12 @@ Repairable in place, by fixing NetBox and running `lv netbox resume`:
 | the prefix was moved to the global table | move it back into a VRF with `enforce_unique` |
 | the prefix was re-CIDRed | revert the CIDR to the one the binding recorded |
 
-A suspension caused by a **cluster CA replacement** is not repaired in NetBox and
-`lv netbox resume` will not lift it — the identities have to be rewritten first
-with `lv netbox rekey` (below). The refusal message says so.
+A suspension caused by a **moved cluster fingerprint** is not repaired in NetBox
+and `lv netbox resume` will not lift it — the identities have to be rewritten
+first with `lv netbox rekey` (below). The refusal message says so. Replacing the
+cluster CA on disk does not move the fingerprint and so does not produce this
+suspension; see
+[Recovering from a moved cluster fingerprint](#recovering-from-a-moved-cluster-fingerprint).
 
 **Re-CIDRing a bound prefix is not supported in v1.** Resume validates against the
 CIDR the binding recorded and writes it back unchanged, so a prefix NetBox now
@@ -363,12 +366,26 @@ reachable again, which means sweeps are still failing:
 `litevirt_netbox_mirror_last_success_seconds` say whether any sweep is completing
 at all, and `litevirt_netbox_api_errors_total` says what NetBox is answering.
 
-### Recovering from a CA replacement
+### Recovering from a moved cluster fingerprint
 
 The cluster fingerprint in every NetBox identity is derived from the cluster CA
-certificate — that is what stops two litevirt clusters sharing one NetBox from
-reclaiming each other's addresses. Replacing the CA changes it, so bindings
-suspend and new allocations refuse until the existing objects are re-stamped:
+certificate recorded in the replicated `cluster` row — that is what stops two
+litevirt clusters sharing one NetBox from reclaiming each other's addresses.
+
+**The fingerprint is minted once and does not track `ca.crt`.** It is derived the
+first time any node finds the `cluster` row missing, and nothing in litevirt
+rewrites that row afterwards. So replacing the CA on disk does **not** move the
+fingerprint, does **not** suspend a binding, and needs no re-key: do not wait for
+a suspension that will not arrive. That is deliberate — a fingerprint that
+followed the live CA would make the inventory mirror see zero objects it owns the
+moment one was replaced, and it would duplicate the whole inventory under fresh
+NetBox ids while every binding was suspended.
+
+A binding is suspended on the fingerprint only when the recorded fingerprint and
+the cluster's current one genuinely differ, which today means the `cluster` row
+itself was rewritten out of band. A supported CA-rotation path that moves the
+fingerprint on purpose does not exist yet; when one is added, this is the command
+that re-stamps the objects it leaves behind:
 
 ```bash
 lv netbox rekey <network>
@@ -378,7 +395,7 @@ Running VMs are unaffected by the suspension. The command re-stamps every object
 carrying the old fingerprint and then resumes the binding — in that order, so a
 run that fails partway leaves the binding suspended rather than live with half
 its objects unrecognisable. Re-running finishes the job; objects already
-rewritten are skipped. Complete a re-key before replacing the CA again.
+rewritten are skipped. Complete a re-key before the fingerprint moves again.
 
 Both forms of the command run under the same cluster-wide leader lease as the
 orphan sweeper and the inventory mirror, because all three write the objects the
@@ -437,9 +454,9 @@ costs two list calls.
 Its pin comes from **litevirt's own local identity index**, whose key IS the
 identity string. Those rows are written only by this cluster's mirror, into this
 cluster's own replicated database, so a fingerprint appearing in one is provably
-this cluster's — and a CA replacement leaves the index exactly as it was. If it
-holds rows under more than one old fingerprint (a re-key interrupted, then
-another CA replacement) every one of them is re-stamped in turn.
+this cluster's. If it holds rows under more than one old fingerprint (a re-key
+interrupted, then a second fingerprint move) every one of them is re-stamped in
+turn.
 
 That also makes this the repair for a cluster whose binding pin was already
 advanced by an older build — one that re-stamped addresses only. The per-network
@@ -496,7 +513,7 @@ things, in this order:
 1. **Re-validate every binding** against NetBox, suspending any that has drifted.
    Nothing lifts a suspension on its own: `lv netbox resume` clears one whose
    drift you have repaired in NetBox, and `lv netbox rekey` rewrites the
-   identities a CA replacement invalidated so a resume can then succeed.
+   identities a moved fingerprint invalidated so a resume can then succeed.
 2. **Reclaim orphans** — addresses NetBox still holds under this cluster's
    identity that nothing claims any more.
 

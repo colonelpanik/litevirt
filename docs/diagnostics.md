@@ -671,7 +671,7 @@ show as DEGRADED and never as CRITICAL, and neither gates admission.
 
 | Code | Subject | Raised when | Clears when |
 |---|---|---|---|
-| `netbox_binding_suspended` | the network | A `netbox_bindings` row is suspended. The evidence names the network, the prefix, and the drift reason. New allocations on that network refuse until an operator runs `lv netbox resume` (or `lv netbox rekey` for a CA change); running workloads are untouched. | Two consecutive sweeps see the binding un-suspended. |
+| `netbox_binding_suspended` | the network | A `netbox_bindings` row is suspended. The evidence names the network, the prefix, and the drift reason. New allocations on that network refuse until an operator runs `lv netbox resume` (or `lv netbox rekey` if the cluster fingerprint moved); running workloads are untouched. | Two consecutive sweeps see the binding un-suspended. |
 | `netbox_sweep_blocked` | `netbox` (cluster) | Three consecutive sweeps declined every reclamation because a host would not answer the absence proof. One unreachable host is ordinary — a reboot, a restart — but while it is away NOT ONE address can be reclaimed, and the pool fills with orphans in silence. | Two consecutive sweeps complete without a `host_unreachable` skip. |
 
 The three-pass threshold is deliberately per-process state held by the lease

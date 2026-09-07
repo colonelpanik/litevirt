@@ -382,6 +382,52 @@ func TestADownHostThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
 	}
 }
 
+// TestAWitnessThatHasNotPublishedDoesNotBlockThePass.
+//
+// A witness votes and never hosts a workload, so it never mirrors and has no
+// reason to be configured for NetBox — but `health.VotingEligible` counts
+// witnesses (the quorum denominator does, so the live-host predicate must), and
+// the gate blocks until every live host has published. A witness therefore
+// blocks mirroring FOREVER, on a cluster whose configuration is entirely
+// correct, and the only remedies would be to configure NetBox on a node that
+// does not need it or to remove the witness.
+//
+// The sweeper's own participant universe (eligibleProofHosts) already excludes
+// `role='witness'` for exactly this reason. This is the same exclusion for the
+// same reason, and it is safe for the same one: a node that never mirrors cannot
+// flap an inventory, which is the only thing this comparison protects.
+func TestAWitnessThatHasNotPublishedDoesNotBlockThePass(t *testing.T) {
+	ctx := context.Background()
+	s := uniformityServer(t, "site-a")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "peer-1", Address: "192.0.2.10", State: "active",
+		CertSerial: "serial-peer-1", Role: "witness",
+	}); err != nil {
+		t.Fatalf("insert witness host: %v", err)
+	}
+	if !s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a live witness that never publishes must not block mirroring forever: it hosts " +
+			"no workload, so it never mirrors and has nothing to be uniform about")
+	}
+}
+
+// TestAWitnessCannotBlockButAWorkerStill Can is the control: the exclusion must
+// be about the ROLE and nothing else, or it would hand every unpublished host a
+// way through.
+func TestAWitnessExclusionDoesNotExcuseAWorker(t *testing.T) {
+	ctx := context.Background()
+	s := uniformityServer(t, "site-a")
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "peer-1", Address: "192.0.2.10", State: "active",
+		CertSerial: "serial-peer-1", Role: "worker",
+	}); err != nil {
+		t.Fatalf("insert worker host: %v", err)
+	}
+	if s.netboxMirrorPassAuthorized(ctx) {
+		t.Fatal("a live WORKER that has not published must still stop the pass")
+	}
+}
+
 // TestAPublicationFailureStillStopsTheGate. Publishing is what makes this node's
 // opinion visible to its peers, and a node whose opinion nobody can see is
 // exactly the node that must not go on to mirror on the strength of a comparison

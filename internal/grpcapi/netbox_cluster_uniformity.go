@@ -47,20 +47,26 @@ import (
 // written under the wrong cluster.
 //
 // So an absent publication from a LIVE host now FAILS CLOSED: the pass declines
-// and a health condition names the hosts whose value is missing. It stays
-// bounded rather than permanent for two reasons — every configured node
-// publishes on its own first pass, and only LIVE hosts are waited for, so a node
-// that has left or that runs with `netbox.enabled` off is excluded by the same
-// predicate that excludes a stale disagreeing value. Stopping the mirror costs
-// stale inventory; mirroring under an unverified set costs objects written under
-// the wrong cluster name, and this branch ranks a leak above a collision.
+// and a health condition names the hosts whose value is missing. That wait is
+// bounded for a host that is coming up — every configured node publishes on its
+// own first pass — and a host that has LEFT is excluded by the same predicate
+// that excludes a stale disagreeing value, as is a witness (which never
+// mirrors). It is NOT bounded for a live worker running with `netbox.enabled`
+// off: nothing excludes that node, so it blocks until somebody acts, which is
+// why the condition names the hosts it is waiting for. See WHAT IT STILL DOES
+// NOT CLOSE below; the two paragraphs must not disagree, and they used to.
+// Stopping the mirror costs stale inventory; mirroring under an unverified set
+// costs objects written under the wrong cluster name, and this branch ranks a
+// leak above a collision.
 //
-// ONLY LIVE HOSTS COUNT. A host that is down, in maintenance, fenced or
-// decommissioned keeps its published row — nothing deletes a departed node's
-// publication — and must not be able to stop mirroring forever by holding a
-// stale value. The live set is the health checker's own predicate,
-// health.VotingEligible over the replicated `hosts` rows: the same one the
-// quorum denominator uses, not a fourth answer to "is this host live".
+// ONLY LIVE HOSTS COUNT, AND ONLY ONES THAT COULD MIRROR. A host that is down,
+// in maintenance, fenced or decommissioned keeps its published row — nothing
+// deletes a departed node's publication — and must not be able to stop mirroring
+// forever by holding a stale value. The live set is the health checker's own
+// predicate, health.VotingEligible over the replicated `hosts` rows: the same
+// one the quorum denominator uses, not a fourth answer to "is this host live".
+// Witnesses are then subtracted, because VotingEligible deliberately includes
+// them and a witness never mirrors — see liveHostsForNetBoxUniformity.
 //
 // NOT HealthyPeers, which the orphan sweeper uses for REACHABILITY. That answer
 // additionally requires a successful probe this run, so it differs per node and
@@ -74,11 +80,14 @@ import (
 // replicated, so a node that has stopped without being demoted to offline yet is
 // waited for until demotion catches up (minutes). That is the fail-closed
 // direction and mirroring is a convergence loop, so nothing is lost but
-// freshness. The case that WOULD block permanently — a live host running with
+// freshness. The case that BLOCKS PERMANENTLY — a live worker running with
 // `netbox.enabled` off, which never publishes because it runs no NetBox pass —
 // is why the condition names the hosts it is waiting for: the block is visible
 // and has a remedy (configure NetBox there, or take the node out), rather than
-// being a mirror that quietly stopped.
+// being a mirror that quietly stopped. Nothing in the predicate excludes such a
+// node, and nothing should: an unconfigured worker can be given the config, and
+// guessing that its silence is benign is the assumption that wrote an inventory
+// under the wrong cluster name in the first place.
 //
 // THE NAME, NOT A HASH. `hosts.capacity_policy_hash` — the precedent for a
 // per-host published config fingerprint — hashes because an admission policy is
@@ -280,11 +289,31 @@ func (s *Server) compareNetBoxClusterName(ctx context.Context) (netboxClusterDis
 }
 
 // liveHostsForNetBoxUniformity is the set whose published values count: every
-// voting-eligible host, plus this node.
+// voting-eligible host that could actually mirror, plus this node.
 //
 // Self is always in it, even if its own row is missing or its state reads
 // offline. This node's resolved name is the value the comparison is made FROM,
 // so excluding it would compare a set against a value not in it.
+//
+// WITNESSES ARE EXCLUDED, and this is the most plausible permanent wedge in the
+// whole gate. A witness votes and never hosts a workload, so it never runs a
+// mirror pass and has no reason to be configured for NetBox at all — but
+// health.VotingEligible counts witnesses (it has to: the quorum denominator
+// does), and the gate blocks until every live host has published. A witness
+// would therefore stop mirroring FOREVER on a cluster whose configuration is
+// entirely correct, with no remedy but configuring NetBox on a node that does
+// not need it or removing the witness.
+//
+// Excluding it costs nothing the comparison is for. What this gate protects
+// against is an inventory FLAPPING between two NetBox clusters as the `netbox`
+// lease moves, and a node that never mirrors can never be the node that moves
+// it. The sweeper's participant universe (eligibleProofHosts) already excludes
+// `role='witness'` for the same reason, and this is deliberately the same
+// exclusion rather than a second answer to it.
+//
+// Self is exempt from the role check, for the same reason it is exempt from the
+// state check: this node is demonstrably running this code, and a comparison
+// that dropped the node making it would compare a set against a value not in it.
 //
 // FAIL CLOSED on an unreadable host table: it returns an error rather than an
 // empty set, because "no live hosts" and "we could not tell who is live" must
@@ -297,6 +326,9 @@ func (s *Server) liveHostsForNetBoxUniformity(ctx context.Context) (map[string]b
 	}
 	live := map[string]bool{s.hostName: true}
 	for _, h := range hosts {
+		if h.Name != s.hostName && h.IsWitness() {
+			continue // a witness votes and never mirrors, so it has nothing to be uniform about
+		}
 		if health.VotingEligible(h.State) {
 			live[h.Name] = true
 		}

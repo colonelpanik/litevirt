@@ -85,6 +85,29 @@ func (a *builtinAllocator) Claim(ctx context.Context, req ClaimRequest) (ClaimRe
 	return ClaimResult{IP: ip}, nil
 }
 
+// Release has NO PRODUCTION CALLER, and that is what keeps ReleaseLease's
+// statement shape off a previous-release peer's replication stream.
+//
+// The shape is new at this release: its fingerprint is absent from the previous
+// release's ledgers, and a receiver that cannot place a fingerprint
+// back-pressures its whole stream rather than dropping the row. Every path that
+// does emit it is a NetBox path, gated behind a bound network and so behind the
+// netbox_ipam_v1 latch, which cannot form while a peer is on the old build. This
+// method is the exception waiting to happen: allocatorFor hands the builtin
+// allocator to a CONTAINER on an unbound network, which is every container in
+// every existing deployment, and nothing about that path is gated.
+//
+// The container delete cascade tombstones leases directly, through
+// ReleaseContainerLeases, whose bulk owner-scoped shape the previous release
+// already accepts. Routing it through this method instead reads like a tidy-up
+// and is a rolling-upgrade regression;
+// TestDeleteContainer_ReleasesThroughTheOldLeaseShape fails if it happens.
+//
+// The method still exists because the Allocator interface is what makes the
+// NetBox and builtin paths interchangeable at the call site, and a
+// half-implemented interface would be worse. Wiring it up is a change that needs
+// its own compatibility decision — the shape must be in the previous release's
+// horizon, or the path must be gated — not a refactor.
 func (a *builtinAllocator) Release(ctx context.Context, req ReleaseRequest) error {
 	return ReleaseLease(ctx, a.db, req.Network, req.IP, req.MAC, req.OwnerKind, req.OwnerHost, req.Name)
 }

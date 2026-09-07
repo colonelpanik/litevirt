@@ -306,22 +306,56 @@ mirror would look for objects under an identity NetBox does not carry yet, find
 nothing, and try to create inventory NetBox already holds — which it refuses,
 because a VM name is unique within a cluster.
 
-Two limits follow from re-stamping being filtered on the fingerprint the binding
-recorded. A cluster with **no bound networks** has nothing to run `lv netbox
-rekey` against, so a mirror-only cluster has no re-key path today. And a binding
-whose pin was already advanced by an older build — one that rewrote addresses
-only — cannot be repaired through this command: the fingerprint its inventory
-carries is no longer recorded anywhere, and re-stamping everything that is not
-the current value would seize a second cluster's objects out of a shared NetBox.
-
 A re-key answers the fingerprint pin and nothing else. If the prefix had ALSO
 drifted — re-CIDRed, say — the rewrite still happens, but the binding is left
 suspended under the remaining reason and the command reports it. Repair that in
 NetBox and run `lv netbox rekey` again.
 
+#### Re-keying inventory with no bound network
+
+The form above takes its old fingerprint from the binding row. A cluster can use
+NetBox purely for **inventory** — the mirror needs a NetBox client and nothing
+else — and then there is no binding to take it from. Run the same command with
+no argument:
+
+```bash
+lv netbox rekey
+```
+
+It re-stamps sets 2 and 3 above, cluster-wide, in the same order and for the
+same reason. It touches no `ipam.ip-address` object and resumes no binding, so a
+cluster that has bound networks as well still runs `lv netbox rekey <network>`
+for each of them afterwards — that run finds the inventory already done and
+costs two list calls.
+
+Its pin comes from **litevirt's own local identity index**, whose key IS the
+identity string. Those rows are written only by this cluster's mirror, into this
+cluster's own replicated database, so a fingerprint appearing in one is provably
+this cluster's — and a CA replacement leaves the index exactly as it was. If it
+holds rows under more than one old fingerprint (a re-key interrupted, then
+another CA replacement) every one of them is re-stamped in turn.
+
+That also makes this the repair for a cluster whose binding pin was already
+advanced by an older build — one that re-stamped addresses only. The per-network
+form can do nothing there, because its pin now equals the live fingerprint; the
+index still records the old one.
+
+When the index holds **no** row under an old fingerprint, nothing is rewritten.
+Either every row already carries the live fingerprint, and the command succeeds
+having changed nothing; or the index is empty, and the command **refuses**. The
+refusal is deliberate and is the safety property of the whole operation: the
+only rule left would be "re-stamp anything that is not the current fingerprint",
+and two litevirt installations can share one NetBox and one NetBox cluster
+object, so that rule would seize the other installation's inventory. An operator
+whose index is genuinely gone removes the stranded objects in NetBox by hand and
+lets the mirror rebuild them.
+
 Both commands are admin-only and both write an audit record (`netbox.rekey`,
 `netbox.resume`), so `lv audit verify` carries a trace of every identity rewrite
-and every lifted suspension.
+and every lifted suspension. A cluster-scoped re-key is audited under the target
+`(inventory)` rather than a network name, and — like the per-network form — is
+recorded on failure as well as success, because a run that stopped partway has
+still rewritten objects.
 
 ### Maintenance and reclamation
 

@@ -771,6 +771,53 @@ func (f *NetBoxFake) DistinctWriters() []string {
 	return out
 }
 
+// SeedVM plants one virtual_machine directly in the store, bypassing the REST
+// path — an object this cluster did not write and never will.
+//
+// The inventory counterpart of SeedIP. A co-tenant's inventory can also be
+// modelled with a second real cluster, and where the scenario is about two
+// installations that is the better fixture. What a second cluster cannot
+// produce is an identity carrying a fingerprint that appears in NO cluster's
+// local index, which is exactly what a pin-DERIVATION assertion needs: the
+// object has to be enumerable by the re-key and still left unmatched by it.
+//
+// It takes the cluster id rather than resolving one, because a seed outside the
+// cluster the re-key enumerates would be left alone whatever the pin logic did.
+func (f *NetBoxFake) SeedVM(name string, clusterID int, identity string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := f.nextVMID()
+	f.vms[id] = &fakeVM{
+		ID:        id,
+		Name:      name,
+		ClusterID: clusterID,
+		Status:    "active",
+		Identity:  identity,
+	}
+	return id
+}
+
+// ClusterID is the id the fake assigned the named cluster, or 0 when no mirror
+// pass has created it yet.
+func (f *NetBoxFake) ClusterID(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clusters[name]
+}
+
+// VMIdentity is one virtual_machine's identity custom field, by id. It answers
+// "was THIS object left alone", which VMIdentities() — a set with no ids in it
+// — cannot.
+func (f *NetBoxFake) VMIdentity(id int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok {
+		return ""
+	}
+	return vm.Identity
+}
+
 // PatchCount is how many PATCH requests the fake has served, over every
 // endpoint.
 //

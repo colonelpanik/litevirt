@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netbox"
 )
 
 // driftBinding is the record a healthy bind leaves behind for the fake below.
@@ -238,6 +239,149 @@ func TestRekeyBindingWritesAnAuditRow(t *testing.T) {
 	if got := rows[0].String("detail"); !strings.Contains(got, "prefix=7") ||
 		!strings.Contains(got, "rewritten=") {
 		t.Errorf("audit detail = %q, want the prefix and the rewrite count", got)
+	}
+}
+
+// seedObjectRefs records n local index rows under one fingerprint — the state
+// the inventory mirror leaves behind, which is where the cluster-scoped re-key
+// derives its pin from.
+func seedObjectRefs(t *testing.T, s *Server, fingerprint string) {
+	t.Helper()
+	ctx := context.Background()
+	refs := []corrosion.ObjectRef{
+		{
+			LitevirtKind: "vm",
+			LitevirtKey:  netbox.Identity(fingerprint, "3f6c2a10-0000-4000-8000-000000000001", ""),
+			NetBoxKind:   "virtualization.virtualmachine",
+			NetBoxID:     4001,
+		},
+		{
+			LitevirtKind: "nic",
+			LitevirtKey:  netbox.Identity(fingerprint, "3f6c2a10-0000-4000-8000-000000000001", "52:54:00:00:00:01"),
+			NetBoxKind:   "virtualization.vminterface",
+			NetBoxID:     6001,
+		},
+	}
+	for _, r := range refs {
+		if err := corrosion.PutObjectRef(ctx, s.db, r); err != nil {
+			t.Fatalf("seed object ref %s: %v", r.LitevirtKey, err)
+		}
+	}
+}
+
+// TestRekeyInventoryOnlyRequiresAdmin pins the role gate on the NETWORK-LESS
+// form.
+//
+// It is a separate scenario from TestRekeyBindingRequiresAdmin because the
+// empty-network branch is a separate entry point: moving it above RequireRole —
+// which reads naturally, since it needs no binding lookup — would leave a
+// viewer able to rewrite every identity in the cluster with the bound form's
+// gate still green.
+func TestRekeyInventoryOnlyRequiresAdmin(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	seedObjectRefs(t, s, "0000000000000000")
+
+	viewer := context.WithValue(context.WithValue(context.Background(),
+		ctxKeyUsername, "vera"), ctxKeyRole, "viewer")
+	if _, err := s.RekeyBinding(viewer, &pb.RekeyBindingRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("viewer got %v, want PermissionDenied", err)
+	}
+
+	// The same call as admin gets PAST the gate — without this the test would
+	// also pass against a handler that refused everyone.
+	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{}); err != nil {
+		t.Fatalf("admin inventory re-key: %v", err)
+	}
+}
+
+// TestRekeyInventoryOnlyWritesAnAuditRow: the cluster-scoped form rewrites
+// identities fleet-wide with no binding row to record that it ran, so the audit
+// row is the ONLY durable trace of it. The target has to distinguish it from a
+// per-network re-key, and the detail has to say how much it touched.
+func TestRekeyInventoryOnlyWritesAnAuditRow(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+	seedObjectRefs(t, s, "0000000000000000")
+
+	if _, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{}); err != nil {
+		t.Fatalf("inventory re-key: %v", err)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT target, detail, result FROM audit_log WHERE action = 'netbox.rekey'`)
+	if err != nil {
+		t.Fatalf("read the audit log: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one netbox.rekey audit row, got %d", len(rows))
+	}
+	if got := rows[0].String("target"); got != rekeyInventoryTarget {
+		t.Errorf("audit target = %q, want %q — a network name here would read as a "+
+			"per-network re-key", got, rekeyInventoryTarget)
+	}
+	if got := rows[0].String("result"); got != "ok" {
+		t.Errorf("audit result = %q, want ok", got)
+	}
+	if got := rows[0].String("detail"); !strings.Contains(got, "pins=1") ||
+		!strings.Contains(got, "refs=2") {
+		t.Errorf("audit detail = %q, want the pin count and the rows rewritten", got)
+	}
+
+	// The rows themselves moved to the live fingerprint, which is what makes
+	// the audited count mean something.
+	fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+	if err != nil {
+		t.Fatalf("ClusterFingerprint: %v", err)
+	}
+	for _, kind := range []string{"vm", "nic"} {
+		refs, err := corrosion.ListObjectRefs(ctx, s.db, kind)
+		if err != nil {
+			t.Fatalf("ListObjectRefs(%s): %v", kind, err)
+		}
+		if len(refs) != 1 {
+			t.Fatalf("want exactly one live %s index row after the re-key, got %d", kind, len(refs))
+		}
+		if cf, _, _, ok := splitIdentity(refs[0].LitevirtKey); !ok || cf != fp {
+			t.Errorf("%s index row key = %q, want one carrying the live fingerprint %q",
+				kind, refs[0].LitevirtKey, fp)
+		}
+	}
+}
+
+// TestRekeyInventoryOnlyRefusesWithNoLocalIndex is the fail-closed half: with an
+// EMPTY index nothing records the fingerprint this cluster's objects carry, and
+// the only other rule available — "rewrite anything that is not current" —
+// would seize a co-tenant installation's objects out of a shared NetBox. The
+// refusal is audited, because an operator has to be able to see that the
+// command ran and declined.
+func TestRekeyInventoryOnlyRefusesWithNoLocalIndex(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+	})
+
+	_, err := s.RekeyBinding(adminCtx(), &pb.RekeyBindingRequest{})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "identity index") {
+		t.Fatalf("the refusal must name the empty local identity index, got %v", err)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT result FROM audit_log WHERE action = 'netbox.rekey'`)
+	if err != nil {
+		t.Fatalf("read the audit log: %v", err)
+	}
+	if len(rows) != 1 || rows[0].String("result") != "error" {
+		t.Fatalf("want one netbox.rekey audit row recording the refusal, got %d rows", len(rows))
 	}
 }
 

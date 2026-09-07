@@ -321,7 +321,8 @@ for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
 ## NetBox IPAM
 
 ```bash
-lv netbox rekey <network>                         # re-stamp identities after a cluster CA replacement
+lv netbox rekey <network>                         # re-stamp a bound network's identities after a CA replacement
+lv netbox rekey                                   # re-stamp the mirrored inventory, cluster-wide
 lv netbox resume <network>                        # lift a suspension once the drift is repaired
 ```
 
@@ -330,12 +331,19 @@ the bind validated, or when the cluster CA — and with it the fingerprint stamp
 on every NetBox object litevirt owns — is replaced. New allocations then refuse
 while running VMs continue untouched.
 
-`lv netbox rekey` is the CA case: it rewrites those identities under the current
-fingerprint and resumes the binding, and is safe to re-run. It covers the bound
-prefix's addresses, the mirrored VM and interface objects, and litevirt's local
-identity index — in that order. It resumes nothing while another drift is still
-present. See `docs/networking.md#recovering-from-a-ca-replacement` for what the
-order buys and the two cases it does not cover.
+`lv netbox rekey <network>` is the CA case: it rewrites those identities under
+the current fingerprint and resumes the binding, and is safe to re-run. It covers
+the bound prefix's addresses, the mirrored VM and interface objects, and
+litevirt's local identity index — in that order. It resumes nothing while another
+drift is still present.
+
+`lv netbox rekey` with no network is the same operation for a cluster that
+mirrors inventory without binding a prefix, where there is no binding row to take
+the old fingerprint from. It re-stamps the mirrored objects and the local index
+only, deriving its pin from that index, and resumes nothing. With no old
+fingerprint recorded anywhere it refuses rather than re-stamping by any other
+rule. See `docs/networking.md#recovering-from-a-ca-replacement` for what the
+order buys and why the refusal matters.
 
 `lv netbox resume` is every other case: repair the prefix in NetBox, then run it
 to re-check the bind-time preconditions and clear the suspension. It refuses

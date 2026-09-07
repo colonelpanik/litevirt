@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -132,12 +133,14 @@ func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, li
 // answers the fingerprint pin and only that: a binding that had also drifted in
 // NetBox stays suspended under the remaining reason, for `lv netbox resume`
 // once an operator has repaired it.
+//
+// An EMPTY network is the cluster-scoped, INVENTORY-ONLY form — see
+// rekeyInventoryOnly. It exists because a cluster can run the inventory mirror
+// with no bound network at all (StartNetBoxMirror asks for a NetBox client and
+// nothing else), and the per-network form has no pin to look up there.
 func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
-	}
-	if req.GetNetwork() == "" {
-		return nil, status.Error(codes.InvalidArgument, "network is required")
 	}
 	if s.netbox == nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -146,6 +149,9 @@ func (s *Server) RekeyBinding(ctx context.Context, req *pb.RekeyBindingRequest) 
 	if s.db == nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"this node has no cluster database; run the re-key on a node that does")
+	}
+	if req.GetNetwork() == "" {
+		return s.rekeyInventoryOnly(ctx)
 	}
 	b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.GetNetwork())
 	if err != nil {
@@ -326,6 +332,151 @@ const (
 	rekeyRefKindVM  = "vm"
 	rekeyRefKindNIC = "nic"
 )
+
+// rekeyInventoryTarget is what the audit trail names for the cluster-scoped
+// form. Parenthesised because a network name never can be, so it can never be
+// confused with a per-network re-key of a network someone called "inventory".
+const rekeyInventoryTarget = "(inventory)"
+
+// rekeyInventoryOnly is the CLUSTER-SCOPED re-key: no network, no binding, no
+// resume — just the inventory objects and the local index that names them.
+//
+// It exists because a cluster can use NetBox purely for INVENTORY.
+// StartNetBoxMirror asks for a NetBox client and nothing else, so a cluster with
+// no bound network is a supported configuration — and one the per-network form
+// cannot serve, because it takes its old-fingerprint pin from a binding row that
+// does not exist. A CA replacement there leaves every virtual_machine and
+// vminterface carrying a fingerprint the cluster no longer answers to, and the
+// next sweep tries to duplicate the whole inventory into a NetBox cluster whose
+// VM names are already taken.
+//
+// WHERE THE PIN COMES FROM, which is the whole safety argument: the LOCAL INDEX.
+// `netbox_objects.litevirt_key` IS the identity string, and those rows are
+// written only by this cluster's own mirror into this cluster's own replicated
+// database — so any fingerprint appearing in one is provably ours, and needs no
+// binding to vouch for it. A CA replacement does not disturb the index either;
+// nothing rewrites it but recordRef and rekeyObjectIndex.
+//
+// What it must NEVER do is fall back to "rewrite anything that is not the
+// current fingerprint". ListVMsByCluster hands this cluster every object in a
+// NetBox cluster it may be SHARING with a second installation, and that rule
+// would stamp the co-tenant's inventory with this cluster's identity — leaving
+// them to find nothing of their own and be refused by the names they already
+// hold. No derivable pin means no re-key.
+//
+// NO BINDING MEANS NO RESUME, and therefore no resume gate. The per-network form
+// leans on that gate to make a partial re-key visible and re-runnable; here the
+// visible artefact is the audit row and the error, and re-runnability comes from
+// the pin filter alone — an object already carrying the new fingerprint no
+// longer matches, so a re-run finishes exactly the work a failed run left.
+//
+// Bound networks are NOT covered. This rewrites no `ipam.ip-address` object and
+// resumes no binding, so a cluster that has both still runs `lv netbox rekey
+// <network>` for each of them; that run finds the inventory already done and
+// costs two list calls.
+func (s *Server) rekeyInventoryOnly(ctx context.Context) (*emptypb.Empty, error) {
+	newFP, err := corrosion.ClusterFingerprint(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "derive cluster fingerprint: %v", err)
+	}
+	pins, rows, err := s.inventoryPins(ctx, newFP)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "derive the re-key pin: %v", err)
+	}
+	if rows == 0 {
+		// FAIL CLOSED. An empty index records no earlier fingerprint at all, so
+		// there is nothing to derive a pin from — and reporting success would be
+		// worse than refusing: an operator whose index was lost while NetBox
+		// still holds stranded inventory would be told the re-key worked.
+		detail := "inventory pins=0 rows=0 vms=0 interfaces=0 refs=0"
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "error")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"the local identity index holds no rows, so nothing records the fingerprint this "+
+				"cluster's NetBox objects carry; re-stamping everything that is not the current "+
+				"fingerprint would seize a second installation's objects out of a shared NetBox. "+
+				"If NetBox holds inventory under an identity this cluster no longer recognises, "+
+				"remove it there by hand and let the mirror rebuild it")
+	}
+	if len(pins) == 0 {
+		// Already consistent: every row the index holds is under the live
+		// fingerprint. Nothing to rewrite, and — deliberately — no other rule to
+		// fall back on. This is also what makes a second run of a completed
+		// re-key a no-op.
+		detail := fmt.Sprintf("inventory pins=0 rows=%d vms=0 interfaces=0 refs=0", rows)
+		slog.Info("netbox re-key: every local index row already carries the live fingerprint",
+			"rows", rows, "fingerprint", newFP)
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "ok")
+		return &emptypb.Empty{}, nil
+	}
+
+	// One pass per stale fingerprint. More than one means a rotation was
+	// interrupted and then rotated again; all of them are ours by construction,
+	// so each is re-keyed in turn rather than guessed between.
+	var counts rekeyCounts
+	var failed error
+	for _, oldFP := range pins {
+		// NetBox first, the local index second — the same order and the same
+		// reason as the per-network form. Leak over collision, every time.
+		if failed = s.rekeyInventory(ctx, oldFP, newFP, &counts); failed != nil {
+			break
+		}
+		if failed = s.rekeyObjectIndex(ctx, oldFP, newFP, &counts); failed != nil {
+			break
+		}
+	}
+
+	detail := fmt.Sprintf("inventory pins=%d rows=%d vms=%d interfaces=%d refs=%d",
+		len(pins), rows, counts.vms, counts.interfaces, counts.refs)
+	if failed != nil {
+		// Audited on BOTH outcomes, as the per-network form is: a re-key that
+		// failed partway has still rewritten objects, so "nothing happened" is
+		// the wrong thing for the audit trail to imply.
+		s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "error")
+		return nil, status.Errorf(codes.Internal, "re-key inventory: %v", failed)
+	}
+	slog.Info("netbox inventory re-keyed", "pins", len(pins), "index_rows", rows,
+		"vms_rewritten", counts.vms, "interfaces_rewritten", counts.interfaces,
+		"index_rows_rewritten", counts.refs, "fingerprint", newFP)
+	s.audit(ctx, "netbox.rekey", rekeyInventoryTarget, detail, "ok")
+	return &emptypb.Empty{}, nil
+}
+
+// inventoryPins reads the local index and returns the distinct fingerprints in
+// it that are NOT the live one, plus how many rows it holds at all.
+//
+// The row count is returned separately because "no stale fingerprints" and "no
+// index" are different states with different answers: the first is a converged
+// cluster, the second is one this command must refuse. A single empty slice
+// cannot tell them apart, and conflating them is precisely how a refusal turns
+// into a silent success.
+//
+// Sorted, so a multi-pin re-key rewrites in the same order every run and a
+// failure partway is reproducible rather than depending on map iteration.
+func (s *Server) inventoryPins(ctx context.Context, liveFP string) (pins []string, rows int, err error) {
+	seen := map[string]bool{}
+	for _, kind := range []string{rekeyRefKindVM, rekeyRefKindNIC} {
+		refs, err := corrosion.ListObjectRefs(ctx, s.db, kind)
+		if err != nil {
+			return nil, 0, fmt.Errorf("list %s index rows: %w", kind, err)
+		}
+		rows += len(refs)
+		for _, ref := range refs {
+			// splitIdentity, not parseIdentity: a VM row's key is
+			// Identity(fp, uuid, "") and carries an EMPTY mac, which
+			// parseIdentity refuses. Reading only NIC rows would still derive
+			// the right pin today, but a cluster whose VMs alone were stranded
+			// would silently get none.
+			cf, _, _, ok := splitIdentity(ref.LitevirtKey)
+			if !ok || cf == liveFP || seen[cf] {
+				continue
+			}
+			seen[cf] = true
+			pins = append(pins, cf)
+		}
+	}
+	sort.Strings(pins)
+	return pins, rows, nil
+}
 
 // rekeyInventory re-stamps this cluster's `virtual_machine` and `vminterface`
 // objects, which carry the same fingerprint every address does.

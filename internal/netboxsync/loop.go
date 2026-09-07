@@ -333,15 +333,6 @@ func (r *Reconciler) applyPhases(ctx context.Context, actions []Action, idx desi
 	return nil
 }
 
-// ensureCluster resolves the NetBox cluster every mirrored VM belongs to,
-// creating the cluster and its type on first use.
-//
-// Named after the operator's own cluster name, never after the fingerprint: the
-// fingerprint is derived from the CA certificate, so a CA replacement would
-// point the mirror at a NEW cluster object and orphan everything under the old
-// one. Two installations sharing a name therefore share a cluster object, which
-// is harmless — every object is still scoped by the identity fingerprint, and
-// that is what BuildActual and Diff filter on.
 // ClusterName is the NetBox cluster name this litevirt cluster mirrors under,
 // placeholder included.
 //
@@ -361,6 +352,15 @@ func ClusterName(ctx context.Context, db *corrosion.Client) (string, error) {
 	return name, nil
 }
 
+// ensureCluster resolves the NetBox cluster every mirrored VM belongs to,
+// creating the cluster and its type on first use.
+//
+// Named after the operator's own cluster name, never after the fingerprint: the
+// fingerprint is derived from the CA certificate, so a CA replacement would
+// point the mirror at a NEW cluster object and orphan everything under the old
+// one. Two installations sharing a name therefore share a cluster object, which
+// is harmless — every object is still scoped by the identity fingerprint, and
+// that is what BuildActual and Diff filter on.
 func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
 	typeID, err := r.nb.EnsureClusterType(ctx, clusterTypeName)
 	if err != nil {

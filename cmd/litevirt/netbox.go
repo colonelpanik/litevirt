@@ -24,32 +24,59 @@ func newNetboxCmd() *cobra.Command {
 
 func newNetboxRekeyCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "rekey <network>",
-		Short: "Rewrite a bound network's NetBox identities after a cluster CA replacement",
-		Long: `Rewrite the identities litevirt owns in a network's NetBox prefix.
+		Use:   "rekey [network]",
+		Short: "Rewrite NetBox identities after a cluster CA replacement",
+		Long: `Rewrite the identities litevirt owns in NetBox.
 
 Every NetBox object litevirt creates is stamped with a fingerprint derived from
 the cluster CA certificate, which is what keeps two clusters sharing one NetBox
-from reclaiming each other's addresses. Replacing the CA changes that
-fingerprint, so the binding suspends and new allocations refuse until the
-existing objects are re-stamped. Running VMs are unaffected throughout.
+from reclaiming each other's objects. Replacing the CA changes that fingerprint,
+so bindings suspend, new allocations refuse and the inventory mirror stops
+recognising what it wrote, until the existing objects are re-stamped. Running
+VMs are unaffected throughout.
 
-The command is safe to re-run: objects already rewritten are skipped, and the
+With a NETWORK, it re-stamps that network's addresses, the mirrored VM and
+interface objects, and litevirt's local identity index -- in that order -- and
+then resumes the binding.
+
+With NO network, it re-stamps the mirrored inventory and the local index only,
+cluster-wide. That is the form for a cluster that uses NetBox purely for
+inventory and has no bound network for the other form to name. It resumes
+nothing, so a cluster with bound networks still runs the per-network form for
+each of them afterwards.
+
+The command is safe to re-run: objects already rewritten are skipped, and a
 binding resumes only once every one of them has been rewritten.`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			network := ""
+			if len(args) == 1 {
+				network = args[0]
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				if _, err := c.RekeyBinding(ctx, &pb.RekeyBindingRequest{Network: args[0]}); err != nil {
+				if _, err := c.RekeyBinding(ctx, &pb.RekeyBindingRequest{Network: network}); err != nil {
 					// The server's message is the whole diagnosis: a re-key can
 					// rewrite every identity and still leave the binding
-					// suspended for a reason only the operator can repair.
-					return fmt.Errorf("rekey %s: %s", args[0], status.Convert(err).Message())
+					// suspended for a reason only the operator can repair, and
+					// the cluster-scoped form can refuse for want of anything
+					// recording the old fingerprint.
+					if network == "" {
+						return fmt.Errorf("rekey: %s", status.Convert(err).Message())
+					}
+					return fmt.Errorf("rekey %s: %s", network, status.Convert(err).Message())
+				}
+				if network == "" {
+					// No binding, so nothing to call live. Saying otherwise
+					// would imply a suspension had been lifted that this form
+					// never touches.
+					fmt.Println("Re-keyed the NetBox inventory identities litevirt owns.")
+					return nil
 				}
 				// Printed ONLY on success. The RPC also returns after rewriting
 				// every identity and leaving the binding suspended, and claiming
 				// "live again" there would send an operator away from a network
 				// that still refuses every create.
-				fmt.Printf("Re-keyed NetBox identities for network %q; the binding is live again.\n", args[0])
+				fmt.Printf("Re-keyed NetBox identities for network %q; the binding is live again.\n", network)
 				return nil
 			})
 		},

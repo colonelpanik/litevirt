@@ -400,7 +400,7 @@ func (s *Server) refuseIfBound(ctx context.Context, op string, networks []string
 		}
 		if alloc != nil {
 			return status.Errorf(codes.FailedPrecondition,
-				"%s is not supported onto the NetBox-bound network %q; create the VM with `lv vm create` instead",
+				"%s is not supported onto the NetBox-bound network %q; create the VM with `lv run` instead",
 				op, netName)
 		}
 	}

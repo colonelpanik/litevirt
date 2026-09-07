@@ -199,18 +199,33 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 	// on the happy path left the one failure an operator most needs a trail for
 	// (a deleted network whose prefix is still bound) as the one delete with no
 	// audit row at all. Emit both, then report the failure.
+	//
+	// And it is NOT retryable, which is the one thing these messages have to
+	// say. The soft delete above has already landed, so GetNetwork answers
+	// NotFound and re-running this command refuses before it reaches the release
+	// at all. What is left is a binding row naming a network that no longer
+	// exists, refusing every future bind of that prefix, and no command deletes
+	// one on its own — so the messages name the prefix and say the release has
+	// to be finished by hand rather than implying a second attempt would do it.
 	relErr := func() error {
 		b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.Name)
 		if err != nil {
 			return status.Errorf(codes.Internal,
-				"network %q deleted, but reading its NetBox binding failed: %v", req.Name, err)
+				"network %q was deleted, but reading its NetBox binding failed, so the binding "+
+					"may still hold a prefix: %v. Re-running the delete cannot finish this — the "+
+					"network record is already gone and the command will answer NotFound. Check "+
+					"for a binding naming %q and release it by hand", req.Name, err, req.Name)
 		}
 		if b == nil {
 			return nil
 		}
 		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
 			return status.Errorf(codes.Internal,
-				"network %q deleted, but releasing NetBox prefix %d failed: %v", req.Name, b.PrefixID, err)
+				"network %q was deleted, but releasing its NetBox prefix %d failed: %v. "+
+					"Re-running the delete cannot finish this — the network record is already "+
+					"gone and the command will answer NotFound. Prefix %d stays bound and will "+
+					"refuse every future bind until the binding is released by hand",
+				req.Name, b.PrefixID, err, b.PrefixID)
 		}
 		return nil
 	}()
@@ -367,11 +382,16 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 	// hand. Fail closed: report the leak rather than returning success.
 	b, err := corrosion.GetBindingByNetwork(ctx, s.db, name)
 	if err != nil {
-		return fmt.Errorf("network %q deleted, but reading its NetBox binding failed: %w", name, err)
+		return fmt.Errorf("network %q was deleted, but reading its NetBox binding failed, so the "+
+			"binding may still hold a prefix: %w. The network record is already gone, so a second "+
+			"deprovision cannot finish this — release any binding naming %q by hand", name, err, name)
 	}
 	if b != nil {
 		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
-			return fmt.Errorf("network %q deleted, but releasing NetBox prefix %d failed: %w", name, b.PrefixID, err)
+			return fmt.Errorf("network %q was deleted, but releasing its NetBox prefix %d failed: %w. "+
+				"The network record is already gone, so a second deprovision cannot finish this — "+
+				"prefix %d stays bound and will refuse every future bind until the binding is "+
+				"released by hand", name, b.PrefixID, err, b.PrefixID)
 		}
 	}
 	return nil

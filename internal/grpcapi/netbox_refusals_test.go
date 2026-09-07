@@ -60,7 +60,7 @@ func TestRefuseIfBoundRefusesEveryUnsafeShape(t *testing.T) {
 		if !strings.Contains(err.Error(), `"bound"`) {
 			t.Fatalf("the refusal must name the network, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), "lv vm create") {
+		if !strings.Contains(err.Error(), "lv run") {
 			t.Fatalf("the refusal must say what to do instead, got: %v", err)
 		}
 	})

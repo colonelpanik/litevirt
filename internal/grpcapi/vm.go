@@ -1881,8 +1881,18 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		//
 		// A failure is SURFACED, not just logged. It means either the lease is
 		// still live (so the external object must stay, and the operator has to
-		// know litevirt still holds the address) or ownership moved under us. The
-		// release is idempotent and runs before the tombstone, so a retry re-runs it.
+		// know litevirt still holds the address) or ownership moved under us.
+		//
+		// A retry is SAFE, but it does not re-run the same release, and the two
+		// failures differ in what it finishes. The release tombstones the local
+		// lease first and deletes the remote object second, so:
+		//   - LOCAL tombstone failed: nothing was freed, and the retry re-runs
+		//     the whole release from a live lease. This is the one a retry fixes.
+		//   - local tombstone landed and the REMOTE delete failed: the lease is
+		//     already gone, so the retry finds none, has no local proof of
+		//     ownership left to re-release with, and takes the no-lease branch —
+		//     it finishes the DELETE and hands the remote object to the orphan
+		//     sweep instead. The address is not released by the retry.
 		if err := s.releaseOneNICLease(ctx, vm, nic); err != nil {
 			slog.Error("release IP failed", "vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", err)
 			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: %v", nic.NetworkName, err))
@@ -1890,7 +1900,11 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 	if len(releaseErrs) > 0 {
 		return nil, status.Errorf(codes.Internal,
-			"delete %s: address release failed (retry is safe): %s",
+			"delete %s: address release failed, so the VM was NOT deleted: %s. "+
+				"Retrying the delete is safe and completes it; whether it also frees the "+
+				"address depends on which half failed — a failed local release is re-run, "+
+				"while an address already released locally is handed to the orphan sweep "+
+				"instead of being freed by the retry",
 			req.Name, strings.Join(releaseErrs, "; "))
 	}
 

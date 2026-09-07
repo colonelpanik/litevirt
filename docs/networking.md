@@ -456,18 +456,23 @@ object, so that rule would seize the other installation's inventory. An operator
 whose index is genuinely gone removes the stranded objects in NetBox by hand and
 lets the mirror rebuild them.
 
-**The same limitation applies to a single lost row**, and it is the one residual
-gap in the re-key. If an object was created in NetBox but the index row recording
-it never landed — a crash in the moment between the two — no re-key can find that
-object again, because a re-key only ever rewrites objects whose fingerprint
-appears in the local index. An ordinary sweep heals this on its own, since the
-mirror searches NetBox by identity before it creates anything; but a CA
-replacement leaves the object under the old fingerprint with nothing pointing at
-it, and after the re-key the mirror searches under the new one, finds nothing,
-and tries to create inventory NetBox already holds. The symptom is a sweep that
-fails on a name NetBox says is already taken.
+**A single lost index row normally heals itself.** If an object was created in
+NetBox but the row recording it never landed — a crash in the moment between the
+two — nothing is stranded for long: the mirror diffs against NetBox's ACTUAL
+state, not against the index, it searches by identity before creating anything,
+and an update re-records the mapping. The very next sweep re-adopts the object
+and writes the row again. No operator action, and no re-key.
 
-It fails closed by choice. Repairing it would mean rewriting an object the
+**It becomes a real gap only if that object is then orphaned by a CA
+replacement**, which is the one residual gap in the re-key. The searches are
+exact matches on the full identity, so once the fingerprint moves the mirror
+looks under the new one, finds nothing, and tries to create inventory NetBox
+already holds under the old — while the re-key cannot reach the object either,
+because it only rewrites fingerprints the local index records and this object's
+was never recorded. The symptom is a sweep that skips a VM, naming it as one
+whose name the NetBox cluster already holds under another identity.
+
+That case fails closed by choice. Repairing it would mean rewriting an object the
 cluster cannot prove is its own, which in a shared NetBox is another cluster's
 inventory. The repair is by hand: find the object in NetBox under the old
 fingerprint — its `litevirt_identity` custom field starts with it, and the

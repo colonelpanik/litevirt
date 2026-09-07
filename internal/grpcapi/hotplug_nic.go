@@ -809,13 +809,23 @@ func (s *Server) detachNICOwner(ctx context.Context, req *pb.DetachDeviceRequest
 // deferred to the next start. So the row goes first here too: the running order
 // minus the unplug. A release that then fails is a pure leak — the row is gone,
 // the lease and the NetBox object linger, and the VM starts without that NIC.
-// What the sweep can then do depends on WHERE the release failed: with the local
-// tombstone landed and only the remote delete failed, the NetBox object is
-// unreferenced and the sweep reclaims it; with the LOCAL tombstone failed the
-// lease is still LIVE, the sweep's live-lease veto keeps it — correctly, that
-// veto is what protects a running guest's address — and all it can do is surface
-// a stuck lease for an operator. Which is why the failure path NAMES the identity
-// for the sweep rather than assuming reclamation.
+// What the sweep can then do is LESS than either half of this looks, and neither
+// case ends in reclamation while the VM is alive:
+//   - LOCAL tombstone failed: the lease is still LIVE, and the sweep's live-lease
+//     veto keeps the address — correctly; that veto is what protects a running
+//     guest's address. All it can do is surface a stuck lease for an operator.
+//   - local tombstone landed, only the REMOTE delete failed: the lease is gone,
+//     so the sweep gets past the lease — and then stops on the absence proof
+//     instead. The identity is `lv:<fingerprint>:<vm-uuid>:<mac>`, the proof is
+//     "no host claims the uuid, the MAC or the address", and this VM STILL EXISTS:
+//     its uuid is in vms.spec and in its domain XML. So the reclamation is
+//     declined for as long as the VM lives, and only a counter and a warning say
+//     so. The address has to be removed in NetBox by hand.
+//
+// Which is why the failure path NAMES the identity for the sweep rather than
+// assuming reclamation: naming it is what makes the leak findable, not what fixes
+// it. (A detach whose VM is later DELETED does get reclaimed — the delete is what
+// retires the uuid the proof is stuck on.)
 func (s *Server) executeNICDetach(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, mac, opID string, epoch, newGen int64, running, latched bool) (*pb.VM, error) {
 	s.appendOpStep(ctx, opID, epoch, corrosion.OpDeviceDetach, corrosion.OpStepReserved)
 
@@ -982,8 +992,15 @@ func (s *Server) failNICDetachAfterUnplug(ctx context.Context, vm *corrosion.VMR
 // also NOT failNICDetachAfterUnplug: there the RETAINED row is what a retry finds
 // and re-releases from, and here that row is exactly what is gone — a retried
 // detach can only answer NotFound. So the identity goes to the orphan sweep,
-// which is the one mechanism that can still reclaim a lease and a NetBox object
+// which is the only mechanism left that could reclaim a lease and a NetBox object
 // nothing references.
+//
+// COULD, not will. The sweep's absence proof asks whether any host still claims
+// the identity's uuid, MAC or address, and the uuid in it is this VM's — which is
+// still here. So while the VM lives the reclamation is declined every pass, and
+// what queuing the identity buys is a counter and a named warning rather than a
+// silent leak. It becomes reclaimable when the VM is deleted. See the ordering
+// note on executeNICDetach.
 func (s *Server) failNICDetachAfterRowRemoval(ctx context.Context, vm *corrosion.VMRecord, nic corrosion.NICRecord, opID string, epoch, newGen int64, mac string, code codes.Code, cause error) (*pb.VM, error) {
 	slog.Error("nic detach: the NIC row is removed but its address could not be released — address retained and named for the orphan sweep",
 		"vm", vm.Name, "op", opID, "mac", mac, "error", cause)

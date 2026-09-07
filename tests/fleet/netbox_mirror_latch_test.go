@@ -18,6 +18,7 @@ package fleet
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/health"
@@ -139,6 +140,61 @@ func TestMirrorWritesNothingWithoutTheInventoryOptIn(t *testing.T) {
 	mustDeleteVM(t, n, "vm-1")
 	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 0 {
 		t.Fatalf("%d netbox_sync_queue row(s) written without a cluster-wide opt-in", got)
+	}
+}
+
+// TestPureIPAMStillReclaimsOrphans is the coherence claim the opt-in rests on,
+// verified rather than assumed.
+//
+// With mirroring off, NetBox holds `ip_address` objects carrying this cluster's
+// identity and nothing else — no `vminterface` for them to be assigned to. So
+// the question is whether the orphan sweeper can still prove one of them
+// unclaimed, because a reclamation that quietly stopped working would turn the
+// DEFAULT configuration into an address pool that fills up and never drains.
+//
+// It can, and the reason is structural: the proof is a per-host fan-out over
+// libvirt and local rows (OrphanProof.Holds — uuid, MAC, address), candidate
+// eligibility is litevirt's own `ip_allocations` row plus an age grace, and the
+// only place the sweeper reads AssignedObjectID at all is the pre-delete
+// time-of-check-to-time-of-use re-read, where it compares the value it recorded
+// against the value NetBox still reports. On a pure-IPAM cluster both are 0, so
+// that comparison is satisfied and nothing about the proof involves assignment.
+//
+// Asserted from a fixture where mirroring is off on EVERY node, so the mirror
+// token cannot latch and the inventory half is genuinely inert — checked, not
+// assumed, by the VM/interface counts below.
+func TestPureIPAMStillReclaimsOrphans(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF, true)
+
+	c := New(t, Options{Nodes: 2, NetBoxURL: nb.URL()})
+	for _, n := range c.Nodes {
+		n.Server.SetNetBoxMirrorInventory(false)
+	}
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+	mustCreateBoundNetwork(t, c, c.Nodes[0], orphanNetwork, orphanSubnet, orphanPrefixID)
+
+	// A leaked address with this cluster's identity, aged past the grace, and —
+	// this being the pure-IPAM shape — assigned to no interface at all.
+	nb.SeedIP(orphanCIDR, orphanVRF, orphanIdentity(t, c.Nodes[0]),
+		time.Now().UTC().Add(-orphanAge))
+
+	// The inventory half really is off: a pass writes nothing, so the sweep below
+	// cannot be leaning on anything the mirror did.
+	mustSyncAllNodes(t, c)
+	if got := nb.VMCountAll(); got != 0 {
+		t.Fatalf("precondition: mirroring is off, yet %d virtual_machine object(s) exist", got)
+	}
+	if got := nb.InterfaceCount(); got != 0 {
+		t.Fatalf("precondition: mirroring is off, yet %d vminterface object(s) exist", got)
+	}
+
+	mustSweep(t, c.Nodes[0])
+
+	if got := nb.Identities(); len(got) != 0 {
+		t.Fatalf("a pure-IPAM cluster must still reclaim a true orphan, still held: %v", got)
 	}
 }
 

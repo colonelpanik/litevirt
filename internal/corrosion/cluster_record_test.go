@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -173,6 +174,65 @@ func TestEnsureClusterRecordRefusesAnEmptyCA(t *testing.T) {
 	if n := len(clusterRows(t, c)); n != 0 {
 		t.Fatalf("cluster rows = %d, want 0 — a blank ca.crt is not a cluster identity", n)
 	}
+}
+
+// The heal must write NOTHING to mutation_log, and that is the whole of whether
+// it survives a mixed-version rolling upgrade.
+//
+// It fires unconditionally on every daemon start — no capability gate, nothing
+// to turn it off — and `cluster` had NO replicated statement shape at the
+// previous release, because nothing ever wrote that row. A replicated write
+// here therefore reaches a peer still running the previous binary as a
+// fingerprint its ledger cannot resolve; that peer fails the shape closed,
+// rolls back the WHOLE batch and stops advancing its watermark, which
+// head-of-line blocks every later statement on that stream (see
+// replicator.go's "unregistered replicated statement shape"). Pre-staging —
+// the RECOMMENDED rolling upgrade — equalises the schema first, so the
+// schema-skew refusal sees no gap and accepts the stream: the binary-resident
+// ledger is then the only cross-version gate, and this shape is not in the old
+// one.
+//
+// Local-only is not a weaker write. Every node derives the row from the SAME
+// shared CA on disk, so all N nodes converge on identical content by
+// construction, and `cluster` is in the anti-entropy table set — which carries
+// no ledger check at all — so a node that cannot derive it yet (no CA on disk)
+// still receives it from a peer.
+func TestEnsureClusterRecordEmitsNoReplicatedStatement(t *testing.T) {
+	ctx := context.Background()
+	c := schemaClient(t)
+
+	before := mutationLogCount(t, c)
+	if err := EnsureClusterRecord(ctx, c, pkiDirWithCA(t, testCAPEM)); err != nil {
+		t.Fatalf("EnsureClusterRecord: %v", err)
+	}
+	if n := len(clusterRows(t, c)); n != 1 {
+		t.Fatalf("cluster rows = %d, want 1 — precondition: the heal must write the row", n)
+	}
+	if after := mutationLogCount(t, c); after != before {
+		t.Fatalf("the startup heal logged %d replicated statement(s): the `cluster` shape would "+
+			"reach a previous-release peer whose ledger cannot resolve it, and that peer rolls "+
+			"the batch back and stalls its watermark. The row must be written LOCALLY — "+
+			"anti-entropy already replicates `cluster`, and every node derives the same value "+
+			"from the shared CA", after-before)
+	}
+	if sql := mutationLogSQL(t, c); strings.Contains(sql, "cluster") {
+		t.Fatalf("a replicated statement names the cluster table: %q", sql)
+	}
+}
+
+// mutationLogSQL is every replicated statement this client has logged,
+// concatenated, so an assertion can name the TABLE rather than only a count.
+func mutationLogSQL(t *testing.T, c *Client) string {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `SELECT stmts FROM mutation_log ORDER BY seq`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	var all []string
+	for _, r := range rows {
+		all = append(all, r.String("stmts"))
+	}
+	return strings.Join(all, "\n")
 }
 
 // The heal leans on the fixed row id to converge: every node writes id='default',

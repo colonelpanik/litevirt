@@ -515,7 +515,7 @@ schema change can't silently make the migration tool lie.
 
 ### CI guardrails
 
-Three checks run on every push and pull request (`.github/workflows/ci.yml`)
+These checks run on every push and pull request (`.github/workflows/ci.yml`)
 to keep the invariants above from rotting. Run them locally with
 `make ci-guards`.
 
@@ -540,6 +540,35 @@ to keep the invariants above from rotting. Run them locally with
    tree or appear as a string literal in the code. Intentional exceptions use
    a `ci:skip-cmd` / `ci:skip-metric` line marker or the `knownAbsentIdentifiers`
    allowlist (for documented-but-roadmap metrics).
+
+4. **Every replicated statement is one a peer can still apply.**
+   `scripts/ci/stmtshapecheck` statically enumerates every SQL statement our
+   builders send down the replicated path, fingerprints each with the same
+   primitive the runtime uses at apply time, and makes three separate
+   assertions about it:
+
+   - **registered** — the fingerprint is in the checked-in compatibility
+     ledger. An unregistered shape does not fail on the receiving peer, it
+     *back-pressures*: the apply fails closed, the batch rolls back and that
+     peer's replication watermark stops advancing, head-of-line blocking every
+     later statement on the stream.
+   - **emitted** — a builder nothing calls never reaches a peer at all, so a
+     registered shape with no caller is a feature that silently does nothing
+     (`reachable.go`).
+   - **gated, if it is a table's first-ever shape** (`newtables.go`). A table
+     that carried no accepted shape at the previous release, and carries one
+     now, is the shape a not-yet-upgraded peer cannot resolve *by
+     construction* — and the receiver on the old binary is the one that
+     stalls. The guard fails until the table is acknowledged in
+     `firstShapeAcks` with the mechanism that keeps the write off that peer's
+     stream: a capability latch that cannot form until the roll completes, or
+     a local-only write on a table anti-entropy already carries (anti-entropy
+     performs no ledger check, so a row that every node derives identically
+     converges without replicating a statement at all).
+
+   `scripts/ci/check-ledger-drift.sh` covers the opposite direction: a
+   fingerprint that *disappeared* from the ledgers while a supported peer can
+   still emit it.
 
 ## See also
 

@@ -1463,8 +1463,8 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 	})
 }
 
-// ensureClusterRecord derives the replicated `cluster` row from this node's CA
-// certificate when the cluster does not have one yet.
+// ensureClusterRecord derives the `cluster` row from this node's CA certificate
+// when the cluster does not have one yet.
 //
 // Nothing else ever wrote that row: `lv host init` mints the PKI, the daemon
 // applies the schema and registers a host, and no path anywhere inserted it. So
@@ -1472,6 +1472,13 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 // every NetBox identity litevirt mints, and the cluster name — found nothing on
 // a real installation, and the whole NetBox integration was inert outside tests
 // that seeded the row by hand.
+//
+// The WRITE is local-only, because this call is unconditional and reaches every
+// installation on the first start after an upgrade: a replicated first-ever
+// `cluster` statement shape would stall the replication stream of every peer
+// still on the previous build. The ROW is still replicated — anti-entropy
+// carries the table, and every node derives the same value from the shared CA.
+// See corrosion.EnsureClusterRecord.
 //
 // A failure is LOGGED, not fatal. This is a heal, not a precondition: a node
 // with no CA on disk yet, or a database that refused one read, must still boot —

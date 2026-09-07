@@ -81,6 +81,42 @@ const clusterRecordID = "default"
 // none: `ca_cert` is NOT NULL so the blank row satisfies every presence check
 // while fingerprintFromCert still refuses it, and this heal — being
 // presence-gated — would never replace it.
+//
+// THE WRITE IS LOCAL-ONLY (execLocal — no mutation_log row, nothing pushed to a
+// peer), and that is a rolling-upgrade requirement, not an optimisation.
+//
+// This heal runs on EVERY daemon start, unconditionally: no capability gate, no
+// config flag, before any NetBox feature exists. And `cluster` had no replicated
+// statement shape at all at the previous release — nothing ever wrote the row,
+// which is the entire reason this file exists. So a REPLICATED write here is a
+// first-ever fingerprint for that table, emitted by every node the moment it is
+// upgraded, into peers still running the previous binary. A peer's ledger lookup
+// misses, the apply fails closed ("unregistered replicated statement shape"),
+// the whole batch rolls back and its watermark stops advancing — head-of-line
+// blocking on the WAL stream into every not-yet-rolled node. It bites the
+// RECOMMENDED rollout specifically, because pre-staging equalises the schema
+// first, so the schema-skew refusal sees no gap and accepts the stream, leaving
+// the binary-resident ledger as the only cross-version gate.
+//
+// LOCAL-ONLY STILL CONVERGES, by construction rather than by replication:
+//
+//   - every node in a cluster shares ONE CA (`lv host init` mints it and pushes
+//     it), so every node's heal derives the SAME `ca_cert` — the only column
+//     anything downstream reads — under the same fixed `id`. There is no value
+//     for two nodes to disagree about;
+//   - `cluster` is in the anti-entropy table set (tableNames in sync.go), and
+//     anti-entropy performs NO ledger check, so the row is repaired onto a node
+//     that could not derive it — one that has not been enrolled yet, or whose
+//     `ca.crt` read failed — exactly as a replicated write would have been, and
+//     without a shape on the wire;
+//   - the write is presence-gated and conflict-guarded, so a row that arrives
+//     from a peer mid-heal wins and this node writes nothing.
+//
+// Gating it behind the NetBox capability latch instead would be circular: the
+// row is what every NetBox identity is minted FROM, so it must exist before any
+// NetBox feature can work, while the latch requires `netbox.enabled` on every
+// node before it forms. The heal would never run on a cluster that had not
+// already run it.
 func EnsureClusterRecord(ctx context.Context, c *Client, pkiDir string) error {
 	rows, err := c.Query(ctx, `SELECT id FROM cluster LIMIT 1`)
 	if err != nil {
@@ -105,12 +141,12 @@ func EnsureClusterRecord(ctx context.Context, c *Client, pkiDir string) error {
 	}
 
 	// DO NOTHING, not DO UPDATE: the presence check above is a read, and a peer's
-	// heal can replicate in between it and this write. The conflict clause is what
-	// makes losing that race a no-op instead of an overwrite — the same "never
-	// rewrite a row we did not create" rule the doc comment states, enforced at
-	// the statement rather than only at the branch.
+	// row can arrive through anti-entropy in between it and this write. The
+	// conflict clause is what makes losing that race a no-op instead of an
+	// overwrite — the same "never rewrite a row we did not create" rule the doc
+	// comment states, enforced at the statement rather than only at the branch.
 	now := c.NowTS()
-	return c.Execute(ctx,
+	return c.execLocal(ctx,
 		`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
 		 VALUES (?, '', '', ?, ?, ?)
 		 ON CONFLICT(id) DO NOTHING`,

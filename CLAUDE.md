@@ -66,8 +66,16 @@ Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
 - each has an `enforcement.*` config flag, default **false**
-- a node advertises the token only while its flag is on, so the cluster-wide
-  latch requires **config uniformity**, not just a uniform build
+- **advertising is not enforcing.** Most tokens are advertised on the strength
+  of the BUILD, whatever the local flag says, so the cluster can latch them —
+  the node's own flag then decides whether it acts. A latched token therefore
+  proves a uniform build, **not** config uniformity, and a cluster can have a
+  token fully latched while members silently do not enforce it.
+  `PingResponse.not_enforcing` is the only way to see that (diagnostic only —
+  see `lv doctor fence`); `advertisedCapabilities` is the authority on which
+  few tokens (operation_protocol_v1, isolation_epoch_v1, owner_epoch_v1 and
+  the others named there) are withheld while their flag is off, and those ARE
+  the config-uniformity cases
 - the latch is monotone and durable: once formed it survives a restart and does
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing

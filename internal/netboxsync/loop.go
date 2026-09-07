@@ -387,11 +387,18 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 		converged = false
 	}
 	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
-		kept, withheld := withoutDeletes(actions)
+		kept, withheld := withoutDestructive(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
-			"reason", why, "withheld_deletes", withheld,
+			"reason", why, "withheld_actions", withheld,
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
+		actions, converged = kept, false
+	} else if kept, withheld := r.withoutUnprovenDeletes(ctx, actions, actual); withheld > 0 {
+		// The whole-pass gate above answers "is this read whole?", which a
+		// PARTIALLY hydrated database passes: some of the cluster's rows are
+		// here, so the read is neither empty nor short of a record it tried to
+		// parse. The per-object rule below is what covers that — see
+		// withoutUnprovenDeletes.
 		actions, converged = kept, false
 	}
 
@@ -454,17 +461,152 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 	return ""
 }
 
-// withoutDeletes returns the actions that are not deletes, and how many it
-// dropped.
+// withoutUnprovenDeletes drops the deletes this pass cannot PROVE, and reports
+// how many it dropped.
 //
-// It filters the ACTION LIST rather than skipping the delete PHASES: a phase is
-// a scheduling boundary, and one skipped by a flag is one a later ordering
-// change can quietly reintroduce. An action that does not exist cannot run,
-// whatever the phase runner does with it.
-func withoutDeletes(actions []Action) ([]Action, int) {
+// deleteBlocker asks whether the desired read is WHOLE, and a partially
+// hydrated database answers yes to every question it poses: the table is not
+// empty, so the empty-read corroboration never runs, and nothing was skipped,
+// so the partial-read counter is zero. A node holding one of the cluster's VMs
+// therefore diffs the other N-1 to "litevirt no longer holds these" and retires
+// them from NetBox — the operator's source of truth — and the same applies one
+// level down, where a `vms` row that replicated ahead of its `vm_interfaces`
+// rows leaves a mirrored VM with every interface deleted out from under it.
+//
+// Nothing else stands in the way, either. Such a node reclaims the shared
+// `netbox` lease immediately, derives a fingerprint from the locally-healed
+// cluster record, and re-latches the capability within seconds of starting; the
+// only remaining brake is the first sweep tick, which is a delay and not a
+// proof.
+//
+// So the rule the empty read already obeys is applied PER OBJECT: a delete needs
+// positive local evidence that the thing it removes is genuinely gone, and the
+// evidence is the record the local database holds for it — live or TOMBSTONED.
+// litevirt soft-deletes, so a destroyed workload leaves one; a row that has not
+// replicated leaves nothing. See corrosion.MirrorEvidence.
+//
+// This is deliberately NOT a replication-freshness gate, which is what it might
+// look like it should be. There is no local signal in this tree that proves a
+// node's replicated view is caught up: `mutation_log` and every
+// `replication_watermarks`-derived gauge measure what THIS node owes its PEERS,
+// so the rebuilt node that has written nothing and holds nothing reads as
+// maximally healthy by all of them — the gate would be green on precisely the
+// node it exists to stop. Per-object evidence needs no such signal, and it
+// degrades the right way: it withholds exactly the deletes it cannot support and
+// lets every other one through, so a bulk teardown whose tombstones have all
+// arrived still converges in one pass.
+//
+// A partial pass is NOT an error. It reports unconverged — the caller withholds
+// the success stamp — and the next sweep re-derives everything from scratch.
+func (r *Reconciler) withoutUnprovenDeletes(ctx context.Context, actions []Action, actual Actual) ([]Action, int) {
+	if !hasDeletes(actions) {
+		// The evidence read costs three table scans, so a pass with nothing to
+		// prove does not pay for them.
+		return actions, 0
+	}
+	known, err := corrosion.ReadMirrorEvidence(ctx, r.db)
+	if err != nil {
+		// A read that FAILED is no evidence at all, so nothing is proven and
+		// every delete goes. Same direction as deleteBlocker's own failed read.
+		kept, withheld := withoutDestructive(actions)
+		slog.Warn("netbox mirror: withholding this sweep's deletes — the local record history "+
+			"could not be read, so no delete can be proven",
+			"error", err, "withheld_actions", withheld)
+		return kept, withheld
+	}
+
+	// The owning VM's NAME, by NetBox object id: a nic delete carries its
+	// parent's id (read from actual state) and the evidence is keyed on the
+	// litevirt name.
+	nameByID := make(map[int]string, len(actual.VMs))
+	for _, v := range actual.VMs {
+		nameByID[v.ID] = v.Name
+	}
+
 	kept := make([]Action, 0, len(actions))
+	var unprovenVMs, unprovenNICs []string
+	for _, a := range actions {
+		if a.Op != "delete" || provenGone(a, actual, nameByID, known) {
+			kept = append(kept, a)
+			continue
+		}
+		switch a.Kind {
+		case "vm":
+			unprovenVMs = append(unprovenVMs, actual.VMs[a.Key].Name)
+		default:
+			unprovenNICs = append(unprovenNICs, actual.NICs[a.Key].MAC)
+		}
+	}
+	withheld := len(unprovenVMs) + len(unprovenNICs)
+	if withheld > 0 {
+		// Sorted, so a condition that lasts several sweeps logs the same list
+		// each time instead of reshuffling it.
+		sort.Strings(unprovenVMs)
+		sort.Strings(unprovenNICs)
+		slog.Warn("netbox mirror: withholding deletes for NetBox objects this node holds no "+
+			"record of, tombstone included — the local database has not replicated them, or "+
+			"they belong to a workload it has never seen; the next sweep re-evaluates",
+			"vms", unprovenVMs, "interface_macs", unprovenNICs,
+			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs),
+			"withheld_deletes", withheld)
+	}
+	return kept, withheld
+}
+
+// provenGone reports whether the local database holds a record — live or
+// tombstoned — of the object this delete would remove.
+//
+// A Kind it does not recognise is NOT proven. There are two of them today, and a
+// third added without a matching evidence question must fail closed rather than
+// inherit a permissive default.
+func provenGone(a Action, actual Actual, nameByID map[int]string, known corrosion.MirrorEvidence) bool {
+	switch a.Kind {
+	case "vm":
+		return known.KnowsVM(actual.VMs[a.Key].Name)
+	case "nic":
+		n := actual.NICs[a.Key]
+		return known.KnowsNIC(nameByID[n.VMID], n.MAC)
+	default:
+		return false
+	}
+}
+
+// hasDeletes reports whether the list holds any delete at all.
+func hasDeletes(actions []Action) bool {
 	for _, a := range actions {
 		if a.Op == "delete" {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutDestructive returns the actions that TAKE nothing away, and how many
+// it dropped.
+//
+// Both destructive ops go, not just the delete. A `clear` is bounded — it
+// unassigns an address rather than destroying it, and the next healthy sweep
+// re-assigns — but it is still the mirror removing something on evidence it has
+// just admitted is partial, and the shape that reaches it is common: an
+// unhydrated `ip_allocations` resolves EVERY NIC to address 0, which reads as
+// "this NIC holds no address" and routes every litevirt-owned address in the
+// cluster into the clear branch. Withholding the delete while letting that
+// through would detach the whole fleet's addressing on the pass that proved it
+// could not be trusted to.
+//
+// Creates, updates and assigns are kept deliberately. They are additive, so the
+// worst a partial read costs there is an object or an assignment that a later
+// pass reconciles — leak over collision, the same direction every other
+// fail-closed decision in this package takes.
+//
+// It filters the ACTION LIST rather than skipping the destructive PHASES: a
+// phase is a scheduling boundary, and one skipped by a flag is one a later
+// ordering change can quietly reintroduce. An action that does not exist cannot
+// run, whatever the phase runner does with it.
+func withoutDestructive(actions []Action) ([]Action, int) {
+	kept := make([]Action, 0, len(actions))
+	for _, a := range actions {
+		if a.Op == "delete" || a.Op == "clear" {
 			continue
 		}
 		kept = append(kept, a)
@@ -638,10 +780,7 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list NetBox leases: %w", err)
 	}
-	byLease := make(map[string]int, len(leases))
-	for _, l := range leases {
-		byLease[leaseKey(l.Network, l.MAC)] = l.NetBoxIPID
-	}
+	byLease, ambiguous := indexLeases(leases)
 
 	// One device lookup per HOST, not per VM: a sweep over a large cluster
 	// otherwise issues one NetBox request per VM to resolve the same handful of
@@ -649,7 +788,10 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 	devices := map[string]int{}
 
 	out := make([]DesiredVM, 0, len(vms))
-	skipped := 0
+	// An ambiguous lease key is a partial read exactly as an unreadable spec is:
+	// it leaves the mirror unable to say which address a NIC holds. It is
+	// counted here so ONE rule covers both — see deleteBlocker.
+	skipped := ambiguous
 	for _, v := range vms {
 		if v.IsTemplate {
 			// A template is a disk image, never a running machine. Mirroring one
@@ -779,6 +921,73 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 	return name
 }
 
+// indexLeases builds the (network, MAC) -> NetBox address id index the desired
+// side resolves each NIC's address through, and reports how many lease rows it
+// could NOT place.
+//
+// A duplicate key is the whole reason this is a function rather than a two-line
+// loop. `leaseKey` is not a uniqueness constraint anywhere in litevirt: the
+// `ip_allocations` primary key is (network, ip), and the only MAC-collision
+// check on the attach path is per-VM — so two VMs given the same MAC on one
+// bound network leave two LIVE leases under one key, each naming a different
+// address object. ListNetBoxLeases has no ORDER BY, so which of them a plain
+// `m[k] = v` loop would keep is not even stable between sweeps.
+//
+// Whichever it kept, the other NIC would resolve to it: the mirror would attach
+// one workload's address to the other's interface and detach it from the one
+// that holds the lease, while both `ip_allocations` rows stayed live so the
+// orphan sweeper could never see the stranding.
+//
+// So the group is DROPPED, not resolved. There is no winner to pick — the two
+// rows are equally real, and picking either one drives a write on ownership the
+// mirror cannot establish. Dropping it leaves both NICs resolving to address 0,
+// which is "this NIC holds no NetBox address": no assign is computed for either,
+// and the count returned here withholds the destructive half of the pass (see
+// deleteBlocker), so the address the mirror could not resolve is not detached
+// either. The duplicate is left for an operator, named in the log.
+func indexLeases(leases []corrosion.LeaseRecord) (map[string]int, int) {
+	grouped := make(map[string][]corrosion.LeaseRecord, len(leases))
+	for _, l := range leases {
+		k := leaseKey(l.Network, l.MAC)
+		grouped[k] = append(grouped[k], l)
+	}
+	out := make(map[string]int, len(grouped))
+	var ambiguousKeys []string
+	dropped := 0
+	for k, group := range grouped {
+		if len(group) == 1 {
+			out[k] = group[0].NetBoxIPID
+			continue
+		}
+		ambiguousKeys = append(ambiguousKeys, k)
+		// Every row in the group is a record this read could not use, not just
+		// the ones after the first: with no way to tell which NIC owns which
+		// address, none of them resolves.
+		dropped += len(group)
+	}
+	// Sorted, so a cluster carrying more than one duplicate logs them in the
+	// same order every sweep instead of reshuffling an operator's log.
+	sort.Strings(ambiguousKeys)
+	for _, k := range ambiguousKeys {
+		group := grouped[k]
+		ips := make([]string, 0, len(group))
+		addrs := make([]int, 0, len(group))
+		for _, l := range group {
+			ips = append(ips, l.IP)
+			addrs = append(addrs, l.NetBoxIPID)
+		}
+		sort.Strings(ips)
+		sort.Ints(addrs)
+		slog.Warn("netbox mirror: two or more live leases claim one MAC on one network, so "+
+			"neither NIC's NetBox address can be resolved; this pass assigns none of them, "+
+			"detaches none of them and withholds its deletes — give each NIC a unique MAC "+
+			"on this network, or release the lease that should not exist",
+			"network", group[0].Network, "mac", group[0].MAC,
+			"leased_ips", ips, "netbox_address_ids", addrs)
+	}
+	return out, dropped
+}
+
 // leaseKey keys a lease by (network, MAC) — not by (network, ip), which is the
 // row's primary key.
 //
@@ -791,10 +1000,13 @@ func nicName(n corrosion.NICRecord, used map[string]bool) string {
 // address", which routes a correct, live assignment into the clear branch and
 // detaches it.
 //
-// The MAC is unique within a network by construction and is the same component
-// the identity carries, so it cannot drift out from under the join. Lower-cased
-// at both ends because NetBox echoes MACs upper-cased and litevirt records them
-// either way.
+// The MAC is the same component the identity carries, so it cannot drift out
+// from under the join the way the recorded IP can. It is NOT unique, though —
+// nothing in litevirt enforces one MAC per network, and this key is therefore
+// not a primary key masquerading under another name. indexLeases is what makes
+// that safe: a key claimed twice resolves to nothing at all. Lower-cased at both
+// ends because NetBox echoes MACs upper-cased and litevirt records them either
+// way.
 func leaseKey(network, mac string) string { return network + "\x00" + strings.ToLower(mac) }
 
 // netboxStatus maps a litevirt VM state onto NetBox's status choice.

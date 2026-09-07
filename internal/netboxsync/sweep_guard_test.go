@@ -165,10 +165,23 @@ func TestSweepDeletesNothingWhenANICWasSkipped(t *testing.T) {
 // VMs the cluster destroyed is exactly what the delete half exists to prevent.
 func TestSweepStillDeletesOnWholeEvidence(t *testing.T) {
 	nb, r, _ := guardReconciler(t)
-	// litevirt holds a DIFFERENT VM, read completely. The mirrored one is gone.
+	ctx := context.Background()
+	// litevirt holds a DIFFERENT VM, read completely…
 	seedVMRow(t, r, "vm-2", `{"uuid":"uuid-2","cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+	// …and the mirrored one is gone, THROUGH THE PRODUCTION DELETE. A destroyed
+	// VM leaves a tombstone behind and `vms.go`'s only hard delete fires solely
+	// on a same-name re-create (which leaves a live row under that name), so a
+	// mirrored VM with neither a live row nor a tombstone is not a state the
+	// cluster can produce — it is what a database that has not finished
+	// replicating looks like, and the per-object evidence rule withholds it.
+	// Modelling the delete as "the row simply is not there" asserted convergence
+	// on that shape.
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-1","cpu":2,"memory_mib":1024}`, macGuard)
+	if err := corrosion.DeleteVM(ctx, r.db, "vm-1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
 
-	if err := r.SyncOnce(context.Background()); err != nil {
+	if err := r.SyncOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,7 +251,13 @@ func TestSuppressedSweepRecordsNoSuccess(t *testing.T) {
 
 	// The positive control: the same fixture with whole evidence must advance
 	// it, or the assertions above are satisfied by a sink nothing ever calls.
+	// The mirrored VM is retired through the production delete, so the pass has
+	// a record for every NetBox object it accounts for.
 	seedVMRow(t, r, "vm-2", `{"uuid":"uuid-2","cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-1","cpu":2,"memory_mib":1024}`, macGuard)
+	if err := corrosion.DeleteVM(ctx, r.db, "vm-1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
 	if err := r.SyncOnce(ctx); err != nil {
 		t.Fatal(err)
 	}

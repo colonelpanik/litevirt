@@ -324,6 +324,17 @@ netbox:
                             # name here or same-named VMs collide. Set it before
                             # the first sweep — changing it later strands
                             # everything written under the previous cluster.
+                            # MUST BE UNIFORM CLUSTER-WIDE: identical on every
+                            # node, or unset on every node. Unlike the
+                            # enforcement.* flags there is no latch mediating
+                            # this one, and the sweep runs on whichever node
+                            # holds the `netbox` leader lease — so a value set
+                            # on only some nodes duplicates the whole inventory
+                            # into a second virtualization.cluster at the first
+                            # leadership handover, and no sweep can then see the
+                            # objects written under the other name. Nothing
+                            # detects it; the mirror logs the name it resolved
+                            # at startup, so compare that line across nodes.
   timeout_sec: 10           # per-request timeout.
   sweep_interval_sec: 900   # how often each configured node runs one maintenance
                             # pass: re-validate every binding, then reclaim

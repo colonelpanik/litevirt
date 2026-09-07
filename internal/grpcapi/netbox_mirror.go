@@ -121,6 +121,24 @@ func (s *Server) StartNetBoxMirror(ctx context.Context, interval time.Duration) 
 	if s.netbox == nil || s.db == nil {
 		return false
 	}
+	// The NetBox cluster this node would mirror into, named ONCE at startup.
+	//
+	// `netbox.cluster_name` has to be uniform cluster-wide and has no latch to
+	// make it so: the sweep runs on whichever node holds the `netbox` lease, so
+	// a value set on some nodes only duplicates the whole inventory into a
+	// second `virtualization.cluster` at the first handover. A node cannot read
+	// a peer's configured value, so this line is what makes a disagreement
+	// findable — one comparison across the fleet's logs. Logged at start rather
+	// than per sweep because it cannot change while the process runs, and a
+	// per-sweep line would be noise on every node every interval.
+	//
+	// Best-effort: a name that cannot be resolved yet (the `cluster` row has not
+	// healed) is not a reason to leave the mirror unstarted — the sweep resolves
+	// it again, and fails there if it still cannot.
+	if name, err := netboxsync.ClusterName(ctx, s.db, s.netboxClusterName); err == nil {
+		slog.Info("netbox mirror: starting", "netbox_cluster", name,
+			"from_config", s.netboxClusterName != "", "sweep_interval", interval)
+	}
 	go s.netboxMirror(interval).Run(ctx)
 	return true
 }

@@ -223,11 +223,22 @@ type NetBoxConfig struct {
 	// a distinct name here gives each installation a namespace of its own.
 	//
 	// Deliberately operator-chosen and NOT derived from the cluster
-	// fingerprint: the fingerprint changes when the CA is replaced, and a
-	// fingerprint-derived name would point the mirror at a fresh cluster object
-	// on the next sweep, duplicating the whole inventory and leaving `lv netbox
-	// rekey` — which resolves the cluster by this same name — with nothing to
-	// repair.
+	// fingerprint: a fingerprint-derived name would move whenever the
+	// fingerprint did, pointing the mirror at a fresh cluster object on the next
+	// sweep, duplicating the whole inventory and leaving `lv netbox rekey` —
+	// which resolves the cluster by this same name — with nothing to repair.
+	//
+	// It MUST be set identically on every node, or left unset on every node.
+	// Unlike the `enforcement.*` flags this one has NO latch to mediate
+	// uniformity: it names the NetBox cluster a sweep writes into, and the sweep
+	// runs on whichever node holds the `netbox` leader lease. Set it on some
+	// nodes only and the first leadership handover mirrors the entire inventory
+	// a second time, into a second `virtualization.cluster`, under the same
+	// identities — and the old objects are then invisible to every sweep that
+	// resolves the other name, so nothing reaps them. Nothing detects this: a
+	// node has no way to read a peer's configured value, so the requirement is
+	// the operator's to hold. The mirror logs the name it resolved at startup so
+	// a disagreement is one comparison across the fleet's logs.
 	ClusterName      string `yaml:"cluster_name,omitempty"`
 	TimeoutSec       int    `yaml:"timeout_sec"`
 	SweepIntervalSec int    `yaml:"sweep_interval_sec"`

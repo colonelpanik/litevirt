@@ -730,25 +730,38 @@ func NewClusterWithNetBoxNamed(t *testing.T, nodes int, nb *NetBoxFake, namePref
 // config.netbox: a real *netbox.Client built from a token FILE (the production
 // constructor, not a hand-assembled struct) and the advertise kill-switch.
 //
-// It also seeds the `cluster` row every node needs to derive a cluster
-// fingerprint. Binding pins that fingerprint onto the binding row, so without
-// it every bind in the fleet fails with "cluster row not found" — a harness
-// gap, not a behaviour under test. Every node gets the SAME ca_cert (the
-// fleet's one CA), so every node derives the SAME fingerprint, which is the
-// property a real cluster has.
+// It also brings up the `cluster` row every node needs to derive a cluster
+// fingerprint — through the PRODUCTION heal, corrosion.EnsureClusterRecord,
+// reading this node's own pki/ca.crt exactly as the daemon does at startup.
+//
+// Deliberately not a hand-written INSERT any more. It used to be, and that hid a
+// blocker for the whole feature: nothing in production ever wrote the row, so on
+// a real cluster no fingerprint could be derived and every bind, claim, mirror
+// pass and re-key refused — while the fleet stayed green because this harness
+// created what the daemon never did. Driving the daemon's own heal means a heal
+// that stops working takes the NetBox fleet suite down with it.
+//
+// Every node's pki/ca.crt is a copy of the one fleet CA, so every node derives
+// the SAME fingerprint, which is the property a real cluster has.
+//
+// The NAME is the one thing still set by hand. The heal deliberately leaves it
+// empty (nothing in litevirt takes a cluster name), and scenarios that assert
+// which NetBox cluster object the mirror wrote into need a stable one.
 func (c *Cluster) wireNetBox(n *Node) {
 	c.t.Helper()
 
-	caPEM, err := os.ReadFile(c.caCert)
-	if err != nil {
-		c.t.Fatalf("read fleet CA for %s: %v", n.Name, err)
+	if err := corrosion.EnsureClusterRecord(context.Background(), n.DB, n.PKIDir); err != nil {
+		c.t.Fatalf("derive cluster record for %s: %v", n.Name, err)
 	}
-	if err := n.DB.Execute(context.Background(),
-		`INSERT INTO cluster (id, name, domain, ca_cert, created_at, updated_at)
-		 VALUES ('default', 'fleet', 'fleet.local', ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET ca_cert = excluded.ca_cert, updated_at = excluded.updated_at`,
-		string(caPEM), n.DB.NowWall(), n.DB.NowWall()); err != nil {
-		c.t.Fatalf("seed cluster row for %s: %v", n.Name, err)
+	rows, err := n.DB.ExecuteRows(context.Background(),
+		`UPDATE cluster SET name = ?, domain = ?, updated_at = ? WHERE id = 'default'`,
+		"fleet", "fleet.local", n.DB.NowTS())
+	if err != nil {
+		c.t.Fatalf("name the cluster row for %s: %v", n.Name, err)
+	}
+	if rows == 0 {
+		c.t.Fatalf("no cluster row for %s after the startup heal — the daemon's "+
+			"EnsureClusterRecord wrote nothing, so no NetBox identity can be minted", n.Name)
 	}
 
 	tokenDir := filepath.Join(c.tmpRoot, n.Name, "netbox")

@@ -296,6 +296,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("init schema: %w", err)
 	}
 
+	// Derive the cluster record from this node's CA if the cluster has none.
+	// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why
+	// it is derived rather than minted, and why it never rewrites a row.
+	d.ensureClusterRecord(ctx)
+
 	// Migrate legacy unscoped network names to stack-scoped names.
 	if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
 		slog.Warn("failed to migrate legacy network names", "error", err)
@@ -1468,6 +1473,27 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 //
 // Only on a real change, so an unchanged address cannot restamp updated_at on
 // every restart and win LWW against a genuine concurrent write from another node.
+// ensureClusterRecord derives the replicated `cluster` row from this node's CA
+// certificate when the cluster does not have one yet.
+//
+// Nothing else ever wrote that row: `lv host init` mints the PKI, the daemon
+// applies the schema and registers a host, and no path anywhere inserted it. So
+// every reader of it — the cluster fingerprint that is the first component of
+// every NetBox identity litevirt mints, and the cluster name — found nothing on
+// a real installation, and the whole NetBox integration was inert outside tests
+// that seeded the row by hand.
+//
+// A failure is LOGGED, not fatal. This is a heal, not a precondition: a node
+// with no CA on disk yet, or a database that refused one read, must still boot —
+// the paths that need the row already refuse fail-closed without it, and the
+// next start heals again.
+func (d *Daemon) ensureClusterRecord(ctx context.Context) {
+	if err := corrosion.EnsureClusterRecord(ctx, d.db, d.cfg.PKIDir); err != nil {
+		slog.Warn("could not derive the cluster record from this node's CA; "+
+			"NetBox identities cannot be minted until it exists", "error", err)
+	}
+}
+
 func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 	want := d.hostAddress()
 	h, err := corrosion.GetHost(ctx, d.db, d.cfg.HostName)

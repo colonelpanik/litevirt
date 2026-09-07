@@ -427,12 +427,37 @@ func GetDeletedVM(ctx context.Context, c *Client, name string) (*VMRecord, error
 // The MIRROR'S CORRECTNESS THEREFORE DEPENDS ON `vms` TOMBSTONES SURVIVING.
 // Retiring the last VM in a cluster is told apart from a database that has not
 // hydrated by nothing else, and the same evidence keyed per name
-// (ReadMirrorEvidence) is what authorizes every individual delete. deleteVM's
-// same-name-re-create cleanup is the only thing in the tree that removes a `vms`
-// tombstone, and that case is safe because it leaves a live row under the same
-// name. A general tombstone GC would not be: it would take the evidence away
-// while leaving the NetBox objects behind, and the mirror would stop being able
-// to distinguish "unhydrated" from "deleted" at all.
+// (ReadMirrorEvidence) is what authorizes every individual delete.
+//
+// THREE THINGS IN THE TREE TAKE A `vms` ROW AWAY FROM A NAME, and each one is
+// safe only because the consumer fails CLOSED on missing evidence — withholding
+// the removal, never performing it:
+//
+//   - the same-name re-create cleanup in InsertVMWithHardware (the
+//     `full-state-delete-ok` DELETEs above the INSERT) drops the tombstone, but
+//     leaves a LIVE row under the same name in the same batch, so the name never
+//     stops being accounted for.
+//   - DiscardReplicatedStateForReseed TRUNCATES `vms` outright, tombstones
+//     included — `vms` is in tableNames and not in reseedKeepTables. Reseed is
+//     self-consistent because the state dump merged straight afterwards carries
+//     tombstones too (dumpTable is `SELECT *`, with no deleted_at predicate),
+//     and the window in between is exactly what this function reports as "no
+//     records".
+//   - RenameVM is an `UPDATE vms SET name = ?`, so after it NO row of any kind
+//     exists at the old name. The mirror is identity-keyed rather than
+//     name-keyed, so a rename keeps the same NetBox object and computes no
+//     delete; if one is ever computed against the old name it is withheld.
+//
+// Only the first is visible to the hard-delete tripwire, which regexes
+// `DELETE FROM <literal table>` (hard_delete_guard_test.go): the reseed names
+// its table through a variable, so the pattern finds no table there, and an
+// UPDATE is not a DELETE at all. The tripwire is not where this invariant is
+// enforced — the fail-closed consumer is.
+//
+// A general tombstone GC would NOT join that list: it would take the evidence
+// away while leaving the NetBox objects behind, with no live row and no merge
+// behind it, and the mirror would stop being able to distinguish "unhydrated"
+// from "deleted" at all.
 func HasVMRecords(ctx context.Context, c *Client) (bool, error) {
 	rows, err := c.Query(ctx, `SELECT name FROM vms LIMIT 1`)
 	if err != nil {

@@ -42,13 +42,21 @@ type MirrorEvidence struct {
 // this name.
 //
 // Keyed on the NAME rather than the spec's incarnation uuid, and that is the
-// stronger choice. `DeleteVM` removes a VM's tombstones when a VM of the SAME
-// NAME is created again (see the cleanup statements on the create path), so a
-// uuid-keyed lookup would lose its evidence on every re-create and leave the old
-// incarnation's NetBox object un-reapable forever. The name survives that: a
-// name the local database holds a row for is a name the cluster has accounted
-// for, whichever incarnation currently owns it — and the old incarnation's object
-// is genuinely obsolete either way.
+// stronger choice. The create path drops a VM's tombstones when a VM of the SAME
+// NAME is created again (the `full-state-delete-ok` statements in
+// InsertVMWithHardware), so a uuid-keyed lookup would lose its evidence on every
+// re-create and leave the old incarnation's NetBox object un-reapable forever.
+// The name survives that: a name the local database holds a row for is a name
+// the cluster has accounted for, whichever incarnation currently owns it — and
+// the old incarnation's object is genuinely obsolete either way.
+//
+// WHAT ACTUALLY TAKES A ROW AWAY FROM A NAME is three paths, not one — the
+// create-path cleanup above, DiscardReplicatedStateForReseed's outright
+// truncation of `vms`/`vm_interfaces`/`vm_nics`, and RenameVM, which UPDATEs
+// `vm_name` and so leaves nothing at the old name. See HasVMRecords for why each
+// is safe. The common property, and the only one this type relies on, is that
+// absent evidence means the caller WITHHOLDS its removal: a path that takes
+// evidence away can cost a withheld delete, never an unproven one.
 //
 // An empty name is never evidence.
 func (e MirrorEvidence) KnowsVM(name string) bool {

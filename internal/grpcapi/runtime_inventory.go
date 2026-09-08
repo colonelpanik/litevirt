@@ -54,13 +54,32 @@ type runtimeWorkload struct {
 
 // runtimeInventory is one host's full local runtime view.
 type runtimeInventory struct {
-	Host           string
-	Workloads      []runtimeWorkload
-	KernelVIPs     []string
+	Host       string
+	Workloads  []runtimeWorkload
+	KernelVIPs []string
+	// UnresolvedTies is the FLEET-WIDE count across every replicated table. It
+	// reports "something is divergent on this node" — the state digest and the
+	// dual-run cross-node finding both want it that broad.
 	UnresolvedTies int
-	Complete       bool
-	Errors         []string
-	SampledAt      string
+	// OwnershipTies counts unresolved ties on the ownership tables ONLY. A
+	// readiness predicate answers a narrower question than the digest does —
+	// "could a tie be hiding the ownership row I am about to certify?" — and only
+	// these tables can. See ownershipTieTables.
+	OwnershipTies int
+	Complete      bool
+	Errors        []string
+	SampledAt     string
+}
+
+// ownershipTieTables are the tables whose rows carry a workload's owner epoch,
+// which makes them the only rows OwnerEpochReadiness reads and therefore the
+// only ones a tie can hide from it.
+//
+// Adding a table here widens a fail-closed predicate. Adding an owner_epoch
+// column to a table WITHOUT adding it here silently narrows one.
+var ownershipTieTables = map[string]bool{
+	"vms":        true, // vms.vm_owner_epoch
+	"containers": true, // containers.owner_epoch
 }
 
 // find returns the inventory entry for (kind, name), if present.
@@ -205,6 +224,11 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 
 	if s.db != nil {
 		inv.UnresolvedTies = s.db.UnresolvedTieCount()
+		for table, n := range s.db.UnresolvedTieTables() {
+			if ownershipTieTables[table] {
+				inv.OwnershipTies += n
+			}
+		}
 	}
 	return inv
 }

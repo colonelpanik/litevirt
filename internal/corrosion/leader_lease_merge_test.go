@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -94,67 +95,109 @@ func gossipLeaseTerms(t *testing.T, a, b *Client) {
 	}
 }
 
-// TestLeaseTermMerge_ConcurrentClaimantsConverge is the case the table exists
-// for: two partitioned nodes each compute MAX(term)+1 = 1 and each name
-// themselves holder.
+// TestLeaseTermMerge_ContestedTermIsFlaggedNotConverged is the case the table
+// exists for, and its assertion is the opposite of what an earlier revision
+// claimed.
 //
-// Both rows are legitimate. What must not happen is the two nodes ending up
-// believing different things about who held term 1, because the executor's
-// (term, holder) check would then refuse the loser on one node and accept it on
-// another — which is not fencing, it is a coin flip per node.
-func TestLeaseTermMerge_ConcurrentClaimantsConverge(t *testing.T) {
+// Two partitioned nodes each compute MAX(term)+1 = 1 and each name themselves
+// holder. That earlier revision asserted the two nodes must CONVERGE on one
+// holder, and the merge was registered to do exactly that. Both were wrong.
+//
+// Converging silently elects a winner for a question the cluster never agreed
+// on: it destroys the losing claim, so no query can afterwards show that two
+// nodes believed they held one tenure, and Phase-2 enforcement would read a
+// confident (term, holder) answer with no indication it was invented by a
+// tie-break. Worse, the two replication paths converged DIFFERENTLY — the WAL
+// path first-writer-wins, the dump path last-writer-wins — so nodes refused
+// opposite claimants and a WAL-converged node flipped its own answer on its next
+// repair cycle.
+//
+// immutableMergeKeepLocalRow keeps each node's own claim and records an
+// unresolved immutable_conflict. The nodes deliberately DISAGREE, and that
+// disagreement is a durable, alertable safety fault instead of a coin flip.
+func TestLeaseTermMerge_ContestedTermIsFlaggedNotConverged(t *testing.T) {
 	a, b := newTestDB(t), newTestDB(t)
+	sma, smb := &fakeSyncMetrics{}, &fakeSyncMetrics{}
+	a.SetSyncMetrics(sma)
+	b.SetSyncMetrics(smb)
 
 	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
 	putLeaseTerm(t, b, "failover", 1, "host-b", "2026-01-01T00:00:05Z", "2026-01-01T00:00:05.000000Z")
 
 	gossipLeaseTerms(t, a, b)
 
-	ra, rb := leaseTermRows(t, a), leaseTermRows(t, b)
-	if len(ra) != 1 || len(rb) != 1 || ra[0] != rb[0] {
-		t.Fatalf("two nodes disagree about who held term 1, so the executor's (term, holder) "+
-			"check refuses the loser on one node and accepts it on another:\n  a: %v\n  b: %v", ra, rb)
+	// Each node keeps its own claim: first-writer-wins locally, on both paths.
+	for name, want := range map[string]string{"a": "host-a", "b": "host-b"} {
+		c := map[string]*Client{"a": a, "b": b}[name]
+		rows, err := c.Query(context.Background(),
+			`SELECT holder FROM leader_lease_terms WHERE key = 'failover' AND term = 1`)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read term 1 on %s: err=%v rows=%d", name, err, len(rows))
+		}
+		if got := rows[0].String("holder"); got != want {
+			t.Errorf("node %s resolved term 1 to %q, want its own claim %q — a contested "+
+				"term must not be silently reassigned", name, got, want)
+		}
 	}
 
-	// The survivor must be one of the two real claimants, never a merged hybrid.
-	holder := ""
-	rows, err := a.Query(context.Background(),
-		`SELECT holder FROM leader_lease_terms WHERE key = 'failover' AND term = 1`)
-	if err != nil || len(rows) == 0 {
-		t.Fatalf("read converged holder: err=%v rows=%d", err, len(rows))
+	// And both nodes RAISE it. Without this the disagreement above would just be
+	// undetected divergence.
+	for name, sm := range map[string]*fakeSyncMetrics{"a": sma, "b": smb} {
+		sm.mu.Lock()
+		unres := append([]string{}, sm.tieUnresolved...)
+		sm.mu.Unlock()
+		found := false
+		for _, s := range unres {
+			if strings.HasPrefix(s, "leader_lease_terms/") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("node %s did not flag the contested term (saw %v). Two holders for one "+
+				"tenure has to be observable, or it is just silent divergence", name, unres)
+		}
 	}
-	holder = rows[0].String("holder")
-	if holder != "host-a" && holder != "host-b" {
-		t.Fatalf("converged holder %q is neither claimant", holder)
+	if a.UnresolvedTieCount() == 0 || b.UnresolvedTieCount() == 0 {
+		t.Error("the unresolved-tie GAUGE stayed 0; litevirt_lww_tie_unresolved_current is what " +
+			"an operator alerts on for 'something is divergent now'")
 	}
 }
 
 // TestLeaseTermMerge_IdenticalRowsAreQuiet pins that a converged table stops
 // talking.
 //
-// authorityMergeRow's comment records the bug this prevents: created_at is a
-// per-node wall clock, so counting it as a fact made two identical logical
-// claims look like a conflict, and an idle cluster re-reported the drift every
-// anti-entropy cycle — burning the operator's divergence signal permanently.
+// A node re-delivering a claim it already holds must merge idempotently. The
+// earlier version of this test asserted the same thing but could not fail:
+// contentDefaultChain is [ruleTombstone, ruleContentMax] and neither rule can
+// return decideUnresolved, so its central unresolvedLen == 0 check was vacuous.
+// Under a merge that CAN flag a conflict the assertion has teeth — it now
+// distinguishes an idempotent re-delivery from a genuine one.
 func TestLeaseTermMerge_IdenticalRowsAreQuiet(t *testing.T) {
 	a, b := newTestDB(t), newTestDB(t)
+	sma, smb := &fakeSyncMetrics{}, &fakeSyncMetrics{}
+	a.SetSyncMetrics(sma)
+	b.SetSyncMetrics(smb)
 
-	// Same facts — same key, term and holder — differing only in the per-node
-	// clock stamped into created_at/updated_at.
+	// The SAME claim on both nodes — same key, term and holder — differing only
+	// in the per-node clock stamped into updated_at.
 	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
-	putLeaseTerm(t, b, "failover", 1, "host-a", "2026-01-01T00:00:05Z", "2026-01-01T00:00:05.000000Z")
+	putLeaseTerm(t, b, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:05.000000Z")
 
 	gossipLeaseTerms(t, a, b)
 
-	ra, rb := leaseTermRows(t, a), leaseTermRows(t, b)
-	if len(ra) != 1 || len(rb) != 1 || ra[0] != rb[0] {
-		t.Fatalf("one logical claim written twice did not converge:\n  a: %v\n  b: %v", ra, rb)
-	}
 	for name, c := range map[string]*Client{"a": a, "b": b} {
+		rows, err := c.Query(context.Background(),
+			`SELECT holder FROM leader_lease_terms WHERE key = 'failover' AND term = 1`)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read on %s: err=%v rows=%d", name, err, len(rows))
+		}
+		if got := rows[0].String("holder"); got != "host-a" {
+			t.Errorf("node %s holder = %q, want host-a", name, got)
+		}
 		if n := c.unresolvedLen.Load(); n != 0 {
-			t.Errorf("node %s flagged %d unresolved tie(s) for one claim written twice; "+
-				"timestamp provenance is not a fact, and counting it re-reports drift on "+
-				"every cycle forever", name, n)
+			t.Errorf("node %s flagged %d unresolved tie(s) for ONE logical claim delivered "+
+				"twice. updated_at is provenance, not a fact; counting it re-reports drift "+
+				"on every anti-entropy cycle forever and burns the operator's signal", name, n)
 		}
 	}
 }
@@ -189,109 +232,77 @@ func TestLeaseTermMerge_TermsDoNotCompete(t *testing.T) {
 	}
 }
 
-// TestLeaseTermMerge_TombstoneLosesToANewerLiveRow records what the anti-entropy
-// path ACTUALLY does, which is not what an earlier revision of this file claimed.
+// TestLeaseTermMerge_TombstoneDominatesRegardlessOfTimestamp: a tombstoned term
+// must not come back from a peer still holding a live copy, whichever side's
+// updated_at is newer. Resurrecting a term moves MAX(term) backwards on that
+// node, and the rejection threshold must never regress.
 //
-// appendOnlyTables governs the WAL apply path. The dump path is different: it
-// compares updated_at FIRST and only consults the content chain — where
-// ruleTombstone lives — on an exact tie. So a live incoming row with a newer
-// updated_at replaces a local tombstone without tombstone dominance ever being
-// considered, and rewrites the holder with it.
+// Two revisions of this test were wrong in instructive ways. The first asserted
+// tombstone dominance on the DEFAULT chain, where it held only on an exact
+// updated_at tie — the dump path compares updated_at first and never reached
+// ruleTombstone otherwise. The second recorded that as documented behaviour and
+// proved it with `updated_at = "2999-01-01T00:00:00Z"`, which production's
+// future-skew quarantine refuses outright once LWWSkewGuardV1 is latched
+// (sync.go reads hlcSkewGuardOn; the test client leaves it nil, so the guard was
+// simply off) — so the load-bearing claim was pinned by a merge that half the
+// cluster configurations would reject.
 //
-// Verified, not assumed. "A row is immutable once written" is therefore true of
-// the WAL path only, and the schema comment now says so.
-//
-// This is acceptable today only because nothing tombstones a term: GC is
-// deliberately not implemented (retention is what stops term numbers being
-// reused). If a GC horizon is ever added, this becomes a real hole — a resurrected
-// term can carry a holder the cluster already resolved against — and closing it
-// would need a bespoke merge enforcing tombstone dominance on both paths.
-func TestLeaseTermMerge_TombstoneLosesToANewerLiveRow(t *testing.T) {
-	a, b := newTestDB(t), newTestDB(t)
+// Both are fixed by the custom merge: tombstoneDominates runs FIRST, before any
+// timestamp compare, so the delta below is a realistic few seconds and the
+// assertion holds under either latch state.
+func TestLeaseTermMerge_TombstoneDominatesRegardlessOfTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		localTS, remoteTS string
+	}{
+		{"incoming live row is newer", "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:05.000000Z"},
+		{"exact tie", "2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:00.000000Z"},
+		{"local tombstone is newer", "2026-01-01T00:00:05.000000Z", "2026-01-01T00:00:00.000000Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := newTestDB(t), newTestDB(t)
 
-	// Node a tombstoned term 1; node b still has it live, with a NEWER updated_at.
-	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
-	tombstoneLeaseTerm(t, a, "failover", 1, "2026-01-01T00:00:30Z")
-	putLeaseTerm(t, b, "failover", 1, "host-b", "2026-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+			// Node a tombstoned term 1; node b still holds it live.
+			putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", tc.localTS)
+			tombstoneLeaseTerm(t, a, "failover", 1, "2026-01-01T00:00:30Z")
+			putLeaseTerm(t, b, "failover", 1, "host-a", "2026-01-01T00:00:00Z", tc.remoteTS)
 
-	gossipLeaseTerms(t, a, b)
+			if err := a.MergeStateBytesLWW(b.DumpStateBytes()); err != nil {
+				t.Fatalf("merge b→a: %v", err)
+			}
 
-	ra, rb := leaseTermRows(t, a), leaseTermRows(t, b)
-	if len(ra) != len(rb) || (len(ra) == 1 && ra[0] != rb[0]) {
-		t.Fatalf("nodes did not converge, which would be a genuine defect regardless of which "+
-			"side wins:\n  a: %v\n  b: %v", ra, rb)
-	}
-	// Convergence is the guarantee. WHICH side wins is decided by updated_at on
-	// this path, so this test pins the documented behaviour rather than a
-	// tombstone-dominance rule that does not apply here.
-	rows, err := a.Query(context.Background(),
-		`SELECT COALESCE(deleted_at, '') AS del FROM leader_lease_terms
-		 WHERE key = 'failover' AND term = 1`)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(rows) == 1 && rows[0].String("del") == "" {
-		t.Log("documented behaviour confirmed: the newer live row won over the older tombstone " +
-			"on the dump path — tombstone dominance applies only on an exact updated_at tie")
-	}
-}
-
-// TestLeaseTermMerge_TombstoneDominatesOnATie pins that a GC'd term does not come back
-// from a peer still holding a live copy. Resurrecting a term would move
-// MAX(term) backwards on that node, and the threshold must never regress.
-func TestLeaseTermMerge_TombstoneDominatesOnATie(t *testing.T) {
-	a, b := newTestDB(t), newTestDB(t)
-
-	// EQUAL updated_at on both sides, which is what routes this through the
-	// content chain where ruleTombstone lives. With unequal timestamps the dump
-	// path decides by updated_at instead and the tombstone can lose — see
-	// TestLeaseTermMerge_TombstoneLosesToANewerLiveRow.
-	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
-	putLeaseTerm(t, b, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
-	tombstoneLeaseTerm(t, a, "failover", 1, "2026-01-02T00:00:00Z")
-
-	gossipLeaseTerms(t, a, b)
-
-	for name, c := range map[string]*Client{"a": a, "b": b} {
-		rows, err := c.Query(context.Background(),
-			`SELECT COALESCE(deleted_at, '') AS del FROM leader_lease_terms
-			 WHERE key = 'failover' AND term = 1`)
-		if err != nil {
-			t.Fatalf("read tombstone on %s: %v", name, err)
-		}
-		if len(rows) == 0 {
-			continue // row gone entirely is also a dominated tombstone
-		}
-		if rows[0].String("del") == "" {
-			t.Errorf("node %s resurrected a tombstoned term from a delayed live copy", name)
-		}
+			rows, err := a.Query(context.Background(),
+				`SELECT COALESCE(deleted_at, '') AS del FROM leader_lease_terms
+				 WHERE key = 'failover' AND term = 1`)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if len(rows) == 0 {
+				return // row gone entirely is also a dominated tombstone
+			}
+			if rows[0].String("del") == "" {
+				t.Errorf("a delayed live copy resurrected a tombstoned term. The GC "+
+					"prohibition at nextLeaseTerm rests on this holding on BOTH paths and "+
+					"at any timestamp delta (case: %s)", tc.name)
+			}
+		})
 	}
 }
 
-// The WAL-path immutability test that belongs here — a stale peer's replayed
-// INSERT must not rewrite a term's holder — lives with Task 3 instead. It needs
-// a statement shape registered in the compatibility ledger, and a shape may only
-// be registered once a real caller emits it ("a registered shape with no emitter
-// never reaches a peer"), so it cannot exist before the mint API does.
+// TestLeaseTermMerge_IsRegisteredEverywhere is the wiring test, and every
+// assertion in it is the reverse of the version that shipped first.
 //
-// That is a genuine gap in THIS task's coverage: appendOnlyTables is registered
-// below but nothing here proves it takes effect, because the four tests above
-// drive the anti-entropy dump path and appendOnlyTables governs the WAL path.
-
-// TestLeaseTermMerge_IsRegisteredEverywhere is the wiring test.
-//
-// Deliberately NOT asserting a customMergeTables entry. This table needs no
-// bespoke merge: appendOnlyTables makes rows immutable on the WAL path and
-// contentDefaultChain converges an exact tie deterministically, which is exactly
-// how audit_chain_heads — append-only with (host_name, epoch, seq) in its key —
-// is registered. project_authority_epochs needs a custom merge because its rows
-// are MUTABLE for one primary key and the immutable merge was wrongly freezing
-// them; nothing here enters that bucket.
+// That version asserted NO customMergeTables entry, on the analogy to
+// audit_chain_heads — append-only, composite key, default content chain. The
+// analogy failed on the one property that matters: audit_chain_heads has a
+// PER-HOST primary key, so two nodes never contend for one row, while
+// (key, term) is contended by construction. With contention reachable, the WAL
+// and anti-entropy paths resolved it by different rules.
 func TestLeaseTermMerge_IsRegisteredEverywhere(t *testing.T) {
-	if _, ok := customMergeTables["leader_lease_terms"]; ok {
-		t.Error("leader_lease_terms has a customMergeTables entry. It does not need one — see " +
-			"this test's comment — and a bespoke merge that duplicates contentDefaultChain is " +
-			"a second implementation of the same rules, free to drift from it")
+	if customMergeTables["leader_lease_terms"] == nil {
+		t.Error("leader_lease_terms has no customMergeTables entry, so the anti-entropy path " +
+			"resolves a contested term by LWW on updated_at while the WAL path resolves it " +
+			"first-writer-wins — nodes then refuse opposite claimants for the same term")
 	}
 	var inSync bool
 	for _, n := range tableNames {
@@ -304,11 +315,24 @@ func TestLeaseTermMerge_IsRegisteredEverywhere(t *testing.T) {
 		t.Error("leader_lease_terms is not in tableNames, so anti-entropy never repairs it; a node " +
 			"that missed a replicated term keeps a low MAX(term) and under-fences forever")
 	}
-	if !appendOnlyTables["leader_lease_terms"] {
-		t.Error("leader_lease_terms is not in appendOnlyTables, so a replicated INSERT is LWW-gated " +
-			"rather than INSERT OR IGNORE")
+	if appendOnlyTables["leader_lease_terms"] {
+		t.Error("leader_lease_terms is in appendOnlyTables AND customMergeTables. " +
+			"deriveDisposition checks customMergeTables first, so the append-only entry is " +
+			"unreachable and only creates a second source of truth that can drift")
 	}
-	if _, ok := capabilityMap["leader_lease_terms"]; !ok {
-		t.Error("leader_lease_terms has no capabilityMap entry")
+	if _, ok := capabilityMap["leader_lease_terms"]; ok {
+		t.Error("leader_lease_terms is in capabilityMap as well as customMergeTables; " +
+			"TestCapabilityMap_PartitionsSchema requires exactly one bucket")
+	}
+	if !reseedKeepTables["leader_lease_terms"] {
+		t.Error("leader_lease_terms is not in reseedKeepTables, so a reseed DELETEs the whole " +
+			"term ledger. The terms an isolated node minted are exactly the ones the peer it " +
+			"reseeds from never received, so MAX(term) regresses and a term number is reused")
+	}
+	if !proofDropExemptTables["leader_lease_terms"] {
+		t.Error("leader_lease_terms is not proof-drop exempt. Its mint is co-batched with the " +
+			"leader_election upsert, and leader_election is anti-entropy excluded — so " +
+			"dropping the entry for a peer lacking proof support would stop replicating " +
+			"lease ownership with no repair path")
 	}
 }

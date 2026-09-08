@@ -906,27 +906,39 @@ var schemaDDL = []string{
 	// row, a bump cannot be lost and a tombstoned-then-recreated row cannot
 	// restart the counter. Same argument as audit_chain_heads.
 	//
-	// Registered exactly like audit_chain_heads: appendOnlyTables plus the default
-	// content chain, with no bespoke merge.
+	// Registered in customMergeTables with immutableMergeKeepLocalRow, NOT as an
+	// append-only table with the default content chain.
 	//
-	// The immutability that buys is PATH-DEPENDENT, and worth stating precisely.
-	// On the WAL apply path appendOnlyTables makes a replicated INSERT apply as
-	// INSERT OR IGNORE, so an existing row cannot be rewritten. The anti-entropy
-	// DUMP path is different: it compares updated_at first and reaches the content
-	// chain (where tombstone dominance lives) only on an exact tie, so a live
-	// incoming row with a newer updated_at can replace a local tombstone. Both
-	// paths converge deterministically, which is the property that matters here;
-	// only the WAL path is strictly immutable.
+	// It was registered that way first, by analogy to audit_chain_heads, and the
+	// analogy was wrong in the one way that mattered. audit_chain_heads has a
+	// per-host primary key, so two nodes never contend for one row; (key, term) is
+	// contended by construction, because two partitioned nodes both compute
+	// MAX(term)+1 and arrive at the same term with different holders. With that
+	// contention reachable, the two replication paths resolved it DIFFERENTLY: the
+	// WAL path applies an INSERT as INSERT OR IGNORE (first-writer-wins) while the
+	// anti-entropy dump path compares updated_at first (last-writer-wins). The same
+	// pair of claims therefore produced different holders on different nodes, and a
+	// WAL-converged node flipped its own answer on its next repair cycle — so the
+	// executor's (term, holder) check would refuse opposite claimants per node,
+	// which is a coin flip rather than fencing.
 	//
-	// A term's HOLDER being immutable is what makes the executor's (term, holder)
-	// check meaningful: two partitioned nodes both computing MAX(term)+1 arrive at
-	// the same term with different holders, and the loser must be refused
-	// everywhere. If a stale peer's replayed INSERT could rewrite that holder,
-	// the check would refuse whichever node replayed last.
+	// immutableMergeKeepLocalRow keeps the local row on the anti-entropy path,
+	// which is precisely what INSERT OR IGNORE already does on the WAL path, so
+	// there is now ONE rule. It also gives tombstone dominance on both paths
+	// (tombstoneDominates runs first), which is what the GC prohibition at
+	// nextLeaseTerm depends on.
 	//
-	// This is NOT project_authority_epochs, which needs a custom merge because
-	// its rows are mutable for one primary key and the immutable merge wrongly
-	// froze them. Nothing here enters that bucket.
+	// What it deliberately does NOT do is converge a contested term. A genuine
+	// facts-conflict for one (key, term) is left unresolved and FLAGGED
+	// (lww_tie_unresolved, category immutable_conflict) rather than coin-flipped.
+	// Two nodes holding one tenure is the event this table exists to make visible;
+	// silently electing a winner would hand Phase-2 enforcement a confident answer
+	// to a question the cluster never agreed on. Enforcement must therefore treat
+	// an unresolved term as refuse, failing closed.
+	//
+	// This is NOT project_authority_epochs. That one converges deterministically
+	// because several nodes legitimately mint one project epoch, so freezing a
+	// conflict would strand it. Two holders for one lease term is not legitimate.
 	`CREATE TABLE IF NOT EXISTS leader_lease_terms (
 		key         TEXT NOT NULL,
 		term        INTEGER NOT NULL DEFAULT 0,
@@ -2335,6 +2347,13 @@ var schemaIndexes = []string{
 	// Partial-on-live so a logout (soft-delete) never blocks a subsequent login
 	// for the same triple; also backs the pull-time resolution lookup.
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_registry_creds_triple ON registry_credentials(scope, owner, registry) WHERE deleted_at IS NULL`,
+
+	// Leader-lease terms: PRIMARY KEY (key, term) covers the allocation read
+	// (MAX(term) per key) but neither of the per-holder lookups, and this table is
+	// retained forever by design — GC is refused at nextLeaseTerm — so an
+	// unindexed scan grows without bound on the renewal hot path, under the
+	// client read lock.
+	`CREATE INDEX IF NOT EXISTS idx_lease_terms_holder ON leader_lease_terms(key, holder, term) WHERE deleted_at IS NULL`,
 }
 
 // tablePrimaryKeys maps table names to their primary key column(s).

@@ -236,5 +236,19 @@ func HistoricalShapes() []HistoricalShape {
 		   WHERE leader_election.expires_at < ?
 		      OR leader_election.holder = excluded.holder`, "failover_lease_literal_key_v50")
 
+	// The lease-term mint's original INSERT OR IGNORE form. The writer now emits
+	// a plain INSERT: the receiver applies it as OR IGNORE anyway (the table is
+	// in customMergeTables, whose WAL branch calls setInsertOrIgnore), so the OR
+	// IGNORE bought nothing on receive and cost the LOCAL writer its error —
+	// SQLite's OR IGNORE skips a row violating NOT NULL or CHECK exactly as it
+	// skips a PK conflict, so a malformed row was dropped with a nil error.
+	//
+	// This shape is retained receive-only because a peer on the first
+	// term-ledger build still emits it, and dropping it would back-pressure that
+	// peer's stream. It applies identically to the new form.
+	add(`INSERT OR IGNORE INTO leader_lease_terms
+		   (key, term, holder, acquired_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`, "lease_term_mint_or_ignore_v51")
+
 	return out
 }

@@ -90,14 +90,21 @@ type Rebalancer struct {
 	LeaseKey string
 
 	// leaseTerm is the fencing term of the lease incarnation this rebalancer
-	// currently holds, 0 when it holds none. Phase 1 records it; nothing
-	// enforces on it yet.
+	// LAST OBSERVED itself holding, 0 when it held none. Phase 1 records it;
+	// nothing enforces on it yet.
 	//
-	// Atomic because it has TWO concurrent writers, not as a precaution:
-	// HoldsLease is called both by this rebalancer's own loop and by the
-	// separate rebalance-executor loop (grpcapi/rebalance_executor.go), which is
-	// the whole reason HoldsLease is exported. A plain int64 assigned from both
-	// would be a data race.
+	// It is INSTANCE-LOCAL, which matters more than the atomic does. Three
+	// separate *Rebalancer values contend for one lease key — the daemon's
+	// proposing loop, the rebalance executor (which constructs its own), and the
+	// RunRebalance RPC (one per call) — so this field describes one instance's
+	// last observation, never "the term for this lease". A Phase-2 enforcement
+	// path must read the term from the ledger, not from here, or the proposer
+	// and the executor will disagree about the same tenure.
+	//
+	// Atomic is defensive, not required: each instance has a single writer,
+	// because HoldsLease is only ever called by that instance's own loop. An
+	// earlier comment here claimed two concurrent writers per instance, on the
+	// assumption that the executor shared this one — it builds its own.
 	leaseTerm atomic.Int64
 
 	// Now is the time source for lease TTL + proposal-expiry +

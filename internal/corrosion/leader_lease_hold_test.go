@@ -2,9 +2,36 @@ package corrosion
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
+
+// termRowCount is the number of live term rows for a key. Several tests below
+// assert on it rather than on the returned term, because the defect they guard
+// is an EXTRA row for one tenure — which a caller-side term check cannot see.
+func termRowCount(t *testing.T, c *Client, key string) int {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT COUNT(*) AS n FROM leader_lease_terms WHERE key = ? AND deleted_at IS NULL`, key)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("count terms: err=%v rows=%d", err, len(rows))
+	}
+	return int(rows[0].Int64("n"))
+}
+
+func seedLease(t *testing.T, c *Client, key, holder string, expires time.Time) {
+	t.Helper()
+	exp := expires.UTC().Format(time.RFC3339)
+	if _, err := c.db.Exec(
+		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET holder = excluded.holder,
+		   expires_at = excluded.expires_at, updated_at = excluded.updated_at`,
+		key, holder, exp, exp); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+}
 
 func TestAcquireLeaseWithTerm_FirstAcquisitionMintsTermOne(t *testing.T) {
 	c := testClient(t)
@@ -22,8 +49,8 @@ func TestAcquireLeaseWithTerm_FirstAcquisitionMintsTermOne(t *testing.T) {
 	}
 }
 
-// TestAcquireLeaseWithTerm_RenewalKeepsTheSameTerm is the heart of the helper. A
-// renewal that bumped the term would make the holder invalidate its own
+// TestAcquireLeaseWithTerm_RenewalKeepsTheSameTerm: a renewal must mint nothing.
+// A renewal that bumped the term would make the holder invalidate its own
 // in-flight work every renewal interval.
 func TestAcquireLeaseWithTerm_RenewalKeepsTheSameTerm(t *testing.T) {
 	c := testClient(t)
@@ -31,312 +58,307 @@ func TestAcquireLeaseWithTerm_RenewalKeepsTheSameTerm(t *testing.T) {
 
 	_, first, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire: %v", err)
 	}
-
-	for i := 1; i <= 3; i++ {
-		held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second,
-			leaseTestNow.Add(time.Duration(i)*time.Second))
-		if err != nil {
-			t.Fatalf("renew %d: %v", i, err)
-		}
-		if !held {
-			t.Fatalf("renew %d lost the lease", i)
+	for i := 0; i < 3; i++ {
+		at := leaseTestNow.Add(time.Duration(i+1) * time.Second)
+		held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, at)
+		if err != nil || !held {
+			t.Fatalf("renewal %d: held=%v err=%v", i, held, err)
 		}
 		if term != first {
-			t.Fatalf("renew %d changed the term %d -> %d", i, first, term)
+			t.Fatalf("renewal %d changed the term %d -> %d", i, first, term)
 		}
 	}
-
-	rows, err := c.Query(ctx, `SELECT COUNT(*) AS n FROM leader_lease_terms WHERE key = 'failover'`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := rows[0].Int64("n"); n != 1 {
-		t.Errorf("three renewals wrote %d term rows, want 1", n)
+	if n := termRowCount(t, c, "failover"); n != 1 {
+		t.Errorf("%d term rows after three renewals, want 1", n)
 	}
 }
 
-// TestAcquireLeaseWithTerm_TakeoverAfterExpiryMintsAHigherTerm pins that a
-// genuine change of holder is a new incarnation.
-func TestAcquireLeaseWithTerm_TakeoverAfterExpiryMintsAHigherTerm(t *testing.T) {
+// TestAcquireLeaseWithTerm_LapsedOwnLeaseIsANewTenure: holder identity alone
+// does not prove an uninterrupted tenure.
+//
+// A lease that fully expired and was then re-taken by its own prior holder is a
+// NEW tenure, because the TTL window is exactly the interval in which other
+// nodes were entitled to act. Classifying it as a renewal kept the old term, so
+// work the holder had in flight before a GC pause, SIGSTOP or IO stall was
+// indistinguishable from work stamped after it — and term growth, the only
+// alerting signal the docs offer, went blind to precisely those lapses.
+func TestAcquireLeaseWithTerm_LapsedOwnLeaseIsANewTenure(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 
-	_, aTerm, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 10*time.Second, leaseTestNow)
+	_, first, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 10*time.Second, leaseTestNow)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire: %v", err)
 	}
-	held, bTerm, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-b", 10*time.Second,
-		leaseTestNow.Add(30*time.Second))
-	if err != nil {
-		t.Fatal(err)
+
+	// An hour later: the lease lapsed 59m50s ago and nobody else took it.
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 10*time.Second,
+		leaseTestNow.Add(time.Hour))
+	if err != nil || !held {
+		t.Fatalf("re-take after lapse: held=%v err=%v", held, err)
 	}
-	if !held {
-		t.Fatal("B could not take over an expired lease")
+	if term == first {
+		t.Errorf("re-taking a lapsed lease returned the old term %d. The lapse is the "+
+			"window other nodes were entitled to act in, so this is a new tenure and "+
+			"must mint", first)
 	}
-	if bTerm <= aTerm {
-		t.Errorf("takeover term %d does not exceed the previous holder's %d, so nothing "+
-			"distinguishes the incarnations", bTerm, aTerm)
+	if term <= first {
+		t.Errorf("new tenure term %d must exceed the lapsed one %d", term, first)
 	}
 }
 
-// TestAcquireLeaseWithTerm_NonHolderGetsNothing pins that a node which does not
-// hold the lease gets held=false AND term 0 — never a usable term.
-func TestAcquireLeaseWithTerm_NonHolderGetsNothing(t *testing.T) {
+// TestAcquireLeaseWithTerm_SupersededHolderFailsClosed: a node whose term has
+// been superseded by a peer's newer claim must return NO term, not mint a fresh
+// higher one.
+//
+// leader_election is anti-entropy excluded while leader_lease_terms is
+// replicated, so "our lease row still names us, but the newest term names
+// someone else" is reachable in ordinary operation. Minting there would promote
+// the node that LOST the term race above the winner — inverting fencing, which
+// is worse than the problem the ledger exists to fix.
+func TestAcquireLeaseWithTerm_SupersededHolderFailsClosed(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 
-	if _, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow); err != nil {
-		t.Fatal(err)
+	if _, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow); err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-b", 60*time.Second,
+	// A peer's claim on a higher term arrives by replication. Our own
+	// leader_election row is untouched — it still names host-a.
+	seedTerm(t, c, "failover", 2, "host-b")
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second,
 		leaseTestNow.Add(time.Second))
 	if err != nil {
-		t.Fatalf("non-holder acquire errored: %v", err)
+		t.Fatalf("renewal after being superseded: %v", err)
 	}
-	if held {
-		t.Error("B acquired a lease A still holds")
+	if held || term != 0 {
+		t.Errorf("a superseded holder got held=%v term=%d, want false/0. Minting here "+
+			"promotes the loser of the term race above the winner", held, term)
 	}
-	if term != 0 {
-		t.Errorf("a non-holder was handed term %d; a term is only meaningful to its holder", term)
-	}
-}
-
-// TestAcquireLeaseWithTerm_DisplacedHolderKeepsItsOwnTerm is the escalation case
-// at the helper level: the ledger already carries the winner's higher term while
-// leader_election still names the old holder, because the two tables replicate
-// independently.
-func TestAcquireLeaseWithTerm_DisplacedHolderKeepsItsOwnTerm(t *testing.T) {
-	c := testClient(t)
-	ctx := context.Background()
-
-	_, aTerm, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// host-b's term row arrives from replication; its leader_election row has not.
-	putLeaseTerm(t, c, "failover", aTerm+1, "host-b", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
-
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second,
-		leaseTestNow.Add(2*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !held {
-		t.Fatal("A unexpectedly lost its local leader_election row")
-	}
-	if term != aTerm {
-		t.Fatalf("the displaced holder renewed into term %d (its own was %d). It has adopted "+
-			"the winner's term and can stamp work that passes the stale-term check without "+
-			"ever acquiring that incarnation", term, aTerm)
+	if n := termRowCount(t, c, "failover"); n != 2 {
+		t.Errorf("%d term rows, want 2 — the superseded holder must not have minted", n)
 	}
 }
 
-// TestAcquireLeaseWithTerm_HeldWithoutATermSelfHeals is the rolling-upgrade
-// case, and it is the normal path on every upgrade rather than an edge case.
-//
-// A binary that predates the term ledger holds the lease. The node restarts on a
-// binary that has the ledger, still holding leader_election, so it classifies as
-// a renewal — and no term exists for it. Nothing failed and nothing crashed, so
-// no amount of write atomicity helps: the term simply never existed. Returning
-// held=true with term 0 would hand the caller the column default, which passes
-// any threshold check trivially.
-func TestAcquireLeaseWithTerm_HeldWithoutATermSelfHeals(t *testing.T) {
+// TestAcquireLeaseWithTerm_HeldWithNoTermSelfHeals is the rolling-upgrade case:
+// a node restarts still holding a lease minted by a binary with no term ledger.
+// Nothing failed, so no write atomicity covers it; it must acquire a term.
+func TestAcquireLeaseWithTerm_HeldWithNoTermSelfHeals(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 
-	// A lease held with NO term row — exactly what an older binary leaves.
-	if err := c.Execute(ctx, leaseUpsertSQL,
-		"failover", "host-a", "2099-01-01T00:00:00Z", "2026-09-08T12:00:00Z",
-		"2026-09-08T12:00:00Z"); err != nil {
-		t.Fatalf("seed pre-ledger lease: %v", err)
-	}
+	seedLease(t, c, "failover", "host-a", leaseTestNow.Add(30*time.Second))
 
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow)
-	if err != nil {
-		t.Fatalf("acquire over a term-less lease: %v", err)
-	}
-	if !held {
-		t.Fatal("lost a lease this node genuinely holds")
-	}
-	if term == 0 {
-		t.Fatal("returned term 0 for a held lease. 0 is the column default, so it passes a " +
-			">= threshold check trivially — the caller believes it is fenced when it is not")
-	}
-}
-
-// TestAcquireLeaseWithTerm_DisplacedNodeWithAForeignHigherTermGetsNothing covers
-// a node that held the lease, lost it to a peer, and finds the peer's higher
-// term already in the ledger.
-//
-// It must come back held=false with term 0 — never with the ledger maximum,
-// which at that moment names the NEW holder's incarnation.
-//
-// Note what this does NOT reach: because the lease has already moved, the
-// pre-read sees the peer and this takes the ACQUISITION path. The renewal path's
-// own loss branch is race-only; see the note above renewLeaseWithTerm.
-func TestAcquireLeaseWithTerm_DisplacedNodeWithAForeignHigherTermGetsNothing(t *testing.T) {
-	c := testClient(t)
-	ctx := context.Background()
-
-	// host-a holds the lease and term 1.
-	held, aTerm, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow)
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
 	if err != nil || !held {
-		t.Fatalf("seed acquire: held=%v err=%v", held, err)
+		t.Fatalf("self-heal: held=%v err=%v", held, err)
 	}
-
-	// The lease moves to host-b with a long expiry, as it would arrive by
-	// replication, and host-b mints its own higher term.
-	if _, err := c.db.Exec(
-		`UPDATE leader_election SET holder = 'host-b', expires_at = '2099-01-01T00:00:00Z'
-		 WHERE key = 'failover'`); err != nil {
-		t.Fatalf("move lease: %v", err)
-	}
-	putLeaseTerm(t, c, "failover", aTerm+1, "host-b", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
-
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second,
-		leaseTestNow.Add(time.Second))
-	if err != nil {
-		t.Fatalf("renew after losing the lease: %v", err)
-	}
-	if held {
-		t.Error("a node that lost the lease was told it still holds it")
-	}
-	if term != 0 {
-		t.Errorf("a node that lost the lease was handed term %d. The ledger maximum at that "+
-			"moment is the NEW holder's incarnation, so returning it lets the displaced node "+
-			"stamp work under the winner's term", term)
+	if term != 1 {
+		t.Errorf("term = %d, want 1", term)
 	}
 }
 
-// TestAcquireLeaseWithTerm_AtomicOnAcquisition is what the guarded batch buys.
+// TestAcquireLeaseWithTerm_NeverRecordsBelowTheThreshold: an acquisition must
+// not record a term below the cluster's rejection threshold.
 //
-// Either both writes land or neither does. A lease recorded without a term is
-// the state the whole self-heal exists to repair, and it must not be reachable
-// through the ordinary acquisition path.
-func TestAcquireLeaseWithTerm_AtomicOnAcquisition(t *testing.T) {
+// nextLeaseTerm runs outside the transaction, so a peer's replicated term N+5
+// can land between the allocation read and the commit. Checking only that the
+// allocated SLOT is free let the legitimate new holder record term N+1 while
+// CurrentLeaseTerm had moved to N+5 — the same inversion as an orphan term,
+// arriving on the success path.
+func TestAcquireLeaseWithTerm_NeverRecordsBelowTheThreshold(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow)
-	if err != nil || !held {
-		t.Fatalf("acquire: held=%v err=%v", held, err)
-	}
+	// A peer already holds a high term for this key; slot 1 is free.
+	seedTerm(t, c, "failover", 5, "host-b")
 
-	lease, err := leaseHolder(ctx, c, "failover")
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
 	if err != nil {
-		t.Fatal(err)
-	}
-	ok, err := leaseTermHeldBy(ctx, c, "failover", term, "host-a")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease != "host-a" || !ok {
-		t.Fatalf("acquisition left a half-written state: leader_election holder=%q, "+
-			"term %d held by us=%v", lease, term, ok)
-	}
-}
-
-// TestAcquireLeaseWithTerm_TermSlotTakenRetries pins the retry path: the term
-// this node allocated is claimed by someone else between the allocation read and
-// the transaction, so the guard declines and a fresh allocation must be tried.
-//
-// Without the retry the acquisition fails outright even though the lease is
-// free, which on the failover path means recovery stalls for a whole cycle.
-func TestAcquireLeaseWithTerm_TermSlotTakenRetries(t *testing.T) {
-	c := testClient(t)
-	ctx := context.Background()
-
-	// Occupy term 1 with a different holder, leaving the LEASE free. An
-	// allocation reads MAX(term)=1 and computes 2, so this does not itself
-	// collide — it proves takeover still works with foreign terms present.
-	putLeaseTerm(t, c, "failover", 1, "host-b", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
-
-	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 60*time.Second, leaseTestNow)
-	if err != nil {
-		t.Fatalf("acquire with a foreign term present: %v", err)
+		t.Fatalf("acquire: %v", err)
 	}
 	if !held {
-		t.Fatal("could not take a free lease because another holder owned an earlier term")
+		t.Fatal("an unheld lease with existing peer terms must still be acquirable")
 	}
-	if term <= 1 {
-		t.Errorf("term %d does not exceed the existing term 1", term)
-	}
-	ok, err := leaseTermHeldBy(ctx, c, "failover", term, "host-a")
+	threshold, err := CurrentLeaseTerm(ctx, c, "failover")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("threshold: %v", err)
 	}
-	if !ok {
-		t.Errorf("term %d was returned but is not held by this node", term)
+	if term < threshold {
+		t.Errorf("acquired term %d is BELOW the rejection threshold %d — this holder "+
+			"would be fenced by its own ledger", term, threshold)
+	}
+	if term != 6 {
+		t.Errorf("term = %d, want 6 (above every retained term)", term)
 	}
 }
 
-// TestAcquireLeaseWithTerm_ExpiryCompareSurvivesSameDay is a regression guard on
-// behaviour all three original call sites carried a comment about. Comparing
-// expires_at against datetime('now') breaks once the date matches, because
-// expires_at is RFC3339 ("…T…Z") and datetime('now') is space-separated, so
-// 'T' > ' ' made a same-day lease never look expired and froze failover
-// cluster-wide until the UTC date rolled over.
+// TestAcquireLeaseWithTerm_AnotherHolderGetsNothing: losing to a live lease
+// yields held=false and term 0, never a term.
+func TestAcquireLeaseWithTerm_AnotherHolderGetsNothing(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	seedLease(t, c, "failover", "host-b", leaseTestNow.Add(time.Hour))
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if held || term != 0 {
+		t.Errorf("held=%v term=%d against a live foreign lease, want false/0", held, term)
+	}
+	if n := termRowCount(t, c, "failover"); n != 0 {
+		t.Errorf("%d term rows after a failed acquisition, want 0", n)
+	}
+}
+
+// TestAcquireLeaseWithTerm_ExpiryCompareSurvivesSameDay guards the
+// RFC3339-vs-datetime('now') string-compare bug: same-day, 'T' > ' ' made a
+// lease never look expired, so a dead leader's lease could not transfer until
+// the UTC date rolled over.
 func TestAcquireLeaseWithTerm_ExpiryCompareSurvivesSameDay(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
-	// Mid-day, so expiry and takeover fall on the same UTC date.
-	midday := time.Date(2026, 9, 8, 13, 30, 0, 0, time.UTC)
 
-	if _, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 5*time.Second, midday); err != nil {
-		t.Fatal(err)
-	}
-	held, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-b", 5*time.Second,
-		midday.Add(60*time.Second))
+	seedLease(t, c, "failover", "host-b", leaseTestNow.Add(-time.Minute))
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("acquire: %v", err)
 	}
 	if !held {
-		t.Fatal("B could not take over a same-day expired lease — this is the datetime('now') " +
-			"string-compare bug, which froze failover cluster-wide until the UTC date rolled")
+		t.Fatal("an expired same-day lease must be takeable")
+	}
+	if term != 1 {
+		t.Errorf("term = %d, want 1", term)
 	}
 }
 
-// TestAcquireLeaseWithTerm_ConcurrentAcquirersGetDistinctTerms pins that two
-// racers never both believe they hold one incarnation.
-func TestAcquireLeaseWithTerm_ConcurrentAcquirersGetDistinctTerms(t *testing.T) {
+// TestAcquireLeaseWithTerm_ConcurrentSameHolderMintsOnce is finding 1's
+// regression test, and it asserts the ROW COUNT rather than the returned term.
+//
+// Production runs three distinct *Rebalancer values against one lease key — the
+// daemon's proposing loop, the executor loop, and the RunRebalance RPC — so two
+// callers with the SAME holder race the first acquisition and every takeover.
+// Both passed the unserialized pre-read, both allocated term 1; one committed,
+// and the other's guard declined only on the slot, which the retry treated as
+// contention and re-allocated as term 2. Two rows for one unbroken tenure, and
+// the caller left holding term 1 was below the threshold — actively fenced by
+// its own ledger.
+//
+// A term-only assertion cannot see this: both callers get a plausible non-zero
+// term. Only the row count shows it.
+func TestAcquireLeaseWithTerm_ConcurrentSameHolderMintsOnce(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 
-	type res struct {
-		holder string
-		held   bool
-		term   int64
+	const callers = 8
+	var wg sync.WaitGroup
+	terms := make([]int64, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, term, err := AcquireLeaseWithTerm(ctx, c, "rebalancer", "host-a", 30*time.Second, leaseTestNow)
+			terms[i], errs[i] = term, err
+		}(i)
 	}
-	out := make(chan res, 2)
-	for _, h := range []string{"host-a", "host-b"} {
-		go func(holder string) {
-			held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", holder, 60*time.Second, leaseTestNow)
-			if err != nil {
-				held, term = false, -1
-			}
-			out <- res{holder, held, term}
-		}(h)
-	}
+	wg.Wait()
 
-	seen := map[int64]string{}
-	for i := 0; i < 2; i++ {
-		r := <-out
-		if !r.held || r.term <= 0 {
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if n := termRowCount(t, c, "rebalancer"); n != 1 {
+		t.Errorf("%d term rows for one unbroken tenure, want 1 — concurrent callers with "+
+			"the same holder each minted, and whichever one kept the lower term is fenced "+
+			"by its own ledger", n)
+	}
+	// Every caller that got a term must have got the same one.
+	var seen int64
+	for i, term := range terms {
+		if term == 0 {
 			continue
 		}
-		if prev, dup := seen[r.term]; dup {
-			t.Errorf("term %d was handed to BOTH %s and %s", r.term, prev, r.holder)
+		if seen == 0 {
+			seen = term
+			continue
 		}
-		seen[r.term] = r.holder
-		ok, err := leaseTermHeldBy(ctx, c, "failover", r.term, r.holder)
+		if term != seen {
+			t.Errorf("caller %d returned term %d but another returned %d — one tenure "+
+				"must have one term", i, term, seen)
+		}
+	}
+}
+
+// TestAcquireLeaseWithTerm_ContentionIsNotAnError: heavy same-node contention
+// must never surface as an error.
+//
+// Before this, exhausting the retry returned one. The failover coordinator maps
+// an error onto slog.Error plus mAttempt(PhaseLease, ResultError, ErrDBError) —
+// which is the paged `result="error"` alert, with a wrong cause since nothing
+// was written — and holdLease renews through the same path, so a contention
+// error immediately before a fence read as "lease lost" and abandoned the fence
+// of a genuinely dead host.
+func TestAcquireLeaseWithTerm_ContentionIsNotAnError(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	const callers = 16
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, errs[i] = AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("caller %d got error %v; contention must report not-held, because the "+
+				"coordinator maps an error to a paged store-error metric and to aborting an "+
+				"in-progress fence", i, err)
 		}
-		if !ok {
-			t.Errorf("%s was handed term %d, which its row does not name it as holding",
-				r.holder, r.term)
+	}
+}
+
+// TestAcquireLeaseWithTerm_UpdatedAtUsesNowTS: updated_at on both replicated
+// writes is the LWW conflict key and must come from Client.NowTS(), which is
+// monotonic, persisted across restart, and HLC-ready — not from the caller's
+// bare-second clock.
+//
+// Bare seconds maximize ties on the one table whose ties operators are told to
+// alert on, and an NTP step-back would emit a key older than this node already
+// replicated.
+func TestAcquireLeaseWithTerm_UpdatedAtUsesNowTS(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	if _, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+
+	bare := leaseTestNow.UTC().Format(time.RFC3339)
+	for _, q := range []struct{ what, sql string }{
+		{"term row", `SELECT updated_at, acquired_at FROM leader_lease_terms WHERE key = 'failover'`},
+		{"lease row", `SELECT updated_at, expires_at FROM leader_election WHERE key = 'failover'`},
+	} {
+		rows, err := c.Query(ctx, q.sql)
+		if err != nil || len(rows) == 0 {
+			t.Fatalf("%s: err=%v rows=%d", q.what, err, len(rows))
+		}
+		if got := rows[0].String("updated_at"); got == bare {
+			t.Errorf("%s updated_at = %q, the caller's bare-second clock. It is the LWW "+
+				"conflict key and must come from NowTS()", q.what, got)
 		}
 	}
 }

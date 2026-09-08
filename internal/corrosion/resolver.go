@@ -475,13 +475,13 @@ var capabilityMap = map[string]tableResolver{
 	// the mirror on a value the owning node is the only writer of, which is a
 	// worse answer than picking one of two values that node itself produced.
 	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
-	// v52 leader-lease terms. Append-only, so a row is immutable once written and
-	// this chain is reached only on an exact updated_at tie between two nodes
-	// that raced the same term — where a deterministic content order is exactly
-	// what is wanted, since every node must pick the same winner for the
-	// executor's (term, holder) check to agree. Same registration as
-	// audit_chain_heads.
-	"leader_lease_terms": {category: "content", chain: contentDefaultChain()},
+	// leader_lease_terms is NOT here: it is in customMergeTables. It was in this
+	// map first, on the theory that this chain would only ever be reached on an
+	// exact updated_at tie between two nodes racing one term. That was wrong —
+	// the chain is reached on ANY tie, but the dump path resolves a DIFFERENT
+	// updated_at by LWW before the chain runs at all, so a contested term was
+	// decided last-writer-wins there and first-writer-wins over the WAL. See the
+	// leader_lease_terms DDL comment in schema.go.
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

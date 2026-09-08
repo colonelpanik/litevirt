@@ -92,40 +92,73 @@ func TestRebalancer_LeaseTTLIsTwicePollInterval(t *testing.T) {
 	}
 }
 
-// TestRebalancer_ConcurrentHoldsLeaseIsRaceFree exercises the two-writer case
-// that HoldsLease exists for.
+// TestRebalancer_SeparateInstancesShareOneTenure is the production shape, and it
+// is not the one an earlier version of this test assumed.
 //
-// HoldsLease is exported so the rebalance executor (grpcapi/rebalance_executor.go,
-// a SEPARATE loop) can gate on the same lease as the proposing loop, so two
-// goroutines call acquireLease on one *Rebalancer concurrently. Recording the
-// term made that struct field mutable for the first time; a plain int64 written
-// from both loops is a data race, which is why leaseTerm is atomic. Run under
-// -race this fails on a plain field.
-func TestRebalancer_ConcurrentHoldsLeaseIsRaceFree(t *testing.T) {
+// That version ran two goroutines against ONE *Rebalancer and justified itself
+// by saying the executor shares this instance. It does not: daemon.go,
+// grpcapi/rebalance_executor.go and grpcapi/rebalance.go each call
+// NewRebalancer, so three DISTINCT instances contend for one lease key with the
+// same holder name. That is what races the first acquisition and every takeover.
+//
+// The invariant is that they share one tenure: exactly one term row, and every
+// instance that holds the lease reports the same term. Asserting only
+// "HoldsLease() == true" — as the earlier version did — passes even when each
+// instance mints its own term, which leaves whichever one kept the lower number
+// below the rejection threshold and fenced by its own ledger.
+func TestRebalancer_SeparateInstancesShareOneTenure(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
 
 	db := newRebalancerTestDB(t)
-	r := NewRebalancer("me", db)
-	r.Now = func() time.Time { return now }
+	const instances = 4
+	rs := make([]*Rebalancer, instances)
+	for i := range rs {
+		rs[i] = NewRebalancer("me", db) // same holder, separate instances
+		rs[i].Now = func() time.Time { return now }
+	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for _, r := range rs {
 		wg.Add(1)
-		go func() {
+		go func(r *Rebalancer) {
 			defer wg.Done()
-			for j := 0; j < 20; j++ {
-				if !r.HoldsLease(ctx) {
-					t.Error("the sole holder must always hold its own lease")
-					return
-				}
-				_ = r.LeaseTerm()
+			for j := 0; j < 10; j++ {
+				r.HoldsLease(ctx)
 			}
-		}()
+		}(r)
 	}
 	wg.Wait()
 
-	if got := r.LeaseTerm(); got <= 0 {
-		t.Errorf("term after concurrent renewal = %d, want > 0", got)
+	rows, err := db.Query(ctx,
+		`SELECT COUNT(*) AS n FROM leader_lease_terms WHERE key = ? AND deleted_at IS NULL`,
+		rs[0].LeaseKey)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("count terms: err=%v rows=%d", err, len(rows))
+	}
+	if n := rows[0].Int64("n"); n != 1 {
+		t.Errorf("%d term rows for one unbroken tenure, want 1 — the daemon loop, the "+
+			"executor and the RunRebalance RPC are separate instances with the same holder, "+
+			"and each minting its own term fences the ones holding a lower number", n)
+	}
+
+	// Every instance that believes it holds the lease must report the same term.
+	var seen int64
+	for i, r := range rs {
+		term := r.LeaseTerm()
+		if term == 0 {
+			continue
+		}
+		if seen == 0 {
+			seen = term
+			continue
+		}
+		if term != seen {
+			t.Errorf("instance %d reports term %d, another reports %d — one tenure must "+
+				"have one term, or the proposer and executor disagree", i, term, seen)
+		}
+	}
+	if seen == 0 {
+		t.Error("no instance recorded a term after acquiring the lease")
 	}
 }

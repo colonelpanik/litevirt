@@ -287,6 +287,7 @@ type collector struct {
 
 	// cluster-correctness metrics.
 	leaderHolder       *prometheus.Desc // who holds the failover lease
+	leaseTerm          *prometheus.Desc // highest lease incarnation per lease key
 	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
 	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
@@ -420,6 +421,13 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"1 if this host currently holds the failover-leader lease",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		leaseTerm: prometheus.NewDesc(
+			"litevirt_leader_lease_term",
+			"Highest recorded lease incarnation (fencing term) per leader-lease key. "+
+				"Each new term is one acquisition, so the RATE is leadership churn — alert on "+
+				"it climbing faster than the expected failover rate. Nothing enforces on a term yet.",
+			[]string{"key"}, prometheus.Labels{"host": hostName},
+		),
 		fenceFailures: prometheus.NewDesc(
 			"litevirt_fence_failures_total",
 			"Cumulative count of fencing_log rows with result != 'fenced' or 'manual-confirmed'",
@@ -507,6 +515,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.clockSkew
 	ch <- c.snapshotDepth
 	ch <- c.leaderHolder
+	ch <- c.leaseTerm
 	ch <- c.fenceFailures
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
@@ -643,6 +652,20 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.leaderHolder, prometheus.GaugeValue, leaderVal)
+
+	// Leader-lease terms, one series per key. This is the signal
+	// docs/operating-model.md tells operators to alert on: the docs named term
+	// growth before any metric exposed it, leaving raw SQL as the only access
+	// path. The key label is bounded by the rows that exist, and only three keys
+	// are ever written (failover, the rebalancer's, dual_run_detector).
+	if termRows, terr := c.db.Query(ctx,
+		`SELECT key, MAX(term) AS term FROM leader_lease_terms
+		 WHERE deleted_at IS NULL GROUP BY key`); terr == nil {
+		for _, r := range termRows {
+			ch <- prometheus.MustNewConstMetric(c.leaseTerm, prometheus.GaugeValue,
+				float64(r.Int64("term")), r.String("key"))
+		}
+	}
 
 	// Cumulative fence failures.
 	if rows, ferr := c.db.Query(ctx,

@@ -45,6 +45,25 @@ var customMergeTables = map[string]customMergeFn{
 	// legitimately mint at once, so it converges deterministically instead of
 	// freezing a conflict. See authorityMergeRow.
 	"project_authority_epochs": (*Client).authorityMergeRow,
+	// leader_lease_terms records which incarnation held a leader lease, so a
+	// contested (key, term) means two nodes believed they held one tenure. That
+	// must be FLAGGED, never silently converged: picking a winner would hand
+	// Phase-2 enforcement a confident answer to a question the cluster did not
+	// actually agree on, and each node would refuse the other's claimant.
+	//
+	// It is registered here rather than left to the default LWW chain because the
+	// two replication paths otherwise disagree. The WAL path applies an INSERT as
+	// INSERT OR IGNORE (first-writer-wins); the anti-entropy dump path compares
+	// updated_at first (last-writer-wins). Identical claims therefore converged on
+	// DIFFERENT holders depending on which path delivered them, and a WAL-converged
+	// node silently flipped its answer on its next repair cycle.
+	// immutableMergeKeepLocalRow always keeps the local row, which is exactly what
+	// INSERT OR IGNORE does, so both paths now implement one rule.
+	//
+	// NOT authorityMergeRow: that one converges deterministically because several
+	// nodes legitimately mint one project epoch. Two nodes holding one lease term is
+	// not legitimate — it is the event this table exists to make visible.
+	"leader_lease_terms": (*Client).immutableMergeKeepLocalRow,
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can

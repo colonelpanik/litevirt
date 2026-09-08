@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // mintLeaseTermSQL records one lease incarnation.
@@ -19,110 +18,85 @@ import (
 // reason: currentAuditEpoch runs its own SELECT MAX(epoch) and audit_heads.go
 // binds the result.
 //
-// INSERT OR IGNORE absorbs the one conflict this can produce. Since the term is
-// read then bound, two goroutines on the SAME node can read the same MAX and
-// compute the same term (rebalancer.go: "two loops on the leader renewing
-// concurrently is safe"). Same node, same holder, same term: the loser skipping
-// silently is correct. A cross-node conflict is not this statement's problem —
-// two partitioned nodes minting one term is the two-leaders case, resolved by the
-// append-only registration and the content chain.
-const mintLeaseTermSQL = `INSERT OR IGNORE INTO leader_lease_terms
+// A plain INSERT, not INSERT OR IGNORE. The receiver applies it as OR IGNORE
+// anyway (leader_lease_terms is in customMergeTables, and the WAL branch for a
+// custom-merge INSERT calls setInsertOrIgnore), so writing OR IGNORE here bought
+// nothing on the receive side and cost the LOCAL writer its error: OR IGNORE
+// skips rows violating NOT NULL and CHECK exactly as it skips a PK conflict, so
+// a malformed row was dropped with a nil error. Locally the term slot is already
+// proven free inside the guard, so a conflict here is a bug that should surface.
+//
+// NOTE on column sources: updated_at is the LWW conflict key and MUST come from
+// Client.NowTS() (monotonic, persisted, HLC-ready); acquired_at and created_at
+// are wall-clock facts about the tenure and come from the caller's clock, which
+// is what keeps the fleet harness's virtual time working. They must not share a
+// source — see the same warning on audit_heads.go's epoch insert.
+const mintLeaseTermSQL = `INSERT INTO leader_lease_terms
 	   (key, term, holder, acquired_at, created_at, updated_at)
 	 VALUES (?, ?, ?, ?, ?, ?)`
 
 // mintLeaseTermStmt builds the mint as a Statement so the WAL apply path can be
 // driven with the SAME shape the writer emits — a test that hand-rolled
 // equivalent SQL would exercise a shape the cluster never sends.
-//
-// It deliberately does NOT call Execute: it is not an emitter, and the writer
-// above passes mintLeaseTermSQL directly for the reason noted there.
-func mintLeaseTermStmt(key string, term int64, holder, ts string) Statement {
+func mintLeaseTermStmt(key string, term int64, holder, acquiredAt, updatedAt string) Statement {
 	return Statement{
 		SQL:    mintLeaseTermSQL,
-		Params: []interface{}{key, term, holder, ts, ts, ts},
+		Params: []interface{}{key, term, holder, acquiredAt, acquiredAt, updatedAt},
 	}
 }
 
-// MintLeaseTerm records a NEW lease incarnation for key, held by holder, and
-// returns its term.
+// leaseTerm is one incarnation record: which holder claimed a given term.
+type leaseTerm struct {
+	Term   int64
+	Holder string
+}
+
+// newestLeaseTerm is the highest LIVE term recorded for key, together with the
+// holder that claimed it. Term 0 with an empty holder means no term exists.
 //
-// Call it only on an ACQUISITION, never on a renewal. A renewal that minted would
-// make the number useless as a fencing token, because the holder would invalidate
-// its own in-flight work every renewal interval.
-//
-// Terms start at 1. Term 0 is the column default, so it must stay distinguishable
-// from a real acquisition — otherwise a row written by a binary that knows
-// nothing of terms reads as a legitimate term 0 and passes any threshold check.
-//
-// It CAN return 0 with no error, and a caller must handle that as "no term
-// recorded" rather than as success: the allocated term can be taken by another
-// node between the allocation read and the insert, in which case OR IGNORE drops
-// this claim.
-//
-// Allocation reads every retained term, TOMBSTONES INCLUDED, while the threshold
-// and own-term reads skip them. That asymmetry is deliberate and was a bug when
-// it was absent. Allocating from the tombstone-filtered maximum meant a
-// tombstoned term left a GAP that allocation walked straight into: with term 1
-// live and term 2 tombstoned, the next term computed as 2, collided, and was
-// dropped — every time, forever. Two failures came out of that one filter:
-//
-//   - a re-acquiring holder that already owned term 1 got term 1 back as
-//     SUCCESS, so a brand-new acquisition silently reused a stale incarnation,
-//     which is precisely the confusion this whole ledger exists to prevent; and
-//   - a holder with no history could never advance at all, because each retry
-//     recomputed the same colliding term. The lease became unacquirable.
-//
-// A term number is therefore never reused, even after its row is tombstoned.
-func MintLeaseTerm(ctx context.Context, c *Client, key, holder string, now time.Time) (int64, error) {
-	next, err := nextLeaseTerm(ctx, c, key)
+// This — not "the highest term this holder ever recorded" — is how a caller
+// learns whether it still owns the current incarnation. An earlier version asked
+// for MAX(term) WHERE holder = ?, which excluded other nodes' terms but NOT this
+// node's terms from incarnations it no longer holds: a host that had once held
+// term 6 got 6 back on a tenure it acquired as term 1, and a reimaged host
+// reusing a hostname inherited its predecessor's highest term. Reading the
+// newest row and checking WHOSE it is answers the actual question.
+func newestLeaseTerm(ctx context.Context, c *Client, key string) (leaseTerm, error) {
+	rows, err := c.Query(ctx,
+		`SELECT term, holder FROM leader_lease_terms
+		 WHERE key = ? AND deleted_at IS NULL
+		 ORDER BY term DESC LIMIT 1`, key)
 	if err != nil {
-		return 0, err
+		return leaseTerm{}, fmt.Errorf("read newest lease term for %q: %w", key, err)
 	}
-	ts := now.UTC().Format(time.RFC3339)
-	// The SQL constant is passed DIRECTLY, not via a Statement field.
-	// stmtshapecheck resolves a replicated statement's SQL statically and rejects
-	// `c.Execute(ctx, stmt.SQL, stmt.Params...)` as "dynamically-built replicated
-	// SQL", because it cannot see through the struct field to a fixed shape.
-	if err := c.Execute(ctx, mintLeaseTermSQL,
-		key, next, holder, ts, ts, ts); err != nil {
-		return 0, fmt.Errorf("mint lease term for %q: %w", key, err)
+	if len(rows) == 0 {
+		return leaseTerm{}, nil
 	}
-	// Verify THIS claim landed, rather than reading back a maximum. Neither
-	// MAX(term) nor even this holder's own MAX(term) can distinguish "my insert
-	// succeeded" from "my insert was dropped and I still own an older term" — and
-	// returning that older term would report a new acquisition while handing back
-	// a stale incarnation.
-	ok, err := leaseTermHeldBy(ctx, c, key, next, holder)
-	if err != nil {
-		return 0, err
-	}
-	if !ok {
-		// Another claimant took this term between the allocation and the insert.
-		return 0, nil
-	}
-	return next, nil
+	return leaseTerm{Term: rows[0].Int64("term"), Holder: rows[0].String("holder")}, nil
 }
 
 // nextLeaseTerm is the term a new incarnation should claim: one above every
-// retained term for this key, tombstones included. See MintLeaseTerm for why
-// tombstones must count here and nowhere else.
+// retained term for this key, TOMBSTONES INCLUDED.
 //
-// DO NOT ADD GC FOR THIS TABLE without reading the two constraints below. Term
-// rows are retained indefinitely by design, and that is load-bearing twice over:
+// The asymmetry with the live-only reads above is deliberate and was a bug when
+// it was absent. Allocating from a tombstone-filtered maximum meant a tombstoned
+// term left a GAP that allocation walked straight into: with term 1 live and
+// term 2 tombstoned, the next term computed as 2 and collided forever.
+//
+// DO NOT ADD GC FOR THIS TABLE without reading both constraints. Term rows are
+// retained indefinitely by design, and that is load-bearing twice over:
 //
 //  1. Retention is what stops a term number being reused. This function
 //     allocates above every retained row precisely so a deleted term cannot be
-//     handed out again to a different incarnation.
-//  2. Tombstone dominance does NOT hold on the anti-entropy dump path — it
-//     compares updated_at first and reaches the content chain only on an exact
-//     tie — so a tombstoned term can be resurrected by a peer's older live copy
-//     carrying a different holder. With no tombstones that is unreachable. With
-//     a GC horizon it becomes a live hole, and closing it needs a bespoke merge
-//     enforcing tombstone dominance on both paths.
+//     handed out again to a different incarnation. leader_lease_terms is in
+//     reseedKeepTables for the same reason — a reseed would otherwise regress
+//     MAX(term) to whatever the source peer happened to have.
+//  2. A GC horizon would have to sit above the highest term any node might still
+//     present in a proof, which is not locally knowable.
 //
-// A horizon would also have to sit above the highest term any node might still
-// present in a proof, which is not locally knowable. If growth ever justifies
-// GC, these are the three problems to solve first, in this order.
+// (Tombstone dominance itself is no longer part of this argument: the custom
+// merge runs tombstoneDominates first on both replication paths, so a tombstone
+// can no longer be overwritten by a peer's older live copy.)
 func nextLeaseTerm(ctx context.Context, c *Client, key string) (int64, error) {
 	rows, err := c.Query(ctx,
 		`SELECT COALESCE(MAX(term), 0) AS max_term FROM leader_lease_terms WHERE key = ?`, key)
@@ -135,64 +109,14 @@ func nextLeaseTerm(ctx context.Context, c *Client, key string) (int64, error) {
 	return rows[0].Int64("max_term") + 1, nil
 }
 
-// leaseTermHeldBy reports whether one specific (key, term) row exists, is live,
-// and names holder. This is the only way to confirm a mint actually landed.
-func leaseTermHeldBy(ctx context.Context, c *Client, key string, term int64, holder string) (bool, error) {
-	rows, err := c.Query(ctx,
-		`SELECT holder FROM leader_lease_terms
-		 WHERE key = ? AND term = ? AND deleted_at IS NULL`, key, term)
-	if err != nil {
-		return false, fmt.Errorf("confirm lease term %q/%d: %w", key, term, err)
-	}
-	if len(rows) == 0 {
-		return false, nil
-	}
-	return rows[0].String("holder") == holder, nil
-}
-
 // CurrentLeaseTerm is the highest term any node has minted for key — the
-// REJECTION THRESHOLD.
+// REJECTION THRESHOLD a Phase-2 enforcement path compares against.
 //
-// This is the only thing MAX(term) may be used for. It must never become a
-// holder's own token; see OwnLeaseTerm.
+// It must never be used as a holder's own token; see newestLeaseTerm.
 func CurrentLeaseTerm(ctx context.Context, c *Client, key string) (int64, error) {
-	rows, err := c.Query(ctx,
-		`SELECT COALESCE(MAX(term), 0) AS max_term FROM leader_lease_terms
-		 WHERE key = ? AND deleted_at IS NULL`, key)
+	t, err := newestLeaseTerm(ctx, c, key)
 	if err != nil {
-		return 0, fmt.Errorf("read current lease term for %q: %w", key, err)
+		return 0, err
 	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	return rows[0].Int64("max_term"), nil
-}
-
-// OwnLeaseTerm is the highest term THIS holder has minted for key — the token a
-// renewal returns.
-//
-// Deliberately distinct from CurrentLeaseTerm, and the distinction is a security
-// boundary rather than a naming preference. leader_lease_terms and
-// leader_election replicate independently, so a displaced holder A can receive
-// winner B's higher term row while A's leader_election row still names A. Because
-// holdLease renews by calling acquireLease (coordinator.go), renewal and
-// acquisition are the same code path, so that window is reached on the ordinary
-// renewal tick. A renewal reading MAX(term) there would hand A a term it never
-// acquired, letting it stamp work that passes the stale-term check.
-//
-// Reading from the ledger rather than process state also means the term survives
-// a restart with no extra bookkeeping: a coordinator that comes back still
-// holding the lease recovers its own term, and one that re-acquires mints a new
-// higher one.
-func OwnLeaseTerm(ctx context.Context, c *Client, key, holder string) (int64, error) {
-	rows, err := c.Query(ctx,
-		`SELECT COALESCE(MAX(term), 0) AS max_term FROM leader_lease_terms
-		 WHERE key = ? AND holder = ? AND deleted_at IS NULL`, key, holder)
-	if err != nil {
-		return 0, fmt.Errorf("read own lease term for %q/%q: %w", key, holder, err)
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	return rows[0].Int64("max_term"), nil
+	return t.Term, nil
 }

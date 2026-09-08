@@ -617,7 +617,9 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 // The CRDT row store cannot offer linearisable CAS across partitions, so this
 // is best-effort. We mitigate races by:
 //  1. Updating only when the existing row is expired or already held by us.
-//  2. Re-reading after the write and refusing to act if the holder changed.
+//  2. Validating that precondition INSIDE the write transaction (the shared
+//     helper's guard), so acquisition needs no post-write read; the renewal
+//     path still reads back and refuses if the holder changed.
 //  3. Re-validating before every destructive call (holdLease).
 //  4. Renewing well before expiry (leaseRenewBefore head-room).
 //
@@ -657,6 +659,13 @@ func (c *Coordinator) LeaseTerm() int64 { return c.leaseTerm.Load() }
 // holdLease re-validates that we still hold the failover lease and that the
 // remaining TTL is at least leaseRenewBefore. Renews if low. Returns false if
 // the lease is lost or read fails.
+// Every false return here CLEARS leaseTerm. holdLease is this coordinator's
+// displacement detector — it is called per fence candidate and again immediately
+// before the destructive call — so it is the one path that most needs to stop
+// reporting a token this node has demonstrably lost. It did not clear it, so a
+// coordinator displaced mid-cycle kept answering with its old term for up to a
+// poll interval, including at the pre-fence check. acquireLease cleared on every
+// loss path, which made the asymmetry easy to miss.
 func (c *Coordinator) holdLease(ctx context.Context) bool {
 	_, ok := c.holdLeaseAtLeast(ctx, leaseRenewBefore)
 	return ok
@@ -692,17 +701,47 @@ func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) 
 // It returns ok=false when the row is missing or unreadable, when the holder is
 // someone else, or when expires_at cannot be parsed — every case in which this
 // node cannot prove it is the leader.
+//
+// Every ok=false return CLEARS leaseTerm. This is the coordinator's
+// displacement detector — holdLease reaches it per fence candidate and again
+// immediately before the destructive call — so it is the one path that most
+// needs to stop reporting a token this node has demonstrably lost. It did not
+// clear it, so a coordinator displaced mid-cycle kept answering with its old
+// term for up to a poll interval, including at the pre-fence check.
+// acquireLease cleared on every loss path, which made the asymmetry easy to
+// miss.
+//
+// Both callers inherit that: holdLease and the fence-bounding
+// holdLeaseAtLeast read the lease through here and nowhere else.
 func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
-	if err != nil || len(rows) == 0 {
+	if err != nil {
+		slog.Error("failover: lease read", "error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
+		return 0, false
+	}
+	if len(rows) == 0 {
+		// The lease row is absent while this coordinator believes it may hold
+		// it. Nothing in the tree ever DELETEs a leader_election row, so this is
+		// local corruption or truncation, not the ordinary non-leader case — it
+		// must stay distinguishable from the skip that fires on N-1 nodes every
+		// poll, and must keep tripping the result="error" alert.
+		slog.Warn("failover: lease row missing")
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
 		return 0, false
 	}
 	if rows[0].String("holder") != c.hostName {
+		c.leaseTerm.Store(0)
 		return 0, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
+		slog.Error("failover: lease expiry unparseable", "value", rows[0].String("expires_at"))
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
 		return 0, false
 	}
 	return expiresAt.Sub(c.now()), true

@@ -85,19 +85,27 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 
 Every acquisition of a leader lease — `failover`, the rebalancer, the dual-run
 detector — records a **term**: an incarnation number for that holder's tenure,
-in the append-only `leader_lease_terms` table. A renewal keeps its term; a term
-is minted on acquisition, so a leader's term is stable for as long as it holds
-the lease, and a coordinator that restarts still holding its lease recovers the
-same number rather than a new one.
-
-There is one exception to "minted on acquisition", and it is expected once per
-host: a node upgraded from a build with no term ledger comes back still holding
-its lease and with no term recorded, so it mints one without any change of
-holder having occurred.
+in the `leader_lease_terms` table. A renewal keeps its term, so a leader's term
+is stable for as long as it holds the lease, and a coordinator that restarts
+still holding its lease recovers the same number rather than a new one.
 
 Terms exist because `leader_election` records *who* holds a lease but not
 *which tenure*, which is what makes a stale leader's writes indistinguishable
 from a current leader's.
+
+A term is minted whenever a **tenure** begins, which is not the same as
+whenever the holder changes. These all mint:
+
+- another host taking the lease (the ordinary case);
+- the same host re-taking its own lease **after it expired** — a GC pause,
+  SIGSTOP or IO stall longer than the TTL ends a tenure, because the lapse is
+  exactly the window other hosts were entitled to act in;
+- once per lease key, ever: a node upgraded from a build with no term ledger
+  comes back still holding its lease with no term recorded, and mints one.
+
+So an ordinary rolling restart of an N-host cluster mints roughly 3N terms —
+each of the three leases moves once per host — on **every** roll. Size a
+term-growth alert against that, not against the one-off upgrade backfill.
 
 **Nothing refuses an action based on a term.** This is not split-brain
 prevention and it is not a working fencing token yet: keeping two nodes from
@@ -116,35 +124,37 @@ ORDER BY key, term DESC;
 ```
 
 A term is never reused, even after its row is tombstoned: allocation takes
-`MAX(term) + 1` over every retained row. Do not add retention or GC to this
-table without reading the constraints recorded at `nextLeaseTerm` in
-`internal/corrosion/leader_lease.go` — retention is what keeps terms unique,
-and a horizon would reopen a resurrectable-tombstone hole.
+`MAX(term) + 1` over every retained row, and the table survives a reseed for the
+same reason. Do not add retention or GC to it without reading the constraints
+recorded at `nextLeaseTerm` in `internal/corrosion/leader_lease.go`.
+
+#### What to alert on
+
+`litevirt_leader_lease_term{key=...}` is the highest recorded incarnation per
+lease key. Its **rate** is leadership churn: terms climbing faster than the
+failover rate you expect means flapping health checks, a TTL too short for the
+environment, or a partition that keeps re-electing. This is the routine signal,
+and it needs no conflict to be useful.
+
+`litevirt_lww_tie_unresolved_current` going above zero for this table is the
+serious one: **two nodes recorded themselves as holding the same term.** That is
+the event the ledger exists to make visible, and it is a safety fault, not a
+transient. `litevirt_lww_tie_unresolved_total` counts them cumulatively.
 
 #### What this table will and will not show you
 
 `PRIMARY KEY (key, term)` makes two rows for one term unrepresentable, so **no
-query can show you that two nodes held the same term.** Once the two claims
-meet, one holder remains and the other is gone. An ordinary-looking table is
-not evidence that no concurrent leadership happened.
+single node's query can show you that two nodes held the same term.** Each node
+keeps its own claim and refuses to overwrite it, so the disagreement lives
+*between* nodes and in the metric above — never as two rows on one host. An
+ordinary-looking table on the host you happened to query is not evidence that no
+concurrent leadership happened.
 
-What fires depends on timing, and only one case is observable at all:
-
-| Two nodes claim one term | Signal |
-|---|---|
-| with the same `updated_at` second | `litevirt_lww_tie_break_total` for this table |
-| a second or more apart | **none** — ordinary LWW: the newer row wins and the losing holder is overwritten silently |
-
-The second row is the more likely case, and it is genuinely invisible: the
-anti-entropy merge compares `updated_at` before it ever looks at row content.
-Treat the tie-break counter as a lower bound on concurrent-claim episodes,
-never as a count of them.
-
-The signal actually worth alerting on is not a conflict at all — it is **term
-growth**. Each new term is one acquisition, so terms climbing faster than the
-failover rate you expect means leadership is churning: flapping health checks,
-a TTL too short for the environment, or a partition that keeps re-electing.
-Expect one step per host during a rolling upgrade, per the exception above.
+A contested term is deliberately **not** resolved into a winner. Electing one
+would destroy the losing claim and hand a future enforcement path a confident
+answer to a question the cluster never agreed on. Instead both claims persist on
+their own nodes and the conflict is flagged, which is why the alert above is the
+access path rather than a query.
 
 ### Even-N clusters cannot fence in a 2/2 partition
 - A 4-node cluster split exactly 2/2 has no majority. Both sides compute

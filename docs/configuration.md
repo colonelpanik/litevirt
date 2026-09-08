@@ -733,11 +733,16 @@ on one flag:
   CA-signed client certificate is treated as admin, so the API inventory is
   gated by a credential distributed to every operator — roughly what
   `/metrics` gives away for free
-- with it **on**, that same certificate is refused without a session
-  (`run lv login`), so the API inventory needs a real identity while
-  `/metrics` still needs nothing. **Enforcing strict mTLS widens this gap
-  rather than closing it** — the metrics endpoint becomes the weakest path to
-  the inventory, and `metrics_bind` is the only thing narrowing it
+- with the flag **on** *and* `strict_mtls_identity_v1` latched cluster-wide —
+  enforcement is `flag && latch`, like the rest of the family, so setting the
+  flag alone changes nothing until the token latches — that same certificate is
+  refused without a session (`run lv login`). The API inventory then needs a
+  real identity while `/metrics` still needs nothing. **Enforcing strict mTLS
+  widens this gap rather than closing it** — the metrics endpoint becomes the
+  weakest path to the inventory, and `metrics_bind` is the only thing narrowing
+  it. During the flag-on-but-not-yet-latched window the first case still
+  applies, and `litevirt_auth_bearerless_client_admin_total` counts the
+  requests that would be denied once it latches
 
 `/api/v1/status` is served on the same port and is also unauthenticated (and
 method-unrestricted). The same path on `rest_port` requires a bearer token.

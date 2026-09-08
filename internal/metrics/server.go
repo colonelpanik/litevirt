@@ -65,9 +65,39 @@ func (s *Server) Start() {
 	}
 
 	slog.Info("metrics server starting", "addr", s.httpSrv.Addr, "bind", s.bindAddr)
+	warnIfMetricsWorldReadable(s.bindAddr, s.port)
 	if err := s.httpSrv.ListenAndServe(); err != http.ErrServerClosed {
 		slog.Error("metrics server error", "error", err)
 	}
+}
+
+// warnIfMetricsWorldReadable says once, at startup, that this endpoint is
+// reachable from off-box with no credential.
+//
+// It is easy to read `metrics_bind: ""` as a listener detail. It is not: the
+// endpoint has no TLS and no authentication of any kind, and it serves the
+// cluster's inventory — every VM name, every container name, this host's name,
+// their CPU/memory/disk allocations — alongside `litevirt_enforcement_*`, which
+// states which security kill-switches are off on this node. Anyone who can
+// reach the port gets all of it. That is a reasonable default for a metrics
+// endpoint on a trusted management network and a poor one anywhere else, and
+// nothing in the daemon distinguishes the two.
+//
+// The default is deliberately NOT changed to loopback here. A silent flip would
+// break every deployment scraping from a remote Prometheus, and it would break
+// it invisibly — the endpoint would simply stop answering. This repo's
+// convention for a behaviour change is a flag whose default keeps the existing
+// behaviour, so the flag stays and the exposure is stated instead.
+func warnIfMetricsWorldReadable(bindAddr string, port int) {
+	if bindAddr != "" && bindAddr != "0.0.0.0" && bindAddr != "::" {
+		return
+	}
+	slog.Warn("metrics endpoint is reachable from any network with NO authentication or TLS: "+
+		"it serves VM and container names, host inventory and resource allocations, and "+
+		"litevirt_enforcement_* (which security kill-switches are off on this node). "+
+		"Set metrics_bind to 127.0.0.1, or to a management-network address, unless every "+
+		"network that can reach this port is trusted",
+		"port", port, "metrics_bind", bindAddr)
 }
 
 // Stop gracefully shuts down the metrics server.

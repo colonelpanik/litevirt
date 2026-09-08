@@ -14,9 +14,15 @@ grpc_port: 7443
 # Prometheus metrics endpoint (HTTP, no auth).
 metrics_port: 7444
 
-# Address the /metrics endpoint listens on. Empty (default) binds all
-# interfaces; set "127.0.0.1" to restrict it to localhost (scrape via a
-# local exporter / SSH tunnel only).
+# Address the /metrics endpoint listens on. Empty (default) binds ALL
+# interfaces, and the endpoint has no TLS and no authentication — anyone who
+# can reach the port reads VM and container names, host inventory, resource
+# allocations, and litevirt_enforcement_* (which security kill-switches are
+# off on this node). Note that ui_port below defaults to localhost and this
+# does not. Set "127.0.0.1" (scrape via a local exporter / SSH tunnel), or a
+# management-network address, unless every network that can reach the port is
+# trusted. The daemon logs a warning at startup while this is empty.
+# See "Metrics endpoint exposure" below.
 metrics_bind: ""
 
 # Web UI port (HTTP).
@@ -617,12 +623,47 @@ To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
 `lv run` or `lv start`; the host check is skipped (project quota still applies)
 and the bypass is audited.
 
+## Metrics endpoint exposure
+
+`/metrics` on `metrics_port` has **no TLS and no authentication**, and
+`metrics_bind` defaults to **all interfaces**. Anyone who can reach the port
+reads, without a credential:
+
+- every VM and container name on this host, with CPU, memory and disk
+  allocations and live I/O counters
+- this host's name, capacity and pressure
+- `litevirt_enforcement_config_enabled{feature}` and
+  `litevirt_enforcement_latched{feature}` — which security kill-switches are
+  enabled on this node and which capabilities have latched
+
+The last one is worth naming separately: it is a readout of which hardening
+features are **off**, which is exactly what an attacker choosing an approach
+would want. The gRPC API withholds the same facts from a caller without a host
+certificate; this endpoint does not.
+
+That default is reasonable on a trusted management network and poor anywhere
+else, and the daemon cannot tell which it is on — so it logs a warning at
+startup whenever `metrics_bind` is empty. It is left as the default because
+changing it would silently break every deployment scraping from a remote
+Prometheus, the way any listener change does.
+
+Restrict it one of two ways:
+
+```yaml
+metrics_bind: "127.0.0.1"      # scrape via a local exporter or an SSH tunnel
+metrics_bind: "10.13.200.5"    # or a management-network address only
+```
+
+Firewalling the port is equivalent and does not need a config change. Note that
+`ui_port` already defaults to localhost; this endpoint does not, which is a
+historical difference and not a judgement that it is less sensitive.
+
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |
 |---------|---------|----------|---------|
 | `grpc_port` | 7443 | gRPC/mTLS | API (CLI, inter-host) |
-| `metrics_port` | 7444 | HTTP | Prometheus `/metrics` |
+| `metrics_port` | 7444 | HTTP, **no auth** | Prometheus `/metrics` — see above |
 | `ui_port` | 7445 | HTTP | Web dashboard |
 | `rest_port` | 7446 | HTTP | REST API gateway |
 | `gossip_port` | 7946 | TCP+UDP | Cluster membership |

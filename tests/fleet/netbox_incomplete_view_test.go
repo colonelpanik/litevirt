@@ -61,16 +61,14 @@ func TestFleetSweepDoesNotFreeAnAddressAHostMissingFromTheHostTableHolds(t *test
 //
 // Both nodes are present in each other's `hosts` table and both answer, so the
 // participant set is stable, complete-looking and identical in both samples. It
-// is still SHORT: the peer knows about a third host this node has never received
-// a row for, and that host was therefore never asked. A host in neither the
+// is still SHORT: the peer holds a `hosts` row for a third host this node has
+// never received, and that host was therefore never asked. A host in neither the
 // local table nor gossip is invisible to both, so the only thing that can reveal
-// it is a peer — either reporting more `hosts` rows than we hold, or naming the
-// host outright when the participant-set closure asks which hosts it knows.
+// it is the peer's own rows — which the participant-set closure reads, by name.
 //
-// The third host has no daemon, and either route to the refusal is correct: the
-// digest count leaves the view uncorroborated before anything is dialled, and
-// the closure adds "unseen" to the set and then cannot reach it. Both are the
-// fail-closed direction, and what this pins is that the address survives.
+// The third host has no daemon, so the closure adds "unseen" to the set and then
+// cannot reach it. That is the fail-closed direction, and what this pins is that
+// the address survives.
 func TestFleetSweepStopsWhenAPeerKnowsAHostThisNodeDoesNot(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 2)
 

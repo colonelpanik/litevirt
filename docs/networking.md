@@ -1025,19 +1025,30 @@ so it happens only under a whole-cluster proof:
   making the two samples agree about a cluster neither of them saw whole.
   Membership converges in seconds and independently of every table, so a host it
   names is a host that exists;
-- that set is then **closed under peer membership**: every participant is asked
-  which hosts *it* knows, the answers are folded in under the same exclusions,
-  and the fan-out repeats until the set stops growing. A holder any reachable
-  node knows about is therefore queried by name, whether or not this node's own
-  `hosts` table ever received its row. A participant that cannot answer, or that
-  answers with no membership view at all, leaves the set unclosed and stops the
-  reclamation. Counting host rows is not enough on its own — two nodes can each
-  know three hosts without knowing the same three;
-- and the count is still compared, for the one thing the closure cannot see: a
-  host row that is *tombstoned* on a peer is filtered out of what that peer
-  reports, yet `lv host rm --force` does not power a machine off. A peer holding
-  more `hosts` rows than the sweeping node — tombstones included — means the
-  sweeping node cannot have asked everyone. Reclamation stops there;
+- that set is then **closed over the `hosts` rows every participant holds**:
+  each one is asked for its own rows, the answers are folded in under the same
+  exclusions, and the fan-out repeats until the set stops growing. A holder any
+  reachable node has a row for is therefore queried by name, whether or not this
+  node's own `hosts` table ever received it. A participant that cannot answer,
+  one that cannot be read, and one whose answer is short of what its own digest
+  counts all leave the set unclosed and stop the reclamation. Counting host rows
+  is not enough on its own — two nodes can each know three hosts without knowing
+  the same three;
+- **tombstoned rows count**, which is why the rows are read rather than listed:
+  `lv host rm --force` does not power a machine off, so a host whose row a peer
+  has soft-deleted may still be running the domain that holds the address. A
+  participant whose `hosts` table is identical to the sweeping node's — same
+  count, same content hash, tombstones included — is not asked for its rows at
+  all, because there is nothing in it the sweeping node has not already read;
+- the same membership proof gates the **bind**, not only the sweep. A node that
+  cannot establish the host set does not go live on a prefix: its binding is
+  suspended, and the next maintenance pass resumes it by itself. Handing out an
+  address a holder already has and freeing one are the same collision from
+  opposite sides, so both sides ask the same question;
+- what rows cannot prove is left alone deliberately: a host that **no** reachable
+  participant has a `hosts` row for, and that this node's own gossip has not yet
+  named, is outside what this proof covers. Membership rows converge in seconds,
+  so the window is short — and everything above still fails closed inside it;
 - **every** eligible host must answer, and answer with a complete scan. One
   unreachable host, one incomplete answer, or a membership change mid-proof and
   the address is left alone;

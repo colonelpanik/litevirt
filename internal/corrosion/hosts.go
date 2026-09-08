@@ -413,3 +413,68 @@ func UpdateHostResources(ctx context.Context, c *Client, name string, cpu, mem, 
 		cpu, mem, disk, c.NowTS(), name,
 	)
 }
+
+// HostNamesFromStateDump extracts the name of EVERY `hosts` row a peer's
+// full-state dump carries — TOMBSTONED ROWS INCLUDED.
+//
+// It exists because ListHosts cannot answer the question a cross-cluster
+// completeness proof has to ask. That query filters `deleted_at IS NULL`, and a
+// forced host removal does not power a machine off: a host whose row a peer has
+// tombstoned may still be running the domain that holds an address. dumpTable is
+// a bare `SELECT * FROM hosts` with no predicate, so the dump the pre-existing
+// state-dump RPCs already serve carries exactly the rows that query drops.
+//
+// FAIL CLOSED by returning an ERROR rather than a short list on every shape that
+// could UNDER-REPORT, because a caller reading a truncated list as the cluster's
+// membership is the precise defect this exists to prevent:
+//
+//   - a dump that cannot be decompressed or parsed;
+//   - one carrying no `hosts` table at all. dumpStateForTables omits a table
+//     with no rows, and a node always holds at least its own row, so an absent
+//     table is an unhydrated database — never the claim that the cluster is
+//     empty;
+//   - one whose `hosts` table has no `name` column;
+//   - a row whose cell count does not match the column list, which the
+//     divergence scanner skips silently and a membership proof must not;
+//   - a row with an empty name, which names no host and cannot be asked.
+//
+// Duplicate names are returned as they appear; the caller folds them into a set.
+func HostNamesFromStateDump(buf []byte) ([]string, error) {
+	payload, err := decompressPayload(buf)
+	if err != nil {
+		return nil, fmt.Errorf("parse peer state dump: %w", err)
+	}
+	for _, t := range payload.Tables {
+		if t.Name != "hosts" {
+			continue
+		}
+		nameCol := -1
+		for i, c := range t.Columns {
+			if c == "name" {
+				nameCol = i
+				break
+			}
+		}
+		if nameCol < 0 {
+			return nil, fmt.Errorf("peer state dump: the hosts table carries no name column")
+		}
+		names := make([]string, 0, len(t.Rows))
+		for _, row := range t.Rows {
+			if len(row) != len(t.Columns) {
+				return nil, fmt.Errorf(
+					"peer state dump: malformed hosts row (%d cells for %d columns)",
+					len(row), len(t.Columns))
+			}
+			name := cellString(row[nameCol])
+			if name == "" {
+				return nil, fmt.Errorf("peer state dump: a hosts row carries an empty name")
+			}
+			names = append(names, name)
+		}
+		if len(names) == 0 {
+			return nil, fmt.Errorf("peer state dump: the hosts table carries no rows")
+		}
+		return names, nil
+	}
+	return nil, fmt.Errorf("peer state dump carries no hosts table")
+}

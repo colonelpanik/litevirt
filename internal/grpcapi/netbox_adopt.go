@@ -609,8 +609,18 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 // machinery rather than inventing a second one: closedProofPeers for the
 // participant universe — which deliberately keeps offline, fenced and tombstoned
 // hosts in (a host that cannot be reached still HOLDS its rows) and is CLOSED
-// under peer membership, so a host only a peer knows about is asked too —
-// dialPeer for the transport, and one bounded timeout each.
+// over the `hosts` rows every participant holds, tombstones included, so a host
+// only a peer has a row for is asked too — dialPeer for the transport, and one
+// bounded timeout each.
+//
+// THE SAME HELPER, NOT A SUBSET OF IT. Every membership check the sweeper makes
+// before it reclaims, this makes before it goes live, because closedProofPeers is
+// the only way either of them reaches a peer set. That is not symmetry for its
+// own sake: a bind that adopts nothing because it could not see a holder hands
+// that holder's address to the next guest created, which is the same collision
+// the sweeper's proof exists to prevent — reached from the other side. A period
+// when the bind skipped the corroboration the sweeper ran is exactly how a
+// tombstoned holder stayed invisible to one and not the other.
 //
 // The peer's answer is its digest of every table in adoptionInventoryTables,
 // from GetStateDigest: an RPC that already exists for anti-entropy, so nothing

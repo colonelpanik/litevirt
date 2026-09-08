@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -121,8 +123,8 @@ func (s *Server) SweepOrphansOnce(ctx context.Context) error {
 //
 // Reclamation requires a STABLE COMPLETE-CLUSTER proof:
 //
-//  1. Read the eligible host set A, CLOSED under peer membership — every
-//     participant is asked which hosts it knows until the set stops growing.
+//  1. Read the eligible host set A, CLOSED over the `hosts` rows every
+//     participant holds — tombstones included — until the set stops growing.
 //  2. Gather complete negative proofs from exactly A.
 //  3. Read the eligible host set B, through the same closure.
 //  4. Proceed only if A == B, every member answered completely, and the leader
@@ -177,18 +179,19 @@ func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error
 // not whole is not a proof.
 func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) error {
 	// 1. Sample A — from closedParticipantSet: the replicated `hosts` table
-	//    UNIONED WITH GOSSIP MEMBERSHIP, then CLOSED under what every reachable
-	//    participant says its own membership is.
+	//    UNIONED WITH GOSSIP MEMBERSHIP, then CLOSED under the `hosts` ROWS every
+	//    reachable participant actually holds, tombstones included.
 	//
-	//    Neither half is a refinement; each is the difference between a proof
+	//    No part of that is a refinement; each is the difference between a proof
 	//    and a coin flip. Built from the `hosts` table alone, a peer whose row
 	//    had not hydrated on this node was absent from BOTH samples, so the
 	//    samples agreed and the five steps below concluded that nobody held the
 	//    address — while that peer's guest still had it on a defined domain. Two
-	//    samples establish STABILITY, not COMPLETENESS. And built from the local
-	//    union alone it was still only the set of hosts this node happens to
-	//    have heard of: a host in neither source is invisible to both samples,
-	//    so the closure asks the peers by name instead of comparing sizes.
+	//    samples establish STABILITY, not COMPLETENESS. Built from the local
+	//    union alone it was still only the set of hosts this node happens to have
+	//    heard of. And closed over what each peer's ListHosts REPORTS, it still
+	//    missed the rows that query filters out: a holder tombstoned on a peer,
+	//    which a local-only witness balanced out of a row-count comparison too.
 	setA, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "read eligible hosts: %v", err)
@@ -200,19 +203,6 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 		// Nobody to ask. An empty universe would make every proof vacuously
 		// complete, which is the one shape that must never authorize a delete.
 		return skipf(skipNoHosts, "no eligible hosts to prove absence")
-	}
-
-	// 1b. …and the membership view itself has to be corroborated, because the
-	//     union is still not a completeness proof: a host in NEITHER the
-	//     replicated table nor gossip is invisible to both, and an invisible host
-	//     is exactly the one whose guest is about to lose its address. So every
-	//     participant is asked how many `hosts` rows IT holds, and a peer that
-	//     holds more than this node does says this node's view of the cluster is
-	//     short — by at least one host it therefore never asked.
-	if reason, cerr := s.membershipViewUncorroborated(ctx, setA); cerr != nil {
-		return skipf(skipHostsRead, "read this node's own host digest: %v", cerr)
-	} else if reason != "" {
-		return skipf(skipMembershipUnproven, "membership view not corroborated: %s", reason)
 	}
 
 	// 2. Collect from exactly A, and require EXACTLY ONE response per member,
@@ -300,96 +290,16 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	return nil
 }
 
-// ── corroborating the membership view ───────────────────────────────────────
-
-// membershipViewUncorroborated asks every participant how many `hosts` rows it
-// holds and reports the first one that holds MORE than this node does.
-//
-// IT IS NOT THE COMPLETENESS PROOF, and a round of this review was spent
-// learning why it cannot be: equal counts over DIFFERENT members compare as
-// agreement. A sweeper that knew a local-only witness while its peer knew a
-// third workload host passed this check with both samples stable, never asked
-// that host, and freed the address its defined domain held. What establishes
-// completeness is closedParticipantSet, which asks each participant WHICH hosts
-// it knows and folds the answers in until the set stops growing — identities,
-// not cardinality.
-//
-// WHAT THIS STILL BUYS, and why it stays: the closure learns members from
-// ListHosts, which filters `WHERE deleted_at IS NULL`. A host row that is
-// TOMBSTONED on a peer and absent here is therefore invisible to the closure —
-// and `lv host rm --force` does not power a machine off, so that host may still
-// be running the domain. The `hosts` DIGEST counts tombstones, so a peer holding
-// one more row than this node still stops the reclamation. Two questions, both
-// necessary: "who else exists" and "does anybody hold a row I have never seen".
-//
-// It returns the operator-facing reason a view is not corroborated, or "" when
-// it is. An error is returned only for the failure that is about THIS node — an
-// unreadable local digest — because that is the one a caller must report
-// differently: everything else is part of the answer, and a participant that
-// cannot be asked leaves the view unproven exactly as a participant holding more
-// rows does.
-//
-// WHY A COUNT AND NOT THE FULL DIGEST. The corroboration the NetBox bind makes
-// over its address-bearing tables compares content hashes as well, and this
-// deliberately does not. `hosts` rows carry per-node timestamps and a per-node
-// `version` / `schema_version`, so two nodes agree on the CONTENT of that table
-// only when they are converged AND on the same build — during any rolling
-// upgrade they are not, and a hash comparison would make the sweeper permanently
-// inert for the length of one. A count is monotone under replication and answers
-// the narrow question left to it: does somebody hold a host row I have never
-// seen, tombstones included?
-//
-// The asymmetry is deliberate in the other direction too: a peer holding FEWER
-// host rows is a peer that is behind, which cannot be the reason THIS node's set
-// is short — and the members it does know are asked for by name by the closure
-// regardless, so nothing rests on that reading any more.
-//
-// FAIL CLOSED at every branch, and the cost of doing so is one skipped sweep:
-// the address stays allocated and the next pass tries again. Leaking an address
-// the next sweep can reclaim is always preferable to freeing one a live guest
-// uses.
-func (s *Server) membershipViewUncorroborated(ctx context.Context, participants []string) (string, error) {
-	local, err := s.localTableDigest(ctx, hostsTableName)
-	if err != nil {
-		return "", err
-	}
-	var peers []string
-	for _, h := range participants {
-		if h != s.hostName {
-			peers = append(peers, h)
-		}
-	}
-	if len(peers) == 0 {
-		// A single-node cluster's view of its own membership IS the cluster's.
-		return "", nil
-	}
-	for _, a := range s.gatherTableDigests(ctx, peers, []string{hostsTableName}) {
-		remote, found := a.digests[hostsTableName]
-		switch {
-		case a.err != nil:
-			return fmt.Sprintf("host %s could not be asked (%v)", a.host, a.err), nil
-		case !found:
-			// An older peer, or one whose digest set does not carry the table.
-			// Silence about `hosts` is not agreement about the cluster's shape.
-			return fmt.Sprintf("host %s reported no %s digest", a.host, hostsTableName), nil
-		case int(remote.GetCount()) > local.Count:
-			return fmt.Sprintf(
-				"host %s knows %d %s row(s) to this node's %d, so this node cannot have asked every host",
-				a.host, remote.GetCount(), hostsTableName, local.Count), nil
-		}
-	}
-	return "", nil
-}
-
 // ── the participant universe ────────────────────────────────────────────────
 
 // proofParticipants is the LOCAL sample of the participant universe: everything
 // this node can name without asking anybody. Both cross-cluster proofs in this
 // package — the orphan sweeper's negative proof and the bind's inventory
-// corroboration — build on it through closedParticipantSet, which asks each of
-// these participants what ITS membership is and folds the answers back in until
-// the set stops growing. Nothing calls this directly to authorize anything: the
-// set of hosts this node happens to have heard of is not the cluster.
+// corroboration — build on it through closedParticipantSet, which reads the
+// `hosts` rows each of these participants actually holds and folds them back in
+// until the set stops growing. Nothing calls this directly to authorize
+// anything: the set of hosts this node happens to have heard of is not the
+// cluster.
 //
 // ONE helper, not one per proof. There were two, and they differed in exactly
 // the way that mattered: the bind's unioned GOSSIP MEMBERSHIP into the
@@ -522,10 +432,16 @@ func (s *Server) eligibleParticipants(ctx context.Context, candidates []particip
 // out is a REFUSAL, not a truncation: an unclosed set proves nothing.
 const hostSetClosureRounds = 8
 
-// closedParticipantSet is proofParticipants CLOSED UNDER PEER MEMBERSHIP: every
-// participant is asked which hosts IT knows, the answers are folded back in
-// under the same exclusions, and the fan-out repeats until the set stops
-// growing.
+// closedParticipantSet is proofParticipants CLOSED OVER THE `hosts` ROWS EVERY
+// PARTICIPANT HOLDS: each one is asked which hosts its own table records —
+// tombstoned rows included — the answers are folded back in under the same
+// exclusions, and the fan-out repeats until the set stops growing.
+//
+// It is the ONE helper both cross-cluster proofs in this package use, and the
+// only place either of them establishes membership. What the sweeper needs to
+// reclaim, the bind needs to go live: a bind that adopts nothing because it
+// could not see a holder is the same defect as a sweep that frees that holder's
+// address, so neither may reach its participant set any other way.
 //
 // WHY THE LOCAL UNION IS NOT ENOUGH, which is the third round of this same
 // lesson. The candidate set this node can build alone — `hosts` plus gossip — is
@@ -538,24 +454,70 @@ const hostSetClosureRounds = 8
 // address and freed it.
 //
 // The answer is not a stricter comparison of this node's set, it is A DIFFERENT
-// QUESTION — asked of the peers, about identities: WHICH hosts do you know? Any
-// holder that any reachable node knows about is then queried by name, whether or
-// not this node's own `hosts` table ever hydrated its row.
+// QUESTION — asked of the peers, about identities: which hosts does your `hosts`
+// table hold? Any holder that any reachable node has a row for is then queried by
+// name, whether or not this node's own table ever hydrated it.
 //
-// It rides ListHosts, an RPC that already exists and that a peer's host cert
-// already authorizes (a bearerless trusted host CN authenticates as admin, and
-// ListHosts asks for viewer) — so nothing new goes on the wire and no proto
-// changes. What ListHosts cannot show is a TOMBSTONED row, because it filters
-// `deleted_at IS NULL`; membershipViewUncorroborated covers that residue with
-// the `hosts` digest count, which does count tombstones.
+// WHY NOT ListHosts, WHICH IS WHAT THIS ASKED FIRST. That RPC filters
+// `deleted_at IS NULL`, so a row TOMBSTONED on a peer is missing from its answer
+// — and a forced host removal does not power a machine off, so that host may
+// still be running the domain. Closing the set over a source that is itself
+// filtered does not establish completeness; it establishes closure over the
+// filter. A local-only witness balanced the tombstone out of the row-count
+// comparison that was supposed to cover the residue, both checks passed, and the
+// address was freed.
 //
-// FAIL CLOSED on both edges, the same direction the per-host proof already takes
-// for an unreachable host. A participant that cannot answer, and one that
-// answers with no membership view at all, both leave the set unclosable — and an
-// unclosed set cannot support "nobody holds this address". The reason is
-// returned rather than an error, because it is part of the ANSWER: nothing about
-// THIS node failed.
+// SO THE SOURCE IS THE PEER'S OWN ROWS, over two RPCs that both predate this
+// feature by releases, exactly as a peer's host cert already authorizes:
+//
+//   - GetStateDigest for the `hosts` digest, which covers the whole table,
+//     TOMBSTONES INCLUDED, on both sides. A digest that AGREES with this node's
+//     (corrosion.TableDigestsAgree — same count, same content hash) says that
+//     peer's `hosts` table IS this node's, row for row. Every name in it is
+//     therefore already a candidate, because localParticipantCandidates reads
+//     every local row with no `deleted_at` predicate. Nothing is hidden and
+//     nothing needs fetching.
+//   - StreamStateDump only when it does NOT agree, because then this node knows
+//     nothing about which rows that peer holds. corrosion.HostNamesFromStateDump
+//     reads the names out of it — dumpTable is a bare `SELECT *`, so the dump
+//     carries the tombstoned rows ListHosts drops.
+//
+// That ordering is what makes it affordable: a converged cluster agrees, so the
+// steady state costs one digest per participant and no dump at all — strictly
+// less than the ListHosts call plus the digest call this replaces. A dump is
+// pulled only from a peer whose `hosts` table genuinely differs from ours, which
+// is the only peer that can be holding a row we have never seen.
+//
+// A DUMP THAT UNDER-REPORTS IS A REFUSAL. The peer's own digest says how many
+// rows it holds; a dump carrying FEWER than that did not carry them all, and
+// reading a short list as a peer's membership is the whole class of defect this
+// function exists to prevent. More is fine — a row inserted between the two
+// reads is a superset, and a superset is asked.
+//
+// FAIL CLOSED on every edge, the same direction the per-host proof already takes
+// for an unreachable host: a participant that cannot be dialled, one that cannot
+// be asked, one silent about `hosts`, one whose dump cannot be fetched or parsed,
+// and one whose dump under-reports all leave the set unclosable — and an unclosed
+// set cannot support "nobody holds this address". The reason is returned rather
+// than an error, because it is part of the ANSWER: nothing about THIS node
+// failed. An unreadable LOCAL digest is the one genuine error, because it leaves
+// the comparison with no left-hand side.
+//
+// WHAT IT STILL CANNOT SEE, stated because a proof's boundary is part of it: a
+// host that no reachable participant has a `hosts` row for and that this node's
+// own gossip has not yet named. A peer's gossip membership is not on the wire —
+// no RPC exposes it, ListHosts and ClusterStatus.hosts are both table-derived,
+// and GetStateDigest is counts — so a holder known ONLY to another node's gossip
+// cannot be reached from here without a new field or RPC to carry it. See the
+// note on gatherHostViews.
 func (s *Server) closedParticipantSet(ctx context.Context) ([]string, string, error) {
+	// Read ONCE, outside the loop: every participant's digest is compared against
+	// the same left-hand side, so which peers count as agreeing cannot drift
+	// between rounds of one closure.
+	local, err := s.localTableDigest(ctx, hostsTableName)
+	if err != nil {
+		return nil, "", fmt.Errorf("read this node's own %s digest: %w", hostsTableName, err)
+	}
 	candidates, err := s.localParticipantCandidates(ctx)
 	if err != nil {
 		return nil, "", err
@@ -579,31 +541,26 @@ func (s *Server) closedParticipantSet(ctx context.Context) ([]string, string, er
 			}
 		}
 		if len(unasked) == 0 {
-			// Closed: every eligible participant has told us what it knows, and
-			// nothing any of them named is outside the set.
+			// Closed: every eligible participant's rows have been read, and
+			// nothing any of them holds is outside the set.
 			return set, "", nil
 		}
-		for _, v := range s.gatherHostViews(ctx, unasked) {
+		for _, v := range s.gatherHostViews(ctx, unasked, local) {
 			asked[v.host] = true
-			if v.err != nil {
-				return nil, fmt.Sprintf(
-					"host %s could not be asked which hosts it knows (%v)", v.host, v.err), nil
-			}
-			if len(v.hosts) == 0 {
-				// A node knows at least itself, so an empty answer is a node
-				// whose own `hosts` table has not hydrated — a view, not the
-				// statement that the cluster is empty.
-				return nil, fmt.Sprintf(
-					"host %s answered without a membership view", v.host), nil
+			if v.unproven != "" {
+				return nil, v.unproven, nil
 			}
 			for _, name := range v.hosts {
 				if name == "" || named[name] {
 					continue
 				}
 				named[name] = true
-				// No role on the wire (pb.Host carries none), so a peer-learned
-				// host is treated exactly as a gossip-learned one: unknown role,
-				// and unknown is not "witness".
+				// No role on the wire that this node can trust as an EXCLUSION:
+				// a peer-learned host is treated exactly as a gossip-learned
+				// one, unknown role, and unknown is not "witness". Where the
+				// role IS known it came from the local table, and that
+				// candidate was seeded before this loop — so the local reading
+				// wins and a peer cannot excuse a host from being asked.
 				candidates = append(candidates, participantCandidate{name: name})
 			}
 		}
@@ -613,16 +570,35 @@ func (s *Server) closedParticipantSet(ctx context.Context) ([]string, string, er
 		hostSetClosureRounds), nil
 }
 
-// hostView is one participant's answer to "which hosts do you know".
+// hostView is one participant's answer to "which hosts does your table hold".
 type hostView struct {
-	host  string
+	host string
+	// hosts is every host that participant holds a `hosts` row for, tombstones
+	// included — or nil when its digest AGREED with this node's, which says its
+	// table IS this node's and so names nothing this node has not already read.
 	hosts []string
-	err   error
+	// unproven is the operator-facing reason its rows could not be established.
+	// Non-empty means the participant set cannot be closed at all: it is not one
+	// participant's problem, it is the proof's.
+	unproven string
 }
 
-// gatherHostViews asks each peer for its host list over the bounded worker pool
-// and per-peer timeout the rest of the proof fan-out already uses.
-func (s *Server) gatherHostViews(ctx context.Context, peers []string) []hostView {
+// gatherHostViews reads each participant's `hosts` rows over the bounded worker
+// pool and per-peer timeout the rest of the proof fan-out already uses.
+//
+// The one shape it cannot reach is a host present only in a PEER's GOSSIP
+// membership, with no `hosts` row on any node this one can ask. Gossip is not on
+// the wire in any form — PingResponse carries capabilities and a clock, never
+// members — so folding a peer's memberlist view into this would take a new field
+// or RPC. Two routes were considered and rejected as unsound rather than merely
+// unavailable: delegating the proof (a peer answering CollectOrphanProof for its
+// own gossip-only members) cannot be routed through this helper at all, so it
+// would strengthen the sweeper and leave the bind exactly as it is — and it has
+// no declared carrier for the hop bound that keeps a delegation from recursing.
+// Until that field exists, this boundary is documented rather than papered over:
+// the set is closed over ROWS, and a holder no reachable node has a row for is
+// outside what rows can prove.
+func (s *Server) gatherHostViews(ctx context.Context, peers []string, local corrosion.TableDigest) []hostView {
 	views := make([]hostView, len(peers))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, orphanProofWorkers)
@@ -632,33 +608,87 @@ func (s *Server) gatherHostViews(ctx context.Context, peers []string) []hostView
 		go func(i int, h string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			views[i] = hostView{host: h}
-			pctx, cancel := context.WithTimeout(ctx, orphanProofTimeout)
-			defer cancel()
-			client, closeConn, derr := s.dialPeer(pctx, h)
-			if derr != nil {
-				views[i].err = derr
-				return
-			}
-			resp, rerr := client.ListHosts(pctx, &pb.ListHostsRequest{})
-			closeConn()
-			if rerr != nil {
-				views[i].err = rerr
-				return
-			}
-			for _, host := range resp.GetHosts() {
-				if host.GetName() != "" {
-					views[i].hosts = append(views[i].hosts, host.GetName())
-				}
-			}
+			views[i] = s.hostRowsOf(ctx, h, local)
 		}(i, h)
 	}
 	wg.Wait()
 	return views
 }
 
+// hostRowsOf reads ONE participant's `hosts` rows: its digest first, and its
+// dump only if that digest does not agree with this node's. See
+// closedParticipantSet for why agreement is sufficient and why every other
+// outcome — including a dump that under-reports its own digest's count — leaves
+// the set unclosable.
+func (s *Server) hostRowsOf(ctx context.Context, host string, local corrosion.TableDigest) hostView {
+	v := hostView{host: host}
+	unproven := func(format string, args ...any) hostView {
+		v.unproven = fmt.Sprintf(format, args...)
+		return v
+	}
+	pctx, cancel := context.WithTimeout(ctx, orphanProofTimeout)
+	defer cancel()
+
+	client, closeConn, derr := s.dialPeer(pctx, host)
+	if derr != nil {
+		return unproven("host %s could not be asked which hosts it knows (%v)", host, derr)
+	}
+	defer closeConn()
+
+	resp, rerr := client.GetStateDigest(pctx, &emptypb.Empty{})
+	if rerr != nil {
+		return unproven("host %s could not be asked for its %s digest (%v)",
+			host, hostsTableName, rerr)
+	}
+	var remote *pb.TableDigest
+	for _, td := range resp.GetTables() {
+		if td.GetName() == hostsTableName {
+			remote = td
+			break
+		}
+	}
+	if remote == nil {
+		// An older peer, or one whose digest set does not carry the table.
+		// Silence about `hosts` is not a statement about which hosts it holds.
+		return unproven("host %s reported no %s digest", host, hostsTableName)
+	}
+	if corrosion.TableDigestsAgree(local, remote) {
+		// Its table IS this node's, tombstones and all, so every row it holds was
+		// already read locally. Nothing to fetch and nothing new to learn.
+		return v
+	}
+
+	dump, ferr := fetchPeerStateDump(pctx, client)
+	if ferr != nil {
+		return unproven("host %s holds a different set of %s rows than this node "+
+			"(%d there, %d here) and its state dump could not be read (%v)",
+			host, hostsTableName, remote.GetCount(), local.Count, ferr)
+	}
+	names, perr := corrosion.HostNamesFromStateDump(dump)
+	if perr != nil {
+		return unproven("host %s holds a different set of %s rows than this node "+
+			"and its state dump could not be read (%v)", host, hostsTableName, perr)
+	}
+	if len(names) < int(remote.GetCount()) {
+		// The peer's own digest counts more rows than its dump carried, so the
+		// list is short by at least one host — the exact shape that must never be
+		// read as that peer's membership.
+		return unproven("host %s dumped %d %s row(s) but its own digest counts %d, "+
+			"so its membership was not read whole",
+			host, len(names), hostsTableName, remote.GetCount())
+	}
+	v.hosts = names
+	return v
+}
+
 // closedProofPeers is closedParticipantSet without this node — the hosts that
 // have to be ASKED, as opposed to the one this node answers for itself.
+//
+// It carries the WHOLE of the membership proof, not a subset of it: the bind
+// reaches its peer set only through here, so the corroboration the sweeper
+// requires to reclaim is the same corroboration the bind requires to go live. A
+// second route into the participant set is how the two proofs came to differ in
+// the first place.
 func (s *Server) closedProofPeers(ctx context.Context) ([]string, string, error) {
 	hosts, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil || unclosed != "" {

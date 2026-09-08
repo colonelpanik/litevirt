@@ -2,9 +2,91 @@ package corrosion
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
+
+// TestHostNamesFromStateDumpCarriesTombstonedRows is the property a membership
+// proof rests on, read out of a REAL dump rather than a hand-built one: the
+// encoder and the parser are pinned against each other here, so a shape drift
+// fails in this package instead of silently producing a short list somewhere
+// that reads it as a cluster's membership.
+//
+// The tombstoned row is the whole point. ListHosts filters `deleted_at IS NULL`
+// and a forced host removal does not power a machine off, so the host whose row
+// a peer has tombstoned is exactly the one that may still be holding an address.
+func TestHostNamesFromStateDumpCarriesTombstonedRows(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"node1", "node2", "removed"} {
+		if err := InsertHost(ctx, c, HostRecord{
+			Name: name, Address: "203.0.113.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := c.Execute(ctx,
+		`UPDATE hosts SET deleted_at = ? WHERE name = 'removed'`, c.NowWall()); err != nil {
+		t.Fatalf("tombstone a host row: %v", err)
+	}
+
+	// Precondition: the filtered read cannot see it, which is why the dump is the
+	// source a completeness proof has to use.
+	live, err := ListHosts(ctx, c)
+	if err != nil {
+		t.Fatalf("ListHosts: %v", err)
+	}
+	for _, h := range live {
+		if h.Name == "removed" {
+			t.Fatal("precondition: ListHosts must filter the tombstoned row")
+		}
+	}
+
+	names, err := HostNamesFromStateDump(c.DumpStateBytes())
+	if err != nil {
+		t.Fatalf("HostNamesFromStateDump: %v", err)
+	}
+	for _, want := range []string{"node1", "node2", "removed"} {
+		if !slices.Contains(names, want) {
+			t.Fatalf("names = %v, want it to carry %q", names, want)
+		}
+	}
+}
+
+// TestHostNamesFromStateDumpFailsClosed pins that every shape which could
+// UNDER-REPORT is an error rather than a short list. A caller reading a
+// truncated list as a cluster's membership is the defect this exists to prevent,
+// so "I could not read it" and "there is nobody else" must never be the same
+// answer.
+func TestHostNamesFromStateDumpFailsClosed(t *testing.T) {
+	c := testClient(t)
+
+	for _, tc := range []struct {
+		name string
+		buf  []byte
+	}{
+		{"not a dump at all", []byte("plain text")},
+		{"an empty payload", []byte(nil)},
+		// A real dump from a database whose `hosts` table is empty:
+		// dumpStateForTables omits a table with no rows, and a node holds at
+		// least its own row — so an absent table is an unhydrated database,
+		// never the claim that the cluster is empty.
+		{"a dump with no hosts table", c.DumpStateBytes()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			names, err := HostNamesFromStateDump(tc.buf)
+			if err == nil {
+				t.Fatalf("must fail closed, got names %v", names)
+			}
+			if names != nil {
+				t.Fatalf("a failure must return no names, got %v", names)
+			}
+		})
+	}
+}
 
 func TestInsertAndGetHost(t *testing.T) {
 	c := testClient(t)

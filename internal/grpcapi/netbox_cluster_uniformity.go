@@ -330,7 +330,7 @@ func (s *Server) compareNetBoxClusterName(ctx context.Context) (netboxClusterDis
 // window for a witness whose own row has not replicated yet, on a cluster that
 // has two of them and no worker.
 //
-// The sweeper's participant universe (eligibleProofHosts) excludes
+// The sweeper's participant universe (proofParticipants) excludes
 // `role='witness'` too, but on its own ground and not this one: a negative proof
 // is about who might be RUNNING the workload holding an address, and a witness
 // hosts none. That reason does not transfer here, so this one is stated in full

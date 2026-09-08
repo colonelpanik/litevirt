@@ -219,6 +219,10 @@ func New(t *testing.T, opts Options) *Cluster {
 	// host-add path produces.
 	c.crossRegisterHosts()
 
+	// Step 3b — gossip membership, which every node in a real cluster has and
+	// this harness did not.
+	c.seedGossipMembership()
+
 	// Step 4 — build grpcapi.Server per node, attach replicator,
 	// start gRPC server on the pre-allocated listener.
 	for _, n := range c.Nodes {
@@ -386,6 +390,49 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
 	}
 	n.DB = db
+}
+
+// seedGossipMembership gives every node the memberlist view a real node has:
+// each of its PEERS, by name and address, with itself excluded exactly as
+// corrosion.Client.Members() excludes it.
+//
+// It is a fidelity fix, not a convenience. The in-process fleet joins no gossip
+// mesh, so Members() answered empty on every node — and every production path
+// that consults it as a SECOND, non-CRDT source of membership was therefore
+// untestable here, silently. That is not a hypothetical gap: the two proofs in
+// netbox_adopt.go and netbox_sweeper.go both union gossip into their participant
+// universe precisely because the replicated `hosts` table can be missing a peer,
+// and with Members() empty a scenario that deleted a `hosts` row proved nothing
+// about the union at all.
+//
+// WHAT A GOSSIP-ONLY PEER CAN AND CANNOT DO HERE. It is NAMED, so it lands in
+// every participant universe. It is not DIALABLE: corrosion's resolver takes the
+// host from the membership address and defaults the port to 7443 — right for a
+// real cluster, wrong for a harness whose daemons listen on ephemeral ports — so
+// a peer known only to gossip answers as unreachable. Both outcomes are
+// fail-closed and the proofs treat them the same way, which is why a scenario
+// can rely on either; a scenario that needs the peer to ANSWER has to leave its
+// `hosts` row in place.
+func (c *Cluster) seedGossipMembership() {
+	for _, target := range c.Nodes {
+		self := target.Name
+		nodes := c.Nodes
+		target.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+			var peers []corrosion.PeerInfo
+			for _, n := range nodes {
+				if n.Name == self {
+					continue
+				}
+				// The gossip port, not the gRPC one: memberlist advertises where
+				// it gossips, and the resolver discards that port anyway.
+				peers = append(peers, corrosion.PeerInfo{
+					Name: n.Name,
+					Addr: net.JoinHostPort(n.Address, "7946"),
+				})
+			}
+			return peers
+		})
+	}
 }
 
 func (c *Cluster) crossRegisterHosts() {

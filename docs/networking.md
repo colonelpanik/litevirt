@@ -392,23 +392,25 @@ being explicit about the rest matters more than the happy path:
 
 #### Binding from a node that is still replicating
 
-Adoption reads **this node's** copy of the replicated database, and an empty
-answer is not proof: a node that has just joined, or one rebuilt after a database
-loss, reports no VMs in exactly the same way as a cluster that genuinely has
-none. No local table separates those two — a deleted VM leaves a tombstone
-behind, so a database with *no VM record of any kind* is suspicious, but that is
-also the state of every cluster before its first VM, which is when most prefixes
-get bound.
+Adoption reads **this node's** copy of the replicated database, and what that
+copy says is not proof of what the cluster holds. A node that has just joined, or
+one rebuilt after a database loss, reports no VMs in exactly the same way as a
+cluster that genuinely has none — and a node that has received *some* rows and
+not others reports a list that looks entirely ordinary while the guest holding
+the first address in the prefix is missing from it. Nothing in the schema records
+how much of a table a node has actually received, so no local read can tell the
+difference.
 
-So when the local VM list is empty **and** holds no tombstone, litevirt asks the
-cluster: every host reports how many `vms` rows it holds, and only a complete
-answer of zeroes corroborates the read. That costs one small request per peer,
-and only on a cluster that has never had a VM — on any other, the local
-tombstone answers it.
+So on **every** bind litevirt asks the cluster: each host reports its `vms`
+digest, and the local list is corroborated only when every host either agrees
+with it (the same rows, by the same comparison anti-entropy repairs on) or holds
+strictly fewer rows — a peer that is behind cannot be the reason this node's list
+is short. That costs one small request per peer.
 
-If the read **cannot** be corroborated — a host that could not be reached, or a
-host that reports rows this node has not received — the bind still succeeds, but
-the binding is created **suspended**:
+If the inventory **cannot** be corroborated — a host that could not be reached, a
+host that reports more rows than this node has, or one that reports the same
+number of *different* rows — the bind still succeeds, but the binding is created
+**suspended**:
 
 ```
 $ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
@@ -1011,6 +1013,16 @@ Reclamation is the only thing in litevirt that deletes an address from NetBox,
 so it happens only under a whole-cluster proof:
 
 - exactly one node sweeps, elected through a cluster-wide lease;
+- the set of hosts that must answer is the replicated `hosts` table **unioned
+  with gossip membership**, because the replicated table can simply be missing a
+  peer — and a peer missing from it would otherwise be absent from both samples,
+  making the two samples agree about a cluster neither of them saw whole.
+  Membership converges in seconds and independently of every table, so a host it
+  names is a host that exists;
+- that view of membership is itself corroborated: every host reports how many
+  `hosts` rows it holds, and a host that knows more of them than the sweeping
+  node does means the sweeping node cannot have asked everyone. Reclamation stops
+  there;
 - **every** eligible host must answer, and answer with a complete scan. One
   unreachable host, one incomplete answer, or a membership change mid-proof and
   the address is left alone;

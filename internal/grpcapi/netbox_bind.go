@@ -171,25 +171,32 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		return fmt.Errorf("NetBox prefix %d was bound to another network concurrently", prefixID)
 	}
 	pending := plan.candidates
-	// WHY THE BINDING MIGHT NOT GO LIVE, in the two cases that exist. They are
-	// mutually exclusive by construction (see adoptionPlan).
+	// WHY THE BINDING MIGHT NOT GO LIVE, in the two cases that exist.
+	//
+	// THE UNCORROBORATED CASE IS TESTED FIRST, and the order is load-bearing: a
+	// partially hydrated node has BOTH — a list of candidates it can see and no
+	// standing to call that list complete — and only the uncorroborated reason is
+	// in the class the revalidation pass lifts by itself (isUnhydratedSuspension).
+	// Writing the adoption reason over it would leave the binding waiting for an
+	// operator who has nothing to repair, while the adoption it names refuses on
+	// the sentinel anyway.
 	suspendReason := ""
 	switch {
+	case plan.uncorroborated:
+		// Nothing corroborates that this node's VM list is the cluster's, so
+		// what it does not name is unknown rather than absent. Live would be a
+		// binding allocating across a prefix whose occupants are unknown; a
+		// REFUSAL would refuse the first bind on a young multi-node cluster with
+		// no way out. Suspended is neither: no claim is served, and the
+		// revalidation pass re-runs adoption and resumes it with no operator
+		// action. See corroborateVMInventory.
+		suspendReason = unhydratedSuspendReason(netName)
 	case len(pending) > 0:
 		suspendReason = adoptionSuspendReason(netName, len(pending))
-	case plan.uncorroborated:
-		// The VM list was empty and nothing corroborates that the cluster is
-		// genuinely empty, so there is no list of existing addresses to adopt —
-		// only an inability to produce one. Live would be a binding allocating
-		// across a prefix whose occupants are unknown; a REFUSAL would refuse the
-		// first bind on a young multi-node cluster with no way out. Suspended is
-		// neither: no claim is served, and the revalidation pass re-runs adoption
-		// and resumes it with no operator action. See corroborateEmptyVMRead.
-		suspendReason = unhydratedSuspendReason(netName)
 	default:
-		// Nothing to adopt and the empty read stands up: the binding is live
-		// immediately, which is both the pre-adoption behaviour and the common
-		// case. No NetBox address request is made at all.
+		// Nothing to adopt and a corroborated inventory to say so: the binding is
+		// live immediately, which is both the pre-adoption behaviour and the
+		// common case. No NetBox address request is made at all.
 		return nil
 	}
 

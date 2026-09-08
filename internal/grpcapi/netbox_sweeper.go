@@ -100,6 +100,7 @@ const (
 	skipHostHolds            = "host_still_claims"
 	skipProofCount           = "proof_count_mismatch"
 	skipMembership           = "membership_changed"
+	skipMembershipUnproven   = "membership_unproven"
 	skipLeaseLost            = "leader_lease_lost"
 	skipRemoteReread         = "netbox_reread_failed"
 	skipObjectChanged        = "netbox_object_changed"
@@ -174,8 +175,16 @@ func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error
 // "best effort" branch and no partial-evidence branch: a negative proof that is
 // not whole is not a proof.
 func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) error {
-	// 1. Sample A.
-	setA, err := s.eligibleProofHosts(ctx)
+	// 1. Sample A — from proofParticipants, which is the replicated `hosts`
+	//    table UNIONED WITH GOSSIP MEMBERSHIP.
+	//
+	//    The union is not a refinement, it is the difference between a proof and
+	//    a coin flip. Built from the `hosts` table alone, a peer whose row had
+	//    not hydrated on this node was absent from BOTH samples, so the samples
+	//    agreed and the five steps below concluded that nobody held the address
+	//    — while that peer's guest still had it on a defined domain. Two samples
+	//    establish STABILITY, not COMPLETENESS.
+	setA, err := s.proofParticipants(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "read eligible hosts: %v", err)
 	}
@@ -183,6 +192,19 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 		// Nobody to ask. An empty universe would make every proof vacuously
 		// complete, which is the one shape that must never authorize a delete.
 		return skipf(skipNoHosts, "no eligible hosts to prove absence")
+	}
+
+	// 1b. …and the membership view itself has to be corroborated, because the
+	//     union is still not a completeness proof: a host in NEITHER the
+	//     replicated table nor gossip is invisible to both, and an invisible host
+	//     is exactly the one whose guest is about to lose its address. So every
+	//     participant is asked how many `hosts` rows IT holds, and a peer that
+	//     holds more than this node does says this node's view of the cluster is
+	//     short — by at least one host it therefore never asked.
+	if reason, cerr := s.membershipViewUncorroborated(ctx, setA); cerr != nil {
+		return skipf(skipHostsRead, "read this node's own host digest: %v", cerr)
+	} else if reason != "" {
+		return skipf(skipMembershipUnproven, "membership view not corroborated: %s", reason)
 	}
 
 	// 2. Collect from exactly A, and require EXACTLY ONE response per member,
@@ -218,8 +240,9 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 		s.onProofCollected()
 	}
 
-	// 3. Sample B.
-	setB, err := s.eligibleProofHosts(ctx)
+	// 3. Sample B, from the same union as A — a set read two different ways
+	//    would compare two different questions and could never be equal.
+	setB, err := s.proofParticipants(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "re-read eligible hosts: %v", err)
 	}
@@ -265,57 +288,181 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	return nil
 }
 
+// ── corroborating the membership view ───────────────────────────────────────
+
+// membershipViewUncorroborated asks every participant how many `hosts` rows it
+// holds and reports the first one that holds MORE than this node does.
+//
+// It returns the operator-facing reason a view is not corroborated, or "" when
+// it is. An error is returned only for the failure that is about THIS node — an
+// unreadable local digest — because that is the one a caller must report
+// differently: everything else is part of the answer, and a participant that
+// cannot be asked leaves the view unproven exactly as a participant holding more
+// rows does.
+//
+// WHY A COUNT AND NOT THE FULL DIGEST. The corroboration the NetBox bind makes
+// over `vms` compares content hashes as well, and deliberately does not here.
+// `hosts` rows carry per-node timestamps and a per-node `version` /
+// `schema_version`, so two nodes agree on the CONTENT of that table only when
+// they are converged AND on the same build — during any rolling upgrade they are
+// not, and a hash comparison would make the sweeper permanently inert for the
+// length of one. A count is monotone under replication and answers the only
+// question asked here: does somebody know about a host I do not?
+//
+// The asymmetry is deliberate in the other direction too: a peer holding FEWER
+// host rows is a peer that is behind, which cannot be the reason THIS node's set
+// is short.
+//
+// FAIL CLOSED at every branch, and the cost of doing so is one skipped sweep:
+// the address stays allocated and the next pass tries again. Leaking an address
+// the next sweep can reclaim is always preferable to freeing one a live guest
+// uses.
+func (s *Server) membershipViewUncorroborated(ctx context.Context, participants []string) (string, error) {
+	local, err := s.localTableDigest(ctx, hostsTableName)
+	if err != nil {
+		return "", err
+	}
+	var peers []string
+	for _, h := range participants {
+		if h != s.hostName {
+			peers = append(peers, h)
+		}
+	}
+	if len(peers) == 0 {
+		// A single-node cluster's view of its own membership IS the cluster's.
+		return "", nil
+	}
+	for _, a := range s.gatherTableDigests(ctx, peers, hostsTableName) {
+		switch {
+		case a.err != nil:
+			return fmt.Sprintf("host %s could not be asked (%v)", a.host, a.err), nil
+		case !a.found:
+			// An older peer, or one whose digest set does not carry the table.
+			// Silence about `hosts` is not agreement about the cluster's shape.
+			return fmt.Sprintf("host %s reported no %s digest", a.host, hostsTableName), nil
+		case int(a.digest.GetCount()) > local.Count:
+			return fmt.Sprintf(
+				"host %s knows %d %s row(s) to this node's %d, so this node cannot have asked every host",
+				a.host, a.digest.GetCount(), hostsTableName, local.Count), nil
+		}
+	}
+	return "", nil
+}
+
 // ── the participant universe ────────────────────────────────────────────────
 
-// eligibleProofHosts is the participant universe for a negative proof.
+// proofParticipants is the participant universe for EVERY cross-cluster proof in
+// this package — the orphan sweeper's negative proof and the bind's
+// VM-inventory corroboration both.
+//
+// ONE helper, not one per proof. There were two, and they differed in exactly
+// the way that mattered: the bind's unioned GOSSIP MEMBERSHIP into the
+// replicated `hosts` table and the sweeper's did not. So the sweeper built its
+// whole universe from the replicated table, a peer whose row had not hydrated on
+// this node was absent from BOTH of its samples, the samples agreed — they
+// establish stability, not completeness — and it deleted an address that peer's
+// guest still held.
+//
+// THE CANDIDATE SET is the `hosts` table unioned with gossip membership.
 //
 // It CANNOT reuse the existing helpers: dualRunProbeTargets has the right
 // universe but reads from ListHosts, and ListHosts filters WHERE deleted_at IS
 // NULL — so it cannot see the tombstoned hosts that may still be running QEMU.
+// Gossip is unioned in because the replicated table is CRDT state and can simply
+// be missing a peer: memberlist converges in seconds, independently of every
+// table, so a host it names is a host that exists whatever the database says.
+// corrosion's peer resolver already falls back to the membership address for a
+// host whose row has not replicated, so a gossip-only peer is dialable.
 //
-// A host is excluded ONLY with fresh, specific, proof-grade power-off evidence
-// and no sign of a later rejoin. It is NOT excluded because its row vanished or
-// because its state reads offline: an offline-looking host can still be running
-// the domain, and dropping it would manufacture exactly the absence being proven.
+// THE FILTERS then apply to every candidate identically, whichever source named
+// it — a union that skipped them would UNDO them, which is worse than not having
+// them: a host excluded by an operator's power-off attestation would be silently
+// re-added by gossip, and after a permanent host loss the sweeper would be inert
+// forever with no escape.
+//
+//   - A WITNESS is excluded: it votes and never hosts workloads. Only the
+//     `hosts` table carries a role, so a gossip-only candidate has none — and an
+//     unknown role is not a statement that it is a witness, so it stays in.
+//   - A host is otherwise excluded ONLY with fresh, specific, proof-grade
+//     power-off evidence and no sign of a later rejoin. It is NOT excluded
+//     because its row vanished or because its state reads offline: an
+//     offline-looking host can still be running the domain, and dropping it
+//     would manufacture exactly the absence being proven.
 //
 // This node is always in the set. Its own row could be missing or tombstoned
 // while it is demonstrably running — it is executing this code — and a proof
 // that omitted the leader would be the easiest possible way to miss a claimant.
-func (s *Server) eligibleProofHosts(ctx context.Context) ([]string, error) {
+func (s *Server) proofParticipants(ctx context.Context) ([]string, error) {
 	// No deleted_at filter, deliberately: a decommissioned row does not power a
 	// machine off, and RemoveHost --force does not even check for workloads.
 	rows, err := s.db.Query(ctx, `SELECT name, COALESCE(role, '') AS role FROM hosts`)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
-	var out []string
+	type candidate struct {
+		name    string
+		witness bool
+	}
+	var candidates []candidate
+	named := map[string]bool{}
 	for _, r := range rows {
 		name := r.String("name")
-		if name == "" || seen[name] {
+		if name == "" || named[name] {
 			continue
 		}
-		if name != s.hostName && r.String("role") == "witness" {
-			continue // a witness votes and never hosts workloads
+		named[name] = true
+		candidates = append(candidates, candidate{name: name, witness: r.String("role") == "witness"})
+	}
+	for _, m := range s.db.Members() {
+		if m.Name == "" || named[m.Name] {
+			continue
 		}
-		if name != s.hostName {
-			excluded, err := s.hasFreshPowerOffProof(ctx, name)
+		named[m.Name] = true
+		// No role: nothing but the `hosts` table records one, and this host's
+		// row is precisely what has not arrived.
+		candidates = append(candidates, candidate{name: m.Name})
+	}
+
+	seen := map[string]bool{}
+	var out []string
+	for _, c := range candidates {
+		if c.name != s.hostName {
+			if c.witness {
+				continue // a witness votes and never hosts workloads
+			}
+			excluded, err := s.hasFreshPowerOffProof(ctx, c.name)
 			if err != nil {
 				// An unreadable fencing_log is not permission to exclude.
-				return nil, fmt.Errorf("read fence evidence for %s: %w", name, err)
+				return nil, fmt.Errorf("read fence evidence for %s: %w", c.name, err)
 			}
 			if excluded {
 				continue
 			}
 		}
-		seen[name] = true
-		out = append(out, name)
+		seen[c.name] = true
+		out = append(out, c.name)
 	}
 	if !seen[s.hostName] && s.hostName != "" {
 		out = append(out, s.hostName)
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// proofPeers is proofParticipants without this node — the hosts that have to be
+// ASKED, as opposed to the one this node answers for itself.
+func (s *Server) proofPeers(ctx context.Context) ([]string, error) {
+	hosts, err := s.proofParticipants(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var peers []string
+	for _, h := range hosts {
+		if h != s.hostName {
+			peers = append(peers, h)
+		}
+	}
+	return peers, nil
 }
 
 // hasFreshPowerOffProof reports whether a host has proof-grade power-off

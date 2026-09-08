@@ -6,6 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -42,6 +46,49 @@ func seedPeerHost(t *testing.T, s *Server, name string) {
 		 VALUES (?, '203.0.113.9', 'root', 'serial', ?, ?)`,
 		name, s.db.NowWall(), s.db.NowTS()); err != nil {
 		t.Fatalf("seed peer host %s: %v", name, err)
+	}
+}
+
+// agreeingPeer is a peer that answers GetStateDigest with THIS node's own
+// digest, and nothing else.
+//
+// It is the positive branch of the proof, which a single-process fixture cannot
+// otherwise reach: seedPeerHost's peer sits on a reserved documentation address
+// nothing answers on, so every scenario built on it exercises "the host could
+// not be asked". A peer that ANSWERS, and answers in agreement, is what says the
+// local inventory IS the cluster's — and it has to be a real answer rather than
+// a skipped check, because the whole defect being fixed here was a check that
+// concluded corroboration from a local read alone.
+type agreeingPeer struct {
+	pb.LiteVirtClient
+	digest func() *pb.StateDigestResponse
+}
+
+func (p *agreeingPeer) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
+	return p.digest(), nil
+}
+
+// peerAgreesWithThisNode makes every peer answer with this node's own digest, so
+// the cluster confirms the local inventory. Read at CALL time, not at wiring
+// time: a scenario seeds rows after the bind, and a snapshot taken here would
+// have the peer agreeing with a database that no longer exists.
+func peerAgreesWithThisNode(t *testing.T, s *Server) {
+	t.Helper()
+	s.peerClientOverride = func(ctx context.Context, _ string) (pb.LiteVirtClient, func(), error) {
+		return &agreeingPeer{digest: func() *pb.StateDigestResponse {
+			digests, err := s.db.StateDigest(ctx)
+			if err != nil {
+				t.Errorf("local StateDigest for the peer stub: %v", err)
+				return &pb.StateDigestResponse{}
+			}
+			resp := &pb.StateDigestResponse{HostName: "peer-b"}
+			for _, d := range digests {
+				resp.Tables = append(resp.Tables, &pb.TableDigest{
+					Name: d.Name, Count: int32(d.Count), Hash: d.Hash, HashV2: d.HashV2,
+				})
+			}
+			return resp
+		}}, func() {}, nil
 	}
 }
 
@@ -145,11 +192,21 @@ func TestBindOnACorroboratedEmptyClusterIsLiveImmediately(t *testing.T) {
 	}
 }
 
-// TestATombstoneCorroboratesAnEmptyReadDespiteAPeer keeps the peer test from
-// being the whole predicate. A cluster that deleted its last VM holds
-// TOMBSTONES, which is positive evidence this database has been told about VMs
-// — so the empty live read is its own answer whether or not peers exist.
-func TestATombstoneCorroboratesAnEmptyReadDespiteAPeer(t *testing.T) {
+// TestALocalRowDoesNotCorroborateAnInventoryWhileAPeerCannotAnswer is the
+// inverse of what this file used to assert, and the correction is the point.
+//
+// The corroboration once short-circuited on ANY local `vms` row, tombstones
+// included: a row was read as positive evidence that this database had been told
+// about VMs, and the empty live read was then taken as its own answer. That
+// reasoning does not survive contact with the hazard. A tombstone says this node
+// once heard about ONE VM; it says nothing about the ones a peer holds right
+// now, and those are the guests whose addresses a bind is about to let NetBox
+// hand out again. The same short-circuit is what let a node knowing one
+// unrelated VM bind over an incumbent's live address.
+//
+// So a local row corroborates nothing by itself. The cluster still has to
+// answer, and a peer that cannot be asked leaves the binding suspended.
+func TestALocalRowDoesNotCorroborateAnInventoryWhileAPeerCannotAnswer(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
@@ -167,8 +224,11 @@ func TestATombstoneCorroboratesAnEmptyReadDespiteAPeer(t *testing.T) {
 	if err != nil || b == nil {
 		t.Fatalf("binding row: %+v (err %v)", b, err)
 	}
-	if b.Suspended {
-		t.Fatalf("a tombstone corroborates the empty read; the bind must be live, got %q", b.SuspendReason)
+	if !b.Suspended {
+		t.Fatal("a local tombstone is not a statement about what a peer holds; the bind must not go live")
+	}
+	if !isUnhydratedSuspension(b.SuspendReason) {
+		t.Fatalf("reason = %q, want the uncorroborated-read one", b.SuspendReason)
 	}
 }
 
@@ -267,10 +327,12 @@ func TestRevalidationResumesAnUnhydratedBindingOnceItCanCorroborate(t *testing.T
 	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
 		t.Fatal(err)
 	}
-	// The rows arrive. Any `vms` row of any kind corroborates the read, exactly
-	// as it does for the inventory mirror.
+	// The rows arrive, AND the cluster confirms they are all of them — which is
+	// what corroboration now means. The arrival alone would not do it: a row this
+	// node holds says nothing about the rows a peer holds.
 	seedVMInState(t, s, "arrived", "other-net", "aa:bb:cc:00:05:01", "",
 		"77777777-7777-7777-7777-777777777777", "running")
+	peerAgreesWithThisNode(t, s)
 
 	if err := s.RevalidateBindingsOnce(ctx); err != nil {
 		t.Fatal(err)
@@ -303,9 +365,11 @@ func TestRevalidationDoesNotResumeWhenALateAddressCannotBeAdopted(t *testing.T) 
 		t.Fatal(err)
 	}
 	// A guest that was invisible to the bind, holding an address INSIDE the
-	// bound prefix. Its arrival also corroborates the read.
+	// bound prefix, and a cluster that now confirms this node's inventory — so
+	// only the adoption can hold the resume back.
 	seedVMHoldingIP(t, s, "late", "shared", "aa:bb:cc:00:06:01", "10.0.5.42",
 		"66666666-6666-6666-6666-666666666666")
+	peerAgreesWithThisNode(t, s)
 
 	if err := s.RevalidateBindingsOnce(ctx); err != nil {
 		t.Fatal(err)
@@ -345,6 +409,7 @@ func TestRevalidationResumesWithInventoryMirroringOff(t *testing.T) {
 	}
 	seedVMInState(t, s, "arrived", "other-net", "aa:bb:cc:00:07:01", "",
 		"55555555-5555-5555-5555-555555555555", "running")
+	peerAgreesWithThisNode(t, s)
 
 	if err := s.RevalidateBindingsOnce(ctx); err != nil {
 		t.Fatal(err)

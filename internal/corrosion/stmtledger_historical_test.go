@@ -75,7 +75,13 @@ import (
 // lease_term_mint_or_ignore_v51 — a peer on the first term-ledger build still
 // emits it, and the two apply identically. No previously accepted historical
 // identity was removed or changed.
-const compatibilityDigest = "686a9e2a93c13fc9dfc67c2d03884177a7fcff13c702b4fbe1df8c91dfb8dbfd"
+// Updated again for schema v52: runtime_action_proofs gained lease_term, so the
+// proof INSERT's shape changed and the pre-term form lost its emitter in this
+// tree. It was ADDED as receive-only proof_insert_pre_lease_term_v51 — a pre-v52
+// peer mints every proof with that shape, and it applies identically here (the
+// missing column takes its DEFAULT 0, the "minted without a term" sentinel). No
+// previously accepted historical identity was removed or changed.
+const compatibilityDigest = "aa6e56d76bd21b94162a6d896b27c6ab49667dd7999923025218f521234f02a1"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -138,6 +144,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"complete_vm_start_pre_epoch_v47":       1,   // reschedule completion before the Phase 4 owner-epoch mint
 	"failover_lease_literal_key_v50":        1,   // coordinator lease upsert with the key as a literal, before the shared bound-key helper
 	"lease_term_mint_or_ignore_v51":         1,   // lease-term mint's original INSERT OR IGNORE form, before the writer needed local constraint errors
+	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

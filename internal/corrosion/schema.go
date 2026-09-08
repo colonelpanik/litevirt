@@ -362,7 +362,12 @@ import (
 //	     concurrent minting of one (key, term) during a partition is the normal
 //	     path, not a fault, and a term's holder must never be rewritten. Nothing
 //	     enforces on a term. One new table.
-const CurrentSchemaVersion = 52
+//	v53: leader-lease term enforcement — runtime_action_proofs gains lease_term,
+//	     the incarnation term of the coordinator that minted the proof. Gated by
+//	     lease_term_v1; 0 = minted without one. One additive column, appended
+//	     LAST in the CREATE TABLE so fresh and upgraded databases share one
+//	     physical column order (the v1 digest is positional).
+const CurrentSchemaVersion = 53
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -998,7 +1003,17 @@ var schemaDDL = []string{
 		executor_host     TEXT NOT NULL DEFAULT '',
 		created_at        TEXT NOT NULL,
 		updated_at        TEXT NOT NULL,
-		deleted_at        TEXT
+		deleted_at        TEXT,
+		-- lease_term (v52) is LAST deliberately, after deleted_at, so this DDL
+		-- produces the SAME physical column order as the ALTER in
+		-- schemaMigrations. The v1 state digest hashes SELECT * positionally
+		-- (sync.go tableRowKeys → encodeRowCells) and anti-entropy only prefers
+		-- the order-invariant v2 hash when BOTH peers emit one
+		-- (antientropy.go:181). A mid-DDL column would therefore make a
+		-- freshly-initialised v52 node and a v51→v52 upgraded node disagree
+		-- about this table's digest forever with identical rows, wherever
+		-- digest_v2 is off. Put every future additive column here, not above.
+		lease_term        INTEGER NOT NULL DEFAULT 0 -- lease incarnation term (v52); 0 = proof minted without one
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -2674,6 +2689,10 @@ var schemaMigrations = []string{
 	// mark-only and this ALTER never runs. Same belt-and-braces shape as every
 	// other column here.
 	`ALTER TABLE netbox_bindings ADD COLUMN netbox_cluster TEXT NOT NULL DEFAULT ''`,
+	// v53: the proof's fencing term. Additive with a 0 default, so an existing
+	// row reads as "minted without a term" — the sentinel the executor refuses
+	// once lease_term_v1 is enforced, never a valid term.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_term INTEGER NOT NULL DEFAULT 0`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2763,6 +2782,7 @@ var alterVersions = []int{
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
 	51, // netbox_bindings.netbox_cluster
+	53, // runtime_action_proofs.lease_term
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

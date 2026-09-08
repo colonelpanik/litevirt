@@ -117,6 +117,7 @@ var historicalLedger = map[string]LedgerEntry{
 	"stmtshape/v1:af5e4d96faa68eb542802fe65ad7c8af296722ed52a56b605599a85eb7b8c370": {Fingerprint: "stmtshape/v1:af5e4d96faa68eb542802fe65ad7c8af296722ed52a56b605599a85eb7b8c370", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:b19dadb8527f340b59dd0980aac9d31de5e577bc9c38c0bd866f7c00bb0b5fac": {Fingerprint: "stmtshape/v1:b19dadb8527f340b59dd0980aac9d31de5e577bc9c38c0bd866f7c00bb0b5fac", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:b3dc2a6b0e7f802e5aabe63ceceaa22d86263f6fc8edeaa03dca018e2f053fa8": {Fingerprint: "stmtshape/v1:b3dc2a6b0e7f802e5aabe63ceceaa22d86263f6fc8edeaa03dca018e2f053fa8", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
+	"stmtshape/v1:b53f7535a68ca1628438db47f84d8de0337ddbe75e0721ce8552fc466ec636ea": {Fingerprint: "stmtshape/v1:b53f7535a68ca1628438db47f84d8de0337ddbe75e0721ce8552fc466ec636ea", Kind: "insert", Table: "runtime_action_proofs", Disposition: DispCustomMerge, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:b6d49ce58c45b16cd480696ec140e071cc67a0a0e341fb476bf74b5429e1bcf1": {Fingerprint: "stmtshape/v1:b6d49ce58c45b16cd480696ec140e071cc67a0a0e341fb476bf74b5429e1bcf1", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:bc9932e9bc1faec786e90a3a89ffac111f07d143e52a9ea2abd0223c2b19fd9f": {Fingerprint: "stmtshape/v1:bc9932e9bc1faec786e90a3a89ffac111f07d143e52a9ea2abd0223c2b19fd9f", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:bd310bb09d23a3eb13fcd79c1183a70aaf8c6ba14d737d046fd172ae4b832fe7": {Fingerprint: "stmtshape/v1:bd310bb09d23a3eb13fcd79c1183a70aaf8c6ba14d737d046fd172ae4b832fe7", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
@@ -334,6 +335,9 @@ var historicalPolicies = map[string][]string{
 	},
 	"pci_release_by_vm_v130": {
 		"stmtshape/v1:80ec2c6cf76c42c88b5d29f1f33691e727585ecce1f82c57599e04d3869d905e",
+	},
+	"proof_insert_pre_lease_term_v51": {
+		"stmtshape/v1:b53f7535a68ca1628438db47f84d8de0337ddbe75e0721ce8552fc466ec636ea",
 	},
 	"quota_reservations_upstream_v44": {
 		"stmtshape/v1:00b397c858b8d1e855d761456564ff4bb839b8e8d48dfba5ebee5922a1d195a2",

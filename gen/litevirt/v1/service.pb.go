@@ -17745,7 +17745,14 @@ type RuntimeActionProof struct {
 	// owner epoch cannot authorize actions after the resource ownership has
 	// advanced. Empty on a proof minted by a pre-owner_epoch node ⇒ the executor
 	// skips the comparison until owner_epoch_v1 enforcement. Additive/wire-compatible.
-	OwnerEpoch    string `protobuf:"bytes,13,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"`
+	OwnerEpoch string `protobuf:"bytes,13,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"`
+	// lease_term is the fencing term of the lease incarnation that minted this
+	// proof. The executor refuses a proof whose term is below the
+	// QUORUM-observed high-water mark for the key, or whose coordinator is not
+	// the holder this node recorded at that term. 0 = minted by a pre-v52 node
+	// ⇒ refused once lease_term_v1 is enforced, accepted before.
+	// Additive/wire-compatible.
+	LeaseTerm     int64 `protobuf:"varint,14,opt,name=lease_term,json=leaseTerm,proto3" json:"lease_term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -17869,6 +17876,13 @@ func (x *RuntimeActionProof) GetOwnerEpoch() string {
 		return x.OwnerEpoch
 	}
 	return ""
+}
+
+func (x *RuntimeActionProof) GetLeaseTerm() int64 {
+	if x != nil {
+		return x.LeaseTerm
+	}
+	return 0
 }
 
 type PromoteReplicaRequest struct {
@@ -26908,7 +26922,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04data\x18\a \x01(\fR\x04data\"W\n" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xbd\x03\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xdc\x03\n" +
 	"\x12RuntimeActionProof\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06action\x18\x02 \x01(\tR\x06action\x12\x1f\n" +
@@ -26928,7 +26942,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vfence_epoch\x18\f \x01(\tR\n" +
 	"fenceEpoch\x12\x1f\n" +
 	"\vowner_epoch\x18\r \x01(\tR\n" +
-	"ownerEpoch\"\x95\x02\n" +
+	"ownerEpoch\x12\x1d\n" +
+	"\n" +
+	"lease_term\x18\x0e \x01(\x03R\tleaseTerm\"\x95\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +

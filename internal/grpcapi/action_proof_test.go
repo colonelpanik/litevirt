@@ -202,3 +202,75 @@ func TestApplyLB_EmptyProofFailsClosed(t *testing.T) {
 		t.Fatalf("ApplyLB with a non-nil empty-id proof must fail closed; got %v, want FailedPrecondition", status.Code(err))
 	}
 }
+
+// TestClaimCarriedProof_DivergentLeaseTermIsRefused: WriteActionProof is
+// INSERT OR IGNORE, so a row with this id may already exist (replicated, or
+// seeded by a peer). claimCarriedProof re-reads it and requires an exact match
+// on the authorization-bearing fields before claiming.
+//
+// lease_term MUST be in that list. Omit it and a divergent same-id row carrying
+// a DIFFERENT term is claimed under a matching carried proof — the term becomes
+// unauthenticated, which defeats the entire column: an attacker (or a confused
+// peer) supplies the term it wants enforced against.
+func TestClaimCarriedProof_DivergentLeaseTermIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // host name "host-a"
+
+	// A row already present locally at term 3.
+	if err := corrosion.WriteActionProof(ctx, s.db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a", LeaseTerm: 3,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// A carried proof with the SAME id and every other field identical, but term 9.
+	_, err := s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+		Id: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a", LeaseTerm: 9,
+	}, corrosion.ActionReschedule, "vm", "vm1")
+	if err == nil {
+		t.Fatal("claimed a proof whose persisted lease_term (3) differs from the carried one (9); " +
+			"the term must be part of the persisted-row field match or it is unauthenticated")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+}
+
+// TestClaimCarriedProof_SeedsTheCarriedLeaseTerm is the other half of the term
+// binding, and the arm that DivergentLeaseTermIsRefused cannot reach.
+//
+// When no row exists yet — the normal case, because the coordinator's replicated
+// row routinely arrives after the direct RPC that carries the proof — the carried
+// fields SEED it. So proofFromPB must forward the term. Drop it there and the
+// seed lands at 0 while the carried proof says 5; the field match immediately
+// below then refuses a perfectly valid proof, and every proof-gated action fails
+// closed the moment the coordinator starts stamping terms.
+//
+// DivergentLeaseTermIsRefused cannot catch that: it seeds the row itself, so the
+// persisted term never comes from proofFromPB at all and the INSERT OR IGNORE is
+// a no-op. Both arms are needed — one proves a wrong term is refused, this one
+// proves a right term survives the round trip through the seed path.
+func TestClaimCarriedProof_SeedsTheCarriedLeaseTerm(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // host name "host-a"
+
+	id, err := s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+		Id: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a", LeaseTerm: 5,
+	}, corrosion.ActionReschedule, "vm", "vm1")
+	if err != nil || id != "p1" {
+		t.Fatalf("claim of a valid term-5 proof: id=%q err=%v; the carried term must reach "+
+			"the seeded row, or the field match refuses the proof that just created it", id, err)
+	}
+
+	pr, ok, err := corrosion.GetActionProof(ctx, s.db, "p1")
+	if err != nil || !ok {
+		t.Fatalf("read seeded proof: ok=%v err=%v", ok, err)
+	}
+	if pr.LeaseTerm != 5 {
+		t.Errorf("seeded lease_term = %d, want 5 — a proof persisted without its term is "+
+			"unenforceable: the executor would read 0 and treat it as pre-term", pr.LeaseTerm)
+	}
+}

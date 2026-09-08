@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -296,5 +297,99 @@ func TestActionProof_FailIsTerminal(t *testing.T) {
 	// Terminal: can't claim or complete after fail.
 	if err := ClaimActionProof(ctx, c, "p1", "host-b"); !errors.Is(err, ErrProofSpent) {
 		t.Fatalf("claim after fail: err=%v; want ErrProofSpent", err)
+	}
+}
+
+// TestActionProof_LeaseTermRoundTrips: the term must survive the write/read
+// cycle. Without this the column can be added to the DDL and silently dropped
+// by proofInsertParams or the GetActionProof scan, which the compiler permits.
+func TestActionProof_LeaseTermRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	p := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 7,
+	}
+	if err := WriteActionProof(ctx, c, p); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, ok, err := GetActionProof(ctx, c, "p1")
+	if err != nil || !ok {
+		t.Fatalf("read: ok=%v err=%v", ok, err)
+	}
+	if got.LeaseTerm != 7 {
+		t.Errorf("lease_term = %d, want 7", got.LeaseTerm)
+	}
+}
+
+// TestActionProof_LeaseTermDefaultsToZero: an existing row written by a
+// pre-Phase-2 peer has no term. It must read back as 0 — the "pre-term proof"
+// sentinel the executor refuses post-latch — and never as a valid term.
+func TestActionProof_LeaseTermDefaultsToZero(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p2", Action: ActionPromote, TargetKind: "vm", TargetName: "vm2",
+		DestHost: "node-b", Coordinator: "node-a",
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, ok, err := GetActionProof(ctx, c, "p2")
+	if err != nil || !ok {
+		t.Fatalf("read: ok=%v err=%v", ok, err)
+	}
+	if got.LeaseTerm != 0 {
+		t.Errorf("lease_term = %d on a proof minted without one, want 0", got.LeaseTerm)
+	}
+}
+
+// TestSchemaV53FreshAndUpgradedColumnOrderMatch pins the reason lease_term sits
+// LAST in the runtime_action_proofs CREATE TABLE, after deleted_at.
+//
+// The v1 state digest hashes SELECT * POSITIONALLY (sync.go tableRowKeys →
+// encodeRowCells), and anti-entropy only prefers the order-invariant v2 hash
+// when BOTH peers emit one (antientropy.go, useV2). ALTER TABLE always appends,
+// so a column placed mid-DDL gives a freshly-initialised node a different
+// physical order from an upgraded one — and those two then disagree about this
+// table's digest forever, with byte-identical rows, wherever digest_v2 is off.
+//
+// Nothing else in the package catches that: the v44 column-order test covers
+// only containers/hosts/notification_routes. Without this, the next additive
+// column on this table reintroduces the divergence silently.
+func TestSchemaV53FreshAndUpgradedColumnOrderMatch(t *testing.T) {
+	ctx := context.Background()
+	fresh := newTestDB(t)
+	upgraded := newTestDB(t)
+
+	// Rewind the upgraded DB to v52: drop the column and un-record its migration.
+	if err := upgraded.execLocal(ctx,
+		`ALTER TABLE runtime_action_proofs DROP COLUMN lease_term`); err != nil {
+		t.Fatalf("simulate v52 drop runtime_action_proofs.lease_term: %v", err)
+	}
+	for _, m := range schemaMigrationLedger {
+		if m.Version == 53 {
+			if err := upgraded.execLocal(ctx,
+				`DELETE FROM applied_migrations WHERE id = ?`, m.ID); err != nil {
+				t.Fatalf("remove v53 ledger %s: %v", m.ID, err)
+			}
+		}
+	}
+	if err := upgraded.execLocal(ctx,
+		`UPDATE schema_state SET version = 52 WHERE id = 1`); err != nil {
+		t.Fatalf("stamp v52: %v", err)
+	}
+	if err := InitSchema(ctx, upgraded); err != nil {
+		t.Fatalf("migrate v52 to v53: %v", err)
+	}
+
+	freshColumns := tableColumnOrder(t, fresh, "runtime_action_proofs")
+	upgradedColumns := tableColumnOrder(t, upgraded, "runtime_action_proofs")
+	if !slices.Equal(freshColumns, upgradedColumns) {
+		t.Errorf("runtime_action_proofs column order differs — an additive column must go LAST "+
+			"in the CREATE TABLE so it lands where ALTER TABLE appends it:\nfresh:    %v\nupgraded: %v",
+			freshColumns, upgradedColumns)
+	}
+	if last := freshColumns[len(freshColumns)-1]; last != "lease_term" {
+		t.Errorf("last column = %q, want lease_term", last)
 	}
 }

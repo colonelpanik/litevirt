@@ -20,7 +20,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		LeaseHolder: p.GetLeaseHolder(), LeaseExpiresAt: p.GetLeaseExpiresAt(),
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
 		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
-		OwnerEpoch: p.GetOwnerEpoch(),
+		OwnerEpoch: p.GetOwnerEpoch(), LeaseTerm: p.GetLeaseTerm(),
 	}
 }
 
@@ -62,12 +62,18 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 	// verified carried-token == the token that will be STAMPED, so a persisted row whose
 	// token differs (a divergent same-id seed) must refuse — otherwise we'd claim the
 	// token-A ledger row while stamping token B, diverging proof from provenance.
+	//
+	// lease_term is in the binding for the same reason as relocation_token: it
+	// is an AUTHORIZATION-bearing field. A divergent same-id row carrying a
+	// different term, claimed under a matching carried proof, would let the
+	// caller choose which term is enforced against — which is the whole column.
 	if pr, ok, err := corrosion.GetActionProof(ctx, s.db, p.GetId()); err != nil {
 		return "", status.Errorf(codes.Unavailable, "read proof %s: %v", p.GetId(), err)
 	} else if !ok || pr.Action != p.GetAction() || pr.TargetKind != p.GetTargetKind() ||
 		pr.TargetName != p.GetTargetName() || pr.DestHost != p.GetDestHost() ||
 		pr.Coordinator != p.GetCoordinator() || pr.RelocationToken != p.GetRelocationToken() ||
-		pr.FenceEpoch != p.GetFenceEpoch() || pr.OwnerEpoch != p.GetOwnerEpoch() {
+		pr.FenceEpoch != p.GetFenceEpoch() || pr.OwnerEpoch != p.GetOwnerEpoch() ||
+		pr.LeaseTerm != p.GetLeaseTerm() {
 		return "", status.Errorf(codes.FailedPrecondition,
 			"persisted proof %s does not match the carried proof (divergent/seeded row)", p.GetId())
 	}

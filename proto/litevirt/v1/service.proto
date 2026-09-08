@@ -1629,6 +1629,13 @@ message RuntimeActionProof {
     // advanced. Empty on a proof minted by a pre-owner_epoch node ⇒ the executor
     // skips the comparison until owner_epoch_v1 enforcement. Additive/wire-compatible.
     string owner_epoch      = 13;
+    // lease_term is the fencing term of the lease incarnation that minted this
+    // proof. The executor refuses a proof whose term is below the
+    // QUORUM-observed high-water mark for the key, or whose coordinator is not
+    // the holder this node recorded at that term. 0 = minted by a pre-v52 node
+    // ⇒ refused once lease_term_v1 is enforced, accepted before.
+    // Additive/wire-compatible.
+    int64  lease_term       = 14;
 }
 
 message PromoteReplicaRequest {

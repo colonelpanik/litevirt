@@ -250,5 +250,19 @@ func HistoricalShapes() []HistoricalShape {
 		   (key, term, holder, acquired_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`, "lease_term_mint_or_ignore_v51")
 
+	// The proof INSERT before the fencing term (v51 and earlier). A peer on a
+	// pre-v52 build emits this shape for every proof it mints, and a receiver
+	// that stopped recognising it would back-pressure that peer's entire
+	// replication stream mid-rolling-upgrade. It applies identically to the new
+	// form: the missing column takes its DEFAULT 0, which is exactly the
+	// "minted without a term" sentinel.
+	add(`INSERT OR IGNORE INTO runtime_action_proofs
+		(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+		 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,
+		 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+		 created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
+		"proof_insert_pre_lease_term_v51")
+
 	return out
 }

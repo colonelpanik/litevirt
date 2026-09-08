@@ -67,6 +67,12 @@ type ActionProof struct {
 	OwnerEpoch      string
 	FenceEpoch      string
 	RelocationToken string
+	// LeaseTerm is the fencing term of the lease incarnation that minted this
+	// proof. It comes from the coordinator's own recorded term, never from a
+	// fresh MAX(term) read — deriving it at stamp time would let a displaced
+	// holder adopt the winner's term (the hole Phase 1 closed). 0 means the
+	// proof was minted without one.
+	LeaseTerm int64
 }
 
 // ProofRecord is a read-back proof row including lifecycle state.
@@ -139,16 +145,16 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 
 const insertProofSQL = `INSERT OR IGNORE INTO runtime_action_proofs
 	(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
-	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,
+	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term,
 	 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
 	 created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
 
 func proofInsertParams(p ActionProof, now string) []interface{} {
 	return []interface{}{
 		p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, p.Coordinator,
 		p.LeaseHolder, p.LeaseExpiresAt, p.QuorumLive, p.QuorumNeeded,
-		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, now, now,
+		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, p.LeaseTerm, now, now,
 	}
 }
 
@@ -157,7 +163,7 @@ func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, boo
 	rows, err := c.Query(ctx,
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
-		        owner_epoch, fence_epoch, relocation_token,
+		        owner_epoch, fence_epoch, relocation_token, lease_term,
 		        status, step_state, result_code, result_detail, executor_host
 		   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, id)
 	if err != nil {
@@ -175,6 +181,7 @@ func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, boo
 			LeaseExpiresAt: r.String("lease_expires_at"), QuorumLive: r.Int("quorum_live"),
 			QuorumNeeded: r.Int("quorum_needed"), OwnerEpoch: r.String("owner_epoch"),
 			FenceEpoch: r.String("fence_epoch"), RelocationToken: r.String("relocation_token"),
+			LeaseTerm: r.Int64("lease_term"),
 		},
 		Status: r.String("status"), StepState: r.String("step_state"),
 		ResultCode: r.String("result_code"), ResultDetail: r.String("result_detail"),

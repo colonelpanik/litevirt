@@ -81,6 +81,71 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   set of changes is silently lost — and under clock skew the host with the faster
   clock wins, so NTP is required.
 
+### Leader-lease terms are recorded, not enforced
+
+Every acquisition of a leader lease — `failover`, the rebalancer, the dual-run
+detector — records a **term**: an incarnation number for that holder's tenure,
+in the append-only `leader_lease_terms` table. A renewal keeps its term; a term
+is minted on acquisition, so a leader's term is stable for as long as it holds
+the lease, and a coordinator that restarts still holding its lease recovers the
+same number rather than a new one.
+
+There is one exception to "minted on acquisition", and it is expected once per
+host: a node upgraded from a build with no term ledger comes back still holding
+its lease and with no term recorded, so it mints one without any change of
+holder having occurred.
+
+Terms exist because `leader_election` records *who* holds a lease but not
+*which tenure*, which is what makes a stale leader's writes indistinguishable
+from a current leader's.
+
+**Nothing refuses an action based on a term.** This is not split-brain
+prevention and it is not a working fencing token yet: keeping two nodes from
+each believing they hold the lease requires consensus, which a CRDT row store
+does not provide, and everything in *CRDT is not linearizable* above still
+holds in full. Enforcement is a separate change and will latch behind a
+capability token the way other cluster-wide behaviour changes do. Until then a
+term is an audit fact — make no availability decision on the strength of one.
+
+To read the current terms:
+
+```sql
+SELECT key, term, holder, acquired_at
+FROM leader_lease_terms
+ORDER BY key, term DESC;
+```
+
+A term is never reused, even after its row is tombstoned: allocation takes
+`MAX(term) + 1` over every retained row. Do not add retention or GC to this
+table without reading the constraints recorded at `nextLeaseTerm` in
+`internal/corrosion/leader_lease.go` — retention is what keeps terms unique,
+and a horizon would reopen a resurrectable-tombstone hole.
+
+#### What this table will and will not show you
+
+`PRIMARY KEY (key, term)` makes two rows for one term unrepresentable, so **no
+query can show you that two nodes held the same term.** Once the two claims
+meet, one holder remains and the other is gone. An ordinary-looking table is
+not evidence that no concurrent leadership happened.
+
+What fires depends on timing, and only one case is observable at all:
+
+| Two nodes claim one term | Signal |
+|---|---|
+| with the same `updated_at` second | `litevirt_lww_tie_break_total` for this table |
+| a second or more apart | **none** — ordinary LWW: the newer row wins and the losing holder is overwritten silently |
+
+The second row is the more likely case, and it is genuinely invisible: the
+anti-entropy merge compares `updated_at` before it ever looks at row content.
+Treat the tie-break counter as a lower bound on concurrent-claim episodes,
+never as a count of them.
+
+The signal actually worth alerting on is not a conflict at all — it is **term
+growth**. Each new term is one acquisition, so terms climbing faster than the
+failover rate you expect means leadership is churning: flapping health checks,
+a TTL too short for the environment, or a partition that keeps re-electing.
+Expect one step per host during a rolling upgrade, per the exception above.
+
 ### Even-N clusters cannot fence in a 2/2 partition
 - A 4-node cluster split exactly 2/2 has no majority. Both sides compute
   quorum=3 with 2 observers each → neither side can fence.

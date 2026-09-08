@@ -21,6 +21,15 @@ type HAHealthMetrics struct {
 	// path); latched-but-config-off flags a stale marker on a disabled feature.
 	configEnabled *prometheus.GaugeVec
 	latched       *prometheus.GaugeVec
+	// featureDegraded is the per-token breakdown of `degraded{reason=
+	// "unsupported_member"}`, which is a single boolean shared by every
+	// configured token and so cannot say WHICH one is unconfirmed.
+	//
+	// It is not derivable from the two gauges above. config-on-and-not-latched
+	// covers the enable window, but a token that latched and then REGRESSED — the
+	// freshness check finding a peer no longer advertising it — still reads
+	// latched=1, and that is exactly the case the durable marker cannot show.
+	featureDegraded *prometheus.GaugeVec
 }
 
 // NewHAHealthMetrics registers the gauges on the default registry.
@@ -43,8 +52,12 @@ func newHAHealthMetrics(reg prometheus.Registerer) *HAHealthMetrics {
 			Name: "litevirt_enforcement_latched",
 			Help: "Whether a capability token's durable enforcement latch is established on this node (1 = latched).",
 		}, []string{"feature"}),
+		featureDegraded: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "litevirt_enforcement_degraded",
+			Help: "Whether a capability this node is configured to enforce is unconfirmed cluster-wide (1 = degraded). The per-feature breakdown of litevirt_ha_degraded{reason=\"unsupported_member\"}.",
+		}, []string{"feature"}),
 	}
-	reg.MustRegister(m.degraded, m.configEnabled, m.latched)
+	reg.MustRegister(m.degraded, m.configEnabled, m.latched, m.featureDegraded)
 	return m
 }
 
@@ -64,6 +77,22 @@ func (m *HAHealthMetrics) SetEnforcement(feature string, configEnabled, latched 
 	}
 	m.configEnabled.WithLabelValues(feature).Set(b2f(configEnabled))
 	m.latched.WithLabelValues(feature).Set(b2f(latched))
+}
+
+// SetDegraded records whether one feature is degraded — configured to enforce
+// here, and not confirmed cluster-wide. Nil-safe.
+//
+// The CALLER must write every supported token every cycle, including the false
+// case and including tokens this node does not enforce. A gauge is only ever as
+// current as its last write: skipping the healthy tokens leaves a feature that
+// was degraded and has since recovered — or been switched off entirely — reading
+// 1 for the life of the process, which is worse than not publishing it at all.
+// RunHAHealthMonitor does this in the same loop as SetEnforcement.
+func (m *HAHealthMetrics) SetDegraded(feature string, degraded bool) {
+	if m == nil {
+		return
+	}
+	m.featureDegraded.WithLabelValues(feature).Set(b2f(degraded))
 }
 
 func b2f(b bool) float64 {

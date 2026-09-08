@@ -178,8 +178,16 @@ type Server struct {
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
 	// monitor detects a POST-latch capability regression (a peer that later stops
 	// advertising) that the one-way durable latch can't reflect. Guarded by capHealthMu.
-	capHealthMu     sync.Mutex
-	capHealthLast   map[string]bool
+	capHealthMu   sync.Mutex
+	capHealthLast map[string]bool
+	// capHealthCause is the health.Reason* the last negative freshness check
+	// returned for a token. The bool above says a token could not be confirmed;
+	// this says WHY, and the two answers demand opposite remedies —
+	// unsupported_capability means a peer really does not advertise it (finish
+	// the rollout), activation_unconfirmed means the sweep could not tell (a
+	// peer's Ping failed, a hosts read failed), which is usually a host being
+	// down and no capability problem at all. Guarded by capHealthMu.
+	capHealthCause  map[string]string
 	capHealthCursor int
 	// isolationCursor round-robins the §A self-reported-quarantine check
 	// (one peer per HA cycle). Guarded by capHealthMu.

@@ -36,7 +36,7 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 		}
 		s.checkOneCapabilityHealth(ctx)
 	}
-	if got := s.evaluateHADegraded(ctx); !got[haUnsupportedMember] {
+	if got, _ := s.evaluateHADegraded(ctx); !got[haUnsupportedMember] {
 		t.Fatalf("a post-latch regression on lww must raise unsupported_member; got %v", got)
 	}
 }

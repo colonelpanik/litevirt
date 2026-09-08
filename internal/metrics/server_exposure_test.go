@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TestClassifyMetricsBind pins how far each bind spelling reaches.
@@ -156,17 +158,35 @@ func TestWarnIfMetricsWorldReadable(t *testing.T) {
 	}
 }
 
-// recordingLogger returns a logger writing to a buffer, and a reader for it.
-// Nothing global is touched — see the comment at the call site.
+// syncBuffer is an io.Writer whose contents can be read concurrently.
+//
+// A bare bytes.Buffer cannot be: slog writes it from whatever goroutine logs,
+// and TestStart_EmitsTheExposureWarning polls it from the test goroutine while
+// Start runs. Guarding only the READ side, as a first version did, guards
+// nothing — `go test -race` reported the write/read pair as a data race.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// recordingLogger returns a logger writing to a synchronized buffer, and a
+// reader for it. Nothing global is touched — see the comment at the call site.
 func recordingLogger() (*slog.Logger, func() string) {
-	var buf bytes.Buffer
-	var mu sync.Mutex
-	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	return slog.New(h), func() string {
-		mu.Lock()
-		defer mu.Unlock()
-		return buf.String()
-	}
+	b := &syncBuffer{}
+	h := slog.NewTextHandler(b, &slog.HandlerOptions{Level: slog.LevelInfo})
+	return slog.New(h), b.String
 }
 
 // messageOf extracts the msg="..." field, so an assertion can target the
@@ -194,8 +214,10 @@ func messageOf(record string) string {
 // CLAUDE.md's worked example for the mutation rule is this exact shape: a test
 // that passed with the wiring deleted.
 //
-// Start is called ONCE in this binary on purpose: it registers collectors on the
-// default Prometheus registry, and MustRegister panics on a second call.
+// The server gets its own Prometheus registry. Start registers a collector, and
+// Stop does not unregister, so sharing the default registerer made this panic
+// with "duplicate metrics collector registration attempted" on the second run
+// of `go test -count=2` — no second caller or parallelism needed.
 func TestStart_EmitsTheExposureWarning(t *testing.T) {
 	db := testDB(t)
 	log, records := recordingLogger()
@@ -204,6 +226,7 @@ func TestStart_EmitsTheExposureWarning(t *testing.T) {
 	// anything real; the bind is what this test is about.
 	s := NewServer(0, "", db, nil, nil, "host-a")
 	s.log = log
+	s.reg = prometheus.NewRegistry()
 
 	done := make(chan struct{})
 	go func() {

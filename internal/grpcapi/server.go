@@ -133,6 +133,14 @@ type Server struct {
 	onProofCollected func()
 	onProofsGathered func(map[string]OrphanProof)
 
+	// onBeforeRetireRevalidate is a PERMANENT-LOSS TEST SEAM: it fires after
+	// RetireLostHost has run its request-time checks and immediately BEFORE the
+	// revalidation that guards the write. It is the only way a test can move the
+	// world inside the exact window that revalidation exists to close — a host
+	// rejoining, or a replacement being admitted under the same name, between
+	// the check and the commit. nil in production.
+	onBeforeRetireRevalidate func()
+
 	// onMaintenanceTick is a MAINTENANCE-LOOP TEST SEAM: it fires after each
 	// completed tick, so a test can observe the CADENCE the loop actually runs
 	// at without a database behind it. nil in production.

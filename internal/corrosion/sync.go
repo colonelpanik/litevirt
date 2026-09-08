@@ -275,6 +275,15 @@ var tableNames = []string{
 	// must re-learn its peers' published values rather than conclude they
 	// published nothing. Host-owned (host_name PK, only that host writes it).
 	"netbox_host_config",
+	// v51 permanent-loss recovery. Both are operator-facing assertions about a
+	// host that is GONE — no secrets, and published to be read: the whole point
+	// of a retirement is that every node reaches the same conclusion about which
+	// premise a lost machine no longer owes. Append-only, so a node that lost its
+	// DB repairs them from a peer with no merge question, and a row that never
+	// replicated is re-inserted rather than conflicting. Fail-closed if they do
+	// NOT travel: a missing retirement means the premise is still owed, so the
+	// sweep and the bind withhold — never the other way round.
+	"netbox_recovery_manifests", "netbox_host_retirements",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

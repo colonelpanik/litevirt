@@ -214,7 +214,7 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	//    hosts a POWER-OFF ATTESTATION left in, it could not see a holder only an
 	//    attested-off witness could name: being off proves nothing about who that
 	//    machine knew existed.
-	setA, unclosed, err := s.closedRuntimeProofSet(ctx)
+	setA, attested, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "read eligible hosts: %v", err)
 	}
@@ -262,7 +262,7 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 
 	// 3. Sample B, through the same closure as A — a set read two different ways
 	//    would compare two different questions and could never be equal.
-	setB, unclosed, err := s.closedRuntimeProofSet(ctx)
+	setB, _, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "re-read eligible hosts: %v", err)
 	}
@@ -306,8 +306,20 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 		s.nbMetrics().IncAPIError(netbox.Classify(err))
 		return skipf(skipReleaseFailed, "release: %v", err)
 	}
-	slog.Info("netbox sweep: reclaimed an orphaned address",
-		"address", cand.Address, "identity", cand.Identity, "netbox_id", cand.NetBoxID)
+	if len(attested) > 0 {
+		// SAID OUT LOUD. This reclamation did not rest on a whole-cluster proof:
+		// one or more participants could not answer, and an operator attested to
+		// what they would have said. That is a supported trade and it is not the
+		// same event as a fully-proved reclamation, so the log distinguishes them
+		// rather than letting the attestation disappear into a success line.
+		slog.Info("netbox sweep: reclaimed an orphaned address, resting on an operator "+
+			"attestation that litevirt could not verify",
+			"address", cand.Address, "identity", cand.Identity, "netbox_id", cand.NetBoxID,
+			"attested_hosts", attested)
+	} else {
+		slog.Info("netbox sweep: reclaimed an orphaned address",
+			"address", cand.Address, "identity", cand.Identity, "netbox_id", cand.NetBoxID)
+	}
 	s.nbMetrics().IncOrphansReclaimed()
 	return nil
 }
@@ -549,6 +561,31 @@ func (s *Server) localParticipantCandidates(ctx context.Context) (*candidateSet,
 		// No role: nothing but the `hosts` table records one, and this host's
 		// row is precisely what has not arrived.
 		cs.addNamed(m)
+	}
+	// THE THIRD SOURCE: the host identities a permanently lost machine knew of,
+	// recovered from an operator's membership manifest.
+	//
+	// It is here, in the candidate universe, and NOT in any exclusion, because
+	// that is what makes a retirement narrow: retiring a source retires the
+	// obligation to ask THAT HOST, and the hosts it could have told us about
+	// remain hosts that may be running a domain. A permanently lost witness that
+	// was the only node able to name a third, still-running holder therefore
+	// still causes that holder to be queried by name.
+	//
+	// addNamed, never addRow: an operator's manifest establishes that a host
+	// EXISTED and never what role it had. A role is what excuses a host from a
+	// runtime scan, so admitting an unverified role reading here would let an
+	// attestation skip a scan — the one thing it must never do. Naming a host
+	// can only ever cause it to be ASKED.
+	recovered, rerr := s.recoveredMembershipCandidates(ctx)
+	if rerr != nil {
+		// Fail closed: an unreadable manifest is not "there are no manifests".
+		// The caller abandons the closure rather than proceeding over a universe
+		// it could not finish assembling.
+		return nil, rerr
+	}
+	for _, name := range recovered {
+		cs.addNamed(name)
 	}
 	return cs, nil
 }
@@ -840,6 +877,16 @@ type participantSets struct {
 	// runtime scan. Corroborated witnesses and attested-off machines excused —
 	// neither has a domain to scan.
 	runtime []string
+	// restedOnAttestation is the hosts whose MEMBERSHIP premise was met by an
+	// operator's attestation rather than by an answer.
+	//
+	// It is carried out of the closure so that the one destructive action in this
+	// subsystem can SAY SO. A reclamation that rested on a human premise and one
+	// that was proved end-to-end are not the same event, and a log line that
+	// recorded them identically would be the quiet implication this whole design
+	// is trying to avoid — that an audited attestation is evidence. Empty is the
+	// ordinary case and costs nothing.
+	restedOnAttestation []string
 }
 
 // closedParticipantSets is THE CANDIDATE UNIVERSE CLOSED OVER EVERY DISCOVERY
@@ -936,9 +983,27 @@ func (s *Server) closedParticipantSets(ctx context.Context) (participantSets, st
 		// Deriving the targets from a set that excludes anybody is what let a
 		// host be excluded before the query that would have refuted it.
 		targets := s.membershipDiscoveryTargets(candidates.names())
+		// THE MEMBERSHIP RETIREMENTS, sampled ONCE PER ROUND over the universe
+		// as it currently stands, and used by BOTH consumers below — the dial
+		// decision and the answered-discovery gate. One sample per round rather
+		// than one per consumer, for the reason powerOffSnapshot exists: the
+		// input is live (it consults reachability), so two consumers evaluating
+		// it separately could disagree about a host that rejoined between them,
+		// and the gate would then pass a host the dial decision had skipped.
+		// It cannot be sampled once for the whole closure instead, because the
+		// candidate universe GROWS across rounds and a host discovered on round
+		// two needs its retirement resolved on round two.
+		//
+		// This is where a retirement attaches: to the premise it excuses, which
+		// is the obligation to ASK THIS HOST what it knew. It is deliberately not
+		// a fourth participant set, and it does not touch the three that exist.
+		retired, rerr := s.membershipRetirementsFor(ctx, candidates.names())
+		if rerr != nil {
+			return participantSets{}, "", rerr
+		}
 		var unasked []string
 		for _, h := range targets {
-			if !asked[h] {
+			if !asked[h] && !retired.retired(h) {
 				unasked = append(unasked, h)
 			}
 		}
@@ -954,10 +1019,11 @@ func (s *Server) closedParticipantSets(ctx context.Context) (participantSets, st
 				return participantSets{}, "", oerr
 			}
 			sets := participantSets{
-				corroborating: s.inventoryCorroborationParticipants(candidates.names()),
-				runtime:       s.runtimeProofParticipants(candidates.all(), off),
+				corroborating:       s.inventoryCorroborationParticipants(candidates.names()),
+				runtime:             s.runtimeProofParticipants(candidates.all(), off),
+				restedOnAttestation: retired.hosts(),
 			}
-			if unanswered := s.participantsThatNeverAnswered(sets, asked); unanswered != "" {
+			if unanswered := s.participantsThatNeverAnswered(sets, asked, retired); unanswered != "" {
 				return participantSets{}, unanswered, nil
 			}
 			return sets, "", nil
@@ -1007,10 +1073,28 @@ func (s *Server) closedParticipantSets(ctx context.Context) (participantSets, st
 //
 // This node is exempt, and only this node: it answers for itself out of its own
 // database and is never dialled.
-func (s *Server) participantsThatNeverAnswered(sets participantSets, asked map[string]bool) string {
+//
+// A MEMBERSHIP-RETIRED host is the second and last thing this accepts in place
+// of an answer, and it is accepted because the gate's subject is whether the
+// premise was MET, not whether an RPC happened. What the gate exists to catch is
+// a participant nobody accounted for at all. For a permanently lost machine the
+// accounting is its manifest — machine-unverifiable, and the honest name for
+// that is in the retirement's own documentation — and the identities it named are
+// already in the universe these sets were derived from. Passing the SAME
+// per-round sample the dial decision used is what keeps the two consistent: a
+// host skipped as retired cannot then be reported as unanswered, and a host that
+// rejoined mid-round cannot be skipped by one and admitted by the other.
+//
+// It is NOT a licence to skip anything else. A retired host still appears in
+// both output sets, so it still owes its inventory digest unless that premise is
+// separately retired, and it still owes a runtime scan unless the fencing log
+// says its machine is off.
+func (s *Server) participantsThatNeverAnswered(sets participantSets, asked map[string]bool,
+	retired membershipRetirements) string {
+
 	for _, set := range [][]string{sets.corroborating, sets.runtime} {
 		for _, h := range set {
-			if h == s.hostName || asked[h] {
+			if h == s.hostName || asked[h] || retired.retired(h) {
 				continue
 			}
 			return fmt.Sprintf(
@@ -1129,12 +1213,15 @@ func (s *Server) membershipViewOf(ctx context.Context, host string) peerMembersh
 // two accessors read identically at a call site while asking hosts that have
 // different things to offer. A witness belongs in the corroboration set and not
 // in this one.
-func (s *Server) closedRuntimeProofSet(ctx context.Context) ([]string, string, error) {
+// The third return is the hosts whose membership premise rested on an operator's
+// attestation rather than on an answer, so the reclamation can record that it
+// did. It is informational and never an input to any decision.
+func (s *Server) closedRuntimeProofSet(ctx context.Context) ([]string, []string, string, error) {
 	sets, unclosed, err := s.closedParticipantSets(ctx)
 	if err != nil || unclosed != "" {
-		return nil, unclosed, err
+		return nil, nil, unclosed, err
 	}
-	return sets.runtime, "", nil
+	return sets.runtime, sets.restedOnAttestation, "", nil
 }
 
 // closedInventoryCorroborationPeers is the INVENTORY-CORROBORATION SET out of one
@@ -1742,6 +1829,17 @@ func (s *Server) resolveQueuedAddress(ctx context.Context, b corrosion.BindingRe
 // exact window the two-sample check defends, which nothing above the server can
 // otherwise reach. nil in production.
 func (s *Server) SetOnProofCollected(fn func()) { s.onProofCollected = fn }
+
+// SetOnBeforeRetireRevalidate installs a hook that runs inside the window
+// RetireLostHost's revalidation closes: after the request-time checks, and
+// immediately before the re-read that guards the write.
+//
+// It exists because "revalidated immediately before committing" is otherwise
+// only assertable structurally. With this, a scenario can rejoin the host or
+// admit a replacement under its name inside the window and assert that nothing
+// was recorded — which is the property, rather than the shape of the code that
+// implements it. nil in production.
+func (s *Server) SetOnBeforeRetireRevalidate(fn func()) { s.onBeforeRetireRevalidate = fn }
 
 // SetOnProofsGathered installs a hook that may MUTATE the gathered proof map
 // before it is checked. It exists to model a host that answers nothing at all

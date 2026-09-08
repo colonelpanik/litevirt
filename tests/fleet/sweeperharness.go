@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -150,6 +151,19 @@ func (n *Node) FailFencingLogRead(t *testing.T) {
 // OnProofCollected installs the hook the sweeper runs between its two
 // eligible-host samples.
 func (n *Node) OnProofCollected(fn func()) { n.Server.SetOnProofCollected(fn) }
+
+// OnProofsGathered installs the hook the sweeper runs with the runtime proofs it
+// collected, keyed by the host that was ASKED.
+//
+// It is the only way a scenario can assert that a particular host WAS QUERIED.
+// That matters wherever the safe outcome and the broken outcome are both "the
+// address survives": a sweep blocked before it asked anybody leaves the address
+// alone for the wrong reason, and an assertion on the address alone cannot tell
+// the two apart. Reading the gathered proofs distinguishes "asked the holder and
+// it claimed the address" from "never learned the holder existed".
+func (n *Node) OnProofsGathered(fn func(map[string]grpcapi.OrphanProof)) {
+	n.Server.SetOnProofsGathered(fn)
+}
 
 // AddHostRow registers a brand-new host in every node's database. Called from
 // OnProofCollected, it is a member joining DURING proof collection — a host the

@@ -104,6 +104,8 @@ const (
 	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
 	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
 	LiteVirt_ResumeBinding_FullMethodName              = "/litevirt.v1.LiteVirt/ResumeBinding"
+	LiteVirt_RetireLostHost_FullMethodName             = "/litevirt.v1.LiteVirt/RetireLostHost"
+	LiteVirt_ListLostHostRetirements_FullMethodName    = "/litevirt.v1.LiteVirt/ListLostHostRetirements"
 	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
 	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
 	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
@@ -404,6 +406,16 @@ type LiteVirtClient interface {
 	// and refuses while any of them still disagree; it never accepts a changed
 	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
 	ResumeBinding(ctx context.Context, in *ResumeBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// RetireLostHost records an operator's attestation about a PERMANENTLY LOST
+	// host and narrowly retires the premises it names. It is the exit from a
+	// membership closure that can never close, and it is the ONE premise in this
+	// subsystem that no machine verifies — see RetireLostHostRequest. Privileged,
+	// audited on both outcomes, refused for a host that is still responding, and
+	// revalidated immediately before the write.
+	RetireLostHost(ctx context.Context, in *RetireLostHostRequest, opts ...grpc.CallOption) (*RetireLostHostResponse, error)
+	// ListLostHostRetirements reports every recovery attestation and whether it
+	// still applies. An unverifiable premise has to be reviewable instead.
+	ListLostHostRetirements(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLostHostRetirementsResponse, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLBResponse, error)
 	InspectLoadBalancer(ctx context.Context, in *InspectLBRequest, opts ...grpc.CallOption) (*LoadBalancer, error)
@@ -1662,6 +1674,26 @@ func (c *liteVirtClient) ResumeBinding(ctx context.Context, in *ResumeBindingReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_ResumeBinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RetireLostHost(ctx context.Context, in *RetireLostHostRequest, opts ...grpc.CallOption) (*RetireLostHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetireLostHostResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RetireLostHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListLostHostRetirements(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLostHostRetirementsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListLostHostRetirementsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListLostHostRetirements_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3469,6 +3501,16 @@ type LiteVirtServer interface {
 	// and refuses while any of them still disagree; it never accepts a changed
 	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
 	ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error)
+	// RetireLostHost records an operator's attestation about a PERMANENTLY LOST
+	// host and narrowly retires the premises it names. It is the exit from a
+	// membership closure that can never close, and it is the ONE premise in this
+	// subsystem that no machine verifies — see RetireLostHostRequest. Privileged,
+	// audited on both outcomes, refused for a host that is still responding, and
+	// revalidated immediately before the write.
+	RetireLostHost(context.Context, *RetireLostHostRequest) (*RetireLostHostResponse, error)
+	// ListLostHostRetirements reports every recovery attestation and whether it
+	// still applies. An unverifiable premise has to be reviewable instead.
+	ListLostHostRetirements(context.Context, *emptypb.Empty) (*ListLostHostRetirementsResponse, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error)
 	InspectLoadBalancer(context.Context, *InspectLBRequest) (*LoadBalancer, error)
@@ -4006,6 +4048,12 @@ func (UnimplementedLiteVirtServer) RekeyBinding(context.Context, *RekeyBindingRe
 }
 func (UnimplementedLiteVirtServer) ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResumeBinding not implemented")
+}
+func (UnimplementedLiteVirtServer) RetireLostHost(context.Context, *RetireLostHostRequest) (*RetireLostHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetireLostHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ListLostHostRetirements(context.Context, *emptypb.Empty) (*ListLostHostRetirementsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListLostHostRetirements not implemented")
 }
 func (UnimplementedLiteVirtServer) ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListLoadBalancers not implemented")
@@ -5833,6 +5881,42 @@ func _LiteVirt_ResumeBinding_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ResumeBinding(ctx, req.(*ResumeBindingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RetireLostHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetireLostHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RetireLostHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RetireLostHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RetireLostHost(ctx, req.(*RetireLostHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListLostHostRetirements_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListLostHostRetirements(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListLostHostRetirements_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListLostHostRetirements(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8779,6 +8863,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResumeBinding",
 			Handler:    _LiteVirt_ResumeBinding_Handler,
+		},
+		{
+			MethodName: "RetireLostHost",
+			Handler:    _LiteVirt_RetireLostHost_Handler,
+		},
+		{
+			MethodName: "ListLostHostRetirements",
+			Handler:    _LiteVirt_ListLostHostRetirements_Handler,
 		},
 		{
 			MethodName: "ListLoadBalancers",

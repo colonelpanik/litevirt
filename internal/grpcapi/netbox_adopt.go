@@ -773,6 +773,43 @@ func (s *Server) proveNoPeerHoldsInventoryRowsWeLack(ctx context.Context, local 
 		// there is nobody for the digests below to have proved anything about.
 		return false, unclosed, nil
 	}
+	// THE INVENTORY PREMISE'S OWN RETIREMENTS, and the only place they are read.
+	//
+	// A permanently lost host cannot produce a digest, so without this the bind
+	// stays suspended forever exactly as it did before the recovery path existed.
+	// What excuses it here is an INVENTORY retirement and nothing else: a
+	// MEMBERSHIP retirement is invisible to this call, because
+	// inventoryRetirementsFor queries on the inventory premise and returns a
+	// type the membership resolver cannot produce.
+	//
+	// THAT SEPARATION IS THE ROUND-FIVE FINDING, REACHED THROUGH THE RECOVERY
+	// PATH. A lost machine's unique VM and NIC rows are precisely what this
+	// comparison exists to notice — they are the rows whose absence makes a held
+	// address invisible — so "we have recovered the list of hosts it knew about"
+	// is not evidence about them. Letting membership excuse this would hand the
+	// incumbent's live address to the next guest created, which is the collision
+	// this branch has already fixed once from the other side.
+	//
+	// What an inventory retirement asserts is that the lost host's unique
+	// address-bearing records have been recovered or independently accounted
+	// for. litevirt cannot check that. See internal/grpcapi/netbox_retirement.go
+	// for the trust boundary; it is a human premise, and an audit row does not
+	// make it true.
+	retired, rerr := s.inventoryRetirementsFor(ctx, peers)
+	if rerr != nil {
+		// Fail closed, and as an ERROR rather than a negative answer: this is a
+		// read of THIS node's own database, so it is about this node.
+		return false, "", rerr
+	}
+	if len(retired) > 0 {
+		remaining := make([]string, 0, len(peers))
+		for _, h := range peers {
+			if !retired.retired(h) {
+				remaining = append(remaining, h)
+			}
+		}
+		peers = remaining
+	}
 	if len(peers) == 0 {
 		// This node stands alone, so its local database IS the cluster's. Not a
 		// vacuous proof: the local read that got us here already answered for

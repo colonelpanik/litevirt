@@ -1102,26 +1102,161 @@ always preferable to freeing one a running guest is using, so every doubt leaves
 the address allocated. Expect reclamation to pause whenever the cluster is not
 whole — that is the design, not a fault.
 
-**After a permanent host loss the sweeper stays inert, and there is no override.**
-A lost host is simply unreachable, so it cannot say which hosts it knew of, so
-the participant set cannot be closed and nothing is reclaimed. `lv host
-fence-confirm <host>` does **not** change that, and it is not offered as a
-remedy: it attests that a machine's libvirt cannot be running a domain, which
-excuses that host from the runtime scan, while saying nothing about the hosts it
-alone knew existed or the replicated rows it held. Excusing a fenced host from
-the *question* is what freed a live address, so the escape hatch was removed.
+**While a host is merely unreachable, the sweeper stays inert and there is no
+override.** It cannot say which hosts it knew of, so the participant set cannot
+be closed and nothing is reclaimed. `lv host fence-confirm <host>` does **not**
+change that: it attests that a machine's libvirt cannot be running a domain,
+which excuses that host from the runtime scan, while saying nothing about the
+hosts it alone knew existed or the replicated rows it held. Excusing a fenced
+host from the *question* is what freed a live address, so that escape hatch does
+not exist.
 
-The way back is to make the host answerable again — repair it, or replace it and
-let the replacement rejoin under that name. Until then the sweep withholds and the
-addresses it would have reclaimed stay allocated, which is the leak this design
-prefers to a collision. `lv health` names the host the proof is waiting on, so the
-pause is never silent. Bindings behave the same way from the other side: a node
-that cannot close the set does not go live on a prefix, its binding is suspended,
-and a later pass resumes it by itself once the cluster is whole.
+The ordinary way back is to make the host answerable again — repair it, or
+replace it and let the replacement rejoin under that name. Until then the sweep
+withholds and the addresses it would have reclaimed stay allocated, which is the
+leak this design prefers to a collision. `lv health` names the host the proof is
+waiting on, so the pause is never silent. Bindings behave the same way from the
+other side: a node that cannot close the set does not go live on a prefix, its
+binding is suspended, and a later pass resumes it by itself once the cluster is
+whole.
 
-The attestation is still time-bounded (24 hours) and still ignored for a host
-that has come back, because it governs the scan for exactly as long as the
-machine is genuinely down.
+The fence attestation is time-bounded (24 hours) and ignored for a host that has
+come back, because it governs the scan for exactly as long as the machine is
+genuinely down.
+
+### Permanent host loss
+
+A machine that is never coming back is a different problem. It cannot be made
+answerable, so the closure can never close, and without a way out reclamation and
+new bindings would stay suspended forever. `lv netbox retire-host` is that way
+out, and the rest of this section is mostly about what it does **not** mean.
+
+#### The trust boundary — read this first
+
+Every other premise in this subsystem is **verified by machine**. Each host is
+asked which hosts *it* knows of; each host is asked for a digest of *its own*
+address-bearing tables; each host scans *its own* libvirt. litevirt believes a
+host about itself and checks nothing on anyone's word.
+
+**A retirement is not like that. It substitutes human-established evidence for
+machine evidence that is permanently unavailable, and litevirt cannot check it.**
+When you retire a host you are asserting something about a machine that no longer
+exists. Nothing corroborates the assertion — not partially, not heuristically, not
+at all.
+
+The record is attributed to you, written to the audit log, replicated, and
+immutable. **Recording it does not make it true.** An audit entry establishes who
+claimed something and when; it does not establish that the claim was correct. If the
+assertion is wrong, the consequence is the one every other mechanism here exists
+to prevent: an address handed to a new guest while a running guest still holds
+it. This is stated at this length because the machinery around a retirement —
+the confirmation prompt, the audit row, the immutable manifest, the exact
+identity — is the machinery of a *verified* premise, and it would be easy to read
+it as evidence rather than as bookkeeping about an assertion.
+
+Everything below is about keeping that assertion as narrow as possible.
+
+#### Two premises are retirable, and a third is not
+
+A retirement is **per host and per premise**. There is no cluster-wide "the
+membership is complete" switch and no way to write one, so several permanent
+losses compose as several narrow grants rather than as a global bypass.
+
+* **What the host knew** (`--knew`, `--knew-nobody`) retires the obligation to
+  ask *that host* which hosts it knew of. **It does not retire the hosts it could
+  have told you about.** The names you pass stay *inputs to discovery* and are
+  queried by name, so a lost host that was the only node aware of a third machine
+  still causes that machine to be asked. List what it knew generously: naming one
+  host too many costs a query, naming one too few is how a running guest's
+  address gets freed. An empty list is a real claim — "it knew of nothing this
+  cluster does not already know of" — which is why it needs `--knew-nobody`
+  rather than an omitted flag.
+* **What became of its records** (`--inventory`) retires the obligation to
+  compare that host's copy of the address-bearing tables before a binding goes
+  live. It matters only for binding and adoption. Use it once you have
+  established what happened to any VM, NIC or address records that existed
+  **only** on the lost host.
+
+**These are separate premises and neither implies the other.** Knowing which
+hosts a machine knew of says nothing about the rows it held — and a lost host's
+unique VM and NIC rows are exactly what an inventory comparison exists to notice,
+since their absence is what makes a held address invisible. A membership-only
+retirement therefore leaves a bind suspended, deliberately.
+
+**Whether the machine's workloads are stopped is not retirable at all.** It has no
+flag on this command. Reclamation still requires fencing evidence: power the
+machine off, then run `lv host fence-confirm <host>`. `lv netbox retire-host`
+tells you when that is still outstanding, because having retired both retirable
+premises is exactly the point at which an operator concludes they are finished.
+
+So the two permissions are:
+
+| Operation | Premises it needs |
+|---|---|
+| Reclaiming an address | membership accounted for **+** power-off evidence |
+| A binding going live | membership accounted for **+** inventory accounted for |
+
+#### It names a machine, not a hostname
+
+A retirement records the **cluster fingerprint** and the lost host's
+**incarnation** — the certificate serial recorded on its `hosts` row. It never
+matches on the hostname, because a hostname is meant to be reused and an
+exception that transferred to whatever machine next answered to the name would be
+the whole failure mode. Admission enforces the property rather than hoping for
+it: a host cannot be re-admitted under the certificate it was removed with, so a
+replacement necessarily presents a different serial and matches no prior
+retirement.
+
+A host whose recorded serial cannot be read is refused rather than retired under a
+placeholder.
+
+#### Nothing is withdrawn; it stops applying
+
+There is no un-retire command and no revocation flag. A retirement stops being
+honoured on its own, checked afresh every time it is read:
+
+* **the host answers again** — a machine that is responding refutes the
+  attestation that it is gone, and its live state governs, exactly as it does for
+  a fence attestation;
+* **a different machine is admitted under that name** — the grant names an
+  incarnation, so the replacement inherits nothing;
+* **the host's record disappears** — with no recorded incarnation there is
+  nothing to match against, so the premise goes back to being owed.
+
+All three fail closed: an unmet condition means the premise is still owed and the
+operation withholds. Certificate rotation on a host that later turns out to be
+recoverable has the same effect, which is the safe direction — re-attest against
+the new serial if the machine really is gone.
+
+`lv netbox retirements` lists every attestation, the accounting given, who gave
+it, and whether it still applies. Reviewing that list is the only check there is,
+which is the practical consequence of the trust boundary above. A row that no
+longer applies is not something to clean up; it is the record of an exception
+that has correctly expired.
+
+#### Recording one
+
+```bash
+# The machine is destroyed. It knew about two hosts this cluster can still reach,
+# and one it was the only node aware of.
+lv netbox retire-host <host> --knew <host-a>,<host-b>,<host-c>
+
+# Its unique address records were re-created on a surviving node, so a binding
+# may go live without comparing against it.
+lv netbox retire-host <host> --inventory "address records re-created on <host-a>"
+
+# Reclamation additionally needs power-off evidence, which is not retirable.
+lv host fence-confirm <host>
+
+# What has been attested, by whom, and whether it still applies.
+lv netbox retirements
+```
+
+The command is privileged, audited on both outcomes, refuses a host that is still
+responding, re-checks that the host is still unreachable and still the same
+incarnation immediately before it writes, and refuses to record anything until
+the cluster has finished rolling to a build that understands these records — the
+records replicate, and a peer on an older build could not apply them.
 
 **During a rolling upgrade, reclamation pauses.** A peer running a build that
 does not implement the proof RPC counts as unreachable, so no proof is complete

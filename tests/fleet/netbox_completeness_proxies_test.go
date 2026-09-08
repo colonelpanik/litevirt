@@ -178,9 +178,15 @@ func TestFleetSweepStopsOnEqualHostCountsOverDifferentMembers(t *testing.T) {
 		return []corrosion.PeerInfo{{Name: peer.Name, Addr: net.JoinHostPort(peer.Address, "7946")}}
 	})
 	// …and a witness only this node knows about restores the row count, so the
-	// two `hosts` tables are the same SIZE over different members. A witness
-	// because it is excluded from the participant set by role, which is what
+	// two `hosts` tables are the same SIZE over different members — which is what
 	// makes the sets differ in membership while agreeing in cardinality.
+	//
+	// Its role is `witness` only to keep it out of the RUNTIME scan. Rounds four
+	// and five removed the exclusion that skipped a witness from the membership
+	// fan-out, so it is asked what it knows like any other host; having no
+	// daemon it cannot answer, which leaves the closure open. That is the
+	// fail-closed direction and not what this scenario is about — the row-count
+	// arithmetic is.
 	if err := corrosion.InsertHost(ctx, sweeper.DB, corrosion.HostRecord{
 		Name: "local-only-witness", Address: "203.0.113.8", GRPCPort: 7443, Role: "witness",
 		SSHUser: "root", SSHPort: 22, State: "active", FenceStrategy: "best-effort",

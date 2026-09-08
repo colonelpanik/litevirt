@@ -45,10 +45,16 @@ import (
 //
 // The arithmetic is the whole point. A local-only witness makes the sweeper's
 // `hosts` row count equal to the peer's, so the count comparison reads as
-// agreement; the witness is excluded from the participant set, so it does not
-// even get asked; and the peer's ListHosts answer omits the tombstone, so a
-// closure built on that answer learns nothing and closes. Every cheap check
-// passes and the live holder's address is freed.
+// agreement, and the peer's ListHosts answer omits the tombstone, so a closure
+// built on that answer learns nothing and closes. Every cheap check passes and
+// the live holder's address is freed.
+//
+// The witness's ROLE is no longer part of why: rounds four and five removed the
+// exclusion that skipped a witness from the fan-out, so today the witness IS
+// asked what it knows and is excused only from the runtime scan. What keeps this
+// scenario safe now is that the local-only witness has no daemon, so the closure
+// cannot complete over it at all — the fail-closed direction. The role is
+// retained here because the row-count arithmetic is what the scenario is about.
 func TestFleetSweepDoesNotFreeAnAddressAPeerOnlyTombstoneHolds(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 3)
 	sweeper, peer, holder := c.Nodes[0], c.Nodes[1], c.Nodes[2]
@@ -69,8 +75,10 @@ func TestFleetSweepDoesNotFreeAnAddressAPeerOnlyTombstoneHolds(t *testing.T) {
 		return []corrosion.PeerInfo{{Name: sweeper.Name, Addr: net.JoinHostPort(sweeper.Address, "7946")}}
 	})
 	// The balance: a host the sweeper knows and the peer does not, so the two
-	// `hosts` tables are the same SIZE over different members — and a witness at
-	// that, so the participant filter drops it before anything is dialled.
+	// `hosts` tables are the same SIZE over different members. Its role is
+	// `witness` only to keep it out of the RUNTIME scan; it is asked what it
+	// knows like any other host, and having no daemon it cannot answer — which
+	// is what leaves the closure open here.
 	if err := corrosion.InsertHost(ctx, sweeper.DB, corrosion.HostRecord{
 		Name: "local-only-witness", Address: "203.0.113.8", GRPCPort: 7443, Role: "witness",
 		SSHUser: "root", SSHPort: 22, State: "active", FenceStrategy: "best-effort",

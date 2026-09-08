@@ -81,7 +81,7 @@ func TestToVMPopulatesEveryComparedField(t *testing.T) {
 	}
 	v := got[0]
 	// EVERY field the diff compares must survive decoding, not just the nullable
-	// objects: a decoder that drops VCPUs, MemoryMB, DiskGB or Name makes every
+	// objects: a decoder that drops VCPUs, MemoryMB, DiskMB or Name makes every
 	// VM look changed on every sweep, defeating write-on-change exactly as
 	// completely as dropping Status does. So all of them are pinned here.
 	if v.ID != 11 {
@@ -96,8 +96,8 @@ func TestToVMPopulatesEveryComparedField(t *testing.T) {
 	if v.MemoryMB != 2049 {
 		t.Errorf("MemoryMB = %d, want 2049", v.MemoryMB)
 	}
-	if v.DiskGB != 41 {
-		t.Errorf("DiskGB = %d, want 41", v.DiskGB)
+	if v.DiskMB != 41 {
+		t.Errorf("DiskMB = %d, want 41", v.DiskMB)
 	}
 	if v.Status != "active" {
 		t.Errorf("Status = %q, want active", v.Status)

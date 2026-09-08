@@ -96,7 +96,7 @@ func TestDiffEmitsNothingWhenIdenticalUsingDecodedActual(t *testing.T) {
 
 	got := Diff([]DesiredVM{{
 		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
-		DiskGB: 20, Status: "active", DeviceID: 9,
+		DiskMB: 20, Status: "active", DeviceID: 9,
 	}}, actual, fp)
 
 	if len(got) != 0 {
@@ -173,7 +173,7 @@ func TestDiffUpdatesNICOnRenameUsingDecodedActual(t *testing.T) {
 		`{"results":[],"next":""}`)
 
 	got := Diff([]DesiredVM{{
-		Name: "new-name", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		Name: "new-name", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskMB: 20, Status: "active",
 		NICs: []DesiredNIC{{Name: "new-name-eth0", MAC: mac}},
 	}}, actual, fp)
 
@@ -228,7 +228,7 @@ func TestDiffClearsEveryOwnedAddressWhenNoneDesired(t *testing.T) {
 	}
 
 	got := Diff([]DesiredVM{{
-		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskMB: 20, Status: "active",
 		NICs: []DesiredNIC{{Name: "eth0", MAC: mac, NetBoxIPID: 0}},
 	}}, actual, fp)
 
@@ -264,7 +264,7 @@ func TestDiffUpdatesOnRenameUsingDecodedActual(t *testing.T) {
 		`"custom_fields":{"litevirt_identity":"`+vmIdent("u1")+`"}}],"next":""}`)
 
 	got := Diff([]DesiredVM{{
-		Name: "new-name", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		Name: "new-name", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskMB: 20, Status: "active",
 	}}, actual, fp)
 
 	if len(got) != 1 || got[0].Op != "update" || got[0].NetBoxID != 11 {
@@ -280,7 +280,7 @@ func TestDiffClearsAStaleDeviceLinkUsingDecodedActual(t *testing.T) {
 	// The host is no longer modelled as a DCIM device.
 	got := Diff([]DesiredVM{{
 		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
-		DiskGB: 20, Status: "active", DeviceID: 0,
+		DiskMB: 20, Status: "active", DeviceID: 0,
 	}}, actual, fp)
 
 	if len(got) != 1 || got[0].Op != "update" {
@@ -359,7 +359,7 @@ func TestDiffDetectsAssignmentDriftUsingDecodedActual(t *testing.T) {
 			`"custom_fields":{"litevirt_identity":"`+nicIdent("u1", "52:54:00:aa:bb:01")+`"}}],"next":""}`)
 
 	got := Diff([]DesiredVM{{
-		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskMB: 20, Status: "active",
 		NICs: []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:bb:01", NetBoxIPID: 41}},
 	}}, actual, fp)
 
@@ -506,7 +506,7 @@ func TestDiffDerivesParentFromActualWhenMappingIsLost(t *testing.T) {
 		`{"results":[],"next":""}`)
 
 	got := Diff([]DesiredVM{{
-		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskGB: 20, Status: "active",
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048, DiskMB: 20, Status: "active",
 		NICs: []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:bb:01"}},
 	}}, actual, fp)
 
@@ -621,7 +621,7 @@ func vmBodyForTest(t *testing.T, d DesiredVM) map[string]any {
 	})
 	if err := c.UpdateVM(context.Background(), 11, netbox.VirtualMachine{
 		Name: d.Name, VCPUs: netbox.VCPUs(d.VCPUs), MemoryMB: d.MemoryMB,
-		DiskGB: d.DiskGB, Status: d.Status, DeviceID: d.DeviceID,
+		DiskMB: d.DiskMB, Status: d.Status, DeviceID: d.DeviceID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -643,7 +643,7 @@ func TestDiffEmitsNothingForADecimalVCPUsThatEqualsTheDesiredCount(t *testing.T)
 
 	got := Diff([]DesiredVM{{
 		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
-		DiskGB: 20, Status: "active", DeviceID: 9,
+		DiskMB: 20, Status: "active", DeviceID: 9,
 	}}, actual, fp)
 
 	if len(got) != 0 {
@@ -665,7 +665,7 @@ func TestDiffConvergesAGenuinelyFractionalVCPUs(t *testing.T) {
 
 	got := Diff([]DesiredVM{{
 		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
-		DiskGB: 20, Status: "active", DeviceID: 9,
+		DiskMB: 20, Status: "active", DeviceID: 9,
 	}}, actual, fp)
 
 	if len(got) != 1 || got[0].Op != "update" {

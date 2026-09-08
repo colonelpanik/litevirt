@@ -94,19 +94,27 @@ func TestSyncCorrectWithQueueEmptied(t *testing.T) {
 // TestSecondSweepIssuesNoPatches is the generic guard against a field the
 // mirror writes in one unit and reads back in another.
 //
-// NetBox's virtual_machine.disk has not consistently meant the same unit across
-// versions, and it echoes a MAC UPPER-cased; either mismatch makes the diff see
-// drift on state that never changed, and the mirror PATCHes the same objects on
-// every sweep forever — burying NetBox's changelog and hammering its API. A
-// converged mirror issues no writes at all.
+// NetBox's virtual_machine.disk is megabytes and it echoes a MAC UPPER-cased;
+// either mismatch makes the diff see drift on state that never changed, and the
+// mirror PATCHes the same objects on every sweep forever — burying NetBox's
+// changelog and hammering its API. A converged mirror issues no writes at all.
+//
+// The VM carries a REAL DISK deliberately. Mirrored with no disks at all its
+// `disk` is 0 on both sides of the diff, and 0 is the one value every unit
+// agrees on — so this scenario passed while the field was written in gibibytes
+// and read back as megabytes, which is how that bug survived to review.
 func TestSecondSweepIssuesNoPatches(t *testing.T) {
 	nb, c := boundMirrorCluster(t, 1)
 
-	mustCreateVM(t, c.Nodes[0], "vm-1", "bound")
+	mustCreateVMWithDiskOnNetwork(t, c, c.Nodes[0], "vm-1", "bound")
 	mustSyncAllNodes(t, c)
 	if nb.VMCount("vm-1") != 1 || nb.InterfaceCount() != 1 {
 		t.Fatalf("precondition: want one VM and one interface mirrored, got %d/%d",
 			nb.VMCount("vm-1"), nb.InterfaceCount())
+	}
+	if got := nb.VMDisk("vm-1"); got <= 0 {
+		t.Fatalf("precondition: the mirrored disk is %d, so the unit half of this "+
+			"scenario would be vacuous", got)
 	}
 
 	before := nb.PatchCount()
@@ -114,6 +122,28 @@ func TestSecondSweepIssuesNoPatches(t *testing.T) {
 	if got := nb.PatchCount() - before; got != 0 {
 		t.Fatalf("a second sweep over unchanged state issued %d PATCH requests, want 0 "+
 			"(a field is being written in one unit and read back in another)", got)
+	}
+}
+
+// TestMirroredDiskIsDecimalMegabytes pins the UNIT of the value the mirror
+// writes, end to end from a real disk row.
+//
+// The round trip alone cannot do it: the fake echoes `disk` verbatim, so a value
+// written in the wrong unit reads back in the wrong unit and compares equal to
+// itself. Only an assertion on the number NetBox ends up holding can tell
+// megabytes from gibibytes.
+func TestMirroredDiskIsDecimalMegabytes(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+
+	// A 64M disk: 67,108,864 bytes.
+	mustCreateVMWithDiskOnNetwork(t, c, c.Nodes[0], "vm-1", "bound")
+	mustSyncAllNodes(t, c)
+
+	// NetBox's megabyte is DECIMAL (1 MB = 1,000,000 bytes) and the conversion
+	// rounds UP, so 67,108,864 bytes is 68 MB — never 67, and never the 1 that
+	// a gibibyte-rounded quota figure would have recorded.
+	if got := nb.VMDisk("vm-1"); got != 68 {
+		t.Fatalf("mirrored disk = %d, want 68 (decimal MB, rounded up from a 64 MiB disk)", got)
 	}
 }
 

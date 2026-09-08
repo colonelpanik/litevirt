@@ -26,9 +26,42 @@ type VirtualMachine struct {
 	DeviceID  int // 0 when the host is not modelled as a DCIM device
 	VCPUs     VCPUs
 	MemoryMB  int
-	DiskGB    int
-	Status    string
-	Identity  string
+	// DiskMB is `virtual_machine.disk`, which NetBox counts in MEGABYTES.
+	// Named for its unit because the field it feeds is the whole trap: while
+	// this was DiskGB the mirror wrote gibibytes into a megabyte column, so a
+	// 20 GiB disk was recorded as 20 MB and read back as 20 GiB. Build it with
+	// DiskMBFromBytes rather than converting at a call site.
+	DiskMB   int
+	Status   string
+	Identity string
+}
+
+// bytesPerMB is NetBox's megabyte: DECIMAL, 1 MB = 1,000,000 bytes — not the
+// binary mebibyte litevirt uses for memory. `virtual_machine.disk` and
+// `virtual_disk.size` are both counted in it.
+const bytesPerMB = 1_000_000
+
+// DiskMBFromBytes converts a provisioned byte count to NetBox's disk unit.
+//
+// THE ONLY conversion into that unit, and it takes BYTES: routing through a
+// gibibyte figure first — project quota's DiskQuotaGiB, say, which rounds each
+// disk up to whole GiB because quota admission must never under-charge — throws
+// away most of the value's precision before the unit is even reached.
+//
+// Rounds UP, so a recorded size never understates the provisioned disk: an
+// inventory record that says a machine has less disk than it has is the reading
+// that gets someone paged.
+func DiskMBFromBytes(sizeBytes int64) int {
+	if sizeBytes <= 0 {
+		return 0
+	}
+	// Divide first, then carry the remainder: adding bytesPerMB-1 up front
+	// overflows int64 for a size near the maximum.
+	mb := sizeBytes / bytesPerMB
+	if sizeBytes%bytesPerMB != 0 {
+		mb++
+	}
+	return int(mb)
 }
 
 // VCPUs is NetBox's `vcpus`, which is a DECIMAL on the model and an integer
@@ -46,10 +79,10 @@ type VirtualMachine struct {
 // a desired 2 and be patched back to it. Truncating on decode would make the
 // two compare equal and leave the fractional value in NetBox forever.
 //
-// Only `vcpus` is decimal. `memory` and `disk` are PositiveIntegerFields on the
-// same model and arrive as JSON integers, so they stay ints — and a null in any
-// of the three is simply the zero value, which is what an unset field means to
-// the diff.
+// Only `vcpus` is decimal. `memory` (mebibytes) and `disk` (DECIMAL megabytes)
+// are PositiveIntegerFields on the same model and arrive as JSON integers, so
+// they stay ints — and a null in any of the three is simply the zero value,
+// which is what an unset field means to the diff.
 type VCPUs float64
 
 // UnmarshalJSON accepts what NetBox and its neighbours actually put on the wire:
@@ -94,7 +127,9 @@ type vmJSON struct {
 	Name   string `json:"name"`
 	VCPUs  VCPUs  `json:"vcpus"`
 	Memory int    `json:"memory"`
-	Disk   int    `json:"disk"`
+	// Megabytes on the wire, and megabytes in the field it lands in: the two
+	// names must not drift apart again.
+	DiskMB int `json:"disk"`
 	Status *struct {
 		Value string `json:"value"`
 	} `json:"status"`
@@ -116,7 +151,7 @@ type vmJSON struct {
 func (j vmJSON) toVM() VirtualMachine {
 	out := VirtualMachine{
 		ID: j.ID, Name: j.Name,
-		VCPUs: j.VCPUs, MemoryMB: j.Memory, DiskGB: j.Disk,
+		VCPUs: j.VCPUs, MemoryMB: j.Memory, DiskMB: j.DiskMB,
 		Status: j.statusValue(),
 	}
 	if j.Cluster != nil {
@@ -224,7 +259,7 @@ func vmBody(vm VirtualMachine) map[string]any {
 		"cluster":       vm.ClusterID,
 		"vcpus":         vm.VCPUs,
 		"memory":        vm.MemoryMB,
-		"disk":          vm.DiskGB,
+		"disk":          vm.DiskMB,
 		"status":        vm.Status,
 		"custom_fields": map[string]string{IdentityField: vm.Identity},
 	}

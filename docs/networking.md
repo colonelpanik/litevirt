@@ -685,7 +685,11 @@ named after the local cluster or after `netbox.cluster_name`) and mirrors:
   `active` while it runs and `offline` in every other state, because NetBox's
   remaining choices describe an operator's intent for a machine rather than a
   hypervisor's runtime, and writing one would overwrite what an operator put
-  there;
+  there. Disk is written in the unit NetBox counts that field in — **decimal
+  megabytes**, 1 MB = 1,000,000 bytes — summed over the VM's disks and rounded
+  **up**, so a recorded size never understates the provisioned disk. It is not
+  the gibibyte figure project quota charges against, which rounds each disk up
+  to a whole GiB;
 - each VM NIC as a `vminterface`, keyed by its MAC;
 - each address litevirt claimed from NetBox as an `ip_address` assigned to the
   interface that holds it.

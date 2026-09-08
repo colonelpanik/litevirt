@@ -357,7 +357,7 @@ func TestVMUpdateAndNICUpdateTargetTheActionsObject(t *testing.T) {
 		{Kind: "nic", Op: "update", Key: nicID, NetBoxID: 21, ParentNetBoxID: 11},
 	}, indexDesired([]DesiredVM{{
 		Name: "vm-1", UUID: "uuid-1", Status: "active", VCPUs: 2, MemoryMB: 2048,
-		DiskGB: 20, DeviceID: 9,
+		DiskMB: 20, DeviceID: 9,
 		NICs: []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:bb:cc"}},
 	}}, fp), fp); err != nil {
 		t.Fatal(err)
@@ -367,7 +367,7 @@ func TestVMUpdateAndNICUpdateTargetTheActionsObject(t *testing.T) {
 	}
 	got := nb.updatedVMs[0].VM
 	if got.Name != "vm-1" || got.VCPUs != 2 || got.MemoryMB != 2048 ||
-		got.DiskGB != 20 || got.Status != "active" || got.DeviceID != 9 || got.Identity != vmID {
+		got.DiskMB != 20 || got.Status != "active" || got.DeviceID != 9 || got.Identity != vmID {
 		t.Fatalf("the update must carry every mirrored field, got %+v", got)
 	}
 	if len(nb.updatedIfaces) != 1 || nb.updatedIfaces[0].ID != 21 ||

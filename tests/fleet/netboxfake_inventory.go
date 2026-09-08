@@ -722,6 +722,29 @@ func (f *NetBoxFake) VMDevice(name string) int {
 	return found
 }
 
+// VMDisk is the value the named virtual machine carries on
+// `virtual_machine.disk`, VERBATIM — the fake stores what was written and
+// normalises nothing, so a scenario asserting a unit is asserting what the
+// mirror actually sent.
+//
+// It returns -1 when the name matches anything other than exactly one object,
+// so a scenario cannot read a disk size out of "no VM".
+func (f *NetBoxFake) VMDisk(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	found := -1
+	for _, vm := range f.vms {
+		if vm.Name != name {
+			continue
+		}
+		if found != -1 {
+			return -1 // duplicated; a size assertion would be arbitrary
+		}
+		found = vm.Disk
+	}
+	return found
+}
+
 // InterfaceNames returns every interface's name, sorted.
 //
 // The names, not just the count: NetBox rejects two interfaces sharing a name

@@ -23,7 +23,10 @@ type DesiredVM struct {
 	Status   string
 	VCPUs    int
 	MemoryMB int
-	DiskGB   int
+	// DiskMB is the total provisioned disk in NetBox's unit for the field it
+	// is mirrored into: DECIMAL megabytes. Not gibibytes, and not the quota
+	// helper's GiB-rounded figure — see netbox.DiskMBFromBytes.
+	DiskMB   int
 	DeviceID int // resolved DCIM device for Host; 0 when the host is not modelled
 	NICs     []DesiredNIC
 }
@@ -356,11 +359,17 @@ func ownedBy(identity, fingerprint string) bool {
 // would round to 2, compare equal to a desired 2, and never be patched back.
 // Widened, `2.0 == 2` agrees and emits no PATCH, and 2.5 differs and converges
 // to the integer.
+//
+// Disk is compared in ONE unit on both sides — megabytes, as NetBox holds it —
+// so a value that is already correct cannot produce a PATCH. Comparing a
+// desired gibibyte figure against an actual megabyte one differs on every sweep
+// for every VM, which is write-on-change defeated at the only place it is
+// decided.
 func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 	return d.Name != a.Name ||
 		netbox.VCPUs(d.VCPUs) != a.VCPUs ||
 		d.MemoryMB != a.MemoryMB ||
-		d.DiskGB != a.DiskGB ||
+		d.DiskMB != a.DiskMB ||
 		d.Status != a.Status ||
 		d.DeviceID != a.DeviceID
 }

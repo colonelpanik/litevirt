@@ -311,7 +311,7 @@ func (r *Reconciler) createVM(ctx context.Context, a Action, idx desiredIndex, f
 			DeviceID:  r.deviceID(ctx, d),
 			VCPUs:     netbox.VCPUs(d.VCPUs),
 			MemoryMB:  d.MemoryMB,
-			DiskGB:    d.DiskGB,
+			DiskMB:    d.DiskMB,
 			Status:    d.Status,
 			Identity:  identity,
 		})
@@ -344,7 +344,7 @@ func (r *Reconciler) updateVM(ctx context.Context, a Action, idx desiredIndex) e
 		DeviceID: d.DeviceID,
 		VCPUs:    netbox.VCPUs(d.VCPUs),
 		MemoryMB: d.MemoryMB,
-		DiskGB:   d.DiskGB,
+		DiskMB:   d.DiskMB,
 		Status:   d.Status,
 		Identity: a.Key,
 	}); err != nil {

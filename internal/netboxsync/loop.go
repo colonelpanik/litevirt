@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/netbox"
 )
 
 // QueueKind is the netbox_sync_queue kind the mirror owns.
@@ -921,7 +922,7 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 			Status:   netboxStatus(v.State),
 			VCPUs:    orSpec(v.CPUActual, spec.CPU),
 			MemoryMB: orSpec(v.MemActual, spec.MemoryMiB),
-			DiskGB:   totalDiskGiB(disks),
+			DiskMB:   totalDiskMB(disks),
 			DeviceID: deviceID,
 			NICs:     nicSet,
 		})
@@ -1113,18 +1114,29 @@ func orSpec(actual int, spec int) int {
 	return spec
 }
 
-// totalDiskGiB sums a VM's disks, rounding each up exactly as project quota
-// does, so the two never disagree about the same VM.
+// totalDiskMB sums a VM's disks in BYTES and converts once, at the NetBox
+// boundary, into the unit `virtual_machine.disk` is counted in: decimal
+// megabytes, rounded up.
 //
-// The value goes onto NetBox's `virtual_machine.disk`. That field's unit has
-// varied across NetBox releases, so what makes the mirror stable is not the
-// unit but the ROUND TRIP: whatever is written must read back equal, or the
-// diff sees drift on unchanged state and PATCHes forever. The fleet's
-// second-sweep-issues-no-PATCHes scenario is what pins that.
-func totalDiskGiB(disks []corrosion.DiskRecord) int {
-	total := 0
+// Deliberately NOT corrosion.DiskQuotaGiB. That helper rounds each disk up to
+// whole gibibytes, which is right for quota admission — a project must never be
+// under-charged for a partial GiB — and lossy for an inventory record: it
+// reports a 64 MiB disk as 1 GiB before the megabyte conversion can see it.
+// Quota and inventory answer different questions, and only quota's needs the
+// rounding.
+//
+// The round trip is necessary but NOT sufficient here, and assuming otherwise
+// is what let the gibibyte-into-a-megabyte-column bug survive: a value written
+// in the wrong unit reads back in the wrong unit and compares equal to itself,
+// so no amount of sweeping detects it. What pins the unit is an assertion on
+// the number, in tests/fleet/netbox_mirror_test.go and
+// internal/netbox/disk_megabytes_test.go.
+func totalDiskMB(disks []corrosion.DiskRecord) int {
+	var totalBytes int64
 	for _, d := range disks {
-		total += corrosion.DiskQuotaGiB(d.SizeBytes)
+		if d.SizeBytes > 0 {
+			totalBytes += d.SizeBytes
+		}
 	}
-	return total
+	return netbox.DiskMBFromBytes(totalBytes)
 }

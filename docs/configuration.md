@@ -643,8 +643,11 @@ reads, without a credential:
 
 The enforcement gauges are worth naming separately: read together they say which
 hardening features are **not** in force here, which is what an attacker choosing
-an approach would want. The gRPC API withholds *that* — `PingResponse`'s
-enforcement posture goes only to a caller presenting a host certificate.
+an approach would want. No API path hands that out without a credential — today
+the gRPC API carries no enforcement posture on any RPC. So this endpoint is a
+weaker gate than the API for **posture**, not only for the inventory described
+below: it is the only place the kill-switch readout is published at all, and it
+is published to anyone who can reach the port.
 
 The inventory is a different gate, and how much weaker this endpoint is depends
 on one flag:

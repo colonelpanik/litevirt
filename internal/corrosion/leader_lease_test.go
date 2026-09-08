@@ -175,3 +175,86 @@ func TestLeaseTermWAL_ReplayCannotRewriteAHoldersTerm(t *testing.T) {
 			"node replayed last instead of the node that actually lost the term", got)
 	}
 }
+
+// TestLeaseTermHolder_ReadsTheHolderRecordedAtThatTerm is the equal-term arm's
+// only input. CurrentLeaseTerm answers "what is the newest term"; this answers
+// "whose was term N", which is a different question and the one the executor
+// asks when a proof's term EQUALS the threshold.
+func TestLeaseTermHolder_ReadsTheHolderRecordedAtThatTerm(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedTerm(t, c, LeaseKeyFailover, 1, "node-a")
+	seedTerm(t, c, LeaseKeyFailover, 2, "node-b")
+
+	for _, tc := range []struct {
+		term       int64
+		wantHolder string
+		wantFound  bool
+	}{
+		{1, "node-a", true},
+		{2, "node-b", true},
+		{3, "", false}, // never minted here
+	} {
+		holder, found, err := LeaseTermHolder(ctx, c, LeaseKeyFailover, tc.term)
+		if err != nil {
+			t.Fatalf("term %d: %v", tc.term, err)
+		}
+		if found != tc.wantFound || holder != tc.wantHolder {
+			t.Errorf("term %d = (%q, %v), want (%q, %v)",
+				tc.term, holder, found, tc.wantHolder, tc.wantFound)
+		}
+	}
+}
+
+// TestLeaseTermHolder_IsScopedToItsKey: the three consumers share one table, so
+// a lookup that ignored `key` would let the rebalancer's term 4 answer for the
+// failover key's term 4 — silently authorizing a proof under another
+// subsystem's ledger.
+//
+// BOTH keys are asserted, and that is what makes the test mean anything. An
+// earlier version checked only the failover key and passed with `AND key = ?`
+// deleted: the unfiltered query returns both rows for term 4 and rows[0]
+// happened to be the failover one, so the assertion was riding on insertion
+// order. Querying both directions cannot be satisfied by whichever row sorts
+// first — one of the two answers is then wrong however the rows come back.
+func TestLeaseTermHolder_IsScopedToItsKey(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedTerm(t, c, LeaseKeyFailover, 4, "node-a")
+	seedTerm(t, c, "rebalancer", 4, "node-z")
+
+	for key, want := range map[string]string{LeaseKeyFailover: "node-a", "rebalancer": "node-z"} {
+		holder, found, err := LeaseTermHolder(ctx, c, key, 4)
+		if err != nil || !found {
+			t.Fatalf("%s term 4: holder=%q found=%v err=%v", key, holder, found, err)
+		}
+		if holder != want {
+			t.Errorf("%s term 4 holder = %q, want %q — the lookup must filter on key, or one "+
+				"subsystem's ledger answers for another's", key, holder, want)
+		}
+	}
+}
+
+// TestLeaseTermHolder_IgnoresTombstonedRows: a tombstoned term is not a tenure
+// anyone holds. Returning its holder would let a deleted incarnation keep
+// authorizing proofs. (nextLeaseTerm deliberately counts tombstones, because
+// ALLOCATION must not reuse a number; this read must not.)
+func TestLeaseTermHolder_IgnoresTombstonedRows(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedTerm(t, c, LeaseKeyFailover, 1, "node-a")
+	if err := c.Execute(ctx,
+		`UPDATE leader_lease_terms SET deleted_at = ?, updated_at = ?
+		  WHERE key = ? AND term = ?`,
+		c.NowTS(), c.NowTS(), LeaseKeyFailover, int64(1)); err != nil {
+		t.Fatalf("tombstone term 1: %v", err)
+	}
+
+	holder, found, err := LeaseTermHolder(ctx, c, LeaseKeyFailover, 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if found || holder != "" {
+		t.Errorf("tombstoned term 1 = (%q, %v), want (\"\", false)", holder, found)
+	}
+}

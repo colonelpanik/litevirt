@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+// LeaseKeyFailover is the failover coordinator's lease key. It lives here, not
+// in internal/failover, because an enforcement path in internal/grpcapi must ask
+// about the SAME key the coordinator acquires — and a second copy of the string
+// in a second package is a divergence nothing would catch: the executor would
+// check a ledger the coordinator never writes and pass every proof.
+const LeaseKeyFailover = "failover"
+
 // mintLeaseTermSQL records one lease incarnation.
 //
 // The term is a BOUND PARAMETER, computed by a separate read, rather than a
@@ -119,4 +126,30 @@ func CurrentLeaseTerm(ctx context.Context, c *Client, key string) (int64, error)
 		return 0, err
 	}
 	return t.Term, nil
+}
+
+// LeaseTermHolder returns the holder recorded for (key, term), and whether such
+// a LIVE row exists on this node.
+//
+// found=false means "this node has not seen that term". It is NOT evidence the
+// term is unheld, and a caller must never read it that way: leader_lease_terms
+// replicates independently of the direct RPC that carries a proof, so a fresh,
+// entirely valid proof routinely arrives before its own term row does. An
+// enforcement path is safe to proceed on found=false only because a quorum
+// threshold check already ran; on its own this answer authorizes nothing.
+//
+// Tombstones are excluded, matching newestLeaseTerm: a deleted incarnation is
+// not a tenure anyone holds. nextLeaseTerm's inclusion of tombstones is about
+// ALLOCATION never reusing a number and does not apply to this read.
+func LeaseTermHolder(ctx context.Context, c *Client, key string, term int64) (string, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT holder FROM leader_lease_terms
+		  WHERE key = ? AND term = ? AND deleted_at IS NULL`, key, term)
+	if err != nil {
+		return "", false, fmt.Errorf("read lease term %d holder for %q: %w", term, key, err)
+	}
+	if len(rows) == 0 {
+		return "", false, nil
+	}
+	return rows[0].String("holder"), true, nil
 }

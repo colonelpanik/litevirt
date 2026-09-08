@@ -53,7 +53,11 @@ const (
 	// failoverLeaseKey is this coordinator's row in leader_election. Named once
 	// so the acquire and the three read sites cannot drift apart; it used to be
 	// a bare 'failover' literal repeated in each of them.
-	failoverLeaseKey = "failover"
+	//
+	// It aliases corrosion.LeaseKeyFailover rather than re-spelling the string,
+	// so an enforcement path outside this package and this coordinator can never
+	// disagree about which ledger the failover lease lives in.
+	failoverLeaseKey = corrosion.LeaseKeyFailover
 	// healthFreshness is the maximum age of a host_health row that may count
 	// toward fencing quorum. Stale rows from dead observers must not fence
 	// hosts they last saw failing days ago.

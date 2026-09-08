@@ -355,7 +355,14 @@ import (
 //	     start on one rather than guessing at a migration, preserving the
 //	     evidence for a deliberate offline recovery — see
 //	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
-const CurrentSchemaVersion = 51
+//	v52: leader-lease term ledger — leader_lease_terms, append-only with term in
+//	     the primary key, giving each lease acquisition a durable incarnation
+//	     number. leader_election is unchanged. Requires a bespoke non-LWW
+//	     monotone merge before it is written to, because concurrent minting of
+//	     one (key, term) during a partition is the normal path, not a fault.
+//	     This version adds the table only; nothing writes to it and nothing
+//	     enforces on a term. One new table.
+const CurrentSchemaVersion = 52
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -883,6 +890,38 @@ var schemaDDL = []string{
 		holder     TEXT NOT NULL,
 		expires_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
+	)`,
+
+	// Leader-lease TERM ledger (v51). APPEND-ONLY, with term in the primary key.
+	//
+	// leader_election says who holds a lease right now; it cannot say which
+	// INCARNATION of that lease, so a stale leader's writes are
+	// indistinguishable from a current leader's. This table supplies the
+	// incarnation number.
+	//
+	// The term is in the PK on purpose. A mutable `epoch INTEGER` on
+	// leader_election is exactly what LWW cannot protect: two nodes both write
+	// epoch=5, LWW picks by updated_at, one silently wins, and a lagging replica
+	// can resurrect a stale epoch. With every term retained as its own immutable
+	// row, a bump cannot be lost and a tombstoned-then-recreated row cannot
+	// restart the counter. Same argument as audit_chain_heads.
+	//
+	// This table MUST NOT be resolved by LWW once anything writes to it: several
+	// nodes legitimately mint one (key, term) during a partition — the
+	// two-leaders case — and updated_at cannot decide that correctly. The
+	// bespoke monotone merge that decides it (customMergeTables) does not exist
+	// yet, and nothing writes to this table until the mint API lands, so the
+	// interim default-chain resolution of an always-empty table is harmless.
+	// Do not add a writer without adding that merge in the same change.
+	`CREATE TABLE IF NOT EXISTS leader_lease_terms (
+		key         TEXT NOT NULL,
+		term        INTEGER NOT NULL DEFAULT 0,
+		holder      TEXT NOT NULL DEFAULT '',
+		acquired_at TEXT NOT NULL,
+		created_at  TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT,
+		PRIMARY KEY (key, term)
 	)`,
 
 	// Per-VM startup leases held by health.reconciler so that during a failover
@@ -2369,6 +2408,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
+	"leader_lease_terms":      {"key", "term"},
 	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
 	"netbox_bindings":         {"prefix_id"},
 	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
@@ -2721,6 +2761,7 @@ var createTableUnits = []struct {
 	{50, "quota_reservations"},
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
+	{52, "leader_lease_terms"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

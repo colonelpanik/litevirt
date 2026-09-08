@@ -367,7 +367,7 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 		"cluster_crl", "host_networks",
 		"health_conditions", "health_evaluator_status", "host_capacity_observations",
-		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config",
+		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config", "leader_lease_terms",
 	} {
 		if ok, _ := tableExists(ctx, c, table); !ok {
 			t.Errorf("table %s missing after v42→v51 migration", table)

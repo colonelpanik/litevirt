@@ -261,6 +261,10 @@ var tableNames = []string{
 	// v47 cluster CRL — a revocation list is published to be read, and a node that
 	// missed the replicated write is exactly the node that must repair from a peer.
 	"cluster_crl",
+	// v51 leader-lease term ledger — a node that missed a replicated term keeps
+	// a low MAX(term), so anti-entropy repair is what keeps the rejection
+	// threshold correct. Nothing secret: lease names, host names, small integers.
+	"leader_lease_terms",
 	// v48 host network intent — operator-facing wiring config, read cluster-wide
 	// by the UI/CLI and repaired from peers if a host loses its DB. LWW-safe
 	// (PK + updated_at); the owning host is the only writer of its rows.

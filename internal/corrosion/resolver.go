@@ -475,6 +475,14 @@ var capabilityMap = map[string]tableResolver{
 	// the mirror on a value the owning node is the only writer of, which is a
 	// worse answer than picking one of two values that node itself produced.
 	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
+	// v52 leader-lease terms. Append-only; rows for one (key, term) never
+	// legitimately differ except when two nodes raced the same term during a
+	// partition, and that case needs a bespoke monotone merge rather than this
+	// chain. Until that merge and the first writer land together, the table is
+	// always empty, so this entry is never reached in anger. It exists because
+	// TestCapabilityMap_PartitionsSchema requires every schemaDDL table to be
+	// classified somewhere.
+	"leader_lease_terms": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

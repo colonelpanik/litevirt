@@ -133,7 +133,7 @@ func TestWarnIfMetricsWorldReadable(t *testing.T) {
 			// independently: the attributes alone satisfy a bare "7444" match,
 			// so a message reduced to slog.Warn("exposed", "port", port,
 			// "metrics_bind", bind) would still pass a combined check.
-			msg := messageOf(got)
+			msg := messageOf(warnRecord(got))
 			for _, want := range []string{"authentication", "litevirt_enforcement", "metrics_bind"} {
 				if !strings.Contains(msg, want) {
 					t.Errorf("the warning MESSAGE does not mention %q, so it no longer says what "+
@@ -189,8 +189,27 @@ func recordingLogger() (*slog.Logger, func() string) {
 	return slog.New(h), b.String
 }
 
-// messageOf extracts the msg="..." field, so an assertion can target the
-// human-readable text rather than being satisfied by an attribute value.
+// warnRecord returns the one WARN line out of an accumulated log buffer, so an
+// assertion targets the exposure warning and not whatever else was logged.
+//
+// This is the reason messageOf takes a single record rather than the buffer:
+// fed the buffer it returns the FIRST msg= it finds, and the one production
+// path that emits this warning logs an Info line immediately above it
+// (server.go: "metrics server starting"), so every message assertion would
+// silently read that instead. The `level=WARN` count check cannot catch it —
+// the extra record is Info.
+func warnRecord(records string) string {
+	for _, line := range strings.Split(records, "\n") {
+		if strings.Contains(line, "level=WARN") {
+			return line
+		}
+	}
+	return ""
+}
+
+// messageOf extracts the msg="..." field from ONE log record, so an assertion
+// can target the human-readable text rather than being satisfied by an
+// attribute value. Pass it warnRecord(...), never a whole buffer.
 func messageOf(record string) string {
 	const key = `msg="`
 	i := strings.Index(record, key)
@@ -254,8 +273,17 @@ func TestStart_EmitsTheExposureWarning(t *testing.T) {
 			"is what makes this feature exist, and every other test here would still pass "+
 			"with it deleted. Log was:\n%s", got)
 	}
-	if !strings.Contains(got, "metrics_bind") {
-		t.Errorf("the warning Start() emitted does not name the setting; got:\n%s", got)
+	// Scoped to the WARN record, not the buffer: Start logs an Info line
+	// immediately above the warning, so a buffer-wide match here would be
+	// satisfiable by the wrong record.
+	warn := warnRecord(got)
+	if !strings.Contains(warn, "metrics_bind") {
+		t.Errorf("the warning Start() emitted does not name the setting; the WARN record was %q, "+
+			"full log:\n%s", warn, got)
+	}
+	if !strings.Contains(messageOf(warn), "authentication") {
+		t.Errorf("the warning Start() emitted no longer says what leaks; message was %q",
+			messageOf(warn))
 	}
 }
 

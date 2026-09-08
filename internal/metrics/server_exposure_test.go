@@ -258,3 +258,42 @@ func TestStart_EmitsTheExposureWarning(t *testing.T) {
 		t.Errorf("the warning Start() emitted does not name the setting; got:\n%s", got)
 	}
 }
+
+// TestStop_BeforeStart_PreventsServing pins that a shutdown requested during
+// startup is not lost.
+//
+// Start assigns httpSrv from whatever goroutine the daemon launched it on
+// (`go d.metrics.Start()`), and Stop runs on the shutdown path. Unsynchronised,
+// Stop could read nil, skip the shutdown, and leave an unauthenticated endpoint
+// serving after shutdown had been requested — and the pair was a data race
+// besides. A test that waits for a log line before stopping cannot reach this:
+// it only exercises the ordering where Start already won.
+func TestStop_BeforeStart_PreventsServing(t *testing.T) {
+	db := testDB(t)
+	log, _ := recordingLogger()
+
+	s := NewServer(0, "127.0.0.1", db, nil, nil, "host-a")
+	s.log = log
+	s.reg = prometheus.NewRegistry()
+
+	// Stop FIRST, before anything has listened.
+	s.Stop(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Start()
+	}()
+
+	select {
+	case <-done:
+		// Start returned without serving, which is the whole point.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start kept serving after Stop had already been called; a shutdown requested " +
+			"during startup must not be lost, or the endpoint outlives the daemon that closed it")
+	}
+
+	if s.httpSrv != nil {
+		t.Error("Start published a listener despite Stop having run first")
+	}
+}

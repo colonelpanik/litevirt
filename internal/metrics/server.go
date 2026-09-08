@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,7 +35,14 @@ type Server struct {
 	virt     *libvirt.Client
 	ctStat   containerStatter
 	hostName string
-	httpSrv  *http.Server
+	// mu guards httpSrv and stopped. Start assigns httpSrv from whatever
+	// goroutine the daemon launches it on (`go d.metrics.Start()`), and Stop
+	// runs on the shutdown path — so the two race, and an unsynchronised Stop
+	// could read nil during startup, skip the shutdown, and leave the endpoint
+	// serving after shutdown was requested.
+	mu      sync.Mutex
+	httpSrv *http.Server
+	stopped bool
 	// reg is where the collector registers. nil means
 	// prometheus.DefaultRegisterer, which is what the daemon uses.
 	// Injectable ONLY so a test can drive the real Start more than once in a
@@ -100,16 +108,26 @@ func (s *Server) Start() {
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 
-	s.httpSrv = &http.Server{
+	srv := &http.Server{
 		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
 		// not get them twice. See normalizeBind.
 		Addr:    s.Addr(),
 		Handler: mux,
 	}
 
-	s.logger().Info("metrics server starting", "addr", s.httpSrv.Addr, "bind", s.bindAddr)
+	s.mu.Lock()
+	if s.stopped {
+		// Stop already ran, so serving now would outlive the shutdown that
+		// asked for it. Nothing has listened yet, so there is nothing to close.
+		s.mu.Unlock()
+		return
+	}
+	s.httpSrv = srv
+	s.mu.Unlock()
+
+	s.logger().Info("metrics server starting", "addr", srv.Addr, "bind", s.bindAddr)
 	warnIfMetricsWorldReadable(s.logger(), s.bindAddr, s.port)
-	if err := s.httpSrv.ListenAndServe(); err != http.ErrServerClosed {
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		s.logger().Error("metrics server error", "error", err)
 	}
 }
@@ -217,9 +235,16 @@ func warnIfMetricsWorldReadable(log *slog.Logger, bindAddr string, port int) {
 }
 
 // Stop gracefully shuts down the metrics server.
+//
+// Safe before Start has assigned the listener: it records the intent, so a Start
+// that has not begun serving yet returns instead of coming up after shutdown.
 func (s *Server) Stop(ctx context.Context) {
-	if s.httpSrv != nil {
-		s.httpSrv.Shutdown(ctx)
+	s.mu.Lock()
+	s.stopped = true
+	srv := s.httpSrv
+	s.mu.Unlock()
+	if srv != nil {
+		srv.Shutdown(ctx)
 	}
 }
 

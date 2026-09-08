@@ -106,6 +106,23 @@ func MintLeaseTerm(ctx context.Context, c *Client, key, holder string, now time.
 // nextLeaseTerm is the term a new incarnation should claim: one above every
 // retained term for this key, tombstones included. See MintLeaseTerm for why
 // tombstones must count here and nowhere else.
+//
+// DO NOT ADD GC FOR THIS TABLE without reading the two constraints below. Term
+// rows are retained indefinitely by design, and that is load-bearing twice over:
+//
+//  1. Retention is what stops a term number being reused. This function
+//     allocates above every retained row precisely so a deleted term cannot be
+//     handed out again to a different incarnation.
+//  2. Tombstone dominance does NOT hold on the anti-entropy dump path — it
+//     compares updated_at first and reaches the content chain only on an exact
+//     tie — so a tombstoned term can be resurrected by a peer's older live copy
+//     carrying a different holder. With no tombstones that is unreachable. With
+//     a GC horizon it becomes a live hole, and closing it needs a bespoke merge
+//     enforcing tombstone dominance on both paths.
+//
+// A horizon would also have to sit above the highest term any node might still
+// present in a proof, which is not locally knowable. If growth ever justifies
+// GC, these are the three problems to solve first, in this order.
 func nextLeaseTerm(ctx context.Context, c *Client, key string) (int64, error) {
 	rows, err := c.Query(ctx,
 		`SELECT COALESCE(MAX(term), 0) AS max_term FROM leader_lease_terms WHERE key = ?`, key)

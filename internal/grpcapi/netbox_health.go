@@ -405,10 +405,13 @@ func (s *Server) applyNetBoxConditions(ctx context.Context, code, subjectKind st
 // ambiguous case: for a leader-written finding it means "nothing is wrong
 // anywhere", and for a per-host one it means only "nothing is wrong here".
 //
-// All four findings are WARNING severity, observed and confirmed alike. None is
+// Every FINDING here is WARNING severity, observed and confirmed alike. None is
 // corruption — one refuses new work, one stops a garbage collector, two stop an
 // inventory mirror — and severity critical is reserved here for a workload
-// running in two places.
+// running in two places. The one INFO writer is the attestation advisory, which
+// is not a finding at all: it reports a substitution an operator chose, must not
+// degrade the roll-up, and reaches the core through
+// applyNetBoxConditionsWithSeverity.
 //
 // `hosts` is the optional structured host list of conditionEvidence, for a
 // finding that is ABOUT other hosts rather than only reported by this one: the
@@ -417,6 +420,18 @@ func (s *Server) applyNetBoxConditions(ctx context.Context, code, subjectKind st
 // unchanged, and it applies to every subject of one call because a per-host
 // finding writes exactly one subject.
 func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectKind string, positive map[string]string, owns func(subject string) bool, hosts ...string) {
+	s.applyNetBoxConditionsWithSeverity(ctx, code, subjectKind, corrosion.SeverityWarning, positive, owns, hosts...)
+}
+
+// applyNetBoxConditionsWithSeverity is the lifecycle core, with the severity as
+// a parameter.
+//
+// Split out rather than adding a fifth WARNING finding, because the attestation
+// advisory is a different KIND of row: it is not a fault, it must not degrade
+// the cluster roll-up, and its log lines must not read as warnings. Every
+// existing caller keeps warning severity through the two wrappers above, so this
+// adds a tier rather than changing one.
+func (s *Server) applyNetBoxConditionsWithSeverity(ctx context.Context, code, subjectKind, severity string, positive map[string]string, owns func(subject string) bool, hosts ...string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	active, err := corrosion.ListHealthConditions(ctx, s.db, false)
@@ -437,20 +452,20 @@ func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectK
 			row = corrosion.HealthCondition{
 				Evaluator: netboxEvaluator, Code: code,
 				SubjectKind: subjectKind, SubjectID: subject,
-				Lifecycle: corrosion.ConditionObserved, Severity: corrosion.SeverityWarning,
+				Lifecycle: corrosion.ConditionObserved, Severity: severity,
 				ObserveCount: 1, FirstSeen: now,
 			}
-			slog.Warn("netbox health: condition observed", "code", code, "subject", subject, "detail", detail)
+			logAtSeverity(severity, "netbox health: condition observed", "code", code, "subject", subject, "detail", detail)
 		} else {
 			row.ObserveCount++
 			row.CleanCount = 0
 			if row.Lifecycle != corrosion.ConditionConfirmed && row.ObserveCount >= 2 {
 				row.Lifecycle = corrosion.ConditionConfirmed
 				row.ConfirmedAt = now
-				slog.Warn("netbox health: condition confirmed", "code", code, "subject", subject, "detail", detail)
+				logAtSeverity(severity, "netbox health: condition confirmed", "code", code, "subject", subject, "detail", detail)
 			}
 		}
-		row.Severity = corrosion.SeverityWarning
+		row.Severity = severity
 		row.Evidence = encodeEvidence(detail, hosts)
 		row.LastSeen = now
 		row.ResolvedAt = ""
@@ -482,4 +497,17 @@ func (s *Server) applyNetBoxConditionsScoped(ctx context.Context, code, subjectK
 			slog.Error("netbox health: persist condition", "code", code, "subject", subject, "error", err)
 		}
 	}
+}
+
+// logAtSeverity logs a condition transition at the level its severity deserves.
+//
+// An INFO condition logged at WARN would be the same misreading the severity
+// tier exists to avoid, one layer down: whoever greps the logs would find a
+// warning that never clears.
+func logAtSeverity(severity, msg string, args ...any) {
+	if severity == corrosion.SeverityInfo {
+		slog.Info(msg, args...)
+		return
+	}
+	slog.Warn(msg, args...)
 }

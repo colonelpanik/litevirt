@@ -278,6 +278,13 @@ func TestTheTrustBoundaryIsWrittenDownWhereTheRowsAreProduced(t *testing.T) {
 		{retirementSourceFile, "the premise resolvers"},
 		{"../corrosion/netbox_recovery.go", "the row writers"},
 		{"../../docs/networking.md", "the operator documentation"},
+		// And wherever the substitution is SURFACED. The advisory exists to make
+		// an unverified premise visible, which is exactly the surface a reader
+		// mistakes for evidence of the premise: a standing row in `lv health`,
+		// with an identity, an attribution and a timestamp, reads like something
+		// that was checked. So the sentence has to travel with it.
+		{advisorySourceFile, "the standing advisory"},
+		{"../../docs/diagnostics.md", "the advisory's operator documentation"},
 	} {
 		src := strings.ToLower(readSourceFile(t, tc.path))
 		// It must say that litevirt does not verify the assertion...

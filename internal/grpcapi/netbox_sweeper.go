@@ -180,6 +180,15 @@ func (s *Server) sweepOrphans(ctx context.Context, interval time.Duration) error
 	}
 	// Findings last: they describe the pass that just finished.
 	s.evaluateNetBoxHealth(ctx, s.closeSweepPass())
+	// And the STANDING advisory over every premise resting on an operator
+	// attestation rather than on machine evidence. Not a finding about this pass
+	// — it describes state that persists between passes — but written from here
+	// for the same reason the two above are: the sweep holds the `netbox` leader
+	// lease, so the cluster has one writer at a time, and the reachability view
+	// it reports is the one this node's own premise resolution just acted on.
+	// It gates nothing and never blocks a reclamation; see
+	// netbox_attestation_advisory.go.
+	s.evaluateAttestedPremises(ctx)
 	return nil
 }
 

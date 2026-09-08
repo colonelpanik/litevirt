@@ -84,6 +84,23 @@ type membershipRetirements map[string]corrosion.HostRetirement
 // retired. It never reports anything about that host's rows or its runtime.
 func (m membershipRetirements) retired(host string) bool { _, ok := m[host]; return ok }
 
+// appliesToIncarnation reports whether the retirement in force for this host is
+// the one recorded against THIS incarnation.
+//
+// THE STRONGER QUESTION, and a reader holding a SPECIFIC grant has to ask it.
+// The map is keyed by host NAME, because that is what its consumers have in hand
+// and because revalidation has already established that the entry matches the
+// name's currently-recorded incarnation. But one hostname can carry SEVERAL
+// grants — a replacement machine can be permanently lost too — and only the one
+// written against the current incarnation applies. Asking `retired` with the
+// name alone would answer true for a superseded grant as well, which is how a
+// surface comes to present an expired exception, under the same host name and
+// the same attribution as the live one.
+func (m membershipRetirements) appliesToIncarnation(host, incarnation string) bool {
+	r, ok := m[host]
+	return ok && r.HostIncarnation == incarnation
+}
+
 // hosts is the retired host names, sorted — for the operator-facing reason a
 // closure gives when it closed over a retirement rather than over an answer.
 func (m membershipRetirements) hosts() []string {
@@ -104,6 +121,14 @@ type inventoryRetirements map[string]corrosion.HostRetirement
 // produces a true answer here: this map is built from a query that filters on
 // the inventory premise, so a membership grant is not in it at all.
 func (i inventoryRetirements) retired(host string) bool { _, ok := i[host]; return ok }
+
+// appliesToIncarnation is the stronger question for the inventory premise. A
+// separate method on a separate type, deliberately, for the reason `retired` is:
+// the two maps have identical shape, so a shared helper would take either.
+func (i inventoryRetirements) appliesToIncarnation(host, incarnation string) bool {
+	r, ok := i[host]
+	return ok && r.HostIncarnation == incarnation
+}
 
 // membershipRetirementsFor resolves the MEMBERSHIP retirements applicable to
 // these candidates.

@@ -1234,6 +1234,16 @@ which is the practical consequence of the trust boundary above. A row that no
 longer applies is not something to clean up; it is the record of an exception
 that has correctly expired.
 
+You do not have to remember to look. For as long as a grant is **in force** —
+revalidated now, and actually supplying a premise — `lv health` carries a
+standing `netbox_premise_attested` advisory naming it, and a grant whose validity
+cannot be established raises `netbox_attestation_unvalidatable` instead. Neither
+gates anything and the advisory is **info** severity, so the cluster does not
+read as degraded while a retirement stands; see
+[A premise resting on an operator attestation](diagnostics.md#a-premise-resting-on-an-operator-attestation).
+Like this listing, the advisory makes the substitution visible and establishes
+nothing about the attested facts.
+
 #### Recording one
 
 ```bash

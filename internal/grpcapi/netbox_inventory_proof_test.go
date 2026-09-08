@@ -624,7 +624,7 @@ func TestClosedParticipantSetReadsRowsFromAPeerThatHoldsMoreThanThisNode(t *test
 			workerRows(append(append([]string{}, known...), "peer-c")...), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +662,7 @@ func TestClosedParticipantSetLearnsAHostONLYAPEERSGOSSIPNames(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), []string{"gossip-only-holder"})
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +699,7 @@ func TestClosedParticipantSetClosesOnOneCallPerParticipant(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -785,7 +785,7 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 			seedPeerHost(t, s, "peer-b")
 			tc.wire(t, s)
 
-			closed, unclosed, err := s.closedParticipantSet(ctx)
+			closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 			if err != nil {
 				t.Fatalf("a peer that cannot answer is part of the answer, not an error: %v", err)
 			}
@@ -802,17 +802,23 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 	}
 }
 
-// TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion is the trap the union
-// walks straight into if it is bolted on rather than folded in.
+// TestDiscoveryTargetsKeepAHostAnOperatorAttestedIsPoweredOff is the fix for
+// exactly the claim this test used to make.
 //
-// The power-off attestation is not a property of the SOURCE that named a host. A
-// host an operator has attested is off must stay out when gossip also names it —
-// otherwise the union silently undoes the one escape hatch the sweeper has, and
-// after a permanent host loss it is inert forever. This is asserted on the
-// DISCOVERY fan-out, which is the set the escape hatch has to reach: a host that
-// is still asked what it knows is a host whose unanswerable dial keeps the set
-// unclosed forever.
-func TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion(t *testing.T) {
+// It once asserted the opposite: that an operator's power-off attestation drops a
+// host from the DISCOVERY fan-out, so the sweeper has an escape from a permanent
+// host loss. That reading was refused, and it was refused because it is unsound.
+// Confirming that a machine is off proves its libvirt cannot be running a domain.
+// It proves NOTHING about the hosts that machine knew existed — and a witness
+// attested off was the only node that could name a third host still holding the
+// address, so excusing it from the question freed a live address.
+//
+// So the attested host stays in the fan-out and is still asked what it knows.
+// Power-off evidence excuses a host from the runtime-proof set and from nothing
+// else (TestTheThreeSetsDifferOnlyWhereTheEvidenceDiffers), and an unreachable
+// host therefore keeps blocking the closure — which is the trade that was chosen
+// over freeing an address a guest holds.
+func TestDiscoveryTargetsKeepAHostAnOperatorAttestedIsPoweredOff(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 
@@ -829,7 +835,8 @@ func TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion(t *testing.T) {
 	}
 
 	// …and the operator attests it powered off. Nothing has made it reachable,
-	// so the attestation governs and it leaves the set.
+	// so the attestation is as strong as it will ever be — and it still buys no
+	// silence about what that host knew.
 	if err := s.db.Execute(ctx,
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail)
 		 VALUES ('fence-confirm-gone', 'gone', 'manual', 'manual-confirmed', ?, 'attested')`,
@@ -840,8 +847,20 @@ func TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.Contains(hosts, "gone") {
-		t.Fatalf("a fenced host named by gossip must still be excluded, got %v", hosts)
+	if !slices.Contains(hosts, "gone") {
+		t.Fatalf("power-off evidence excuses a SCAN, never the question of who exists: an "+
+			"attested host must still be asked what it knows, got %v", hosts)
+	}
+
+	// The corroboration set keeps it too: a machine that is off still holds
+	// every replicated row it received.
+	cs, err := s.localParticipantCandidates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corroborating := s.inventoryCorroborationParticipants(cs.names()); !slices.Contains(corroborating, "gone") {
+		t.Fatalf("an attested host still holds its rows, so its inventory digest must be "+
+			"consulted, got %v", corroborating)
 	}
 }
 
@@ -854,7 +873,7 @@ func localDiscoveryTargets(t *testing.T, s *Server) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.membershipDiscoveryTargets(context.Background(), cs.names())
+	return s.membershipDiscoveryTargets(cs.names()), nil
 }
 
 // localRoleReading is the accumulated witness reading for one host across every
@@ -897,7 +916,7 @@ func TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer(t *testing.T) {
 			workerRows(append(append([]string{}, known...), "tombstoned-holder")...), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -933,7 +952,7 @@ func TestClosedParticipantSetLearnsAHostOnlyAPeerKnows(t *testing.T) {
 		t.Fatalf("precondition: peer-c must be unknown to this node's own sources, got %v", local)
 	}
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close — every participant answered: %q (err %v)", unclosed, err)
 	}
@@ -942,15 +961,20 @@ func TestClosedParticipantSetLearnsAHostOnlyAPeerKnows(t *testing.T) {
 	}
 }
 
-// TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions is the trap
-// a third source walks straight into if it is bolted on rather than folded in.
+// TestTheRuntimeExclusionAppliesToPeerNamedHostsToo is the trap a third source
+// walks straight into if it is bolted on rather than folded in.
 //
-// Eligibility is not a property of the SOURCE that named a host. A host excluded
-// by an operator's power-off attestation must stay excluded when a PEER also
-// names it — otherwise the closure silently undoes the one escape hatch the
-// sweeper has, and after a permanent host loss it is inert forever with nothing
-// an operator can do about it.
-func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testing.T) {
+// An exclusion is not a property of the SOURCE that named a host. A host the
+// runtime-proof set excuses on an operator's power-off attestation must stay
+// excused when a PEER names it rather than this node's own table or gossip —
+// otherwise the merge quietly re-adds it and the sweeper waits for a scan from a
+// machine that is off.
+//
+// Note what is NOT being asserted, because this test asserted it once: the
+// attested host is still ASKED WHAT IT KNOWS. It is dialled here like any other
+// candidate, and the set closes because it answered — not because it was skipped.
+// Power-off evidence excuses a scan and never a memory.
+func TestTheRuntimeExclusionAppliesToPeerNamedHostsToo(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
@@ -959,7 +983,7 @@ func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testin
 		return membershipNaming(host, workerRows("peer-b", "gone"), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -969,20 +993,29 @@ func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testin
 	}
 
 	// …and the operator attests it powered off. Nothing has made it reachable,
-	// so the attestation governs and it leaves the set — even though the peer
-	// still names it.
+	// so the attestation governs the SCAN — even though the peer still names it,
+	// and even though it is still asked what it knows.
 	if err := s.db.Execute(ctx,
 		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail)
 		 VALUES ('fence-confirm-gone', 'gone', 'manual', 'manual-confirmed', ?, 'attested')`,
 		s.db.NowWall()); err != nil {
 		t.Fatalf("write fence confirmation: %v", err)
 	}
-	closed, unclosed, err = s.closedParticipantSet(ctx)
+	closed, unclosed, err = s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
-		t.Fatalf("the set must still close: %q (err %v)", unclosed, err)
+		t.Fatalf("the set must still close — the attested host answered: %q (err %v)",
+			unclosed, err)
 	}
 	if slices.Contains(closed, "gone") {
-		t.Fatalf("a fenced host named by a peer must still be excluded, got %v", closed)
+		t.Fatalf("a peer-named host attested off owes no runtime scan, got %v", closed)
+	}
+	peers, unclosed, err := s.closedInventoryCorroborationPeers(ctx)
+	if err != nil || unclosed != "" {
+		t.Fatalf("the corroboration set must close too: %q (err %v)", unclosed, err)
+	}
+	if !slices.Contains(peers, "gone") {
+		t.Fatalf("an attested host still holds its replicated rows, so its digest must be "+
+			"consulted, got %v", peers)
 	}
 }
 
@@ -1010,7 +1043,7 @@ func TestAPeersROWMayExcuseAWitnessNoRowHereRecords(t *testing.T) {
 			&pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1045,7 +1078,7 @@ func TestAWitnessNamedInGOSSIPBeforeAnyROWIsStillExcused(t *testing.T) {
 			append(workerRows("peer-b"), &pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1099,7 +1132,7 @@ func TestTwoROWSThatDisagreeAboutAWitnessKeepTheHostIN(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1121,7 +1154,7 @@ func TestClosedParticipantSetWithholdsWhenAParticipantCannotAnswer(t *testing.T)
 	// nothing answers on.
 	seedPeerHost(t, s, "peer-b")
 
-	closed, unclosed, err := s.closedParticipantSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("an unreachable peer is part of the answer, not an error: %v", err)
 	}
@@ -1148,7 +1181,7 @@ func TestClosedParticipantSetWithholdsOnAnEmptyMembershipView(t *testing.T) {
 		return membershipNaming(host, nil, nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("an empty view is part of the answer, not an error: %v", err)
 	}
@@ -1176,7 +1209,7 @@ func TestClosedParticipantSetIsBounded(t *testing.T) {
 		return membershipNaming(host, workerRows(fmt.Sprintf("peer-generated-%d", n)), nil)
 	})
 
-	closed, unclosed, err := s.closedParticipantSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("a growing set is part of the answer, not an error: %v", err)
 	}

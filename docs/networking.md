@@ -1035,23 +1035,37 @@ so it happens only under a whole-cluster proof:
   name is therefore queried by name, whether or not this node's own `hosts` table
   ever received it. Counting host rows is not enough on its own — two nodes can
   each know three hosts without knowing the same three;
-- **witnesses are asked what they know, and excused only from the scan.** These
-  are two different sets and litevirt keeps them apart deliberately. A witness
-  runs the daemon, gossips and holds the same replicated `hosts` table as any
-  worker, so it is a first-class source of membership; what it does not do is host
-  a workload, so scanning it for a guest proves nothing and it is left out of the
-  set that must answer with a scan. Excluding a witness from the *question* was a
-  bug twice over: a host whose role this node had recorded as `witness` but which
-  had since been made a worker was never asked, and its stale role could never be
-  corrected — an exclusion must not skip the query that would have refuted it —
-  and a genuine witness that was the only node able to name a third host was never
-  asked either. A host counts as a witness only while **every** `hosts` row read
-  for it agrees; two rows that disagree, or no row anywhere, and it must answer
-  with a scan like any worker;
-- **an unreachable witness pauses reclamation exactly as an unreachable worker
-  does.** It is dialled for its membership view, and a host that cannot say what
-  it knows leaves the set unclosed — the same escape applies, and it is the only
-  one: `lv host fence-confirm <host>` once the machine really is off;
+- **there are three sets, and what a host owes depends on what it has.** litevirt
+  keeps them apart deliberately, because collapsing a pair of them has freed or
+  handed out a held address three times. A host that knows *who exists* is asked
+  which hosts it knows of — everyone, whatever its role and whatever its power
+  state. A host that holds *the replicated rows* must have its inventory digest
+  agree — everyone running the daemon, **witnesses included**. A host with *a
+  running domain to scan* must answer with a scan — workload hosts only, and a
+  witness is excused there and only there;
+- **witnesses are asked what they know and asked what rows they hold, and
+  excused only from the scan.** A witness runs the daemon, gossips and receives
+  every replicated row, so it is a first-class source of membership *and* of
+  inventory; what it does not do is host a workload, so scanning it for a guest
+  proves nothing. Excluding a witness from the *question* was a bug twice over: a
+  host whose role this node had recorded as `witness` but which had since been
+  made a worker was never asked, and its stale role could never be corrected — an
+  exclusion must not skip the query that would have refuted it — and a genuine
+  witness that was the only node able to name a third host was never asked either.
+  Excluding it from the *inventory* comparison was a third: it held the only
+  replicated copy of a running guest's records, every other node's inventory was
+  equally short, they agreed with each other, and a bind went live over a held
+  address. A host counts as a witness only while **every** `hosts` row read for it
+  agrees; two rows that disagree, or no row anywhere, and it must answer with a
+  scan like any worker;
+- **an unreachable host of any role pauses reclamation, and a fence attestation
+  does not lift that.** Every host is dialled for its membership view, and one
+  that cannot say what it knows leaves the set unclosed. `lv host fence-confirm
+  <host>` excuses a machine from the runtime **scan** — it cannot be running a
+  domain if it is off — and from nothing else: being off says nothing about the
+  hosts that machine alone knew existed, or about the rows it holds. A fenced
+  witness that was the only node able to name a third, still-running holder is the
+  case that settles it;
 - a view carries **both** halves of what a node knows, because neither half can
   substitute for the other. Its `hosts` rows include **tombstoned** ones: `lv
   host rm --force` does not power a machine off, so a host whose row a peer has
@@ -1088,24 +1102,26 @@ always preferable to freeing one a running guest is using, so every doubt leaves
 the address allocated. Expect reclamation to pause whenever the cluster is not
 whole — that is the design, not a fault.
 
-**After a permanent host loss the sweeper stays inert** until an operator
-attests the machine is off:
+**After a permanent host loss the sweeper stays inert, and there is no override.**
+A lost host is simply unreachable, so it cannot say which hosts it knew of, so
+the participant set cannot be closed and nothing is reclaimed. `lv host
+fence-confirm <host>` does **not** change that, and it is not offered as a
+remedy: it attests that a machine's libvirt cannot be running a domain, which
+excuses that host from the runtime scan, while saying nothing about the hosts it
+alone knew existed or the replicated rows it held. Excusing a fenced host from
+the *question* is what freed a live address, so the escape hatch was removed.
 
-```bash
-lv host fence-confirm <host>
-```
+The way back is to make the host answerable again — repair it, or replace it and
+let the replacement rejoin under that name. Until then the sweep withholds and the
+addresses it would have reclaimed stay allocated, which is the leak this design
+prefers to a collision. `lv health` names the host the proof is waiting on, so the
+pause is never silent. Bindings behave the same way from the other side: a node
+that cannot close the set does not go live on a prefix, its binding is suspended,
+and a later pass resumes it by itself once the cluster is whole.
 
-Without that, the lost host is simply unreachable, every proof is incomplete,
-and nothing is ever reclaimed. The attestation counts for 24 hours — long enough
-that a confirmation does not expire between passes — and only for a host that is
-still unreachable: a host that comes back is never excluded from the proof set,
-whatever the fencing record says.
-
-Two things follow from that, and both are deliberate. During those 24 hours a
-host that is unreachable but alive is out of the proof set, so an address only it
-holds could be reclaimed — confirm a fence only for a machine you know is off.
-And the attestation cannot be revoked early; if it was given in error, the way
-back is to make the host reachable again.
+The attestation is still time-bounded (24 hours) and still ignored for a host
+that has come back, because it governs the scan for exactly as long as the
+machine is genuinely down.
 
 **During a rolling upgrade, reclamation pauses.** A peer running a build that
 does not implement the proof RPC counts as unreachable, so no proof is complete

@@ -110,34 +110,36 @@ func TestSweeperIgnoresFenceProofAfterRejoin(t *testing.T) {
 	}
 }
 
-// TestSweeperHonoursFenceConfirmOlderThanVIPWindow pins the sweeper's OWN fence
-// window.
+// TestSweeperStaysBlockedByAnUnreachableHostAnOperatorAttestedIsOff is the
+// liveness trade this proof makes, and it is the opposite of what this test
+// asserted for two rounds.
 //
-// The VIP release proof expires an operator's `lv host fence-confirm` after five
-// minutes, which is right for a failover decision made seconds after a host
-// drops. A sweep runs on a ten-minute lease cadence, so borrowing that window
-// would expire every confirmation before the next pass could ever read it: after
-// a permanent host loss the sweeper would be inert forever, and no amount of
-// re-confirming would help — the operator has no way to land a confirmation
-// inside a window narrower than the cadence.
+// `lv host fence-confirm` was offered as the escape from a permanent host loss:
+// attest that the machine is off and the sweeper proceeds without it. That
+// reading was refused. Confirming a machine is off proves its libvirt cannot be
+// running a domain — it proves NOTHING about the hosts that machine alone knew
+// existed, and nothing about the replicated rows it held. A fenced witness that
+// was the only node able to name a third, still-running holder is the shape that
+// settled it (netbox_witness_membership_test.go).
 //
-// The attestation is safe to honour for far longer here because reachability is
-// checked FIRST and independently: a host that comes back is never excluded,
-// however fresh its fence record (TestSweeperIgnoresFenceProofAfterRejoin). The
-// window only bounds an UNREACHABLE host's attestation.
-func TestSweeperHonoursFenceConfirmOlderThanVIPWindow(t *testing.T) {
+// So an unreachable host keeps the participant set unclosed however strong its
+// fence record, the sweep withholds, and the address leaks until the cluster is
+// whole again. `lv health` names the host it is waiting on. What the attestation
+// still buys is one thing only: the host owes no runtime SCAN, which the
+// package-local tests pin directly.
+func TestSweeperStaysBlockedByAnUnreachableHostAnOperatorAttestedIsOff(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 2)
 
 	// Permanently gone: off the network, and attested down ten minutes ago —
-	// older than the VIP window, well inside the sweeper's.
+	// older than the VIP window, well inside the sweeper's own.
 	c.Nodes[1].Stop()
 	fenceConfirmAged(t, c.Nodes[0], c.Nodes[1].Name, 10*time.Minute)
 
 	mustSweep(t, c.Nodes[0])
 
-	if len(nb.Identities()) != 0 {
-		t.Fatalf("a confirmation older than the VIP window must still exclude an unreachable host, still held: %v",
-			nb.Identities())
+	if len(nb.Identities()) != 1 {
+		t.Fatalf("an attestation that a host is off is not a statement about what that host "+
+			"knew: the sweep must stay blocked, released %v", nb.Released())
 	}
 }
 

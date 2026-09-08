@@ -606,16 +606,26 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 // nodes: do your address-bearing tables say the same as mine? Every host agrees,
 // or nothing is corroborated. That is the orphan sweeper's negative-proof
 // discipline applied to a different absence, and it reuses the sweeper's own
-// machinery rather than inventing a second one: closedProofPeers for the
-// participant universe — which deliberately keeps offline, fenced and tombstoned
-// hosts in (a host that cannot be reached still HOLDS its rows) and is CLOSED
-// over every participant's own membership view, `hosts` rows and gossip members
-// alike, so a host only a peer has a row for, or only a peer's gossip names, is
-// asked too — dialPeer for the transport, and one bounded timeout each.
+// machinery rather than inventing a second one: closedInventoryCorroborationPeers
+// for the participant universe — which deliberately keeps offline, fenced,
+// tombstoned and WITNESS hosts in (a host that cannot be reached still HOLDS its
+// rows, and a witness holds every one of them while hosting nothing) and is
+// CLOSED over every participant's own membership view, `hosts` rows and gossip
+// members alike, so a host only a peer has a row for, or only a peer's gossip
+// names, is asked too — dialPeer for the transport, and one bounded timeout each.
 //
-// THE SAME HELPER, NOT A SUBSET OF IT. Every membership check the sweeper makes
-// before it reclaims, this makes before it goes live, because closedProofPeers is
-// the only way either of them reaches a peer set. That is not symmetry for its
+// THE SET IT ASKS IS THE CORROBORATION SET AND NOT THE RUNTIME-PROOF SET, which
+// is a distinction this check got wrong once. The sweeper's set excuses a witness
+// because a witness has no domain to scan; this check wants the ROWS, which a
+// witness has in full. Reading the sweeper's set here meant a witness holding the
+// only replicated copy of an incumbent's VM and NIC rows was never asked, the
+// remaining nodes' equally short inventories agreed, and the bind went live over
+// a held address.
+//
+// THE SAME CLOSURE, NOT A SUBSET OF IT. Every membership check the sweeper makes
+// before it reclaims, this makes before it goes live, because
+// closedParticipantSets is the only way either of them reaches a peer set — each
+// through the accessor named for the set it needs. That is not symmetry for its
 // own sake: a bind that adopts nothing because it could not see a holder hands
 // that holder's address to the next guest created, which is the same collision
 // the sweeper's proof exists to prevent — reached from the other side. A period
@@ -754,7 +764,7 @@ func (s *Server) proveNoPeerHoldsInventoryRowsWeLack(ctx context.Context, local 
 	if s.db == nil {
 		return false, "", fmt.Errorf("no cluster database")
 	}
-	peers, unclosed, err := s.closedProofPeers(ctx)
+	peers, unclosed, err := s.closedInventoryCorroborationPeers(ctx)
 	if err != nil {
 		return false, "", err
 	}

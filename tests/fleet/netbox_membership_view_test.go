@@ -1,5 +1,5 @@
-// The FOURTH cheap proxy for a complete host set, and the boundary that is left
-// once it is gone.
+// The FOURTH cheap proxy for a complete host set, and what replaced the last of
+// them.
 //
 // Round three of this review closed the participant set over each peer's
 // ListHosts answer, which is a filtered read: it drops `deleted_at IS NULL`
@@ -9,17 +9,22 @@
 // meant to cover that residue was balanced out by a local-only witness. Both
 // checks passed and the address was freed.
 //
-// The set is now closed over the `hosts` ROWS each participant actually holds,
-// read from the state dump the anti-entropy RPCs already serve, which is a bare
-// `SELECT *` and therefore carries the tombstones ListHosts drops. The first two
-// scenarios here are that fix, from both sides — the sweep that frees an address
-// and the bind that hands one out.
+// Closing the set over each participant's `hosts` ROWS, read out of the state
+// dump, fixed those two. It could not fix the third, and the reason was
+// structural: a holder known only to another node's GOSSIP membership has no row
+// anywhere, so no table-derived answer — ListHosts, ClusterStatus.hosts, a state
+// digest, a state dump — can name it.
 //
-// The third is the boundary, and it is SKIPPED rather than weakened: a holder
-// known only to another node's GOSSIP membership, with no `hosts` row anywhere
-// this node can read. Rows cannot prove anything about it, and no RPC carries a
-// peer's memberlist view, so closing it needs a new field or RPC on the wire.
-// The scenario stays here, intact, so that landing one is a one-line change.
+// All three are now closed over each participant's own MEMBERSHIP VIEW
+// (GetMembershipView): its `hosts` rows, tombstones included and each carrying
+// the role the exclusions turn on, plus its gossip members, plus an explicit
+// completeness flag. The state-dump path is gone rather than kept alongside it —
+// two mechanisms answering one question is how the count-versus-content
+// confusion survived three rounds here.
+//
+// The scenarios below are that fix from three directions: the sweep that frees
+// an address, the bind that hands one out, and the gossip-only holder no row can
+// see.
 
 package fleet
 
@@ -56,6 +61,12 @@ func TestFleetSweepDoesNotFreeAnAddressAPeerOnlyTombstoneHolds(t *testing.T) {
 	}
 	sweeper.DB.SetMembersForTests(func() []corrosion.PeerInfo {
 		return []corrosion.PeerInfo{{Name: peer.Name, Addr: net.JoinHostPort(peer.Address, "7946")}}
+	})
+	// The peer's gossip does not name the holder either, so its TOMBSTONED ROW is
+	// the only record of the holder anywhere: the outcome turns on that row and
+	// not on the membership view's gossip half, which the scenario below covers.
+	peer.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: sweeper.Name, Addr: net.JoinHostPort(sweeper.Address, "7946")}}
 	})
 	// The balance: a host the sweeper knows and the peer does not, so the two
 	// `hosts` tables are the same SIZE over different members — and a witness at
@@ -111,6 +122,11 @@ func TestFleetBindDoesNotHandOutTheAddressOfAPeerOnlyTombstonedHolder(t *testing
 	binder.DB.SetMembersForTests(func() []corrosion.PeerInfo {
 		return []corrosion.PeerInfo{{Name: peer.Name, Addr: net.JoinHostPort(peer.Address, "7946")}}
 	})
+	// As above: with the holder out of the peer's gossip too, its tombstoned row
+	// is the only thing that can reveal it.
+	peer.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: binder.Name, Addr: net.JoinHostPort(binder.Address, "7946")}}
+	})
 	if err := peer.DB.Execute(ctx,
 		"UPDATE hosts SET deleted_at = '2026-09-01T00:00:00Z' WHERE name = ?", holder.Name); err != nil {
 		t.Fatal(err)
@@ -119,45 +135,31 @@ func TestFleetBindDoesNotHandOutTheAddressOfAPeerOnlyTombstonedHolder(t *testing
 	assertBindHandsOutNoHeldAddress(t, c, binder)
 }
 
-// TestFleetSweepDoesNotFreeAnAddressAGossipOnlyHolderHolds is the BOUNDARY of
-// what a row-based membership proof can establish, and it is knowingly open.
+// TestFleetSweepDoesNotFreeAnAddressAGossipOnlyHolderHolds is the shape no
+// amount of reading ROWS could ever have reached.
 //
 // No node the sweeper can read has a `hosts` row for the holder — not the
-// sweeper, not the peer — and the sweeper's own gossip does not name it. The
-// only record of its existence anywhere is the PEER's memberlist view, and that
-// is not on the wire in any form: ListHosts and ClusterStatus.hosts are both
-// table-derived, GetStateDigest is counts, and PingResponse carries capabilities
-// and a clock. So there is no question the sweeper can ask that would reveal it.
+// sweeper, not the peer — and the sweeper's own gossip does not name it either.
+// The only record of its existence anywhere is the PEER's memberlist view, which
+// no table records and therefore no table-derived answer can carry: ListHosts and
+// ClusterStatus.hosts are both derived from `hosts`, GetStateDigest is counts,
+// and a state dump is tables. Gossip has to be asked for directly.
 //
-// It is skipped rather than deleted, and rather than "fixed" by delegating the
-// proof to peers, because that fix is unsound in ways the outcome here would
-// hide:
+// GetMembershipView asks for it, so the sweeper learns the holder's NAME from
+// the peer and the reclamation stops — either because the holder answers that it
+// holds the MAC, or because a host this node cannot resolve cannot be asked and
+// an unanswered participant leaves the set unclosed. Both are the fail-closed
+// direction, and the assertion is deliberately about the address rather than
+// about which of the two happened.
 //
-//   - delegation cannot be routed through the one helper both proofs use, so it
-//     would strengthen the sweeper and leave the bind — which corroborates over
-//     digests and dumps, not over the proof RPC — exactly as it is. Whatever the
-//     sweeper needs to reclaim, the bind needs to go live;
-//   - bounding it to one hop needs the REQUEST to say "do not delegate further",
-//     and OrphanProofRequest has no field for that. The only carrier left is
-//     out-of-band metadata: a field in everything but the schema, silently
-//     absent from any peer that does not set it, and if it is ever lost the
-//     delegation recurses across the cluster;
-//   - and one hop is not enough anyway. A holder in a THIRD node's gossip, where
-//     that node is itself only in the peer's gossip, is two hops away. Making
-//     depth exhaustion report an incomplete proof restores soundness only if a
-//     delegate can tell which participants the original caller already knows,
-//     which it cannot — so the rule has to be approximated by a local set
-//     difference, which is closing over a filtered source all over again.
-//
-// What closes this soundly is a declared way to ask a peer for its gossip
-// membership; see the report accompanying this branch. Until then the proof's
-// boundary is written down where it can be read, in gatherHostViews and here,
-// rather than papered over.
+// Delegation was considered as a cheaper fix and rejected as unsound, not merely
+// unavailable: a peer answering CollectOrphanProof for its own gossip-only
+// members cannot be routed through the one helper both proofs use, so it would
+// strengthen the sweeper and leave the bind exactly as it is; OrphanProofRequest
+// has no field to bound the hop, leaving only out-of-band metadata that is
+// silently absent from any peer that does not set it; and one hop is not enough
+// anyway, since a holder in a THIRD node's gossip is two hops away.
 func TestFleetSweepDoesNotFreeAnAddressAGossipOnlyHolderHolds(t *testing.T) {
-	t.Skip("BLOCKED on a wire change: a peer's gossip membership is not exposed by any " +
-		"RPC, and no sound one-hop delegation exists without a field to bound it. See the " +
-		"doc comment above and gatherHostViews in internal/grpcapi/netbox_sweeper.go.")
-
 	nb, c := boundClusterWithOrphan(t, 3)
 	sweeper, peer, holder := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	holder.Virt.DefineStoppedDomain("ghost", orphanMAC)

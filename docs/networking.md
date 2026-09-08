@@ -1029,30 +1029,36 @@ so it happens only under a whole-cluster proof:
   making the two samples agree about a cluster neither of them saw whole.
   Membership converges in seconds and independently of every table, so a host it
   names is a host that exists;
-- that set is then **closed over the `hosts` rows every participant holds**:
-  each one is asked for its own rows, the answers are folded in under the same
-  exclusions, and the fan-out repeats until the set stops growing. A holder any
-  reachable node has a row for is therefore queried by name, whether or not this
-  node's own `hosts` table ever received it. A participant that cannot answer,
-  one that cannot be read, and one whose answer is short of what its own digest
-  counts all leave the set unclosed and stop the reclamation. Counting host rows
-  is not enough on its own — two nodes can each know three hosts without knowing
-  the same three;
-- **tombstoned rows count**, which is why the rows are read rather than listed:
-  `lv host rm --force` does not power a machine off, so a host whose row a peer
-  has soft-deleted may still be running the domain that holds the address. A
-  participant whose `hosts` table is identical to the sweeping node's — same
-  count, same content hash, tombstones included — is not asked for its rows at
-  all, because there is nothing in it the sweeping node has not already read;
+- that set is then **closed over every participant's own membership view**: each
+  one is asked which hosts it knows of at all, the answers are folded in under
+  the same exclusions, and the fan-out repeats until the set stops growing. A
+  holder any reachable node can name is therefore queried by name, whether or not
+  this node's own `hosts` table ever received it. Counting host rows is not enough
+  on its own — two nodes can each know three hosts without knowing the same
+  three;
+- a view carries **both** halves of what a node knows, because neither half can
+  substitute for the other. Its `hosts` rows include **tombstoned** ones: `lv
+  host rm --force` does not power a machine off, so a host whose row a peer has
+  soft-deleted may still be running the domain that holds the address. Its
+  **gossip members** are the only source that can name a host with no `hosts` row
+  anywhere — memberlist converges in seconds, independently of every table — so a
+  holder known only to another node's gossip is now covered too, which no
+  table-derived answer could ever have reached;
 - the same membership proof gates the **bind**, not only the sweep. A node that
   cannot establish the host set does not go live on a prefix: its binding is
   suspended, and the next maintenance pass resumes it by itself. Handing out an
   address a holder already has and freeing one are the same collision from
   opposite sides, so both sides ask the same question;
-- what rows cannot prove is left alone deliberately: a host that **no** reachable
-  participant has a `hosts` row for, and that this node's own gossip has not yet
-  named, is outside what this proof covers. Membership rows converge in seconds,
-  so the window is short — and everything above still fails closed inside it;
+- **reclamation withholds whenever the membership view cannot be closed**, and
+  that is a longer list than an unreachable host. A participant that cannot be
+  dialled, one that reports its own enumeration incomplete, one that names no
+  hosts at all (a node holds at least its own row, so that is an unhydrated
+  database rather than a small cluster), and one **running a version too old to
+  answer the question** each leave the set unclosed. The last is the mixed-version
+  case, and it is deliberate: during a rolling upgrade the not-yet-upgraded hosts
+  cannot report what they know, so reclamation pauses until the roll finishes
+  rather than proceeding on a cluster it can only partly see. The skip reason
+  names the host, so `lv health` says which one;
 - **every** eligible host must answer, and answer with a complete scan. One
   unreachable host, one incomplete answer, or a membership change mid-proof and
   the address is left alone;

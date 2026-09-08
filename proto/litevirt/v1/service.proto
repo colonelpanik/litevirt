@@ -321,6 +321,50 @@ message OrphanProofResponse {
     bool holds_address = 6;
 }
 
+// MembershipHost is one `hosts` row a responder holds, reduced to what a
+// membership proof reads: the identity, plus the role the proof's exclusions
+// turn on.
+//
+// A TOMBSTONED row is included and is NOT marked as one. That is the contract:
+// soft-deleting a host row does not power a machine off, so a tombstone names a
+// candidate exactly like a live row and nothing downstream may branch on the
+// difference. It is also why this is a message rather than a bare name — a
+// caller that had only names could not apply the witness exclusion to a host it
+// learned here, and re-deriving that exclusion from a second source is how two
+// proofs come to differ.
+message MembershipHost {
+    string name = 1;
+    // role as the row records it ("worker" or "witness"), empty when it records
+    // none. Empty is NOT the statement that a host is a witness.
+    string role = 2;
+}
+
+// MembershipViewResponse is one host's WHOLE candidate universe: every `hosts`
+// row it holds INCLUDING TOMBSTONED ONES, plus the gossip members only its own
+// memberlist can name. Gossip is the sole source that can name a host with no
+// `hosts` row anywhere, so a proof that must not miss a claimant cannot be
+// closed without it.
+//
+// It is deliberately UNFILTERED. The responder states what it knows and applies
+// no eligibility rule of its own; the caller applies the proof's exclusions to
+// every candidate itself, whichever source named it, so they exist at one site
+// and cannot drift.
+//
+// complete is false when this node's own enumeration was not whole — its `hosts`
+// read failed, or its table does not even carry its own row, which is an
+// unhydrated database rather than a small cluster. An INCOMPLETE view is not
+// evidence of absence: a caller must withhold rather than read a short list as
+// this node's membership. gossip_members EXCLUDES the responder itself, exactly
+// as memberlist membership does, and is legitimately empty on a node with no
+// gossip layer.
+message MembershipViewResponse {
+    string host = 1;
+    repeated MembershipHost hosts = 2;
+    repeated string gossip_members = 3;
+    bool complete = 4;
+    repeated string errors = 5;
+}
+
 // RekeyBindingRequest re-stamps every NetBox object a bound network owns with
 // the cluster's CURRENT fingerprint, then resumes the binding. It names the
 // litevirt network rather than the prefix id because that is what an operator
@@ -2069,6 +2113,15 @@ service LiteVirt {
     // rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
     // from every host before reclaiming an address in NetBox.
     rpc CollectOrphanProof(OrphanProofRequest) returns (OrphanProofResponse);
+    // GetMembershipView answers, for THIS host, "which hosts could be running
+    // anything at all" — every `hosts` row it holds, TOMBSTONES INCLUDED, plus
+    // its own gossip membership, which is the only source that can name a host
+    // with no row anywhere. Peer-only, like CollectOrphanProof, and gathered by
+    // the same caller: one membership closure gates both reclaiming an address
+    // and binding a prefix. An older peer answers Unimplemented, which is a
+    // definite failure the closure treats as "cannot corroborate" — that, not a
+    // capability latch, is what makes this safe on a mixed-version cluster.
+    rpc GetMembershipView(google.protobuf.Empty) returns (MembershipViewResponse);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);

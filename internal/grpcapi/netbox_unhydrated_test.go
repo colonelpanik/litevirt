@@ -61,21 +61,21 @@ func seedPeerHost(t *testing.T, s *Server, name string) {
 // concluded corroboration from a local read alone.
 type agreeingPeer struct {
 	pb.LiteVirtClient
-	digest func() *pb.StateDigestResponse
-	hosts  func() *pb.ListHostsResponse
+	digest     func() *pb.StateDigestResponse
+	membership func() *pb.MembershipViewResponse
 }
 
 func (p *agreeingPeer) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
 	return p.digest(), nil
 }
 
-// ListHosts is the other half of agreeing: the participant-set closure asks each
-// participant which hosts IT knows, and a peer that names the same ones closes
-// the set in a single round. A peer that agreed about every table but could not
-// answer this would still leave the bind suspended — correctly, but for a reason
-// none of these scenarios is about.
-func (p *agreeingPeer) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
-	return p.hosts(), nil
+// GetMembershipView is the other half of agreeing: the participant-set closure
+// asks each participant which hosts IT knows of, and a peer that names the same
+// ones and no new gossip members closes the set in a single round. A peer that
+// agreed about every table but could not answer this would still leave the bind
+// suspended — correctly, but for a reason none of these scenarios is about.
+func (p *agreeingPeer) GetMembershipView(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.MembershipViewResponse, error) {
+	return p.membership(), nil
 }
 
 // peerAgreesWithThisNode makes every peer answer with this node's own digest, so
@@ -98,12 +98,8 @@ func peerAgreesWithThisNode(t *testing.T, s *Server) {
 				})
 			}
 			return resp
-		}, hosts: func() *pb.ListHostsResponse {
-			resp := &pb.ListHostsResponse{}
-			for _, name := range localHostNames(ctx, s) {
-				resp.Hosts = append(resp.Hosts, &pb.Host{Name: name})
-			}
-			return resp
+		}, membership: func() *pb.MembershipViewResponse {
+			return viewLikeThisNodes(ctx, s, "peer-b")
 		}}, func() {}, nil
 	}
 }

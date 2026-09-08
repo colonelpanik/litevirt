@@ -609,9 +609,9 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 // machinery rather than inventing a second one: closedProofPeers for the
 // participant universe — which deliberately keeps offline, fenced and tombstoned
 // hosts in (a host that cannot be reached still HOLDS its rows) and is CLOSED
-// over the `hosts` rows every participant holds, tombstones included, so a host
-// only a peer has a row for is asked too — dialPeer for the transport, and one
-// bounded timeout each.
+// over every participant's own membership view, `hosts` rows and gossip members
+// alike, so a host only a peer has a row for, or only a peer's gossip names, is
+// asked too — dialPeer for the transport, and one bounded timeout each.
 //
 // THE SAME HELPER, NOT A SUBSET OF IT. Every membership check the sweeper makes
 // before it reclaims, this makes before it goes live, because closedProofPeers is
@@ -893,14 +893,15 @@ func (s *Server) gatherTableDigests(ctx context.Context, peers []string, tables 
 	return answers
 }
 
-// vmsTableName and hostsTableName are the tables a proof compares across the
-// cluster. Literals rather than imports: they are matched against names a PEER
-// put on the wire, and on a mixed-version cluster the two sides are different
-// builds.
-const (
-	vmsTableName   = "vms"
-	hostsTableName = "hosts"
-)
+// vmsTableName is the table the inventory corroboration starts from. A literal
+// rather than an import: it is matched against a name a PEER put on the wire,
+// and on a mixed-version cluster the two sides are different builds.
+//
+// There is no `hosts` counterpart any more. Membership was once compared as a
+// `hosts` DIGEST and then read out of a `hosts` state dump; both are gone —
+// GetMembershipView asks each node for its own universe directly, so nothing
+// here compares that table.
+const vmsTableName = "vms"
 
 // unhydratedSuspendPrefix is the head of the reason a bind writes when it could
 // not corroborate an empty VM inventory, and the whole of how the revalidation

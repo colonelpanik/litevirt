@@ -5,141 +5,121 @@
 // covers the outcomes. What it cannot do is hand a peer a specific ANSWER, and
 // these proofs turn on exactly that: a peer holding more rows than us, the same
 // number of DIFFERENT rows, or fewer; a peer that names a host nobody here has
-// heard of, one that cannot answer at all, one that answers with no membership
-// view. A stub peer is the only way to sit on each of those branches
-// deliberately rather than by arranging a fixture that happens to produce one.
+// heard of, one that names it only in GOSSIP, one running a build too old to
+// answer the question at all, one that answers with no membership view. A stub
+// peer is the only way to sit on each of those branches deliberately rather than
+// by arranging a fixture that happens to produce one.
 
 package grpcapi
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// answeringPeer is a peer that answers GetStateDigest with whatever the scenario
-// decided, serves a state dump when it has been given one, and nothing else.
+// answeringPeer is a peer that answers GetStateDigest and GetMembershipView with
+// whatever the scenario decided, and nothing else.
+//
+// pb.LiteVirtClient is embedded UNIMPLEMENTED, which is load-bearing: any other
+// RPC panics on the nil interface rather than quietly returning a zero value. So
+// a scenario asserts by construction that the participant-set closure reaches a
+// peer with one membership call and pulls no state dump — the whole-database
+// fetch this replaced.
 type answeringPeer struct {
 	pb.LiteVirtClient
 	tables []*pb.TableDigest
-	// dump is the gzipped state dump this peer serves. nil means it serves NONE
-	// — which the participant-set closure only ever asks for when this peer's
-	// `hosts` digest disagrees with the local one, so a scenario that leaves it
-	// nil is asserting that no dump was needed.
-	dump []byte
+	// membership is what this peer answers GetMembershipView with. nil means it
+	// answers Unimplemented, which is an OLDER BUILD — the shape that carries
+	// this feature's entire mixed-version story.
+	membership *pb.MembershipViewResponse
 }
 
 func (p *answeringPeer) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
 	return &pb.StateDigestResponse{HostName: "peer-b", Tables: p.tables}, nil
 }
 
-// StreamStateDump is how the participant-set closure reads a peer's `hosts`
-// ROWS, tombstones included, once that peer's digest says its table is not this
-// node's.
-func (p *answeringPeer) StreamStateDump(_ context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.StateDumpChunk], error) {
-	if p.dump == nil {
-		return nil, fmt.Errorf("this peer serves no state dump")
+// GetMembershipView is how the participant-set closure reads a peer's whole
+// candidate universe: its `hosts` rows, tombstones included, and the gossip
+// members only its own memberlist can name.
+func (p *answeringPeer) GetMembershipView(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.MembershipViewResponse, error) {
+	if p.membership == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"unknown method GetMembershipView for service litevirt.v1.LiteVirt")
 	}
-	return &dumpStream{data: p.dump}, nil
-}
-
-// dumpStream replays one gzipped dump as the single chunk StreamStateDump would
-// send for a payload this small. grpc.ClientStream is embedded unimplemented:
-// the closure only ever calls Recv, and anything else must fail loudly rather
-// than quietly return a zero value.
-type dumpStream struct {
-	grpc.ClientStream
-	data []byte
-	sent bool
-}
-
-func (d *dumpStream) Recv() (*pb.StateDumpChunk, error) {
-	if d.sent {
-		return nil, io.EOF
-	}
-	d.sent = true
-	return &pb.StateDumpChunk{Data: d.data, Final: true}, nil
+	return p.membership, nil
 }
 
 // peerReports wires every peer dial to a stub answering with these digests.
 //
-// Every scenario built on it is about an INVENTORY digest branch, so it also
-// answers with this node's own `hosts` digest unless the scenario supplied one:
-// the closure then reads that peer's table as identical to this one's, closes in
-// a single round having learned nothing new and having pulled no dump, and the
-// inventory comparison is what decides the outcome. A stub that stayed silent
-// about `hosts` would leave every bind here unproven for a reason none of these
-// scenarios is about.
+// Every scenario built on it is about an INVENTORY digest branch, so the peer
+// also answers the membership question with a view identical to this node's:
+// the closure then learns nothing new, closes in a single round, and the
+// inventory comparison is what decides the outcome. A stub that could not answer
+// the membership question would leave every bind here unproven for a reason none
+// of these scenarios is about.
 func peerReports(s *Server, tables ...*pb.TableDigest) {
-	s.peerClientOverride = func(ctx context.Context, _ string) (pb.LiteVirtClient, func(), error) {
-		answer := tables
-		if !namesTable(answer, hostsTableName) {
-			d, err := s.localTableDigest(ctx, hostsTableName)
-			if err == nil {
-				answer = append(append([]*pb.TableDigest{}, answer...), digestOf(d))
-			}
-		}
-		return &answeringPeer{tables: answer}, func() {}, nil
+	s.peerClientOverride = func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		return &answeringPeer{tables: tables, membership: viewLikeThisNodes(ctx, s, host)}, func() {}, nil
 	}
 }
 
-func namesTable(tables []*pb.TableDigest, name string) bool {
-	for _, t := range tables {
-		if t.GetName() == name {
-			return true
-		}
+// peerKnows wires every peer dial to a peer answering the membership question
+// with fn(host). Called per dial, so a scenario can answer differently each
+// round.
+func peerKnows(s *Server, fn func(host string) *pb.MembershipViewResponse) {
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		return &answeringPeer{membership: fn(host)}, func() {}, nil
 	}
-	return false
 }
 
-// hostsDumpNaming builds the gzipped state dump a peer holding exactly these
-// `hosts` rows would serve. deleted names it as a TOMBSTONED row — the shape
-// ListHosts filters out and the reason the closure reads rows instead.
-//
-// The payload shape is corrosion's, and it is pinned against the real encoder by
-// TestHostNamesFromStateDump* in that package: a drift there makes the parse fail
-// here rather than silently producing a stub nobody notices is wrong.
-func hostsDumpNaming(t *testing.T, live []string, deleted []string) []byte {
+// viewLikeThisNodes is the membership view a peer whose `hosts` table is
+// identical to this node's, and whose gossip names nobody new, answers with.
+func viewLikeThisNodes(ctx context.Context, s *Server, host string) *pb.MembershipViewResponse {
+	return membershipNaming(host, workerRows(localHostNames(ctx, s)...), nil)
+}
+
+// membershipNaming builds the view a peer holding exactly these `hosts` rows and
+// naming exactly these gossip members answers with. complete is true — the
+// scenarios that need an incomplete view build one explicitly, because "could
+// not enumerate" is a different claim from "knows nobody".
+func membershipNaming(host string, rows []*pb.MembershipHost, gossip []string) *pb.MembershipViewResponse {
+	return &pb.MembershipViewResponse{
+		Host: host, Hosts: rows, GossipMembers: gossip, Complete: true,
+	}
+}
+
+// workerRows names `hosts` rows carrying the ordinary worker role, which is what
+// the exclusions leave in. Tombstoned and live rows are indistinguishable on the
+// wire by contract — soft-deleting a row does not power a machine off — so a
+// scenario about a tombstone names it here exactly like any other row and pins
+// the CONTRACT in tests/fleet, against a real server.
+func workerRows(names ...string) []*pb.MembershipHost {
+	out := make([]*pb.MembershipHost, 0, len(names))
+	for _, n := range names {
+		out = append(out, &pb.MembershipHost{Name: n, Role: "worker"})
+	}
+	return out
+}
+
+// seedSelfHost gives this node the `hosts` row every real node holds for itself,
+// which is the row a responder's completeness check looks for.
+// newAdoptTestServer's database has none — that is itself the unhydrated shape
+// TestGetMembershipViewIsIncompleteWithoutARowForItself is about.
+func seedSelfHost(t *testing.T, s *Server) {
 	t.Helper()
-	type table struct {
-		Name    string          `json:"name"`
-		Columns []string        `json:"cols"`
-		Rows    [][]interface{} `json:"rows"`
-	}
-	tbl := table{Name: hostsTableName, Columns: []string{"name", "deleted_at"}}
-	for _, n := range live {
-		tbl.Rows = append(tbl.Rows, []interface{}{n, nil})
-	}
-	for _, n := range deleted {
-		tbl.Rows = append(tbl.Rows, []interface{}{n, "2026-09-01T00:00:00Z"})
-	}
-	body, err := json.Marshal(struct {
-		Tables []table `json:"tables"`
-	}{Tables: []table{tbl}})
-	if err != nil {
-		t.Fatalf("marshal dump: %v", err)
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if _, err := gz.Write(body); err != nil {
-		t.Fatalf("gzip dump: %v", err)
-	}
-	if err := gz.Close(); err != nil {
-		t.Fatalf("close gzip: %v", err)
-	}
-	return buf.Bytes()
+	seedPeerHost(t, s, s.hostName)
 }
 
 // localHostNames is every host THIS node holds a `hosts` row for, tombstones
@@ -377,17 +357,15 @@ func TestBindRequiresTheSAMEMembershipProofTheSweeperDoes(t *testing.T) {
 	agreeing := agreeingDigests(t, s)
 	// The peer agrees about every address-bearing table, and holds one `hosts`
 	// row this node does not: an unreachable third host.
-	dump := hostsDumpNaming(t, append(append([]string{}, known...), "unreachable-third"), nil)
 	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
 		if host == "unreachable-third" {
 			return nil, nil, fmt.Errorf("no route to host")
 		}
-		return &answeringPeer{dump: dump, tables: append(append([]*pb.TableDigest{}, agreeing...),
-			&pb.TableDigest{
-				Name:  hostsTableName,
-				Count: int32(len(known) + 1),
-				Hash:  "a-fuller-host-table",
-			})}, func() {}, nil
+		return &answeringPeer{
+			tables: agreeing,
+			membership: membershipNaming(host,
+				workerRows(append(append([]string{}, known...), "unreachable-third")...), nil),
+		}, func() {}, nil
 	}
 
 	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
@@ -489,116 +467,273 @@ func TestBindSuspendsWhenAPeerIsSilentAboutOneInventoryTable(t *testing.T) {
 	}
 }
 
-// ── reading a participant's own `hosts` rows ────────────────────────────────
+// ── one participant's membership view ───────────────────────────────────────
+
+// TestGetMembershipViewServesEveryRowAndTheGossipNamesNoTableHolds is the
+// responder side of the closure, and the two halves it must carry.
+//
+// A TOMBSTONED row is served like any other: `lv host rm --force` does not power
+// a machine off, so the host whose row was soft-deleted is exactly the one that
+// may still be running the domain holding an address. And a gossip member with
+// no row anywhere is served too, because that is the only source that can name
+// such a host at all — no table records it, so no table-derived answer could.
+func TestGetMembershipViewServesEveryRowAndTheGossipNamesNoTableHolds(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedSelfHost(t, s)
+	seedPeerHost(t, s, "peer-b")
+	// The asker: a live host, because the host whose row is tombstoned below is
+	// no longer a trusted CN — which is itself the point of tombstoning it.
+	seedPeerHost(t, s, "peer-c")
+	if err := s.db.Execute(ctx,
+		`UPDATE hosts SET deleted_at = '2026-09-01T00:00:00Z' WHERE name = ?`, "peer-b"); err != nil {
+		t.Fatalf("tombstone the peer row: %v", err)
+	}
+	s.db.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: "gossip-only", Addr: "203.0.113.9:7946"}}
+	})
+
+	// The precondition that makes the tombstone case worth serving: the filtered
+	// read every earlier attempt at this proof was built on cannot see it.
+	live, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range live {
+		if h.Name == "peer-b" {
+			t.Fatal("precondition: ListHosts must be blind to the tombstoned row")
+		}
+	}
+
+	resp, err := s.GetMembershipView(mtlsCtx("peer-c"), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("a peer must be able to ask: %v", err)
+	}
+	if !resp.GetComplete() {
+		t.Fatalf("both enumerations succeeded, so the view is complete: %v", resp.GetErrors())
+	}
+	var named []string
+	for _, r := range resp.GetHosts() {
+		named = append(named, r.GetName())
+	}
+	if !slices.Contains(named, "peer-b") {
+		t.Fatalf("a TOMBSTONED row must still be served — a forced removal does not power a "+
+			"machine off; got %v", named)
+	}
+	if !slices.Contains(named, s.hostName) {
+		t.Fatalf("this host's own row must be served, got %v", named)
+	}
+	if !slices.Contains(resp.GetGossipMembers(), "gossip-only") {
+		t.Fatalf("a gossip member no table records must be served — nothing else can name "+
+			"it; got %v", resp.GetGossipMembers())
+	}
+	if resp.GetHost() != s.hostName {
+		t.Fatalf("host = %q, want the responder's own name", resp.GetHost())
+	}
+}
+
+// TestGetMembershipViewCarriesTheRoleTheExclusionsTurnOn.
+//
+// The witness exclusion is the one rule that can drop a host from a proof on
+// sight, and only a `hosts` row records a role. A view carrying bare names would
+// leave a caller unable to apply that rule to a host it learned here — and
+// re-deriving the rule from some second source is how two proofs come to
+// disagree.
+func TestGetMembershipViewCarriesTheRoleTheExclusionsTurnOn(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "a-witness", Address: "203.0.113.8", GRPCPort: 7443, Role: "witness",
+		SSHUser: "root", SSHPort: 22, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := s.GetMembershipView(mtlsCtx("a-witness"), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("a peer must be able to ask: %v", err)
+	}
+	for _, r := range resp.GetHosts() {
+		if r.GetName() == "a-witness" {
+			if r.GetRole() != "witness" {
+				t.Fatalf("role = %q on the wire, want the row's own role — the exclusion "+
+					"turns on it, and a caller that got a bare name could not apply it",
+					r.GetRole())
+			}
+			return
+		}
+	}
+	t.Fatalf("the witness row must be served at all, got %v", resp.GetHosts())
+}
+
+// TestGetMembershipViewIsIncompleteWithoutARowForItself.
+//
+// A node holds at least its own row, so a table that does not carry one has not
+// hydrated — it is not a small cluster. Serving that as a whole view would let a
+// caller close a participant set over a database that has barely started, which
+// is the shape this proof exists to refuse.
+func TestGetMembershipViewIsIncompleteWithoutARowForItself(t *testing.T) {
+	s := newAdoptTestServer(t)
+	seedPeerHost(t, s, "peer-b")
+	// Deliberately NOT seedSelfHost: this node's table names a peer and not
+	// itself, which no hydrated database does.
+
+	resp, err := s.GetMembershipView(mtlsCtx("peer-b"), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("a failed enumeration is part of the ANSWER, not an error: %v", err)
+	}
+	if resp.GetComplete() {
+		t.Fatal("a node with no row for itself has an unhydrated table, and must say so")
+	}
+	if len(resp.GetErrors()) == 0 {
+		t.Fatal("an incomplete view must name the reason it is incomplete")
+	}
+}
+
+// TestGetMembershipViewIsPeerOnly.
+//
+// The answer names every host this node knows of, tombstones included, which is
+// cluster-internal shape. Peer-mTLS is the same trust boundary
+// CollectOrphanProof draws, and it is drawn by the same helper rather than a
+// second convention.
+func TestGetMembershipViewIsPeerOnly(t *testing.T) {
+	s := newAdoptTestServer(t)
+	if _, err := s.GetMembershipView(context.Background(), &emptypb.Empty{}); err == nil {
+		t.Fatal("a caller with no peer host certificate must be refused")
+	}
+}
+
+// ── reading each participant's membership view ──────────────────────────────
 
 // TestClosedParticipantSetReadsRowsFromAPeerThatHoldsMoreThanThisNode.
 //
 // A peer holding a `hosts` row this node has never received is the shape a row
 // COUNT was once used to detect, and detecting it was all a count could do: it
 // said "this node's view is short" and stopped there. The set is now closed over
-// the peer's ROWS instead, so the extra host is learned BY NAME and asked — and
-// stopping only happens if it cannot answer, which is the fail-closed edge
+// the peer's own view instead, so the extra host is learned BY NAME and asked —
+// and stopping only happens if it cannot answer, which is the fail-closed edge
 // rather than the whole mechanism.
 func TestClosedParticipantSetReadsRowsFromAPeerThatHoldsMoreThanThisNode(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
 
-	local := localDigestFor(t, s, hostsTableName)
 	known := localHostNames(ctx, s)
-	dump := hostsDumpNaming(t, append(append([]string{}, known...), "peer-c"), nil)
-	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		return &answeringPeer{dump: dump, tables: []*pb.TableDigest{{
-			Name: hostsTableName, Count: int32(local.Count + 1), Hash: "a-fuller-host-table",
-		}}}, func() {}, nil
-	}
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host,
+			workerRows(append(append([]string{}, known...), "peer-c")...), nil)
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if unclosed != "" {
-		t.Fatalf("the peer's rows were readable, so the set must close: %q", unclosed)
+		t.Fatalf("every participant answered, so the set must close: %q", unclosed)
 	}
 	if !slices.Contains(closed, "peer-c") {
 		t.Fatalf("the host only the peer holds a row for must be a participant, got %v", closed)
 	}
 }
 
-// TestClosedParticipantSetCannotBeClosedByAShortDump is what keeps the ROW read
-// from becoming the weaker of the two things it replaced.
+// TestClosedParticipantSetLearnsAHostONLYAPEERSGOSSIPNames is the finding this
+// RPC exists for, and the one shape rows could never reach.
 //
-// A count could not be short — a peer computes it over its own table — while a
-// dump can: dumpStateForTables omits a table with no rows and the scanner skips a
-// malformed one. So the peer's own digest COUNT is the check on its own dump. A
-// dump carrying fewer rows than that leaves the set unclosed, because a short
-// list read as a peer's membership is this whole class of defect.
-func TestClosedParticipantSetCannotBeClosedByAShortDump(t *testing.T) {
+// No node the sweeper can read holds a `hosts` row for the holder, and this
+// node's own gossip does not name it. The only record of its existence anywhere
+// is the PEER's memberlist view. Every table-derived answer — ListHosts,
+// ClusterStatus.hosts, a state digest, a state dump — is blind to it by
+// construction, because there is no row to derive it from.
+func TestClosedParticipantSetLearnsAHostONLYAPEERSGOSSIPNames(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
 
-	// The peer says it holds three rows and dumps one.
-	dump := hostsDumpNaming(t, []string{"peer-b"}, nil)
-	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		return &answeringPeer{dump: dump, tables: []*pb.TableDigest{{
-			Name: hostsTableName, Count: 3, Hash: "three-rows",
-		}}}, func() {}, nil
+	known := localHostNames(ctx, s)
+	if slices.Contains(known, "gossip-only-holder") {
+		t.Fatal("precondition: no row anywhere may name the holder")
 	}
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		if host == "gossip-only-holder" {
+			// It answers too, so the set can actually close and the assertion is
+			// about LEARNING the name rather than about a dial failing.
+			return membershipNaming(host, workerRows(known...), []string{"gossip-only-holder"})
+		}
+		return membershipNaming(host, workerRows(known...), []string{"gossip-only-holder"})
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil {
-		t.Fatalf("a short dump is part of the answer, not an error: %v", err)
+		t.Fatal(err)
 	}
-	if unclosed == "" {
-		t.Fatalf("a dump shorter than the peer's own digest count must leave the set "+
-			"unclosed, got %v", closed)
+	if unclosed != "" {
+		t.Fatalf("every participant answered, so the set must close: %q", unclosed)
 	}
-	if !strings.Contains(unclosed, "peer-b") || !strings.Contains(unclosed, hostsTableName) {
-		t.Fatalf("the reason must name the host and the table, got %q", unclosed)
+	if !slices.Contains(closed, "gossip-only-holder") {
+		t.Fatalf("a host only a PEER's gossip names must be a participant — no table "+
+			"anywhere records it; got %v", closed)
 	}
 }
 
-// TestClosedParticipantSetSkipsTheDumpWhenAPeersHostRowsAgree is the property
-// that makes reading rows affordable, and it is a SOUNDNESS statement, not an
-// optimisation.
+// TestClosedParticipantSetClosesOnOneCallPerParticipant is the cost statement,
+// and it is a soundness statement too.
 //
-// A `hosts` digest that agrees says the peer's table is this node's table, row
-// for row, tombstones included — and localParticipantCandidates reads every local
-// row with no `deleted_at` predicate. So there is nothing in that peer's table
-// this node has not already read, and pulling its whole state dump every pass to
-// re-learn names it already holds would be cost with no evidence attached.
-func TestClosedParticipantSetSkipsTheDumpWhenAPeersHostRowsAgree(t *testing.T) {
+// What this replaced read a peer's whole-table digest set and then, for any peer
+// whose `hosts` table differed at all, a gzipped dump of the entire replicated
+// database — per participant, twice per candidate, every sweep. One unary call
+// per participant per closure is strictly less, and the stub proves no dump is
+// pulled by not implementing one: the embedded nil client panics if anything
+// asks.
+func TestClosedParticipantSetClosesOnOneCallPerParticipant(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
 
-	// dump nil: the stub serves NO dump, so a closure that asked for one fails.
-	peerReports(s)
+	var mu sync.Mutex
+	calls := map[string]int{}
+	known := localHostNames(ctx, s)
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		mu.Lock()
+		calls[host]++
+		mu.Unlock()
+		return membershipNaming(host, workerRows(known...), nil)
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil || unclosed != "" {
-		t.Fatalf("an agreeing peer needs no dump, so the set must close: %q (err %v)",
-			unclosed, err)
+		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
 	if !slices.Contains(closed, "peer-b") {
-		t.Fatalf("the peer must still be a participant, got %v", closed)
+		t.Fatalf("the peer must be a participant, got %v", closed)
+	}
+	if calls["peer-b"] != 1 {
+		t.Fatalf("a participant already read must not be asked again: %v", calls)
+	}
+	if _, self := calls[s.hostName]; self {
+		t.Fatalf("this node answers for itself from its own database and must not be "+
+			"dialled: %v", calls)
 	}
 }
 
 // TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer pins the silences.
 //
-// A host that cannot be reached, one that answers without a `hosts` digest (an
-// older build, or one whose digest set does not carry the table), and one whose
-// dump cannot be parsed are all hosts whose rows could not be read. None of them
-// is agreement, and reading any of them as agreement is what would let a
+// A host that cannot be reached, one running a build with no membership view to
+// report, one that says its own enumeration failed, and one naming a host with
+// an empty name are all hosts whose view could not be read. None of them is
+// agreement, and reading any of them as agreement is what would let a
 // reclamation rest on a cluster this node cannot see all of.
+//
+// The OLDER BUILD case is the whole mixed-version story, so it is pinned as its
+// own branch with its own reason rather than left to fall through the transport
+// one: this RPC's novelty is what makes it safe on a cluster mid-upgrade, and an
+// Unimplemented answer is a definite failure.
 func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 	ctx := context.Background()
 
 	for _, tc := range []struct {
 		name string
 		wire func(t *testing.T, s *Server)
+		want string
 	}{
 		{
 			// seedPeerHost's address is a reserved documentation address nothing
@@ -607,26 +742,41 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 			wire: func(*testing.T, *Server) {},
 		},
 		{
-			name: "silent about the hosts table",
+			name: "an older build with no membership view",
 			wire: func(_ *testing.T, s *Server) {
-				s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-					return &answeringPeer{tables: []*pb.TableDigest{
-						{Name: vmsTableName, Count: 0},
-					}}, func() {}, nil
-				}
+				// membership nil: the stub answers Unimplemented.
+				peerKnows(s, func(string) *pb.MembershipViewResponse { return nil })
+			},
+			want: "build",
+		},
+		{
+			name: "a view the peer reports as incomplete",
+			wire: func(_ *testing.T, s *Server) {
+				peerKnows(s, func(host string) *pb.MembershipViewResponse {
+					return &pb.MembershipViewResponse{
+						Host:     host,
+						Hosts:    workerRows(host),
+						Complete: false,
+						Errors:   []string{"read this host's `hosts` rows: database is locked"},
+					}
+				})
 			},
 		},
 		{
-			name: "a dump that cannot be parsed",
+			name: "a row that names no host",
 			wire: func(_ *testing.T, s *Server) {
-				s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-					return &answeringPeer{
-						dump: []byte("not a gzipped state dump"),
-						tables: []*pb.TableDigest{{
-							Name: hostsTableName, Count: 1, Hash: "a-different-host-table",
-						}},
-					}, func() {}, nil
-				}
+				peerKnows(s, func(host string) *pb.MembershipViewResponse {
+					return membershipNaming(host,
+						append(workerRows(host), &pb.MembershipHost{Role: "worker"}), nil)
+				})
+			},
+		},
+		{
+			name: "a gossip member that names no host",
+			wire: func(_ *testing.T, s *Server) {
+				peerKnows(s, func(host string) *pb.MembershipViewResponse {
+					return membershipNaming(host, workerRows(host), []string{""})
+				})
 			},
 		},
 	} {
@@ -644,6 +794,9 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 			}
 			if !strings.Contains(unclosed, "peer-b") {
 				t.Fatalf("the reason must name the host, got %q", unclosed)
+			}
+			if tc.want != "" && !strings.Contains(unclosed, tc.want) {
+				t.Fatalf("the reason must say %q so the repair is legible, got %q", tc.want, unclosed)
 			}
 		})
 	}
@@ -691,59 +844,33 @@ func TestProofParticipantsKeepsGossipUnderTheSameExclusions(t *testing.T) {
 
 // ── the participant-set closure ─────────────────────────────────────────────
 
-// peerKnows wires every peer dial to a peer whose `hosts` table holds exactly
-// fn(). Called per dial, so a scenario can answer differently each round.
-//
-// The digest it reports deliberately DISAGREES with this node's, because that is
-// what makes the closure read its rows at all — a peer whose table agrees is a
-// peer whose rows this node has already read locally.
-func peerKnows(t *testing.T, s *Server, fn func() []string) {
-	t.Helper()
-	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		names := fn()
-		return &answeringPeer{
-			dump: hostsDumpNaming(t, names, nil),
-			tables: []*pb.TableDigest{{
-				Name:  hostsTableName,
-				Count: int32(len(names)),
-				Hash:  "a-different-host-table",
-			}},
-		}, func() {}, nil
-	}
-}
-
-// TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer is the case that closing
-// the set over ListHosts could not reach, and the reason it reads rows instead.
+// TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer is the case closing the
+// set over ListHosts could not reach, and the reason a row's tombstone is not on
+// the wire as a flag.
 //
 // The holder's row exists only on the peer, and only as a TOMBSTONE. ListHosts
 // filters `deleted_at IS NULL`, so a closure built on it learns nothing and
 // closes — over the filter, not over the cluster — while a forced host removal
 // has not powered that machine off and its domain still holds the address. The
-// dump is a bare `SELECT *`, so the row is there to be read.
+// membership view carries the row like any other, so nothing here can branch on
+// it even by accident.
 func TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
 
-	// The peer's table: the hosts this node knows, plus a tombstoned holder it
-	// does not. Same row COUNT this node holds plus one, and the one extra row is
-	// the one that matters.
 	known := localHostNames(ctx, s)
-	dump := hostsDumpNaming(t, known, []string{"tombstoned-holder"})
-	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
-		return &answeringPeer{dump: dump, tables: []*pb.TableDigest{{
-			Name:  hostsTableName,
-			Count: int32(len(known) + 1),
-			Hash:  "a-table-with-a-tombstone",
-		}}}, func() {}, nil
-	}
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host,
+			workerRows(append(append([]string{}, known...), "tombstoned-holder")...), nil)
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if unclosed != "" {
-		t.Fatalf("the peer's rows were readable, so the set must close: %q", unclosed)
+		t.Fatalf("the peer's view was readable, so the set must close: %q", unclosed)
 	}
 	if !slices.Contains(closed, "tombstoned-holder") {
 		t.Fatalf("a host a peer holds a TOMBSTONED row for must be a participant — "+
@@ -756,14 +883,15 @@ func TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer(t *testing.T) {
 //
 // A host in NEITHER the local `hosts` table nor gossip is invisible to both
 // samples of the sweeper's five-step proof, so the samples agree and stability
-// gets mistaken for completeness. Reading each participant's own `hosts` rows is
-// what reveals it — by name, so it can then be asked whether it holds the
-// address.
+// gets mistaken for completeness. Reading each participant's own view is what
+// reveals it — by name, so it can then be asked whether it holds the address.
 func TestClosedParticipantSetLearnsAHostOnlyAPeerKnows(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
-	peerKnows(t, s, func() []string { return []string{"peer-b", "peer-c"} })
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host, workerRows("peer-b", "peer-c"), nil)
+	})
 
 	local, err := s.proofParticipants(ctx)
 	if err != nil {
@@ -795,7 +923,9 @@ func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testin
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
 	// "gone" is named ONLY by the peer: no host row here, and not in gossip.
-	peerKnows(t, s, func() []string { return []string{"peer-b", "gone"} })
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host, workerRows("peer-b", "gone"), nil)
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil || unclosed != "" {
@@ -821,6 +951,115 @@ func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testin
 	}
 	if slices.Contains(closed, "gone") {
 		t.Fatalf("a fenced host named by a peer must still be excluded, got %v", closed)
+	}
+}
+
+// TestAPeersROWMayExcuseAWitnessNoRowHereRecords is what carrying the role on
+// the wire buys, and it is the liveness half of this change.
+//
+// A witness votes and never hosts workloads, and — the operative part — it runs
+// no libvirt, so a witness dragged into the participant set answers with an
+// INCOMPLETE proof and stops every reclamation. Before the role was on the wire,
+// a witness whose row had not replicated here (or had been tombstoned there) was
+// learned as a nameless candidate, dialled, and wedged the sweeper with no
+// escape but a per-host operator attestation. The row that names it also says
+// what it is.
+func TestAPeersROWMayExcuseAWitnessNoRowHereRecords(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host, append(workerRows("peer-b"),
+			&pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
+	})
+
+	closed, unclosed, err := s.closedParticipantSet(ctx)
+	if err != nil || unclosed != "" {
+		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
+	}
+	if slices.Contains(closed, "a-witness") {
+		t.Fatalf("a host whose only row says `role=witness` hosts no workloads and must "+
+			"not be dialled, got %v", closed)
+	}
+}
+
+// TestAWitnessNamedInGOSSIPBeforeAnyROWIsStillExcused is the ordinary shape of
+// the case above, and the one an order-dependent merge gets wrong.
+//
+// A witness IS a gossip member — it runs the daemon and votes — so this node
+// names it in gossip while its ROW has not replicated here. Gossip carries no
+// role, so the only role reading anywhere arrives later, from a peer. If a
+// gossip naming could stand in for a row reading, the AND would treat the
+// nameless candidate as "not a witness" and the peer's row could never excuse
+// it: the witness would land in the proof set, be asked for an orphan proof it
+// cannot complete (it runs no libvirt), and stop every reclamation the cluster
+// would otherwise make.
+func TestAWitnessNamedInGOSSIPBeforeAnyROWIsStillExcused(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+	// This node knows the witness ONLY through gossip: no row for it here.
+	s.db.SetMembersForTests(func() []corrosion.PeerInfo {
+		return []corrosion.PeerInfo{{Name: "a-witness", Addr: "203.0.113.8:7946"}}
+	})
+	// The peer's row is the only role reading in the cluster this node can read.
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host,
+			append(workerRows("peer-b"), &pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
+	})
+
+	closed, unclosed, err := s.closedParticipantSet(ctx)
+	if err != nil || unclosed != "" {
+		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
+	}
+	if slices.Contains(closed, "a-witness") {
+		t.Fatalf("a host gossip named before any row described it must still be excused once "+
+			"a row does — being named is not a reading of its role; got %v", closed)
+	}
+}
+
+// TestTwoROWSThatDisagreeAboutAWitnessKeepTheHostIN is the fail-closed half of
+// the same rule.
+//
+// `lv host config --role` makes a role mutable, so the local row and a peer's row are the
+// same replicated datum mid-flight, and there is no timestamp on the wire to
+// order them. Trusting either one alone is fail-OPEN in one direction: a stale
+// local `role=witness` would excuse a host that has since become a worker and is
+// running the domain holding the address. A disagreement therefore resolves
+// toward ASKING — a witness that gets dialled is work, a workload host that does
+// not is a freed address someone is using.
+func TestTwoROWSThatDisagreeAboutAWitnessKeepTheHostIN(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+	// This node's row says witness…
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "contested", Address: "203.0.113.8", GRPCPort: 7443, Role: "witness",
+		SSHUser: "root", SSHPort: 22, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	local, err := s.proofParticipants(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(local, "contested") {
+		t.Fatalf("precondition: this node's own row must excuse it, got %v", local)
+	}
+
+	// …and the peer's row says worker. It answers, so the set can close.
+	known := localHostNames(ctx, s)
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host, workerRows(known...), nil)
+	})
+
+	closed, unclosed, err := s.closedParticipantSet(ctx)
+	if err != nil || unclosed != "" {
+		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
+	}
+	if !slices.Contains(closed, "contested") {
+		t.Fatalf("two rows disagreeing about a role must leave the host IN — asking it is "+
+			"work, not asking it can free an address it holds; got %v", closed)
 	}
 }
 
@@ -850,14 +1089,18 @@ func TestClosedParticipantSetWithholdsWhenAParticipantCannotAnswer(t *testing.T)
 
 // TestClosedParticipantSetWithholdsOnAnEmptyMembershipView.
 //
-// A node knows at least itself, so an answer naming nobody is a node whose own
+// A node knows at least itself, so an answer naming no rows is a node whose own
 // `hosts` table has not hydrated — not the claim that the cluster is empty.
 // Folding that in as "learned nothing new" would close the set on the one answer
-// that says the peer cannot speak for the cluster either.
+// that says the peer cannot speak for the cluster either. The responder refuses
+// this shape itself; this is the caller's backstop for one that claims
+// completeness with nothing in it.
 func TestClosedParticipantSetWithholdsOnAnEmptyMembershipView(t *testing.T) {
 	s := newAdoptTestServer(t)
 	seedPeerHost(t, s, "peer-b")
-	peerKnows(t, s, func() []string { return nil })
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		return membershipNaming(host, nil, nil)
+	})
 
 	closed, unclosed, err := s.closedParticipantSet(context.Background())
 	if err != nil {
@@ -877,10 +1120,14 @@ func TestClosedParticipantSetWithholdsOnAnEmptyMembershipView(t *testing.T) {
 func TestClosedParticipantSetIsBounded(t *testing.T) {
 	s := newAdoptTestServer(t)
 	seedPeerHost(t, s, "peer-b")
+	var mu sync.Mutex
 	round := 0
-	peerKnows(t, s, func() []string {
+	peerKnows(s, func(host string) *pb.MembershipViewResponse {
+		mu.Lock()
 		round++
-		return []string{fmt.Sprintf("peer-generated-%d", round)}
+		n := round
+		mu.Unlock()
+		return membershipNaming(host, workerRows(fmt.Sprintf("peer-generated-%d", n)), nil)
 	})
 
 	closed, unclosed, err := s.closedParticipantSet(context.Background())

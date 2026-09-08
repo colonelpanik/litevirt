@@ -56,6 +56,7 @@ const (
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_GetRuntimeInventory_FullMethodName        = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
 	LiteVirt_CollectOrphanProof_FullMethodName         = "/litevirt.v1.LiteVirt/CollectOrphanProof"
+	LiteVirt_GetMembershipView_FullMethodName          = "/litevirt.v1.LiteVirt/GetMembershipView"
 	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -329,6 +330,15 @@ type LiteVirtClient interface {
 	// rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
 	// from every host before reclaiming an address in NetBox.
 	CollectOrphanProof(ctx context.Context, in *OrphanProofRequest, opts ...grpc.CallOption) (*OrphanProofResponse, error)
+	// GetMembershipView answers, for THIS host, "which hosts could be running
+	// anything at all" — every `hosts` row it holds, TOMBSTONES INCLUDED, plus
+	// its own gossip membership, which is the only source that can name a host
+	// with no row anywhere. Peer-only, like CollectOrphanProof, and gathered by
+	// the same caller: one membership closure gates both reclaiming an address
+	// and binding a prefix. An older peer answers Unimplemented, which is a
+	// definite failure the closure treats as "cannot corroborate" — that, not a
+	// capability latch, is what makes this safe on a mixed-version cluster.
+	GetMembershipView(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*MembershipViewResponse, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -1067,6 +1077,16 @@ func (c *liteVirtClient) CollectOrphanProof(ctx context.Context, in *OrphanProof
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(OrphanProofResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_CollectOrphanProof_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetMembershipView(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*MembershipViewResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipViewResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetMembershipView_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3375,6 +3395,15 @@ type LiteVirtServer interface {
 	// rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
 	// from every host before reclaiming an address in NetBox.
 	CollectOrphanProof(context.Context, *OrphanProofRequest) (*OrphanProofResponse, error)
+	// GetMembershipView answers, for THIS host, "which hosts could be running
+	// anything at all" — every `hosts` row it holds, TOMBSTONES INCLUDED, plus
+	// its own gossip membership, which is the only source that can name a host
+	// with no row anywhere. Peer-only, like CollectOrphanProof, and gathered by
+	// the same caller: one membership closure gates both reclaiming an address
+	// and binding a prefix. An older peer answers Unimplemented, which is a
+	// definite failure the closure treats as "cannot corroborate" — that, not a
+	// capability latch, is what makes this safe on a mixed-version cluster.
+	GetMembershipView(context.Context, *emptypb.Empty) (*MembershipViewResponse, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3833,6 +3862,9 @@ func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRunt
 }
 func (UnimplementedLiteVirtServer) CollectOrphanProof(context.Context, *OrphanProofRequest) (*OrphanProofResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CollectOrphanProof not implemented")
+}
+func (UnimplementedLiteVirtServer) GetMembershipView(context.Context, *emptypb.Empty) (*MembershipViewResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMembershipView not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -5062,6 +5094,24 @@ func _LiteVirt_CollectOrphanProof_Handler(srv interface{}, ctx context.Context, 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).CollectOrphanProof(ctx, req.(*OrphanProofRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetMembershipView_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetMembershipView(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetMembershipView_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetMembershipView(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8597,6 +8647,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CollectOrphanProof",
 			Handler:    _LiteVirt_CollectOrphanProof_Handler,
+		},
+		{
+			MethodName: "GetMembershipView",
+			Handler:    _LiteVirt_GetMembershipView_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",

@@ -357,10 +357,10 @@ import (
 //	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
 //	v52: leader-lease term ledger — leader_lease_terms, append-only with term in
 //	     the primary key, giving each lease acquisition a durable incarnation
-//	     number. leader_election is unchanged. Requires a bespoke non-LWW
-//	     monotone merge before it is written to, because concurrent minting of
-//	     one (key, term) during a partition is the normal path, not a fault.
-//	     This version adds the table only; nothing writes to it and nothing
+//	     number. leader_election is unchanged. Registered like audit_chain_heads
+//	     — append-only (immutable rows) plus the default content chain — because
+//	     concurrent minting of one (key, term) during a partition is the normal
+//	     path, not a fault, and a term's holder must never be rewritten. Nothing
 //	     enforces on a term. One new table.
 const CurrentSchemaVersion = 52
 
@@ -906,13 +906,20 @@ var schemaDDL = []string{
 	// row, a bump cannot be lost and a tombstoned-then-recreated row cannot
 	// restart the counter. Same argument as audit_chain_heads.
 	//
-	// This table MUST NOT be resolved by LWW once anything writes to it: several
-	// nodes legitimately mint one (key, term) during a partition — the
-	// two-leaders case — and updated_at cannot decide that correctly. The
-	// bespoke monotone merge that decides it (customMergeTables) does not exist
-	// yet, and nothing writes to this table until the mint API lands, so the
-	// interim default-chain resolution of an always-empty table is harmless.
-	// Do not add a writer without adding that merge in the same change.
+	// Registered exactly like audit_chain_heads: appendOnlyTables (a replicated
+	// INSERT applies as INSERT OR IGNORE and is never LWW-gated, so a row is
+	// immutable once written) plus the default content chain for an exact
+	// updated_at tie. No bespoke merge.
+	//
+	// A term's HOLDER being immutable is what makes the executor's (term, holder)
+	// check meaningful: two partitioned nodes both computing MAX(term)+1 arrive at
+	// the same term with different holders, and the loser must be refused
+	// everywhere. If a stale peer's replayed INSERT could rewrite that holder,
+	// the check would refuse whichever node replayed last.
+	//
+	// This is NOT project_authority_epochs, which needs a custom merge because
+	// its rows are mutable for one primary key and the immutable merge wrongly
+	// froze them. Nothing here enters that bucket.
 	`CREATE TABLE IF NOT EXISTS leader_lease_terms (
 		key         TEXT NOT NULL,
 		term        INTEGER NOT NULL DEFAULT 0,

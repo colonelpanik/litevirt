@@ -14,6 +14,12 @@ var appendOnlyTables = map[string]bool{
 	// from displacing a newer one on a peer, which is exactly the move that
 	// would hide a truncation.
 	"audit_chain_heads": true,
+	// A term row is an assertion about a fixed (key, term): who held that lease
+	// incarnation. It has no later revision, and append-only is what stops a
+	// stale peer replaying its own losing claim over the converged holder —
+	// which would make the executor's (term, holder) check refuse whichever
+	// node replayed last.
+	"leader_lease_terms": true,
 	// A retirement is a signed assertion about a fixed (host, key). It has no
 	// later revision, and append-only is what makes it self-repairing: a row
 	// deleted locally has nothing to conflict with, so anti-entropy re-inserts

@@ -443,12 +443,99 @@ message LostHostRetirement {
     string attested_at = 5;
     // The accounting from the manifest this grant rests on.
     repeated string accounting = 6;
-    // False when the grant no longer APPLIES — the host is reachable again, or
-    // the incarnation recorded for that name has moved. The row is immutable and
-    // is never withdrawn; it simply stops being honoured, and this says so.
+    // False when the grant no longer APPLIES — trust in it has been withdrawn,
+    // the host is reachable again, or the incarnation recorded for that name has
+    // moved. The grant row itself is immutable in every case: a withdrawal is a
+    // separate record beside it, never an edit of it.
     bool applies = 7;
     // Why it does not apply, when applies is false.
     string not_applying_because = 8;
+    // True when trust in EVERY grant version this rests on has been withdrawn.
+    // A withdrawn grant supplies no premise, whatever the host's state is:
+    // withdrawal is durable, so it does not come back when the host next goes
+    // unreachable.
+    bool withdrawn = 9;
+    // Every withdrawal recorded against this grant, newest first — including one
+    // that a later attestation out-ran. The withdrawals stand BESIDE the
+    // original attestation above rather than replacing it: who attested, when
+    // and why remain, and who withdrew, when and why are added.
+    repeated RetirementWithdrawalRecord withdrawals = 10;
+    // The grant versions (recovery manifest ids) this grant rests on that no
+    // withdrawal names. Non-empty alongside a withdrawal means a LATER
+    // attestation is keeping the grant in force — the withdrawal is recorded and
+    // was not silently swallowed, but it does not reach a version attested after
+    // it.
+    repeated string unwithdrawn_versions = 11;
+}
+
+// RetirementWithdrawalRecord is one recorded withdrawal of trust in ONE grant
+// version. It is an ADDITION to the trail, never an edit of the attestation.
+message RetirementWithdrawalRecord {
+    // The grant version this withdrawal removes trust in: the id of the recovery
+    // manifest that supplied it. Each attestation mints a fresh manifest id, so
+    // this is what makes a withdrawal aimed at one version unable to reach a
+    // later one.
+    string grant_version = 1;
+    string withdrawn_by = 2;
+    string withdrawn_at = 3;
+    // The operator's reason. Recorded, never verified — exactly like the
+    // attestation it withdraws.
+    string reason = 4;
+}
+
+// WithdrawHostRetirementRequest removes trust in a recorded permanent-loss
+// grant.
+//
+// IT HAS NO PREREQUISITES, and that asymmetry is the design. GRANTING trust
+// needs evidence — an accounting, an exact incarnation, a host that is not
+// answering, a revalidation immediately before the write. REMOVING it needs
+// none: every consequence of a withdrawal is a WITHHELD premise, so the proof
+// goes back to being owed, which is the fail-closed direction. The host does not
+// have to be dead, unreachable, or currently matching the grant.
+//
+// RECORDED IS NOT THE SAME AS INACTIVE, which is why "already lapsed" is not a
+// refusal. A grant whose host is reachable is merely SKIPPED, not durably
+// invalidated: if that incarnation goes unreachable again the stored grant
+// applies again. A dormant grant is a live grant, so any recorded, unwithdrawn
+// grant may be withdrawn.
+message WithdrawHostRetirementRequest {
+    // The host name, for the audit subject and for an operator reading the
+    // record. Nothing matches on it.
+    string host = 1;
+    // REQUIRED: the exact incarnation (recorded certificate serial) whose grant
+    // is withdrawn. A hostname is reusable, so it cannot identify a grant — and
+    // a withdrawal aimed by name would land on whichever grant that name
+    // currently carries rather than the one the operator meant.
+    string host_incarnation = 2;
+    // REQUIRED: "membership" or "inventory". The two premises are separate
+    // grants and withdrawing one never withdraws the other.
+    string premise = 3;
+    // REQUIRED: why trust is being removed. Not a gate — it is the reviewable
+    // half, kept beside the original attestation so the trail carries both
+    // halves of the decision.
+    string reason = 4;
+}
+
+// WithdrawHostRetirementResponse reports exactly which grant versions the
+// withdrawal now covers, so an operator can see what it reached and what it did
+// not.
+message WithdrawHostRetirementResponse {
+    string host_incarnation = 1;
+    string premise = 2;
+    // Every grant version this withdrawal covers.
+    repeated string withdrawn_versions = 3;
+    // How many withdrawal records this call added. Zero on a repeat: withdrawal
+    // is idempotent, and reporting the zero is how a repeat reads as "already
+    // withdrawn" rather than as a fresh act.
+    int32 newly_recorded = 4;
+    // Grant versions the withdrawal does NOT cover — attested after it was
+    // enumerated, i.e. a re-attestation that raced it. Non-empty means the grant
+    // is still in force on the strength of that later record; the withdrawal is
+    // recorded regardless, and withdrawing again covers the newer version too.
+    repeated string uncovered_versions = 5;
+    // False when the grant still supplies its premise despite this withdrawal,
+    // which is exactly the uncovered-versions case above.
+    bool grant_withdrawn = 6;
 }
 
 // RekeyBindingRequest re-stamps every NetBox object a bound network owns with
@@ -2287,6 +2374,13 @@ service LiteVirt {
     // audited on both outcomes, refused for a host that is still responding, and
     // revalidated immediately before the write.
     rpc RetireLostHost(RetireLostHostRequest) returns (RetireLostHostResponse);
+    // WithdrawHostRetirement removes trust in a recorded grant, so a mistaken
+    // attestation does not stand indefinitely. It has NO prerequisites — the
+    // host need not be dead, unreachable or currently matching — because every
+    // consequence of a withdrawal is a withheld premise. Privileged, audited,
+    // idempotent, and durable: a withdrawn grant does not come back when its
+    // host next goes unreachable. See WithdrawHostRetirementRequest.
+    rpc WithdrawHostRetirement(WithdrawHostRetirementRequest) returns (WithdrawHostRetirementResponse);
     // ListLostHostRetirements reports every recovery attestation and whether it
     // still applies. An unverifiable premise has to be reviewable instead.
     rpc ListLostHostRetirements(google.protobuf.Empty) returns (ListLostHostRetirementsResponse);

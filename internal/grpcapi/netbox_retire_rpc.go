@@ -284,8 +284,17 @@ func (s *Server) ListLostHostRetirements(ctx context.Context, _ *emptypb.Empty) 
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
+		// The withdrawals for this premise, once. Read here rather than inside
+		// retirementStillApplies so the listing can report the RECORDS as well
+		// as the verdict: a withdrawal that a later attestation out-ran must
+		// still be visible, or the operator who made it sees their decision
+		// silently swallowed.
+		withdrawals, werr := corrosion.LoadRetirementWithdrawals(ctx, s.db, fp, premise)
+		if werr != nil {
+			return nil, status.Errorf(codes.Internal, "%v", werr)
+		}
 		for _, r := range byIncarnation {
-			applies, why := s.retirementStillApplies(ctx, r)
+			applies, why := s.retirementStillApplies(ctx, r, withdrawals)
 			row := &pb.LostHostRetirement{
 				HostName:           r.HostName,
 				HostIncarnation:    r.HostIncarnation,
@@ -294,6 +303,19 @@ func (s *Server) ListLostHostRetirements(ctx context.Context, _ *emptypb.Empty) 
 				AttestedAt:         r.AttestedAt,
 				Applies:            applies,
 				NotApplyingBecause: why,
+				Withdrawn:          withdrawals.Withdrawn(r.HostIncarnation),
+				// Named even when a later attestation is keeping the grant in
+				// force: that is the outcome an operator most needs to account
+				// for, and the versions are what let them do it.
+				UnwithdrawnVersions: withdrawals.UnwithdrawnVersions(r.HostIncarnation),
+			}
+			for _, w := range withdrawals.Records(r.HostIncarnation) {
+				row.Withdrawals = append(row.Withdrawals, &pb.RetirementWithdrawalRecord{
+					GrantVersion: w.ManifestID,
+					WithdrawnBy:  w.WithdrawnBy,
+					WithdrawnAt:  w.WithdrawnAt,
+					Reason:       w.Reason,
+				})
 			}
 			// The accounting from the manifests this grant rests on — the union,
 			// newest first, because the read side unions them too and a listing
@@ -326,7 +348,26 @@ func (s *Server) ListLostHostRetirements(ctx context.Context, _ *emptypb.Empty) 
 // It reports the REASON as well as the verdict, because "recorded but not
 // honoured" is the state most likely to confuse somebody who ran the command and
 // then watched the sweep keep withholding.
-func (s *Server) retirementStillApplies(ctx context.Context, r corrosion.HostRetirement) (bool, string) {
+//
+// THE WITHDRAWAL IS CHECKED FIRST, and the wording distinguishes it from every
+// other reason. The others describe a grant that has stopped MATCHING and that
+// applies again the moment it matches again; a withdrawal is a recorded decision
+// that does not come back. Reporting "the host is responding again" for a
+// withdrawn grant would tell an operator their withdrawal had not taken.
+func (s *Server) retirementStillApplies(ctx context.Context, r corrosion.HostRetirement,
+	withdrawals corrosion.RetirementWithdrawals) (bool, string) {
+
+	if withdrawals.Withdrawn(r.HostIncarnation) {
+		recs := withdrawals.Records(r.HostIncarnation)
+		by, at := "an operator", "an earlier time"
+		if len(recs) > 0 {
+			by, at = recs[0].WithdrawnBy, recs[0].WithdrawnAt
+		}
+		return false, fmt.Sprintf("trust in this grant was withdrawn by %s at %s, so the "+
+			"premise is owed again. Unlike the other reasons a grant stops applying, this "+
+			"one is durable: it does not lapse when the host next goes unreachable. "+
+			"Re-attesting records a new grant version and supplies the premise again", by, at)
+	}
 	now, found, err := corrosion.HostIncarnationOf(ctx, s.db, r.HostName)
 	switch {
 	case err != nil:

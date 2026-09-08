@@ -159,9 +159,14 @@ func (a attestedPremiseAdvisory) detail() string {
 			"attested facts. "+
 			"IT IS NOT EVIDENCE THAT THE MACHINE IS POWERED OFF and cannot become any: "+
 			"excluding a runtime still requires fencing evidence (`lv host fence-confirm`). "+
-			"Review the accounting with `lv netbox retirements`. Nothing withdraws a "+
-			"retirement by hand — it stops applying on its own once the host answers again, "+
-			"or once a different machine is admitted under its name.",
+			"Review the accounting with `lv netbox retirements`. If it is wrong, remove trust "+
+			"in it with `lv netbox withdraw-retirement --incarnation "+
+			"<incarnation> --premise <premise> --reason <why>`: that is durable and needs no "+
+			"evidence of its own, because withdrawing only ever puts a premise back to being "+
+			"owed. It also stops applying on its own — with nothing written — once the host "+
+			"answers again or a different machine is admitted under its name, but that is "+
+			"only a pause: the stored grant applies again if that same machine goes "+
+			"unreachable once more.",
 		a.HostName, strings.Join(names, ","), a.Incarnation, strings.Join(lines, "; "))
 }
 

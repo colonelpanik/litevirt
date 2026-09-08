@@ -41,6 +41,12 @@ func (r *reachSet) add(name string) {
 	r.names[name] = true
 }
 
+func (r *reachSet) remove(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.names, name)
+}
+
 func (r *reachSet) list() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -80,6 +86,18 @@ func (g *fleetGate) HealthyPeers(ctx context.Context) []string {
 // host is down", and a rejoin is what makes that attestation stale. The sweeper
 // must then go back to ASKING this host rather than assuming it away.
 func (n *Node) Rejoin() { n.cluster.reach.add(n.Name) }
+
+// GoUnreachableAgain undoes a Rejoin: the node stops being counted toward
+// quorum, as a machine that answered briefly and then went away for good does.
+//
+// It exists for ONE property that cannot be expressed without it. A retirement
+// whose host is reachable is merely SKIPPED by the resolver — nothing is written
+// — so the stored grant APPLIES AGAIN the moment that incarnation goes
+// unreachable once more. A dormant grant is a live grant, and the difference
+// between "paused" and "withdrawn" is only visible by pausing a grant and then
+// un-pausing it. Stop() cannot do this: it closes the listener, but the reach
+// overlay a Rejoin added keeps the name in HealthyPeers regardless.
+func (n *Node) GoUnreachableAgain() { n.cluster.reach.remove(n.Name) }
 
 // ── taking a node down ──────────────────────────────────────────────────────
 

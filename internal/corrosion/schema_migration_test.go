@@ -362,13 +362,14 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		t.Fatalf("stored version after migration = %d, want %d", v, CurrentSchemaVersion)
 	}
 	// Every post-42 table healed, including the three v50 health tables and the
-	// six v51 NetBox tables.
+	// seven v51 NetBox tables.
 	for _, table := range []string{
 		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 		"cluster_crl", "host_networks",
 		"health_conditions", "health_evaluator_status", "host_capacity_observations",
 		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config",
 		"netbox_recovery_manifests", "netbox_host_retirements",
+		"netbox_retirement_withdrawals",
 	} {
 		if ok, _ := tableExists(ctx, c, table); !ok {
 			t.Errorf("table %s missing after v42→v51 migration", table)

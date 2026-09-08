@@ -1210,10 +1210,10 @@ retirement.
 A host whose recorded serial cannot be read is refused rather than retired under a
 placeholder.
 
-#### Nothing is withdrawn; it stops applying
+#### A grant that stops applying is PAUSED, not withdrawn
 
-There is no un-retire command and no revocation flag. A retirement stops being
-honoured on its own, checked afresh every time it is read:
+A retirement stops being honoured on its own, checked afresh every time it is
+read:
 
 * **the host answers again** — a machine that is responding refutes the
   attestation that it is gone, and its live state governs, exactly as it does for
@@ -1228,11 +1228,76 @@ operation withholds. Certificate rotation on a host that later turns out to be
 recoverable has the same effect, which is the safe direction — re-attest against
 the new serial if the machine really is gone.
 
+**None of the three is a withdrawal.** They are re-derived from live state on
+every read, and nothing is written — so a grant whose host answered once is
+merely *dormant*, and it **applies again** the moment that same incarnation goes
+unreachable once more. A dormant grant is a live grant.
+
 `lv netbox retirements` lists every attestation, the accounting given, who gave
-it, and whether it still applies. Reviewing that list is the only check there is,
-which is the practical consequence of the trust boundary above. A row that no
-longer applies is not something to clean up; it is the record of an exception
-that has correctly expired.
+it, whether it still applies, and whether trust in it has been withdrawn.
+Reviewing that list is the only check there is, which is the practical
+consequence of the trust boundary above. A row that is merely not applying is not
+something to clean up; it is the record of an exception that is currently
+dormant.
+
+#### Withdrawing one, for good
+
+`lv netbox withdraw-retirement <host> --incarnation <serial> --premise
+<membership|inventory> --reason <why>` removes trust in a recorded grant. It is
+the only durable way to end one, and it exists because an attestation nothing can
+check would otherwise stand indefinitely once it turned out to be wrong.
+
+**It has no prerequisites, and that asymmetry is the design.** Granting trust is
+guarded — an accounting, an exact identity, a host that is not answering, a
+re-check immediately before the write. *Removing* it is guarded by nothing,
+because every consequence of a withdrawal is a premise going back to being
+**owed**: reclamation and binding withhold rather than proceed. So the host need
+not be dead, unreachable, or currently matching, and it need not have a `hosts`
+record at all. It works on any recorded, unwithdrawn grant — active or dormant.
+
+It records that trust was withdrawn. **It does not establish what was true**, any
+more than the attestation did.
+
+**It names a machine and a premise.** `--incarnation` is required: a hostname is
+meant to be reused, so a withdrawal aimed by name would land on whichever grant
+that name carries now rather than the one you meant, leaving the mistake in
+place. `--premise` is required because the two premises are separate grants —
+withdrawing what a host *knew* does not withdraw what became of its *records*.
+
+**It is an addition to the record, not an edit of it.** Who attested what, when
+and why survives untouched; who withdrew it, when and why is recorded beside it,
+and the listing shows both.
+
+**It does not discard the host identities the attestation named.** Those remain
+inputs to discovery, exactly as they are while the grant stands, because naming a
+host can only ever cause it to be *asked*. This is the same rule that governs
+retirement itself, in the other direction, and it is the easiest thing here to
+expect wrongly: drop those identities and a still-running holder goes unqueried,
+so being *more* careful would end up freeing a live guest's address.
+
+**It targets a grant VERSION.** Each attestation records a new recovery manifest,
+and that manifest id is the grant's version. A withdrawal covers exactly the
+versions recorded when it ran, which is what makes two things true at once: a
+delayed or re-delivered copy of the old grant cannot resurrect it (a replay
+carries the version the withdrawal already named), and a withdrawal cannot cancel
+a *later* attestation (a re-attestation mints a version no withdrawal names). The
+discriminator is an identity, never a clock, so no skew or delivery order changes
+the answer.
+
+So re-attesting after a withdrawal works, and if somebody re-attested while a
+withdrawal was in flight the grant stays in force on the strength of that later
+record — the listing names the version holding it up, and withdrawing again
+covers it too. Nothing is silently swallowed in either direction.
+
+Repeating a withdrawal is safe: it is the same assertion about the same version,
+so it succeeds and reports that nothing new was recorded. Like `retire-host`, it
+is privileged, audited, and refuses to record anything until the cluster has
+finished rolling to a build that understands these records — which can never lock
+you out, because a grant can only exist if that latch has already formed and the
+latch is monotone.
+
+A withdrawn grant leaves the `netbox_premise_attested` advisory, because it
+supplies no premise any more.
 
 You do not have to remember to look. For as long as a grant is **in force** —
 revalidated now, and actually supplying a premise — `lv health` carries a
@@ -1258,8 +1323,14 @@ lv netbox retire-host <host> --inventory "address records re-created on <host-a>
 # Reclamation additionally needs power-off evidence, which is not retirable.
 lv host fence-confirm <host>
 
-# What has been attested, by whom, and whether it still applies.
+# What has been attested, by whom, whether it still applies, and what has been
+# withdrawn.
 lv netbox retirements
+
+# That attestation was wrong. Remove trust in it — no prerequisites, and the
+# host identities it named stay inputs to discovery.
+lv netbox withdraw-retirement <host> --incarnation <serial> \
+    --premise membership --reason "the accounting named the wrong machine"
 ```
 
 The command is privileged, audited on both outcomes, refuses a host that is still

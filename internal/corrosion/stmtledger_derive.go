@@ -41,6 +41,14 @@ var appendOnlyTables = map[string]bool{
 	// locally has nothing to conflict with, so anti-entropy re-inserts it from a
 	// peer with no bespoke merge rule.
 	"netbox_host_retirements": true,
+	// A withdrawal is an operator's assertion that trust in ONE GRANT VERSION —
+	// a fixed (cluster, host incarnation, premise, manifest id) — is removed. It
+	// has no later revision either: withdrawing again is the same assertion, and
+	// restoring trust is a FRESH ATTESTATION under a new manifest id rather than
+	// an edit here. Append-only is also what makes a replayed grant unable to
+	// resurrect: the withdrawal row a peer re-inserts is the one that already
+	// covered that version.
+	"netbox_retirement_withdrawals": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply

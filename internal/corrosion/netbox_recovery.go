@@ -442,3 +442,293 @@ func HostIncarnationOf(ctx context.Context, c *Client, host string) (incarnation
 	}
 	return rows[0].String("cert_serial"), true, nil
 }
+
+// ── WITHDRAWING A RETIREMENT: REMOVING TRUST NEEDS NO EVIDENCE ──────────────
+//
+// READ THIS BEFORE CHANGING THE WITHDRAWAL PATH.
+//
+// A retirement is an operator's assertion substituted for machine evidence, so
+// there has to be a way to take it back — a mistaken attestation would otherwise
+// stand indefinitely. Two things about that are easy to get backwards.
+//
+// RECORDED IS NOT THE SAME AS INACTIVE. The resolver merely SKIPS a grant while
+// its host is reachable; it does not durably invalidate it. If that same
+// incarnation becomes unreachable again, the stored grant APPLIES AGAIN. A
+// dormant grant is a live grant, so withdrawal must work on ANY recorded,
+// unwithdrawn grant — active or dormant — with no prerequisite about the host
+// being dead, unreachable, or currently matching. Refusing to withdraw a dormant
+// grant would block withdrawal in exactly the state that most needs it.
+//
+// THE ASYMMETRY IS DELIBERATE. GRANTING trust needs evidence: an accounting, an
+// exact incarnation, a host that is not answering, a revalidation immediately
+// before the write. REMOVING it needs none of that, because every failure mode
+// of a withdrawal is a WITHHELD premise — the proof goes back to being owed,
+// which is the fail-closed direction. Anything that made withdrawal harder would
+// be trading a safe outcome for an unsafe one.
+//
+// WHAT A WITHDRAWAL DOES NOT DO. It does not establish that the hosts a manifest
+// named never existed. Those identities stay inputs to discovery
+// (RecoveredMembershipIdentities reads every manifest and asks nothing about
+// withdrawal), because naming a host can only ever cause it to be ASKED — the
+// leak direction — and dropping them is how withdrawing a source would come to
+// hide a still-running holder. It is the same rule that governs retirement
+// itself, in the other direction.
+
+// RetirementWithdrawal is one recorded withdrawal of trust in ONE GRANT VERSION.
+//
+// THE GRANT VERSION IS THE MANIFEST ID. Each attestation mints a fresh manifest
+// id, so the manifests recorded for one (cluster, incarnation, premise) are that
+// grant's version history — and naming one of them is what lets a withdrawal
+// aimed at an earlier version leave a later one alone.
+type RetirementWithdrawal struct {
+	ClusterFingerprint string
+	HostIncarnation    string
+	Premise            RetirementPremise
+	// ManifestID is the grant version this withdrawal removes trust in.
+	ManifestID string
+	// HostName is RECORD ONLY — for an operator reading the row.
+	HostName    string
+	WithdrawnBy string
+	WithdrawnAt string
+	// Reason is the operator's account of why trust was removed, kept beside the
+	// original attestation rather than replacing it.
+	Reason string
+}
+
+// InsertRetirementWithdrawal records the withdrawal of trust in ONE grant
+// version.
+//
+// A SEPARATE TABLE, NOT ANOTHER RETIREMENT ROW. Inserting "another retirement
+// with the same key" as a superseding void record is a SILENT NO-OP —
+// netbox_host_retirements is keyed (cluster_fingerprint, host_incarnation,
+// premise) and written with INSERT OR IGNORE — so the shape the problem suggests
+// does nothing and reports success. And a revocation COLUMN would edit the
+// operator's original assertion; withdrawal is an addition to the record.
+//
+// INSERT OR IGNORE here is not that trap: the key includes the manifest id, so a
+// repeat is genuinely the same withdrawal of the same version, which is what
+// makes withdrawal IDEMPOTENT rather than an error the second time.
+func InsertRetirementWithdrawal(ctx context.Context, c *Client, w RetirementWithdrawal) error {
+	switch {
+	case w.ClusterFingerprint == "":
+		return fmt.Errorf("a retirement withdrawal must name the cluster fingerprint it applies in")
+	case w.HostIncarnation == "":
+		return fmt.Errorf("a retirement withdrawal must name the host incarnation whose grant " +
+			"it withdraws; a hostname is reusable and cannot identify one")
+	case w.HostIncarnation == UnknownIncarnation:
+		return fmt.Errorf("the incarnation %q is the placeholder for a certificate serial that "+
+			"could not be read and identifies no incarnation, so no grant can be keyed to it",
+			UnknownIncarnation)
+	case !ValidPremise(w.Premise):
+		return fmt.Errorf("unknown retirement premise %q; only %q and %q are retirable, so "+
+			"only those can be withdrawn", w.Premise, PremiseMembership, PremiseInventory)
+	case w.ManifestID == "":
+		// Without a version this row would not name WHICH grant it withdraws,
+		// and a later re-attestation could not be distinguished from the one
+		// being withdrawn.
+		return fmt.Errorf("a retirement withdrawal must name the grant version it withdraws " +
+			"(the id of the recovery manifest that supplied it)")
+	case w.WithdrawnBy == "":
+		return fmt.Errorf("a retirement withdrawal must record who withdrew it")
+	case w.WithdrawnAt == "":
+		return fmt.Errorf("a retirement withdrawal must record when it was withdrawn")
+	case strings.TrimSpace(w.Reason) == "":
+		// Not a gate on the withdrawal — it is the reviewable half. The original
+		// attestation records who asserted what and why; this records who took
+		// it back and why, and a blank one leaves the trail saying only that
+		// somebody did.
+		return fmt.Errorf("a retirement withdrawal must record why trust was removed")
+	}
+	return c.Execute(ctx,
+		`INSERT OR IGNORE INTO netbox_retirement_withdrawals
+		   (cluster_fingerprint, host_incarnation, premise, manifest_id, host_name,
+		    withdrawn_by, withdrawn_at, reason, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		w.ClusterFingerprint, w.HostIncarnation, string(w.Premise), w.ManifestID, w.HostName,
+		w.WithdrawnBy, w.WithdrawnAt, w.Reason, c.NowWall(), c.NowTS())
+}
+
+// GrantVersionsFor is the manifest ids recorded for ONE premise in ONE cluster,
+// keyed by host incarnation — each grant's VERSION HISTORY.
+//
+// One query for the whole premise rather than one per candidate, because the
+// resolver runs this on every proof pass.
+//
+// PREMISE-SCOPED AT THE QUERY, for the reason every read of these tables is: a
+// caller that received both premises' versions would have to filter, and a
+// caller that forgot would treat a membership attestation as an inventory one.
+func GrantVersionsFor(ctx context.Context, c *Client, fingerprint string,
+	premise RetirementPremise) (map[string][]string, error) {
+
+	if fingerprint == "" {
+		return nil, fmt.Errorf("reading grant versions requires a cluster fingerprint")
+	}
+	if !ValidPremise(premise) {
+		return nil, fmt.Errorf("unknown retirement premise %q", premise)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT host_incarnation, id FROM netbox_recovery_manifests
+		  WHERE cluster_fingerprint = ? AND premise = ? AND deleted_at IS NULL`,
+		fingerprint, string(premise))
+	if err != nil {
+		return nil, fmt.Errorf("read %s grant versions: %w", premise, err)
+	}
+	out := map[string][]string{}
+	for _, r := range rows {
+		inc, id := r.String("host_incarnation"), r.String("id")
+		if inc == "" || id == "" {
+			continue
+		}
+		out[inc] = append(out[inc], id)
+	}
+	for _, ids := range out {
+		sort.Strings(ids)
+	}
+	return out, nil
+}
+
+// RetirementWithdrawals is the withdrawal state for ONE premise in ONE cluster:
+// which grant versions have had trust removed, and which versions each grant
+// currently rests on.
+//
+// It is a TYPE rather than two maps a caller compares, because the predicate is
+// the whole subtlety and there must be exactly one copy of it. See Withdrawn.
+type RetirementWithdrawals struct {
+	// byIncarnation is incarnation → manifest id → the withdrawal record.
+	byIncarnation map[string]map[string]RetirementWithdrawal
+	// versions is incarnation → the manifest ids the grant rests on.
+	versions map[string][]string
+}
+
+// Withdrawn reports whether the grant recorded for this incarnation has had
+// trust removed from EVERY version it rests on.
+//
+// THIS IS THE PREDICATE, and both halves of it are load-bearing:
+//
+//  1. AT LEAST ONE WITHDRAWAL EXISTS. Without this the "every version is
+//     withdrawn" test would be vacuously true for a grant with no manifest rows
+//     visible yet, and an ordinary replication skew would read as a withdrawal.
+//  2. EVERY RECORDED VERSION IS COVERED. A grant resting on a version nothing
+//     has withdrawn still rests on a live human attestation, so it applies. That
+//     is what makes a withdrawal unable to cancel a NEWER attestation: a
+//     re-attestation mints a fresh manifest id, no withdrawal names it, and the
+//     grant comes back on the strength of that record rather than of the one
+//     that was withdrawn.
+//
+// THE DISCRIMINATOR IS AN IDENTITY, NEVER A CLOCK. A delayed or re-delivered
+// copy of the old grant carries the manifest id it always had, so it is still
+// covered and cannot resurrect anything; a genuinely new attestation carries an
+// id no withdrawal names. Nothing here compares timestamps, so no clock skew and
+// no replay ordering can flip the answer.
+func (w RetirementWithdrawals) Withdrawn(incarnation string) bool {
+	withdrawn := w.byIncarnation[incarnation]
+	if len(withdrawn) == 0 {
+		return false
+	}
+	for _, id := range w.versions[incarnation] {
+		if _, ok := withdrawn[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// Records is the withdrawals recorded for one incarnation, newest first, for the
+// operator-facing listing. Present whether or not the grant is fully withdrawn:
+// a withdrawal that a later attestation out-ran must still be visible, or the
+// operator who made it would see their decision silently swallowed.
+func (w RetirementWithdrawals) Records(incarnation string) []RetirementWithdrawal {
+	out := make([]RetirementWithdrawal, 0, len(w.byIncarnation[incarnation]))
+	for _, rec := range w.byIncarnation[incarnation] {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].WithdrawnAt != out[j].WithdrawnAt {
+			return out[i].WithdrawnAt > out[j].WithdrawnAt
+		}
+		return out[i].ManifestID < out[j].ManifestID
+	})
+	return out
+}
+
+// Versions is the grant versions recorded for one incarnation, sorted.
+func (w RetirementWithdrawals) Versions(incarnation string) []string {
+	return append([]string(nil), w.versions[incarnation]...)
+}
+
+// UnwithdrawnVersions is the grant versions this incarnation rests on that NO
+// withdrawal names — the versions keeping a grant in force after a withdrawal.
+//
+// It exists so the withdrawal path and the listing can SAY which record a grant
+// is still resting on. A withdrawal that a concurrent re-attestation out-ran
+// must not be silently swallowed, and naming the version that beat it is what
+// makes the outcome reviewable instead of mysterious.
+func (w RetirementWithdrawals) UnwithdrawnVersions(incarnation string) []string {
+	withdrawn := w.byIncarnation[incarnation]
+	var out []string
+	for _, id := range w.versions[incarnation] {
+		if _, ok := withdrawn[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// LoadRetirementWithdrawals reads the withdrawal state for ONE premise.
+//
+// TOMBSTONES ARE NOT FILTERED, deliberately, and this is the one read in the
+// subsystem that does not filter them. A withdrawal removes trust; letting a
+// `deleted_at` on the withdrawal row put a grant back into force would make
+// deleting a row a way to RESTORE trust, which is the fail-open direction and
+// the one thing this table must not permit. Restoring trust takes a fresh
+// attestation under a new grant version, which is a positive act by a named
+// person — not the disappearance of a row.
+func LoadRetirementWithdrawals(ctx context.Context, c *Client, fingerprint string,
+	premise RetirementPremise) (RetirementWithdrawals, error) {
+
+	out := RetirementWithdrawals{byIncarnation: map[string]map[string]RetirementWithdrawal{}}
+	if fingerprint == "" {
+		return out, fmt.Errorf("reading retirement withdrawals requires a cluster fingerprint")
+	}
+	if !ValidPremise(premise) {
+		return out, fmt.Errorf("unknown retirement premise %q", premise)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT cluster_fingerprint, host_incarnation, premise, manifest_id, host_name,
+		        withdrawn_by, withdrawn_at, reason
+		   FROM netbox_retirement_withdrawals
+		  WHERE cluster_fingerprint = ? AND premise = ?`,
+		fingerprint, string(premise))
+	if err != nil {
+		return out, fmt.Errorf("read %s retirement withdrawals: %w", premise, err)
+	}
+	for _, r := range rows {
+		inc, id := r.String("host_incarnation"), r.String("manifest_id")
+		if inc == "" || inc == UnknownIncarnation || id == "" {
+			// Names no grant version, so it withdraws nothing. Skipped rather
+			// than errored, for the same reason ListHostRetirements skips a row
+			// with no incarnation: one malformed row must not block every
+			// legitimate withdrawal.
+			continue
+		}
+		if out.byIncarnation[inc] == nil {
+			out.byIncarnation[inc] = map[string]RetirementWithdrawal{}
+		}
+		out.byIncarnation[inc][id] = RetirementWithdrawal{
+			ClusterFingerprint: r.String("cluster_fingerprint"),
+			HostIncarnation:    inc,
+			Premise:            RetirementPremise(r.String("premise")),
+			ManifestID:         id,
+			HostName:           r.String("host_name"),
+			WithdrawnBy:        r.String("withdrawn_by"),
+			WithdrawnAt:        r.String("withdrawn_at"),
+			Reason:             r.String("reason"),
+		}
+	}
+	versions, err := GrantVersionsFor(ctx, c, fingerprint, premise)
+	if err != nil {
+		return RetirementWithdrawals{byIncarnation: map[string]map[string]RetirementWithdrawal{}}, err
+	}
+	out.versions = versions
+	return out, nil
+}

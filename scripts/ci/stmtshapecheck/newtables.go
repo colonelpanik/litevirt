@@ -124,6 +124,12 @@ var firstShapeAcks = map[string]string{
 	"netbox_host_retirements": "same RPC, same DurablyLatched(netbox_ipam_v1) refusal, in the " +
 		"same handler as the manifest above — a retirement is never written without one. " +
 		"Append-only and operator-driven only, so nothing re-emits the shape on a timer",
+	"netbox_retirement_withdrawals": "written only by the WithdrawHostRetirement RPC, which " +
+		"refuses unless DurablyLatched(netbox_ipam_v1) — the same latch the two tables above " +
+		"rely on. The gate can never lock an operator out of withdrawing something: recording " +
+		"a retirement required that same durable latch, and the latch is MONOTONE, so any " +
+		"grant that exists is proof the latch already formed and cannot un-form. Append-only " +
+		"and operator-driven only — no background writer, no timer, no loop re-emits it",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

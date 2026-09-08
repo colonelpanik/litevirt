@@ -483,6 +483,10 @@ var capabilityMap = map[string]tableResolver{
 	// and the default chain settles it.
 	"netbox_recovery_manifests": {category: "content", chain: contentDefaultChain()},
 	"netbox_host_retirements":   {category: "content", chain: contentDefaultChain()},
+	// Same shape, and the key carries the whole assertion: (fingerprint,
+	// incarnation, premise, manifest id) is one withdrawal of trust in one grant
+	// version, so two rows under one key are the same withdrawal written twice.
+	"netbox_retirement_withdrawals": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

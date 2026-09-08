@@ -21,6 +21,7 @@ func newNetboxCmd() *cobra.Command {
 		newNetboxRekeyCmd(),
 		newNetboxResumeCmd(),
 		newNetboxRetireHostCmd(),
+		newNetboxWithdrawRetirementCmd(),
 		newNetboxRetirementsCmd(),
 	)
 	return cmd
@@ -76,12 +77,20 @@ it. Reclamation still requires fencing evidence: power the machine off, then run
 ` + "`lv host fence-confirm <host>`" + `. Until you do, the sweep keeps withholding, and
 this command tells you so.
 
-WHAT ENDS A RETIREMENT. Nothing is withdrawn by hand. It simply stops applying
-the moment the host is reachable again, or the moment a different machine is
-admitted under that name -- the retirement names a specific incarnation (the
-certificate serial recorded for that machine), never the hostname, so a
-replacement inherits nothing. Run ` + "`lv netbox retirements`" + ` to see what is
-recorded and what still applies.
+WHAT ENDS A RETIREMENT. Two different things, and the difference matters.
+
+It PAUSES on its own the moment the host is reachable again, or the moment a
+different machine is admitted under that name -- the retirement names a specific
+incarnation (the certificate serial recorded for that machine), never the
+hostname, so a replacement inherits nothing. That is a pause and not a
+withdrawal: nothing is written, and the stored grant applies AGAIN if that same
+machine goes unreachable once more.
+
+To remove trust in one for good -- because it was a mistake, or the accounting
+was wrong -- run ` + "`lv netbox withdraw-retirement`" + `. That is durable and needs no
+evidence of its own: withdrawing only ever puts a premise back to being owed.
+Run ` + "`lv netbox retirements`" + ` to see what is recorded, what still applies, and
+what has been withdrawn.
 
 The command refuses a host that is still responding, and refuses to record
 anything until the cluster has finished rolling to a build that understands
@@ -155,6 +164,128 @@ these records.`,
 	return cmd
 }
 
+func newNetboxWithdrawRetirementCmd() *cobra.Command {
+	var (
+		incarnation string
+		premise     string
+		reason      string
+	)
+	cmd := &cobra.Command{
+		Use:   "withdraw-retirement <host>",
+		Short: "Remove trust in a recorded permanent-loss attestation",
+		Long: `Take back a permanent-loss attestation.
+
+WHAT THIS IS FOR. ` + "`lv netbox retire-host`" + ` substitutes your judgement for
+evidence litevirt cannot obtain, and litevirt cannot check what you asserted. If
+one turns out to be wrong -- the accounting named the wrong machine, the host was
+not permanently lost after all, somebody ran it by mistake -- this is how the
+cluster stops relying on it. Without it a mistaken attestation stands
+indefinitely.
+
+IT ASKS FOR NOTHING BUT THE TARGET, and that asymmetry is deliberate. Recording
+a retirement is guarded: it refuses a host that is still responding, it demands
+an accounting, and it re-checks everything immediately before it writes. Removing
+one is not guarded at all, because every consequence of a withdrawal is a premise
+going back to being OWED -- reclamation and binding withhold rather than proceed.
+Making this harder would trade a safe outcome for an unsafe one. So the host does
+not have to be dead, unreachable, or currently matching, and it does not even
+have to have a host record any more.
+
+A DORMANT GRANT IS A LIVE GRANT, which is why "it already stopped applying" is
+not a reason to skip this. A retirement whose host is answering again is merely
+PAUSED: nothing was written, and the stored grant applies again the moment that
+same machine goes unreachable once more. Withdrawal is the only thing that is
+durable.
+
+IT NAMES A MACHINE AND A PREMISE, never just a hostname. --incarnation is
+required: a hostname is meant to be reused, so aiming by name would land on
+whichever grant that name carries now rather than on the one you meant, leaving
+the mistake in place. --premise is required for the same reason the two premises
+are separate -- withdrawing what a host KNEW does not withdraw what became of its
+RECORDS. Both values are in ` + "`lv netbox retirements`" + `.
+
+WHAT IT DOES NOT DO, and this is the easiest thing to expect wrongly: it does NOT
+discard the host identities the attestation named. Those stay inputs to
+discovery. Withdrawing permission to trust a source does not establish that the
+hosts it named never existed -- and dropping them is how being MORE careful would
+end up freeing a live guest's address, because a host nothing records is a host
+nothing asks.
+
+It also does not delete the original attestation. Who attested what, when and
+why survives untouched, and who withdrew it, when and why is recorded beside it.
+
+RE-ATTESTING AFTER A WITHDRAWAL WORKS. A withdrawal covers the grant versions
+recorded when you ran it and nothing attested afterwards, so running
+` + "`lv netbox retire-host`" + ` again records a fresh version and supplies the premise
+again. That also means a withdrawal that raced somebody else's re-attestation
+does not silence it: the listing names the version that is holding the grant up,
+and withdrawing again covers it too.
+
+Repeating a withdrawal is safe and reports that nothing new was recorded.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			host := args[0]
+			if incarnation == "" {
+				return fmt.Errorf("pass --incarnation: a withdrawal names the exact machine " +
+					"(the certificate serial `lv netbox retirements` reports), never the " +
+					"hostname, because a hostname is reusable")
+			}
+			if premise == "" {
+				return fmt.Errorf("pass --premise membership or --premise inventory: the two " +
+					"are separate grants and withdrawing one does not withdraw the other")
+			}
+			if strings.TrimSpace(reason) == "" {
+				return fmt.Errorf("pass --reason: the attestation records who asserted what " +
+					"and why, and this records who took it back and why")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.WithdrawHostRetirement(ctx, &pb.WithdrawHostRetirementRequest{
+					Host:            host,
+					HostIncarnation: incarnation,
+					Premise:         premise,
+					Reason:          reason,
+				})
+				if err != nil {
+					return fmt.Errorf("withdraw-retirement %s: %s",
+						host, status.Convert(err).Message())
+				}
+				if resp.GetNewlyRecorded() == 0 {
+					fmt.Printf("Already withdrawn: %s premise for %s (incarnation %s), "+
+						"%d grant version(s). Nothing new recorded.\n",
+						resp.GetPremise(), host, resp.GetHostIncarnation(),
+						len(resp.GetWithdrawnVersions()))
+				} else {
+					fmt.Printf("Withdrew trust in the %s premise for %s (incarnation %s), "+
+						"%d grant version(s).\n",
+						resp.GetPremise(), host, resp.GetHostIncarnation(),
+						resp.GetNewlyRecorded())
+				}
+				if !resp.GetGrantWithdrawn() {
+					// The concurrent-re-attestation outcome, said plainly. It
+					// must never look like the withdrawal was ignored.
+					fmt.Printf("The grant is STILL IN FORCE: it rests on grant version(s) "+
+						"%s, attested after this withdrawal was aimed. The withdrawal is "+
+						"recorded; run this again to cover the newer version too.\n",
+						strings.Join(resp.GetUncoveredVersions(), ", "))
+					return nil
+				}
+				fmt.Printf("The %s premise for %s is owed again. This does NOT discard the "+
+					"host identities the attestation named -- they remain inputs to "+
+					"discovery, so any host it named is still queried.\n",
+					resp.GetPremise(), host)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&incarnation, "incarnation", "",
+		"The exact incarnation (recorded certificate serial) whose grant is withdrawn; required")
+	cmd.Flags().StringVar(&premise, "premise", "",
+		"Which premise to withdraw: membership or inventory; required")
+	cmd.Flags().StringVar(&reason, "reason", "",
+		"Why trust is being removed, recorded beside the original attestation; required")
+	return cmd
+}
+
 func newNetboxRetirementsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "retirements",
@@ -166,11 +297,23 @@ reviewing them is the only check there is. Each row names the host, the exact
 incarnation it was written against, the premise it retires, who attested it and
 when, and the accounting they gave.
 
-A retirement is never withdrawn. It stops APPLYING on its own once the host
-answers again, or once a different machine is admitted under that name, and this
-listing says which rows are no longer honoured and why. A row that does not
-apply is not a problem to clean up -- it is the record of an exception that has
-correctly expired.`,
+A grant stops APPLYING on its own once the host answers again, or once a
+different machine is admitted under that name, and this listing says which rows
+are no longer honoured and why. That is a PAUSE: the stored grant applies again
+if that same machine goes unreachable once more, so a row that does not apply is
+not a problem to clean up.
+
+A WITHDRAWN grant is different, and the listing labels it so. Withdrawal is a
+recorded decision by a named person and it is durable -- it does not come back
+when the host next goes unreachable, and a re-delivered copy of the old grant
+cannot resurrect it. The withdrawal appears BESIDE the original attestation
+rather than replacing it, so both halves of the decision are readable: who
+attested what and why, and who took it back and why. Use
+` + "`lv netbox withdraw-retirement`" + ` to record one.
+
+If a withdrawn grant is listed as still APPLYING, a LATER attestation is holding
+it up -- somebody re-attested after the withdrawal, and the grant versions that
+withdrawal does not reach are named on the row.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -188,11 +331,29 @@ correctly expired.`,
 					if !r.GetApplies() {
 						state = "does not apply"
 					}
+					if r.GetWithdrawn() {
+						// Said in the state column, because "withdrawn" is a
+						// different fact from "not currently matching" and an
+						// operator scanning this list must not have to infer it.
+						state += " (WITHDRAWN)"
+					}
 					fmt.Printf("%s  premise=%s  %s\n", r.GetHostName(), r.GetPremise(), state)
 					fmt.Printf("    incarnation %s, attested by %s at %s\n",
 						r.GetHostIncarnation(), r.GetAttestedBy(), r.GetAttestedAt())
 					for _, a := range r.GetAccounting() {
 						fmt.Printf("    accounting: %s\n", a)
+					}
+					// The withdrawals BESIDE the attestation, never instead of
+					// it: both halves of the decision have to be readable.
+					for _, w := range r.GetWithdrawals() {
+						fmt.Printf("    withdrawn by %s at %s: %s (grant version %s)\n",
+							w.GetWithdrawnBy(), w.GetWithdrawnAt(), w.GetReason(),
+							w.GetGrantVersion())
+					}
+					if len(r.GetWithdrawals()) > 0 && len(r.GetUnwithdrawnVersions()) > 0 {
+						fmt.Printf("    still resting on grant version(s) no withdrawal "+
+							"reaches: %s (a later attestation)\n",
+							strings.Join(r.GetUnwithdrawnVersions(), ", "))
 					}
 					if !r.GetApplies() {
 						fmt.Printf("    %s\n", r.GetNotApplyingBecause())

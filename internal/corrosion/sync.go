@@ -284,6 +284,12 @@ var tableNames = []string{
 	// NOT travel: a missing retirement means the premise is still owed, so the
 	// sweep and the bind withhold — never the other way round.
 	"netbox_recovery_manifests", "netbox_host_retirements",
+	// And the withdrawal of trust in a grant version. It MUST travel with them:
+	// a node that received the grant and not its withdrawal would honour a
+	// premise the operator has removed trust in. Append-only, so it repairs the
+	// same way, and the fail-closed direction is the same one — a withdrawal
+	// that arrives makes a premise owed again, never the reverse.
+	"netbox_retirement_withdrawals",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

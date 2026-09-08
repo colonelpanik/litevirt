@@ -50,6 +50,14 @@ import (
 //  5. IT IS REVALIDATED ON EVERY READ, not only when it was written: a
 //     reachable host's live state governs, and a re-admitted machine's new
 //     incarnation matches nothing.
+//  6. IT CAN BE WITHDRAWN, per GRANT VERSION, by a named person — and that is
+//     the one thing on this list that is DURABLE rather than re-derived. The
+//     conditions above describe a grant that has stopped MATCHING and that
+//     applies again the moment it matches again; a dormant grant is a live
+//     grant. A withdrawal is a decision, so it does not lapse when the host
+//     next goes unreachable, and a replayed copy of the old grant cannot undo
+//     it. Removing trust needs no evidence, which is the reverse of the
+//     asymmetry that governs granting it.
 //
 // THE THREE PERMISSIONS, AND WHY THEY ARE THREE.
 //
@@ -171,7 +179,7 @@ func (s *Server) inventoryRetirementsFor(ctx context.Context, names []string) (i
 // each passes its own premise literal. There is no way to call this with a
 // premise a caller chose at runtime, because nothing passes one.
 //
-// FOUR THINGS MUST HOLD before a retirement applies to a host, and every one of
+// FIVE THINGS MUST HOLD before a retirement applies to a host, and every one of
 // them fails CLOSED — an unmet condition means the premise is still owed:
 //
 //  1. THE CLUSTER MATCHES. Retirements are scoped by cluster fingerprint, so a
@@ -188,12 +196,28 @@ func (s *Server) inventoryRetirementsFor(ctx context.Context, names []string) (i
 //     a different certificate serial, so its row records a different incarnation
 //     and the prior incarnation's retirement matches nothing. Re-admission
 //     cannot inherit an exception.
-//  4. THE HOST IS NOT CURRENTLY RESPONDING. Same rule hasFreshPowerOffProof
+//  4. TRUST IN THE GRANT HAS NOT BEEN WITHDRAWN. This is the one condition that
+//     is DURABLE rather than re-derived from live state, and the distinction
+//     matters: the others all describe a grant that has stopped MATCHING and
+//     will apply again the moment it matches again, whereas a withdrawal is a
+//     recorded decision by a named person that does not come back when the host
+//     next goes unreachable. It is checked BEFORE the live reads below because
+//     it needs none of them — removing trust is not conditional on anything
+//     about the host — and it is checked per GRANT VERSION, so an attestation
+//     recorded after the withdrawal supplies the premise again on its own
+//     strength. See corrosion.RetirementWithdrawals.Withdrawn.
+//  5. THE HOST IS NOT CURRENTLY RESPONDING. Same rule hasFreshPowerOffProof
 //     applies to a fence attestation, for the same reason: a retirement asserts
 //     that a machine is GONE, so a machine that is answering refutes it and its
 //     LIVE STATE GOVERNS. This is what makes a detected rejoin invalidate the
-//     exception with nothing written and no operator action — and it is why
-//     there is no revocation column.
+//     exception with nothing written and no operator action.
+//
+// CONDITIONS 4 AND 5 ARE NOT INTERCHANGEABLE, and conflating them is the
+// mistake this file must not make. A grant whose host is reachable is merely
+// SKIPPED here — nothing is written, and if that incarnation goes unreachable
+// again the stored grant applies again. A dormant grant is a live grant. That is
+// exactly why a withdrawal has to be recorded rather than inferred from the host
+// having answered once.
 func (s *Server) applicableRetirements(ctx context.Context, names []string,
 	premise corrosion.RetirementPremise) (map[string]corrosion.HostRetirement, error) {
 
@@ -217,6 +241,14 @@ func (s *Server) applicableRetirements(ctx context.Context, names []string,
 		// permanent loss from doing one `hosts` read per candidate per round.
 		return nil, nil
 	}
+	// THE WITHDRAWALS, once for the whole premise. An error propagates rather
+	// than degrading to "nothing is withdrawn": a withdrawal that cannot be
+	// read is a grant whose standing is unknown, and honouring it on that basis
+	// would be reading an unreadable table as permission.
+	withdrawals, err := corrosion.LoadRetirementWithdrawals(ctx, s.db, fp, premise)
+	if err != nil {
+		return nil, err
+	}
 	out := make(map[string]corrosion.HostRetirement, len(byIncarnation))
 	for _, name := range names {
 		if name == "" || name == s.hostName {
@@ -236,6 +268,13 @@ func (s *Server) applicableRetirements(ctx context.Context, names []string,
 		r, ok := byIncarnation[inc]
 		if !ok {
 			continue // no retirement for THIS incarnation
+		}
+		if withdrawals.Withdrawn(inc) {
+			// Trust in every version this grant rests on has been withdrawn by
+			// a named person. Unlike everything below, this does not depend on
+			// the host's current state, so it does not lapse when the host next
+			// goes unreachable.
+			continue
 		}
 		if s.hostIsReachable(ctx, name) {
 			// It is answering. Whatever was attested about it, it is not gone.

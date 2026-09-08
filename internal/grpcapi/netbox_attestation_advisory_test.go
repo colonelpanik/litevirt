@@ -264,19 +264,21 @@ func TestAdvisoryStopsShowingAGrantThatIsNoLongerInForce(t *testing.T) {
 		stillRecorded bool
 		why           string
 	}{{
-		name: "revoked",
+		name: "the grant row was tombstoned",
 		lapse: func(t *testing.T, s *Server) {
-			// A revocation is a tombstone on the grant. There is no revocation
-			// column and no `lv` verb: this is what withdrawing one looks like
-			// in the rows, and the read side filters it out.
+			// NOT the supported withdrawal — that is
+			// `lv netbox withdraw-retirement`, which adds a record beside the
+			// grant and is covered in netbox_withdrawal_test.go. This is the
+			// row-level tombstone an out-of-band repair leaves behind, and the
+			// read side filters it out.
 			if err := s.db.Execute(context.Background(),
 				`UPDATE netbox_host_retirements SET deleted_at = ?, updated_at = ?
 				   WHERE host_incarnation = ?`,
 				"2026-09-08T11:00:00Z", s.db.NowTS(), advisoryIncarnation); err != nil {
-				t.Fatalf("revoke the retirement: %v", err)
+				t.Fatalf("tombstone the retirement: %v", err)
 			}
 		},
-		why: "a revoked grant excuses nothing, so it must not appear as usable evidence",
+		why: "a tombstoned grant excuses nothing, so it must not appear as usable evidence",
 	}, {
 		name: "the incarnation was replaced",
 		lapse: func(t *testing.T, s *Server) {

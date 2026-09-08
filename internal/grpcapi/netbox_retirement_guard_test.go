@@ -185,18 +185,31 @@ func TestTheTwoRETIRABLEPremisesCannotLeakIntoEachOther(t *testing.T) {
 		}
 	}
 
-	// Every one of the four read-side conditions must still be reachable from
+	// Every one of the five read-side conditions must still be reachable from
 	// the shared revalidation, because each is a separate way a retirement stops
 	// applying and every one of them fails closed.
 	for _, needed := range []string{"ClusterFingerprint", "HostIncarnationOf",
-		"ListHostRetirements", "hostIsReachable"} {
+		"ListHostRetirements", "LoadRetirementWithdrawals", "hostIsReachable"} {
 		if !slices.Contains(functionsCalled(shared), needed) {
-			t.Fatalf("applicableRetirements no longer calls %s. The four conditions are the "+
+			t.Fatalf("applicableRetirements no longer calls %s. The five conditions are the "+
 				"whole of what keeps a retirement narrow: the cluster must match, the host's "+
 				"incarnation must be recorded and known, a grant must exist for THAT "+
-				"incarnation and that premise, and the host must not be responding. Dropping "+
-				"hostIsReachable is what lets a rejoin keep its exception; dropping "+
-				"HostIncarnationOf is what lets a hostname reuse inherit one.", needed)
+				"incarnation and that premise, trust in it must not have been withdrawn, and "+
+				"the host must not be responding. Dropping hostIsReachable is what lets a "+
+				"rejoin keep its exception; dropping HostIncarnationOf is what lets a "+
+				"hostname reuse inherit one; dropping LoadRetirementWithdrawals is what "+
+				"makes a withdrawal a row nothing reads.", needed)
+		}
+	}
+	// And the withdrawal must be checked on the SHARED revalidation rather than
+	// in one premise's wrapper. A premise whose grants could not be withdrawn —
+	// or that resolved withdrawal differently — would be the soft spot
+	// everything migrates to, exactly as for the other four conditions.
+	for _, wrapper := range []string{"membershipRetirementsFor", "inventoryRetirementsFor"} {
+		if slices.Contains(functionsCalled(funcs[wrapper]), "LoadRetirementWithdrawals") {
+			t.Fatalf("%s reads the withdrawals itself. Withdrawal is resolved once, in "+
+				"applicableRetirements, for both premises: a second copy is how the two "+
+				"would come to honour a withdrawal differently", wrapper)
 		}
 	}
 }

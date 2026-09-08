@@ -105,6 +105,7 @@ const (
 	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
 	LiteVirt_ResumeBinding_FullMethodName              = "/litevirt.v1.LiteVirt/ResumeBinding"
 	LiteVirt_RetireLostHost_FullMethodName             = "/litevirt.v1.LiteVirt/RetireLostHost"
+	LiteVirt_WithdrawHostRetirement_FullMethodName     = "/litevirt.v1.LiteVirt/WithdrawHostRetirement"
 	LiteVirt_ListLostHostRetirements_FullMethodName    = "/litevirt.v1.LiteVirt/ListLostHostRetirements"
 	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
 	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
@@ -413,6 +414,13 @@ type LiteVirtClient interface {
 	// audited on both outcomes, refused for a host that is still responding, and
 	// revalidated immediately before the write.
 	RetireLostHost(ctx context.Context, in *RetireLostHostRequest, opts ...grpc.CallOption) (*RetireLostHostResponse, error)
+	// WithdrawHostRetirement removes trust in a recorded grant, so a mistaken
+	// attestation does not stand indefinitely. It has NO prerequisites — the
+	// host need not be dead, unreachable or currently matching — because every
+	// consequence of a withdrawal is a withheld premise. Privileged, audited,
+	// idempotent, and durable: a withdrawn grant does not come back when its
+	// host next goes unreachable. See WithdrawHostRetirementRequest.
+	WithdrawHostRetirement(ctx context.Context, in *WithdrawHostRetirementRequest, opts ...grpc.CallOption) (*WithdrawHostRetirementResponse, error)
 	// ListLostHostRetirements reports every recovery attestation and whether it
 	// still applies. An unverifiable premise has to be reviewable instead.
 	ListLostHostRetirements(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLostHostRetirementsResponse, error)
@@ -1684,6 +1692,16 @@ func (c *liteVirtClient) RetireLostHost(ctx context.Context, in *RetireLostHostR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RetireLostHostResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_RetireLostHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) WithdrawHostRetirement(ctx context.Context, in *WithdrawHostRetirementRequest, opts ...grpc.CallOption) (*WithdrawHostRetirementResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WithdrawHostRetirementResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_WithdrawHostRetirement_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3508,6 +3526,13 @@ type LiteVirtServer interface {
 	// audited on both outcomes, refused for a host that is still responding, and
 	// revalidated immediately before the write.
 	RetireLostHost(context.Context, *RetireLostHostRequest) (*RetireLostHostResponse, error)
+	// WithdrawHostRetirement removes trust in a recorded grant, so a mistaken
+	// attestation does not stand indefinitely. It has NO prerequisites — the
+	// host need not be dead, unreachable or currently matching — because every
+	// consequence of a withdrawal is a withheld premise. Privileged, audited,
+	// idempotent, and durable: a withdrawn grant does not come back when its
+	// host next goes unreachable. See WithdrawHostRetirementRequest.
+	WithdrawHostRetirement(context.Context, *WithdrawHostRetirementRequest) (*WithdrawHostRetirementResponse, error)
 	// ListLostHostRetirements reports every recovery attestation and whether it
 	// still applies. An unverifiable premise has to be reviewable instead.
 	ListLostHostRetirements(context.Context, *emptypb.Empty) (*ListLostHostRetirementsResponse, error)
@@ -4051,6 +4076,9 @@ func (UnimplementedLiteVirtServer) ResumeBinding(context.Context, *ResumeBinding
 }
 func (UnimplementedLiteVirtServer) RetireLostHost(context.Context, *RetireLostHostRequest) (*RetireLostHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RetireLostHost not implemented")
+}
+func (UnimplementedLiteVirtServer) WithdrawHostRetirement(context.Context, *WithdrawHostRetirementRequest) (*WithdrawHostRetirementResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WithdrawHostRetirement not implemented")
 }
 func (UnimplementedLiteVirtServer) ListLostHostRetirements(context.Context, *emptypb.Empty) (*ListLostHostRetirementsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListLostHostRetirements not implemented")
@@ -5899,6 +5927,24 @@ func _LiteVirt_RetireLostHost_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).RetireLostHost(ctx, req.(*RetireLostHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_WithdrawHostRetirement_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WithdrawHostRetirementRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).WithdrawHostRetirement(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_WithdrawHostRetirement_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).WithdrawHostRetirement(ctx, req.(*WithdrawHostRetirementRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8867,6 +8913,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RetireLostHost",
 			Handler:    _LiteVirt_RetireLostHost_Handler,
+		},
+		{
+			MethodName: "WithdrawHostRetirement",
+			Handler:    _LiteVirt_WithdrawHostRetirement_Handler,
 		},
 		{
 			MethodName: "ListLostHostRetirements",

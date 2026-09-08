@@ -348,7 +348,14 @@ import (
 //	     established evidence for the machine evidence the lost host can no
 //	     longer produce; PK (cluster_fingerprint, host_incarnation, premise), so
 //	     it can never widen into a cluster-wide "membership is complete"
-//	     switch). Six new tables + three ADD COLUMNs.
+//	     switch) and netbox_retirement_withdrawals (the operator's withdrawal of
+//	     trust in ONE GRANT VERSION — PK (cluster_fingerprint, host_incarnation,
+//	     premise, manifest_id), where the manifest id IS the grant version, so a
+//	     withdrawal cannot reach a version attested after it and a replayed old
+//	     grant stays withdrawn; a separate append-only table rather than a
+//	     revocation column, because the grant is the operator's original
+//	     assertion and withdrawal is an addition to the record, not an edit).
+//	     Seven new tables + three ADD COLUMNs.
 const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2292,6 +2299,58 @@ var schemaDDL = []string{
 		deleted_at          TEXT,
 		PRIMARY KEY (cluster_fingerprint, host_incarnation, premise)
 	)`,
+
+	// THE WITHDRAWAL half: removing trust in ONE GRANT VERSION.
+	//
+	// WHY A SEPARATE TABLE AND NOT A COLUMN, AND NOT ANOTHER RETIREMENT ROW.
+	// Both of the obvious shapes are silent no-ops:
+	//
+	//   - Another row in netbox_host_retirements collides on that table's key
+	//     and its writer is INSERT OR IGNORE, so a "superseding void record"
+	//     inserts nothing at all and reports success.
+	//   - A revocation COLUMN would make the grant mutable, and the grant is the
+	//     operator's original assertion. Withdrawal is an ADDITION to the record:
+	//     who attested it, when and why survive untouched beside who withdrew it,
+	//     when and why.
+	//
+	// THE GRANT VERSION IS THE MANIFEST ID, and it is in the key. Each
+	// attestation mints a fresh manifest id (randid), so the manifests recorded
+	// for one (cluster, incarnation, premise) ARE that grant's version history —
+	// which is what makes "withdraw v1 without touching a later v2" expressible
+	// at all. A withdrawal names the exact versions it removes trust in, so a
+	// version attested afterwards is not covered by it and the grant rests on
+	// that instead. The discriminator is an identity, never a clock: a REPLAYED
+	// old manifest carries the id it always had and stays covered, while a
+	// genuinely new attestation carries an id no withdrawal names.
+	//
+	// APPEND-ONLY, like both halves above, and self-repairing for the same
+	// reason: a row deleted locally has nothing to conflict with, so anti-entropy
+	// re-inserts it from a peer with no bespoke merge rule.
+	//
+	// A TOMBSTONE ON A WITHDRAWAL DOES NOT RESTORE TRUST. deleted_at exists for
+	// schema uniformity and the replication machinery; the read side deliberately
+	// does NOT filter on it, because a deleted withdrawal row must not be able to
+	// put a grant back into force. Removing trust needs no evidence; restoring it
+	// needs a fresh attestation.
+	`CREATE TABLE IF NOT EXISTS netbox_retirement_withdrawals (
+		cluster_fingerprint TEXT NOT NULL,
+		host_incarnation    TEXT NOT NULL,
+		premise             TEXT NOT NULL,
+		-- The GRANT VERSION this withdrawal removes trust in: the id of the
+		-- recovery manifest that supplied that version's evidence.
+		manifest_id         TEXT NOT NULL,
+		-- Record only, as everywhere else here: for an operator reading the row.
+		host_name           TEXT NOT NULL,
+		withdrawn_by        TEXT NOT NULL,
+		withdrawn_at        TEXT NOT NULL,
+		-- The operator's reason, kept beside the original attestation so the
+		-- trail shows both halves of the decision.
+		reason              TEXT NOT NULL,
+		created_at          TEXT NOT NULL,
+		updated_at          TEXT NOT NULL,
+		deleted_at          TEXT,
+		PRIMARY KEY (cluster_fingerprint, host_incarnation, premise, manifest_id)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2453,6 +2512,8 @@ var tablePrimaryKeys = map[string][]string{
 	"netbox_host_config":        {"host_name"},
 	"netbox_recovery_manifests": {"id"},
 	"netbox_host_retirements":   {"cluster_fingerprint", "host_incarnation", "premise"},
+	"netbox_retirement_withdrawals": {"cluster_fingerprint", "host_incarnation", "premise",
+		"manifest_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2801,6 +2862,7 @@ var createTableUnits = []struct {
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
 	{51, "netbox_recovery_manifests"}, {51, "netbox_host_retirements"},
+	{51, "netbox_retirement_withdrawals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

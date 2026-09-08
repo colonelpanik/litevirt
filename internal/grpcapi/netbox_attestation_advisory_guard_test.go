@@ -48,6 +48,11 @@ var advisoryCodeCallers = []string{
 	filepath.Join("internal", "grpcapi", "netbox_attestation_advisory_test.go"),
 	filepath.Join("internal", "grpcapi", "netbox_attestation_advisory_guard_test.go"),
 	filepath.Join("tests", "fleet", "netbox_attestation_advisory_test.go"),
+	// The withdrawal tests ASSERT on the advisory rather than gating on it: a
+	// withdrawn grant supplies no premise, so it must stop being advertised as
+	// in force. Reading the code to check that it went away is the opposite of
+	// reading it to act on it.
+	filepath.Join("internal", "grpcapi", "netbox_withdrawal_test.go"),
 }
 
 // TestTheAdvisoryIsInNoGatingList is the guard on "blocks nothing".
@@ -132,9 +137,14 @@ func TestTheAdvisoryWritesNothingButHealthConditions(t *testing.T) {
 		}
 	}
 
-	// The writers of the recovery tables, named explicitly: a call to either is
-	// the advisory acquiring the power to record or destroy a grant.
-	forbidden := []string{"InsertHostRetirement", "InsertRecoveryManifest"}
+	// The writers of the recovery tables, named explicitly: a call to any of
+	// them is the advisory acquiring the power to record or destroy a grant.
+	// InsertRetirementWithdrawal is the one that would let a DISPLAY revoke:
+	// withdrawal is the supported way to remove trust, and it must stay an
+	// operator's deliberate act rather than something a recomputed surface can
+	// do on its own.
+	forbidden := []string{"InsertHostRetirement", "InsertRecoveryManifest",
+		"InsertRetirementWithdrawal"}
 	// And the shapes any other write would take.
 	forbiddenPrefixes := []string{"Insert", "Update", "Delete", "Tombstone", "Execute",
 		"Suspend", "Resume", "Claim", "Release", "Retire"}

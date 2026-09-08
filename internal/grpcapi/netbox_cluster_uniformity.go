@@ -335,7 +335,9 @@ func (s *Server) compareNetBoxClusterName(ctx context.Context) (netboxClusterDis
 // is about who might be RUNNING the workload holding an address, and a witness
 // hosts none. That reason does not transfer here, so this one is stated in full
 // rather than borrowed. Note what the sweeper does NOT exclude a witness from —
-// its membership-discovery fan-out, which asks every host what it knows.
+// its membership-discovery fan-out, which asks every host what it knows, and its
+// inventory-corroboration set, which asks every host what rows it holds. A
+// witness is excused from the SCAN and from nothing else.
 //
 // Self is never excluded, by state or by role: this node's resolved name is the
 // value the comparison is made FROM, so a set that dropped it would be compared

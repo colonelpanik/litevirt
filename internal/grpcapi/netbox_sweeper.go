@@ -577,7 +577,7 @@ type membershipView struct {
 // database, not a small cluster, so its enumeration is reported INCOMPLETE. That
 // rule is applied to what this node SERVES and not to what it reads locally, and
 // the asymmetry is the point: this node is in its own participant set
-// unconditionally (keepUnlessPoweredOff adds it), so its own missing row hides
+// unconditionally (participantsWithThisNode adds it), so its own missing row hides
 // nobody from it — while a peer is the only source for its own table, and a peer
 // that has not even received its own row is a peer whose rows cannot be read as
 // the cluster's.
@@ -1056,7 +1056,7 @@ func (s *Server) gatherMembershipViews(ctx context.Context, peers []string) []pe
 }
 
 // membershipViewOf reads ONE participant's membership view over
-// GetMembershipView. See closedParticipantSet for why every failure — including
+// GetMembershipView. See closedParticipantSets for why every failure — including
 // an older peer's Unimplemented — leaves the set unclosable.
 //
 // The answer is keyed by the host that was ASKED and never by the host the

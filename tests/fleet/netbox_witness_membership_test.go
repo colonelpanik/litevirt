@@ -214,3 +214,65 @@ func TestFleetBindDoesNotHandOutAnAddressOnlyAWitnessHoldsTheRowsFor(t *testing.
 
 	assertBindHandsOutNoHeldAddress(t, c, binder)
 }
+
+// TestFleetBindGoesLiveWhenTheWitnessAgrees is the liveness half of putting
+// witnesses in the inventory-corroboration set, and the reason that widening is
+// affordable.
+//
+// A witness receives the replicated rows like any other node, so once the
+// cluster has converged its digests AGREE and it corroborates instead of
+// blocking. The binding here starts suspended for the ordinary reason — the
+// binder had received nothing — and the revalidation pass then resumes it LIVE
+// and adopts the address the incumbent holds, with nobody running a command.
+// The witness is in the corroboration set, so the resume happens only because it
+// answered and agreed — a witness that could not answer, or held different rows,
+// would keep the binding suspended (the scenario above).
+//
+// Without this, the fix for the round-five finding could have been "ask the
+// witness and wedge on it", which is indistinguishable from the bug for anyone
+// running a witness.
+func TestFleetBindGoesLiveWhenTheWitnessAgrees(t *testing.T) {
+	nb := NewNetBoxFake()
+	t.Cleanup(nb.Close)
+	nb.AddPrefix(adoptPrefix, adoptSubnet, adoptVRF, true)
+	c := NewClusterWithNetBox(t, 3, nb)
+	gates := gateAll(t, c)
+	latchNetBoxIPAM(t, c, gates)
+	binder, witness, holder := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	ctx := context.Background()
+
+	for _, n := range c.Nodes {
+		if err := n.DB.Execute(ctx,
+			"UPDATE hosts SET role = 'witness' WHERE name = ?", witness.Name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustCreateUnboundNetwork(t, c, holder, adoptNetName, adoptSubnet)
+	mustCreateVMHoldingIP(t, c, holder, "incumbent", adoptNetName, adoptFirstIP)
+	want := vmNICIdentity(t, holder, "incumbent")
+
+	mustCreateSuspendedBoundNetwork(t, c, binder)
+
+	// The cluster converges, witness included: every node now holds the same
+	// address-bearing rows.
+	dump := pullDump(t, c, holder)
+	binder.DB.MergeStateBytesLWW(dump)
+	witness.DB.MergeStateBytesLWW(dump)
+
+	if err := binder.Server.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatalf("RevalidateBindingsOnce: %v", err)
+	}
+
+	b, err := corrosion.GetBindingByPrefix(ctx, binder.DB, adoptPrefix)
+	if err != nil || b == nil {
+		t.Fatalf("binding row: %+v (err %v)", b, err)
+	}
+	if b.Suspended {
+		t.Fatalf("a witness that holds the same rows must corroborate, not block: %q",
+			b.SuspendReason)
+	}
+	if ids := nb.Identities(); len(ids) != 1 || ids[0] != want {
+		t.Fatalf("the resumed bind must adopt the address the incumbent holds, got %v want [%s]",
+			ids, want)
+	}
+}

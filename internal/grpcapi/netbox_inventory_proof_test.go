@@ -802,14 +802,17 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 	}
 }
 
-// TestProofParticipantsKeepsGossipUnderTheSameExclusions is the trap the union
+// TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion is the trap the union
 // walks straight into if it is bolted on rather than folded in.
 //
-// eligibility is not a property of the SOURCE that named a host. A host excluded
-// by an operator's power-off attestation must stay excluded when gossip also
-// names it — otherwise the union silently undoes the one escape hatch the
-// sweeper has, and after a permanent host loss it is inert forever.
-func TestProofParticipantsKeepsGossipUnderTheSameExclusions(t *testing.T) {
+// The power-off attestation is not a property of the SOURCE that named a host. A
+// host an operator has attested is off must stay out when gossip also names it —
+// otherwise the union silently undoes the one escape hatch the sweeper has, and
+// after a permanent host loss it is inert forever. This is asserted on the
+// DISCOVERY fan-out, which is the set the escape hatch has to reach: a host that
+// is still asked what it knows is a host whose unanswerable dial keeps the set
+// unclosed forever.
+func TestDiscoveryTargetsKeepGossipUnderThePowerOffExclusion(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 
@@ -817,12 +820,12 @@ func TestProofParticipantsKeepsGossipUnderTheSameExclusions(t *testing.T) {
 	s.db.SetMembersForTests(func() []corrosion.PeerInfo {
 		return []corrosion.PeerInfo{{Name: "gone", Addr: "203.0.113.9:7946"}}
 	})
-	hosts, err := s.proofParticipants(ctx)
+	hosts, err := localDiscoveryTargets(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(hosts, "gone") {
-		t.Fatalf("a gossip-only peer must be a participant, got %v", hosts)
+		t.Fatalf("a gossip-only peer must be asked what it knows, got %v", hosts)
 	}
 
 	// …and the operator attests it powered off. Nothing has made it reachable,
@@ -833,13 +836,42 @@ func TestProofParticipantsKeepsGossipUnderTheSameExclusions(t *testing.T) {
 		s.db.NowWall()); err != nil {
 		t.Fatalf("write fence confirmation: %v", err)
 	}
-	hosts, err = s.proofParticipants(ctx)
+	hosts, err = localDiscoveryTargets(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if slices.Contains(hosts, "gone") {
 		t.Fatalf("a fenced host named by gossip must still be excluded, got %v", hosts)
 	}
+}
+
+// localDiscoveryTargets is the membership-discovery fan-out over the candidates
+// this node can name WITHOUT asking anybody — one closure round's worth of
+// targets, which is what the exclusion tests above and below are about.
+func localDiscoveryTargets(t *testing.T, s *Server) ([]string, error) {
+	t.Helper()
+	cs, err := s.localParticipantCandidates(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return s.membershipDiscoveryTargets(context.Background(), cs.names())
+}
+
+// localRoleReading is the accumulated witness reading for one host across every
+// `hosts` row THIS node holds. It is what runtimeProofParticipants consumes, and
+// deliberately not something the fan-out can see.
+func localRoleReading(t *testing.T, s *Server, host string) (witness, known bool) {
+	t.Helper()
+	cs, err := s.localParticipantCandidates(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cs.all() {
+		if c.name == host {
+			return c.witness, true
+		}
+	}
+	return false, false
 }
 
 // ── the participant-set closure ─────────────────────────────────────────────
@@ -893,7 +925,7 @@ func TestClosedParticipantSetLearnsAHostOnlyAPeerKnows(t *testing.T) {
 		return membershipNaming(host, workerRows("peer-b", "peer-c"), nil)
 	})
 
-	local, err := s.proofParticipants(ctx)
+	local, err := localDiscoveryTargets(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,12 +990,17 @@ func TestClosedParticipantSetKeepsPeerNamedHostsUnderTheSameExclusions(t *testin
 // the wire buys, and it is the liveness half of this change.
 //
 // A witness votes and never hosts workloads, and — the operative part — it runs
-// no libvirt, so a witness dragged into the participant set answers with an
-// INCOMPLETE proof and stops every reclamation. Before the role was on the wire,
+// no libvirt, so a witness dragged into the RUNTIME-PROOF set answers with an
+// INCOMPLETE scan and stops every reclamation. Before the role was on the wire,
 // a witness whose row had not replicated here (or had been tombstoned there) was
-// learned as a nameless candidate, dialled, and wedged the sweeper with no
-// escape but a per-host operator attestation. The row that names it also says
-// what it is.
+// learned as a nameless candidate, asked for a proof it could not give, and
+// wedged the sweeper with no escape but a per-host operator attestation. The row
+// that names it also says what it is.
+//
+// It IS still asked what it knows: the membership-discovery fan-out has no role
+// filter, and a witness holds the whole replicated `hosts` table. Being excused
+// is about the SCAN, and the two sets are deliberately different sets — the
+// assertion below is on the proof set the closure returns.
 func TestAPeersROWMayExcuseAWitnessNoRowHereRecords(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
@@ -978,8 +1015,8 @@ func TestAPeersROWMayExcuseAWitnessNoRowHereRecords(t *testing.T) {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
 	if slices.Contains(closed, "a-witness") {
-		t.Fatalf("a host whose only row says `role=witness` hosts no workloads and must "+
-			"not be dialled, got %v", closed)
+		t.Fatalf("a host whose every row says `role=witness` hosts no workloads, so it must "+
+			"not be asked for a runtime scan, got %v", closed)
 	}
 }
 
@@ -1039,12 +1076,21 @@ func TestTwoROWSThatDisagreeAboutAWitnessKeepTheHostIN(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	local, err := s.proofParticipants(ctx)
+	// Precondition, stated on the ROLE READING rather than on a participant set:
+	// this node's only row for the host says witness. That reading is exactly
+	// what the old code acted on — and it must NOT keep the host out of the
+	// fan-out, or the peer row that contradicts it could never be read.
+	if witness, known := localRoleReading(t, s, "contested"); !known || !witness {
+		t.Fatalf("precondition: this node's own row must read as a witness (known %v, witness %v)",
+			known, witness)
+	}
+	targets, err := localDiscoveryTargets(t, s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.Contains(local, "contested") {
-		t.Fatalf("precondition: this node's own row must excuse it, got %v", local)
+	if !slices.Contains(targets, "contested") {
+		t.Fatalf("a host this node alone calls a witness must still be ASKED what it knows — "+
+			"excluding it is what prevents learning the exclusion was wrong; got %v", targets)
 	}
 
 	// …and the peer's row says worker. It answers, so the set can close.

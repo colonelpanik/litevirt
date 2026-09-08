@@ -1029,13 +1029,29 @@ so it happens only under a whole-cluster proof:
   making the two samples agree about a cluster neither of them saw whole.
   Membership converges in seconds and independently of every table, so a host it
   names is a host that exists;
-- that set is then **closed over every participant's own membership view**: each
-  one is asked which hosts it knows of at all, the answers are folded in under
-  the same exclusions, and the fan-out repeats until the set stops growing. A
-  holder any reachable node can name is therefore queried by name, whether or not
-  this node's own `hosts` table ever received it. Counting host rows is not enough
-  on its own — two nodes can each know three hosts without knowing the same
-  three;
+- that set is then **closed over every host's own membership view**: each one is
+  asked which hosts it knows of at all, the answers are folded in, and the
+  fan-out repeats until the set stops growing. A holder any reachable node can
+  name is therefore queried by name, whether or not this node's own `hosts` table
+  ever received it. Counting host rows is not enough on its own — two nodes can
+  each know three hosts without knowing the same three;
+- **witnesses are asked what they know, and excused only from the scan.** These
+  are two different sets and litevirt keeps them apart deliberately. A witness
+  runs the daemon, gossips and holds the same replicated `hosts` table as any
+  worker, so it is a first-class source of membership; what it does not do is host
+  a workload, so scanning it for a guest proves nothing and it is left out of the
+  set that must answer with a scan. Excluding a witness from the *question* was a
+  bug twice over: a host whose role this node had recorded as `witness` but which
+  had since been made a worker was never asked, and its stale role could never be
+  corrected — an exclusion must not skip the query that would have refuted it —
+  and a genuine witness that was the only node able to name a third host was never
+  asked either. A host counts as a witness only while **every** `hosts` row read
+  for it agrees; two rows that disagree, or no row anywhere, and it must answer
+  with a scan like any worker;
+- **an unreachable witness pauses reclamation exactly as an unreachable worker
+  does.** It is dialled for its membership view, and a host that cannot say what
+  it knows leaves the set unclosed — the same escape applies, and it is the only
+  one: `lv host fence-confirm <host>` once the machine really is off;
 - a view carries **both** halves of what a node knows, because neither half can
   substitute for the other. Its `hosts` rows include **tombstoned** ones: `lv
   host rm --force` does not power a machine off, so a host whose row a peer has

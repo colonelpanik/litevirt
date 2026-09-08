@@ -125,11 +125,12 @@ func (s *Server) SweepOrphansOnce(ctx context.Context) error {
 //
 // Reclamation requires a STABLE COMPLETE-CLUSTER proof:
 //
-//  1. Read the eligible host set A, CLOSED over every participant's own
+//  1. Read the runtime-proof host set A, CLOSED over EVERY candidate's own
 //     membership view — its `hosts` rows, tombstones included, and its gossip
-//     members — until the set stops growing.
+//     members — until the set stops growing. Every candidate is asked whatever
+//     its role; only the set that must SCAN excuses a witness.
 //  2. Gather complete negative proofs from exactly A.
-//  3. Read the eligible host set B, through the same closure.
+//  3. Read the runtime-proof host set B, through the same closure.
 //  4. Proceed only if A == B, every member answered completely, and the leader
 //     lease is still valid.
 //  5. Re-read the NetBox object and require it to still match.
@@ -198,7 +199,9 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	//    which a local-only witness balanced out of a row-count comparison too.
 	//    And closed over each peer's `hosts` ROWS, it still could not see a
 	//    holder that only another node's GOSSIP names, because no table
-	//    anywhere records one.
+	//    anywhere records one. Closed over the hosts a ROLE FILTER left in, it
+	//    still could not see a holder only a WITNESS could name — nor learn that
+	//    the role it filtered a holder out on was stale.
 	setA, unclosed, err := s.closedParticipantSet(ctx)
 	if err != nil {
 		return skipf(skipHostsRead, "read eligible hosts: %v", err)
@@ -297,26 +300,10 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 	return nil
 }
 
-// ── the participant universe ────────────────────────────────────────────────
+// ── the participant universe, and the TWO SETS built out of it ──────────────
 
-// proofParticipants is the LOCAL sample of the participant universe: everything
-// this node can name without asking anybody. Both cross-cluster proofs in this
-// package — the orphan sweeper's negative proof and the bind's inventory
-// corroboration — build on it through closedParticipantSet, which asks each of
-// these participants for its OWN membership view and folds the answers back in
-// until the set stops growing. Nothing calls this directly to authorize
-// anything: the set of hosts this node happens to have heard of is not the
-// cluster.
-//
-// ONE helper, not one per proof. There were two, and they differed in exactly
-// the way that mattered: the bind's unioned GOSSIP MEMBERSHIP into the
-// replicated `hosts` table and the sweeper's did not. So the sweeper built its
-// whole universe from the replicated table, a peer whose row had not hydrated on
-// this node was absent from BOTH of its samples, the samples agreed — they
-// establish stability, not completeness — and it deleted an address that peer's
-// guest still held.
-//
-// THE CANDIDATE SET is the `hosts` table unioned with gossip membership.
+// THE CANDIDATE UNIVERSE is the `hosts` table unioned with gossip membership,
+// closed over every candidate's own membership view (closedParticipantSet).
 //
 // It CANNOT reuse the existing helpers: dualRunProbeTargets has the right
 // universe but reads from ListHosts, and ListHosts filters WHERE deleted_at IS
@@ -327,33 +314,51 @@ func (s *Server) reclaimIfProven(ctx context.Context, cand orphanCandidate) erro
 // corrosion's peer resolver already falls back to the membership address for a
 // host whose row has not replicated, so a gossip-only peer is dialable.
 //
-// THE FILTERS then apply to every candidate identically, whichever source named
-// it — a union that skipped them would UNDO them, which is worse than not having
-// them: a host excluded by an operator's power-off attestation would be silently
-// re-added by gossip, and after a permanent host loss the sweeper would be inert
-// forever with no escape.
+// TWO SETS COME OUT OF THAT UNIVERSE AND THEY ARE NOT THE SAME SET. They answer
+// different questions, and collapsing them has freed a held address twice:
 //
-//   - A WITNESS is excluded: it votes and never hosts workloads. Only a `hosts`
-//     ROW carries a role — this node's or a peer's, they are the same replicated
-//     datum read from two places — so a candidate no row anywhere records has
-//     none, and an unknown role is not a statement that it is a witness, so it
-//     stays in. Two rows that disagree also leave it in (candidateSet.addRow).
-//   - A host is otherwise excluded ONLY with fresh, specific, proof-grade
-//     power-off evidence and no sign of a later rejoin. It is NOT excluded
-//     because its row vanished or because its state reads offline: an
-//     offline-looking host can still be running the domain, and dropping it
-//     would manufacture exactly the absence being proven.
+//   - membershipDiscoveryTargets — WHO IS ASKED WHAT IT KNOWS. Everyone. A
+//     host's role says nothing about what it knows: a witness runs the daemon,
+//     participates in gossip and holds the same replicated `hosts` table, so it
+//     is a first-class source of membership while being a useless target for a
+//     runtime scan. It takes NAMES ONLY, so no role can reach it even by
+//     accident — teaching it to filter on one means changing its signature.
+//   - runtimeProofParticipants — WHO MUST PRODUCE A RUNTIME SCAN. A witness is
+//     excused HERE, and only here: it hosts no workload, so scanning it proves
+//     nothing and dialling it for a proof it cannot complete would wedge the
+//     sweeper.
 //
-// This node is always in the set. Its own row could be missing or tombstoned
+// EXCLUDING A HOST FROM DISCOVERY IS PRECISELY WHAT PREVENTS LEARNING THE
+// EXCLUSION WAS WRONG. A role lives in a replicated row that `lv host config
+// --role` mutates, so this node's copy can be stale, and the rule that a host
+// counts as a witness only while EVERY row read agrees (candidateSet.addRow) can
+// never fire for a host nobody ever queried. An exclusion must not precede the
+// query that could refute it: the closure asks every discovery target before any
+// proof set exists, and derives the proof set only on the round that closes.
+//
+// ONE PAIR, NOT ONE PER PROOF. Both cross-cluster proofs in this package — the
+// orphan sweeper's negative proof and the bind's inventory corroboration — reach
+// a host set only through closedParticipantSet. There were two helpers once, and
+// they differed in exactly the way that mattered: the bind's unioned GOSSIP
+// MEMBERSHIP into the replicated `hosts` table and the sweeper's did not. So the
+// sweeper built its whole universe from the replicated table, a peer whose row
+// had not hydrated on this node was absent from BOTH of its samples, the samples
+// agreed — they establish stability, not completeness — and it deleted an
+// address that peer's guest still held.
+//
+// THE ONE EXCLUSION BOTH SETS SHARE is an operator's proof-grade power-off
+// attestation (keepUnlessPoweredOff), and it applies to every candidate
+// identically whichever source named it. A union that skipped it for the newest
+// source would UNDO it, which is worse than not having it: a host attested off
+// would be silently re-added by gossip or by a peer's view, and after a
+// permanent host loss the sweeper would be inert forever with no escape. A host
+// is NOT excluded because its row vanished or because its state reads offline —
+// an offline-looking host can still be running the domain, and dropping it would
+// manufacture exactly the absence being proven.
+//
+// THIS NODE IS ALWAYS IN BOTH SETS. Its own row could be missing or tombstoned
 // while it is demonstrably running — it is executing this code — and a proof
 // that omitted the leader would be the easiest possible way to miss a claimant.
-func (s *Server) proofParticipants(ctx context.Context) ([]string, error) {
-	candidates, err := s.localParticipantCandidates(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return s.eligibleParticipants(ctx, candidates.all())
-}
 
 // participantCandidate is one host some source named, plus the only property
 // that can exclude it on sight.
@@ -433,12 +438,26 @@ func (cs *candidateSet) addNamed(name string) {
 	cs.order = append(cs.order, name)
 }
 
-// all returns the candidates in the order they were first named.
+// all returns the candidates WITH their accumulated role reading, in the order
+// they were first named. Only runtimeProofParticipants may consume this: a role
+// is what excuses a host from a SCAN, and nothing else.
 func (cs *candidateSet) all() []participantCandidate {
 	out := make([]participantCandidate, 0, len(cs.order))
 	for _, n := range cs.order {
 		out = append(out, participantCandidate{name: n, witness: cs.byName[n].witness})
 	}
+	return out
+}
+
+// names returns the candidates as BARE NAMES, in the order they were first
+// named — the whole universe, with no role attached to filter on.
+//
+// It exists so the membership-discovery fan-out cannot see a role. Every host
+// here gets asked what it knows, because what a host knows does not depend on
+// what it is allowed to run.
+func (cs *candidateSet) names() []string {
+	out := make([]string, 0, len(cs.order))
+	out = append(out, cs.order...)
 	return out
 }
 
@@ -531,7 +550,7 @@ type membershipView struct {
 // database, not a small cluster, so its enumeration is reported INCOMPLETE. That
 // rule is applied to what this node SERVES and not to what it reads locally, and
 // the asymmetry is the point: this node is in its own participant set
-// unconditionally (eligibleParticipants adds it), so its own missing row hides
+// unconditionally (keepUnlessPoweredOff adds it), so its own missing row hides
 // nobody from it — while a peer is the only source for its own table, and a peer
 // that has not even received its own row is a peer whose rows cannot be read as
 // the cluster's.
@@ -591,33 +610,75 @@ func (s *Server) GetMembershipView(ctx context.Context, _ *emptypb.Empty) (*pb.M
 	return out, nil
 }
 
-// eligibleParticipants applies the exclusions to a candidate set and returns the
-// sorted participant list.
+// membershipDiscoveryTargets is THE MEMBERSHIP-DISCOVERY FAN-OUT: every host
+// that gets asked which hosts it knows of.
 //
-// ONE filter, whichever source named a candidate — the local table, gossip, or a
-// peer's membership view. A union that skipped it for the newest source would
-// UNDO it, which is worse than not having it: a host excluded by an operator's
-// power-off attestation would be silently re-added, and after a permanent host
-// loss the sweeper would be inert forever with no escape.
-func (s *Server) eligibleParticipants(ctx context.Context, candidates []participantCandidate) ([]string, error) {
+// EVERYONE, WITH NO ROLE FILTERING AT ALL. Its parameter is a list of NAMES and
+// not a []participantCandidate, which is the point: no role is in scope here, so
+// the filter that must never be applied cannot be applied without changing this
+// signature — see TestMembershipDiscoveryTargetsCannotFilterByRole, which fails
+// if it ever grows one. A witness runs the daemon, participates in gossip and
+// holds the same replicated `hosts` table as any worker; what it CANNOT do is
+// host a workload, which is a statement about runtimeProofParticipants and about
+// nothing else.
+//
+// The one exclusion is the shared one: a host an operator has attested is
+// powered off. That is not a role, it is proof-grade evidence about this
+// specific machine, and it is also the only escape from a permanent host loss.
+func (s *Server) membershipDiscoveryTargets(ctx context.Context, names []string) ([]string, error) {
+	return s.keepUnlessPoweredOff(ctx, names)
+}
+
+// runtimeProofParticipants is THE RUNTIME-PROOF SET: every host that must return
+// a complete runtime scan before an address can be reclaimed, or a matching
+// inventory before a bind goes live.
+//
+// A WITNESS IS EXCUSED, ON A CORROBORATED ROLE ONLY. It votes and never hosts
+// workloads, so scanning it proves nothing — and it runs no libvirt, so dragging
+// it in wedges every reclamation behind an incomplete proof. Only a `hosts` ROW
+// carries a role, this node's and a peer's being the same replicated datum read
+// from two places, so: a candidate no row anywhere records has no role and stays
+// IN (being named is not a reading of its role), and two rows that disagree
+// leave it IN as well (candidateSet.addRow). Callers must have READ every
+// discovery target's membership view before deriving this set, so that a row the
+// host itself holds is part of the agreement — closedParticipantSet is the only
+// caller, and it derives this only on the round that closes.
+func (s *Server) runtimeProofParticipants(ctx context.Context, candidates []participantCandidate) ([]string, error) {
+	scannable := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		if c.witness && c.name != s.hostName {
+			continue // hosts no workload: a scan of it is not evidence
+		}
+		scannable = append(scannable, c.name)
+	}
+	return s.keepUnlessPoweredOff(ctx, scannable)
+}
+
+// keepUnlessPoweredOff applies the ONE exclusion both participant sets share —
+// an operator's fresh, specific, proof-grade power-off attestation with no sign
+// of a later rejoin — guarantees this node is in the result, and sorts.
+//
+// It takes NAMES, never candidates: a role must not be reachable from the code
+// path both sets go through, or the two would drift back into one.
+func (s *Server) keepUnlessPoweredOff(ctx context.Context, names []string) ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
-	for _, c := range candidates {
-		if c.name != s.hostName {
-			if c.witness {
-				continue // a witness votes and never hosts workloads
-			}
-			excluded, err := s.hasFreshPowerOffProof(ctx, c.name)
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		if name != s.hostName {
+			excluded, err := s.hasFreshPowerOffProof(ctx, name)
 			if err != nil {
 				// An unreadable fencing_log is not permission to exclude.
-				return nil, fmt.Errorf("read fence evidence for %s: %w", c.name, err)
+				return nil, fmt.Errorf("read fence evidence for %s: %w", name, err)
 			}
 			if excluded {
 				continue
 			}
 		}
-		seen[c.name] = true
-		out = append(out, c.name)
+		seen[name] = true
+		out = append(out, name)
 	}
 	if !seen[s.hostName] && s.hostName != "" {
 		out = append(out, s.hostName)
@@ -636,11 +697,22 @@ func (s *Server) eligibleParticipants(ctx context.Context, candidates []particip
 // out is a REFUSAL, not a truncation: an unclosed set proves nothing.
 const hostSetClosureRounds = 8
 
-// closedParticipantSet is proofParticipants CLOSED OVER EVERY PARTICIPANT'S OWN
-// MEMBERSHIP VIEW: each one is asked which hosts its `hosts` table records —
-// tombstoned rows included — and which hosts its GOSSIP names, the answers are
-// folded back in under the same exclusions, and the fan-out repeats until the
-// set stops growing.
+// closedParticipantSet is THE CANDIDATE UNIVERSE CLOSED OVER EVERY DISCOVERY
+// TARGET'S OWN MEMBERSHIP VIEW: each one is asked which hosts its `hosts` table
+// records — tombstoned rows included — and which hosts its GOSSIP names, the
+// answers are folded back in, and the fan-out repeats until the set stops
+// growing. It returns the RUNTIME-PROOF SET, derived on the round that closes.
+//
+// THE FAN-OUT AND THE PROOF SET ARE DIFFERENT SETS and this is the only place
+// both are built (see the section comment above membershipDiscoveryTargets).
+// Everyone is asked what it knows — witnesses very much included, since a
+// witness holds the whole replicated `hosts` table and gossips like any other
+// node — and only the returned proof set excuses them. Fanning out over the
+// proof set instead excluded a host on a role reading nothing had corroborated,
+// and excluding it is exactly what prevented the corroboration: a stale local
+// `role='witness'` hid a host that had since become a worker and still held the
+// address, and a genuine witness that was the only node able to name a third
+// holder was never asked.
 //
 // It is the ONE helper both cross-cluster proofs in this package use, and the
 // only place either of them establishes membership. What the sweeper needs to
@@ -673,8 +745,8 @@ const hostSetClosureRounds = 8
 // not in any table, so no table-derived answer can carry it, and the dump is
 // tables. GetMembershipView asks for both halves of a node's universe at once:
 //
-//   - its `hosts` rows, tombstones included, each with the role the proof's
-//     witness exclusion turns on;
+//   - its `hosts` rows, tombstones included, each with the role the RUNTIME
+//     PROOF's witness exclusion turns on — never the fan-out's, which has none;
 //   - its gossip members, which memberlist converges on in seconds
 //     independently of every table, and which is the ONLY source that can name a
 //     host no database anywhere records;
@@ -710,19 +782,29 @@ func (s *Server) closedParticipantSet(ctx context.Context) ([]string, string, er
 	asked := map[string]bool{s.hostName: true}
 
 	for round := 0; round < hostSetClosureRounds; round++ {
-		set, eerr := s.eligibleParticipants(ctx, candidates.all())
-		if eerr != nil {
-			return nil, "", eerr
+		// THE FAN-OUT, over NAMES: every candidate is asked what it knows,
+		// whatever its role says it may run. Deriving the targets from the same
+		// set the proof is derived from is what let a host be excluded before
+		// the query that would have refuted the exclusion.
+		targets, derr := s.membershipDiscoveryTargets(ctx, candidates.names())
+		if derr != nil {
+			return nil, "", derr
 		}
 		var unasked []string
-		for _, h := range set {
+		for _, h := range targets {
 			if !asked[h] {
 				unasked = append(unasked, h)
 			}
 		}
 		if len(unasked) == 0 {
-			// Closed: every eligible participant's view has been read, and
-			// nothing any of them knows of is outside the set.
+			// Closed: every discovery target's view has been read and nothing
+			// any of them knows of is outside the universe, so a role reading
+			// can now be acted on — every host that could refute one has spoken.
+			// THE PROOF SET IS DERIVED HERE AND NOWHERE ELSE.
+			set, perr := s.runtimeProofParticipants(ctx, candidates.all())
+			if perr != nil {
+				return nil, "", perr
+			}
 			return set, "", nil
 		}
 		for _, v := range s.gatherMembershipViews(ctx, unasked) {

@@ -330,11 +330,12 @@ func (s *Server) compareNetBoxClusterName(ctx context.Context) (netboxClusterDis
 // window for a witness whose own row has not replicated yet, on a cluster that
 // has two of them and no worker.
 //
-// The sweeper's participant universe (proofParticipants) excludes
+// The sweeper's RUNTIME-PROOF SET (runtimeProofParticipants) excludes
 // `role='witness'` too, but on its own ground and not this one: a negative proof
 // is about who might be RUNNING the workload holding an address, and a witness
 // hosts none. That reason does not transfer here, so this one is stated in full
-// rather than borrowed.
+// rather than borrowed. Note what the sweeper does NOT exclude a witness from —
+// its membership-discovery fan-out, which asks every host what it knows.
 //
 // Self is never excluded, by state or by role: this node's resolved name is the
 // value the comparison is made FROM, so a set that dropped it would be compared

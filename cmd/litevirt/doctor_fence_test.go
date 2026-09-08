@@ -192,3 +192,60 @@ func TestDoctorFence_CoveredClusterSaysSo(t *testing.T) {
 		t.Errorf("a covered cluster warns anyway; got:\n%s", out)
 	}
 }
+
+// TestDoctorFence_CaveatsPrintOnTheHazardPath pins that the "not established"
+// note survives a WARNING.
+//
+// It used to print only on the clean path, which had the reasoning backwards:
+// the hazard path is where the host table reads most misleadingly. An operator
+// who fixes the one host the remedy names, having never been told the per-host
+// latch is unobservable, believes they closed a hazard that is still open.
+func TestDoctorFence_CaveatsPrintOnTheHazardPath(t *testing.T) {
+	out, code := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: true, EnforcedEverywhere: false, VmsWithSharedDisk: 1,
+		Hosts: []*pb.FenceHostPosture{
+			enforcingHost("kvm001"),
+			{Host: "kvm002", Reachable: true, PostureKnown: true},
+		},
+	})
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(out, "WARNING") {
+		t.Fatalf("fixture is not on the hazard path; got:\n%s", out)
+	}
+	if !strings.Contains(out, "not established by this check") {
+		t.Errorf("the hazard path hides what the check could not establish, which is where "+
+			"an operator is most likely to act on it; got:\n%s", out)
+	}
+}
+
+// TestDoctorFence_UnlatchedEnforcingHostsAreQualified covers the state the
+// report renders most misleadingly, and it is a REACHABLE one — mid-rollout,
+// with every operator having already set the flag.
+//
+// `enforcing` in the host table is a host's config flag; the flag does nothing
+// until the capability latches cluster-wide. So a fleet can print a column of
+// `enforcing` under `capability latched: false` while not one host is fencing
+// anything. Saying only "not latched" leaves the operator to derive that, and
+// the table actively argues the other way.
+func TestDoctorFence_UnlatchedEnforcingHostsAreQualified(t *testing.T) {
+	out, _ := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: false, EnforcedEverywhere: true, VmsWithSharedDisk: 1,
+		Hosts: []*pb.FenceHostPosture{enforcingHost("kvm001"), enforcingHost("kvm002")},
+	})
+	if !strings.Contains(out, "no host is fencing") {
+		t.Errorf("every host reads `enforcing` under an unlatched capability and nothing "+
+			"qualifies it, so the table reads as covered; got:\n%s", out)
+	}
+
+	// The note must not fire once the latch is real: an unconditional version
+	// would tell a covered cluster that nothing is fencing.
+	covered, _ := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: true, EnforcedEverywhere: true, VmsWithSharedDisk: 1,
+		Hosts: []*pb.FenceHostPosture{enforcingHost("kvm001")},
+	})
+	if strings.Contains(covered, "no host is fencing") {
+		t.Errorf("a latched, fully-enforcing cluster is told no host is fencing; got:\n%s", covered)
+	}
+}

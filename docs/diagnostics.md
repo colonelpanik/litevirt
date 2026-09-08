@@ -443,8 +443,11 @@ Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
 
 ### What it does not establish
 
-Printed on every clean run, because these are the two things that would make a
-clean result wrong:
+Printed on **every** run, clean or not. These are the two things that would make
+a clean result wrong, and the host table reads most misleadingly on the warning
+path — a fleet can show a column of `enforcing` above a WARNING, and an operator
+who fixes the one host the remedy names would otherwise never learn that the
+per-host latch is unobservable:
 
 - **Each host's own capability latch.** The latch is per-node state
   (`internal/health.Checker`'s `activated` map plus its marker files) with no
@@ -456,6 +459,13 @@ clean result wrong:
 - **Shared-disk VMs this node has not replicated.** The count comes from the
   queried node's `vm_disks` rows, so a VM created on a peer whose rows have not
   arrived is not counted. A zero is "none that this node knows of".
+
+When `capability latched` is false and any host reads `enforcing`, the report
+says so explicitly: `enforcing` is that host's config flag, and the flag does
+nothing until the capability has latched cluster-wide, so no host is fencing
+whatever the table shows. Without that line a mid-rollout fleet — every operator
+having already set the flag — prints a column of `enforcing` that reads as
+covered.
 
 ## Persisted LWW clock & backward-clock protection
 

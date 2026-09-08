@@ -21,7 +21,8 @@ metrics_port: 7444
 # off on this node). Note that ui_port below defaults to localhost and this
 # does not. Set "127.0.0.1" (scrape via a local exporter / SSH tunnel), or a
 # management-network address, unless every network that can reach the port is
-# trusted. The daemon logs a warning at startup while this is empty.
+# trusted. The daemon warns at startup while this reaches every interface, and
+# also if it is set to a public address. Silence is not a safety claim.
 # See "Metrics endpoint exposure" below.
 metrics_bind: ""
 
@@ -643,9 +644,17 @@ certificate; this endpoint does not.
 
 That default is reasonable on a trusted management network and poor anywhere
 else, and the daemon cannot tell which it is on — so it logs a warning at
-startup whenever `metrics_bind` is empty. It is left as the default because
-changing it would silently break every deployment scraping from a remote
-Prometheus, the way any listener change does.
+startup when the bind reaches every interface, and a differently-worded one when
+it is a **public** address, which is almost never deliberate for an endpoint
+with no authentication. It is left as the default because changing it would
+silently break every deployment scraping from a remote Prometheus, the way any
+listener change does.
+
+**Silence is not a safety claim.** No warning means the bind is neither a
+wildcard nor obviously public — a loopback, RFC1918, CGNAT/tailnet or link-local
+address, or a hostname, which is deliberately not resolved (resolution at startup
+can block and can disagree with what the listener does). Whether the networks
+that can reach it are trusted is not something the daemon can know.
 
 Restrict it one of two ways:
 
@@ -653,6 +662,10 @@ Restrict it one of two ways:
 metrics_bind: "127.0.0.1"      # scrape via a local exporter or an SSH tunnel
 metrics_bind: "10.13.200.5"    # or a management-network address only
 ```
+
+Both IPv6 wildcard spellings work — `"::"` and `"[::]"`. (Before this,
+`metrics_bind: "::"` composed an invalid address, `ListenAndServe` failed, and
+the daemon logged the error and served no metrics at all.)
 
 Firewalling the port is equivalent and does not need a config change. Note that
 `ui_port` already defaults to localhost; this endpoint does not, which is a

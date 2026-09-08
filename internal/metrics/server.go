@@ -2,11 +2,14 @@ package metrics
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,7 +63,9 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", s.bindAddr, s.port),
+		// JoinHostPort, not Sprintf("%s:%d"): an IPv6 literal needs brackets and
+		// must not get them twice. See normalizeBind.
+		Addr:    net.JoinHostPort(normalizeBind(s.bindAddr), strconv.Itoa(s.port)),
 		Handler: mux,
 	}
 
@@ -71,7 +76,70 @@ func (s *Server) Start() {
 	}
 }
 
-// warnIfMetricsWorldReadable says once, at startup, that this endpoint is
+// metricsExposure is how far a metrics_bind value reaches.
+type metricsExposure int
+
+const (
+	// metricsBindRestricted is loopback, an RFC1918 private address, a CGNAT
+	// address (a tailnet), or link-local. Reachable by something, but by a
+	// bounded something the operator chose.
+	metricsBindRestricted metricsExposure = iota
+	// metricsBindWildcard is every interface — the DEFAULT, and the case an
+	// operator most likely did not choose.
+	metricsBindWildcard
+	// metricsBindPublic is a globally routable address. Almost never deliberate
+	// for an endpoint with no authentication.
+	metricsBindPublic
+)
+
+// cgnatV4 is 100.64.0.0/10, RFC 6598 shared address space. netip has no
+// predicate for it and classifies it exactly like 8.8.8.8 — not private, global
+// unicast — but it is where tailnet addresses live, so binding there is a
+// deliberately restricted choice and must not be warned about.
+var cgnatV4 = netip.MustParsePrefix("100.64.0.0/10")
+
+// normalizeBind strips the brackets an operator may write around an IPv6
+// literal, so ONE spelling reaches both the listener and the classifier.
+//
+// This also fixes a bind that could not work: the address was composed with
+// Sprintf("%s:%d"), so metrics_bind "::" produced ":::7444" — "too many colons"
+// — and ListenAndServe failed, silently leaving the node with no metrics
+// endpoint at all, because Start only logs that error. "[::]" worked. Both
+// spellings now normalise to the same host and are joined with
+// net.JoinHostPort, which re-adds the brackets exactly once.
+func normalizeBind(bindAddr string) string {
+	return strings.Trim(bindAddr, "[]")
+}
+
+// classifyMetricsBind decides how far this bind reaches.
+//
+// A hostname is reported RESTRICTED rather than resolved. Resolution at startup
+// can block, can disagree with what the listener later does, and a hostname
+// pointing at a wildcard is rare — while a false warning is one an operator
+// cannot silence, which is how a startup warning becomes one everybody skips.
+// The doc comment on the warning says plainly that silence is not a safety
+// claim, and configuration.md repeats it.
+func classifyMetricsBind(bindAddr string) metricsExposure {
+	host := normalizeBind(bindAddr)
+	if host == "" {
+		return metricsBindWildcard
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return metricsBindRestricted // a hostname — not classified, see above
+	}
+	addr = addr.Unmap()
+	switch {
+	case addr.IsUnspecified():
+		return metricsBindWildcard
+	case addr.IsLoopback(), addr.IsPrivate(), addr.IsLinkLocalUnicast(), cgnatV4.Contains(addr):
+		return metricsBindRestricted
+	default:
+		return metricsBindPublic
+	}
+}
+
+// warnIfMetricsWorldReadable says once, at startup, when this endpoint is
 // reachable from off-box with no credential.
 //
 // It is easy to read `metrics_bind: ""` as a listener detail. It is not: the
@@ -83,21 +151,30 @@ func (s *Server) Start() {
 // endpoint on a trusted management network and a poor one anywhere else, and
 // nothing in the daemon distinguishes the two.
 //
+// SILENCE IS NOT A SAFETY CLAIM. It means the bind is not a wildcard and not
+// obviously public — a private, CGNAT or link-local address, or a hostname this
+// deliberately does not resolve. Whether the networks that can reach it are
+// trusted is not something the daemon can know.
+//
 // The default is deliberately NOT changed to loopback here. A silent flip would
 // break every deployment scraping from a remote Prometheus, and it would break
 // it invisibly — the endpoint would simply stop answering. This repo's
 // convention for a behaviour change is a flag whose default keeps the existing
 // behaviour, so the flag stays and the exposure is stated instead.
 func warnIfMetricsWorldReadable(bindAddr string, port int) {
-	if bindAddr != "" && bindAddr != "0.0.0.0" && bindAddr != "::" {
-		return
+	const what = "it serves VM and container names, host inventory and resource allocations, " +
+		"and litevirt_enforcement_* (which security kill-switches are off on this node)"
+	switch classifyMetricsBind(bindAddr) {
+	case metricsBindWildcard:
+		slog.Warn("metrics endpoint is bound to EVERY interface with NO authentication or TLS: "+
+			what+". Set metrics_bind to 127.0.0.1, or to a management-network address, unless "+
+			"every network that can reach this port is trusted",
+			"port", port, "metrics_bind", bindAddr)
+	case metricsBindPublic:
+		slog.Warn("metrics endpoint is bound to a PUBLIC address with NO authentication or TLS: "+
+			what+". Anyone on the internet who can reach this address can read it",
+			"port", port, "metrics_bind", bindAddr)
 	}
-	slog.Warn("metrics endpoint is reachable from any network with NO authentication or TLS: "+
-		"it serves VM and container names, host inventory and resource allocations, and "+
-		"litevirt_enforcement_* (which security kill-switches are off on this node). "+
-		"Set metrics_bind to 127.0.0.1, or to a management-network address, unless every "+
-		"network that can reach this port is trusted",
-		"port", port, "metrics_bind", bindAddr)
 }
 
 // Stop gracefully shuts down the metrics server.

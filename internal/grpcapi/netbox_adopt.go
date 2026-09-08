@@ -144,7 +144,7 @@ func adoptionRefused(err error) bool {
 // errAdoptionUncorroborated is the sentinel for the one adoption that cannot be
 // performed because litevirt cannot ENUMERATE what needs performing: nothing
 // corroborates that the local VM list is the cluster's, so what it does not name
-// is unknown rather than absent (see corroborateVMInventory).
+// is unknown rather than absent (see corroborateAdoptionInventory).
 //
 // It lives on adoptExistingAddresses rather than on each of the three resume
 // doors, because that function's contract is "adopt EVERY address a guest already
@@ -433,7 +433,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 	// The ONE read this function cannot fail closed on from the read itself.
 	// Recorded on the plan rather than acted on here, because what it costs is
 	// decided by the caller: a bind SUSPENDS, and an adoption that is meant to
-	// finish a suspension REFUSES. See corroborateVMInventory.
+	// finish a suspension REFUSES. See corroborateAdoptionInventory.
 	//
 	// On EVERY bind, not only an empty read. An empty list is the loudest shape
 	// of an unreplicated inventory but not the only one, and it is not even the
@@ -443,7 +443,7 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 	// address to the next VM created there. Gating the check on `len(vms) == 0`
 	// let exactly that through — one unrelated VM was enough to skip it.
 	plan := adoptionPlan{}
-	plan.uncorroborated = !s.corroborateVMInventory(ctx, b)
+	plan.uncorroborated = !s.corroborateAdoptionInventory(ctx, b)
 
 	var cands []adoptCandidate
 	seen := make(map[string]string) // bare address -> the VM already claiming it
@@ -590,54 +590,73 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 	return plan, nil
 }
 
-// corroborateVMInventory decides the one thing planAdoption cannot fail closed
-// on from its own read, and reports whether this node's VM inventory is
-// CORROBORATED as the cluster's.
+// corroborateAdoptionInventory decides the one thing planAdoption cannot fail
+// closed on from its own read, and reports whether this node's inventory of the
+// addresses guests ALREADY hold is CORROBORATED as the cluster's.
 //
-// corrosion.ListVMs answers from local rows alone, and nothing in the schema
-// records how much of the table this node has actually received. So the list it
-// returns is indistinguishable from the cluster's whole list — whether it came
-// back empty on a node hydrating after a database loss, or came back with three
-// VMs on a node that has not yet received the fourth, which is the one holding
-// the address inside the prefix about to be bound.
+// corrosion.ListVMs and the NIC reads beside it answer from local rows alone,
+// and nothing in the schema records how much of a table this node has actually
+// received. So what they return is indistinguishable from the cluster's whole
+// inventory — whether it came back empty on a node hydrating after a database
+// loss, or came back with three VMs on a node that has not yet received the
+// fourth, which is the one holding the address inside the prefix about to be
+// bound.
 //
 // THE SECOND SIGNAL IS THE CLUSTER ITSELF, ASKED. The question goes to the other
-// nodes: does your `vms` table say the same as mine? Every host answers, or
-// nothing is corroborated. That is the orphan sweeper's negative-proof
+// nodes: do your address-bearing tables say the same as mine? Every host agrees,
+// or nothing is corroborated. That is the orphan sweeper's negative-proof
 // discipline applied to a different absence, and it reuses the sweeper's own
-// machinery rather than inventing a second one: proofParticipants for the
-// participant universe (which deliberately keeps offline, fenced and tombstoned
-// hosts in — a host that cannot be reached still HOLDS its rows), dialPeer for
-// the transport, and one bounded timeout each.
+// machinery rather than inventing a second one: closedProofPeers for the
+// participant universe — which deliberately keeps offline, fenced and tombstoned
+// hosts in (a host that cannot be reached still HOLDS its rows) and is CLOSED
+// under peer membership, so a host only a peer knows about is asked too —
+// dialPeer for the transport, and one bounded timeout each.
 //
-// The peer's answer is its `vms` digest from GetStateDigest — an RPC that
-// already exists for anti-entropy, so nothing new goes on the wire — and it is
-// read by exactly the predicate anti-entropy repairs on
-// (corrosion.TableDigestsAgree). The digest covers the whole table, TOMBSTONES
-// INCLUDED, on both sides.
+// The peer's answer is its digest of every table in adoptionInventoryTables,
+// from GetStateDigest: an RPC that already exists for anti-entropy, so nothing
+// new goes on the wire and one call carries them all, read by exactly the
+// predicate anti-entropy repairs on (corrosion.TableDigestsAgree). Each digest
+// covers the whole of its table, TOMBSTONES INCLUDED, on both sides.
+//
+// AGREEMENT, NOT A COUNT RELATIONSHIP. An earlier round of this accepted a peer
+// holding STRICTLY FEWER rows, reasoning that a lagging peer cannot be why our
+// list is short. Fewer rows do not make a subset: a peer holding one incumbent
+// VM and a binder holding two unrelated ones compare as "the peer is behind",
+// and the incumbent's address is then handed to the next VM created there. No
+// relation between two cardinalities means "nothing you hold is missing here",
+// so the only sound reading of a peer that does not AGREE is that this node's
+// inventory is not the cluster's.
+//
+// DROPPING THAT RELAXATION IS AFFORDABLE BECAUSE THE BIND IS CONVERGENT. A bind
+// that cannot corroborate is not refused: it is recorded SUSPENDED under
+// unhydratedSuspendReason, the one class isUnhydratedSuspension lets the
+// periodic revalidation pass lift by ITSELF. So a lagging peer DELAYS a bind, it
+// never fails one, and nobody has to run a command to finish it. That is what
+// buys the strictness — the check can ask for the strongest property rows can
+// support instead of the weakest one that still lets a bind through.
 //
 // FAIL CLOSED at every branch. An unreachable host, a peer that answers without
-// a `vms` entry, an unreadable host table, a peer holding rows we do not — none
-// of them is a corroborated inventory. What that costs is a suspension that
-// lifts itself on the next pass; what fail-open would cost is a live binding
-// over addresses running guests hold.
+// one of the digests, an unreadable local digest, a participant set that cannot
+// be closed, any disagreement — none of them is a corroborated inventory. What
+// that costs is a suspension that lifts itself on the next pass; what fail-open
+// would cost is a live binding over addresses running guests hold.
 //
-// WHAT IT STILL CANNOT SEE: a NIC row whose `vms` row is absent everywhere.
-// Adoption enumerates VMs and then their NICs, so such a NIC is invisible to the
-// adoption this corroborates for — the proof covers exactly the table the
-// consumer reads, and no more.
-func (s *Server) corroborateVMInventory(ctx context.Context, b corrosion.BindingRecord) bool {
-	local, err := s.localTableDigest(ctx, vmsTableName)
+// WHAT IT STILL CANNOT SEE: an inventory that is identical on every host in the
+// closed participant set and wrong on all of them. Agreement across the cluster
+// is the strongest statement replicated rows can support; no proof can invent a
+// row nobody holds.
+func (s *Server) corroborateAdoptionInventory(ctx context.Context, b corrosion.BindingRecord) bool {
+	local, err := s.localTableDigests(ctx, adoptionInventoryTables())
 	if err != nil {
-		slog.Warn("netbox: could not read this node's own VM inventory digest while binding a "+
+		slog.Warn("netbox: could not read this node's own inventory digests while binding a "+
 			"prefix; treating it as uncorroborated",
 			"network", b.Network, "prefix", b.PrefixID, "error", err)
 		return false
 	}
-	proven, why, perr := s.proveNoPeerHoldsVMRowsWeLack(ctx, local)
+	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, local)
 	if perr != nil {
-		slog.Warn("netbox: could not establish whether any peer holds a VM record this node has "+
-			"not received while binding a prefix; treating it as uncorroborated",
+		slog.Warn("netbox: could not establish whether any peer holds an inventory record this "+
+			"node has not received while binding a prefix; treating it as uncorroborated",
 			"network", b.Network, "prefix", b.PrefixID, "error", perr)
 		return false
 	}
@@ -649,7 +668,7 @@ func (s *Server) corroborateVMInventory(ctx context.Context, b corrosion.Binding
 	// EMPTY local table on a multi-node cluster is a node that has replicated
 	// nothing at all, while a populated one that the cluster does not confirm is
 	// a node that is part-way there.
-	if local.Count == 0 {
+	if local[vmsTableName].Count == 0 {
 		slog.Warn("netbox: uncorroborated empty VM inventory — this node's local database holds "+
 			"no VM record of any kind and the cluster could not confirm that it holds none "+
 			"either, which a node that has not finished replicating looks exactly like; a "+
@@ -658,54 +677,81 @@ func (s *Server) corroborateVMInventory(ctx context.Context, b corrosion.Binding
 			"network", b.Network, "prefix", b.PrefixID, "reason", why)
 		return false
 	}
-	slog.Warn("netbox: uncorroborated VM inventory — this node holds VM records but the cluster "+
-		"could not confirm they are ALL of them, and the guests this node has not received are "+
-		"exactly the ones whose addresses would go unadopted; a binding made now is created "+
-		"SUSPENDED and a revalidation pass resumes it once the inventory can be corroborated",
-		"network", b.Network, "prefix", b.PrefixID, "local_vms", local.Count, "reason", why)
+	slog.Warn("netbox: uncorroborated VM inventory — this node holds guest records but the "+
+		"cluster could not confirm they are ALL of them, and the guests this node has not "+
+		"received are exactly the ones whose addresses would go unadopted; a binding made now "+
+		"is created SUSPENDED and a revalidation pass resumes it once the inventory can be "+
+		"corroborated",
+		"network", b.Network, "prefix", b.PrefixID, "local_vms", local[vmsTableName].Count,
+		"reason", why)
 	return false
 }
 
-// proveNoPeerHoldsVMRowsWeLack asks every host in the sweeper's participant
-// universe for its `vms` digest and reports whether NONE of them holds rows this
-// node has not received.
+// adoptionInventoryTables lists every replicated table adoption reads to find an
+// address a guest ALREADY holds. It is the whole of what corroboration has to
+// cover, because a table left OUT is a table whose absent rows corroborate
+// perfectly: identical `vms` tables with the incumbent's NIC rows missing here
+// agreed on the only table an earlier round compared, and the bind went live
+// having seen nothing.
 //
-// The comparison is against THIS NODE'S digest, not against zero. Against zero it
-// proved only emptiness, which made the whole check meaningless the moment the
-// local table held a single unrelated row.
+// DERIVED, not written out a second time. `vms` is the enumeration adoption
+// starts from, and nicClaimTables (netbox_proof.go) is this package's single
+// registry of the tables that record a NIC's MAC and IP — vm_nics and
+// vm_interfaces for the VM side (the v42 hardware model dual-writes them, and a
+// VM created through the plain InsertVM path has only vm_interfaces rows), and
+// container_interfaces for the container side, which is where a subnet-less
+// container's address lives and NOWHERE else. The orphan proof reads exactly
+// that registry, so a table added there is covered here without anybody
+// remembering to — which is the property that was missing while this check
+// covered `vms` alone and the addresses lived on the NIC rows.
 //
-// A peer is accepted in exactly two shapes:
+// ip_allocations is deliberately NOT here, and saying so is part of the set
+// being deliberate: adoption does read it, but only to learn what it has ALREADY
+// accounted for. A lease row this node has not received makes adoption re-adopt
+// an address it already owns — a duplicate NetBox object, which the POST's own
+// conflict-recovery path resolves — and never a collision. The tables above are
+// the ones whose missing rows make a held address INVISIBLE.
+func adoptionInventoryTables() []string {
+	tables := make([]string, 0, len(nicClaimTables)+1)
+	tables = append(tables, vmsTableName)
+	for _, t := range nicClaimTables {
+		tables = append(tables, t.name)
+	}
+	return tables
+}
+
+// proveNoPeerHoldsInventoryRowsWeLack asks every host in the CLOSED participant
+// universe for its digest of each address-bearing table and reports whether they
+// ALL AGREE with this node's.
 //
-//   - It AGREES with us (corrosion.TableDigestsAgree): same count, same content
-//     hash. Nothing it holds is missing here.
-//   - It holds STRICTLY FEWER rows than we do. Replication is additive and this
-//     node is the one enumerating, so a peer that is behind cannot be the reason
-//     our list is short — and refusing on one would refuse every bind on a
-//     cluster where any node is lagging, which is a cluster that has just
-//     restarted a node. The residual it accepts is a peer that holds fewer rows
-//     OVERALL yet still holds one we lack, which needs divergent writes on both
-//     sides of a partition to produce; inside that window every other reader of
-//     this table is wrong too, and the sweeper's own proof is what protects the
-//     addresses.
-//
-// Everything else — more rows than us, or the same count over different content
-// — says our list is not the cluster's, and the bind must not go live on it.
+// One shape is accepted, and only one: corrosion.TableDigestsAgree on every
+// table — same count, same content hash — for every participant. Nothing any of
+// them holds is then missing here. Everything else says our inventory is not the
+// cluster's, and the bind must not go live on it. See
+// corroborateAdoptionInventory for why that strictness is affordable (the bind
+// suspends, and the revalidation pass finishes it) and why no relation between
+// two row counts can replace it.
 //
 // The second return is the operator-facing reason a negative answer is negative
-// — which host, and what it said — because "we could not prove it" with nothing
-// attached is the log line nobody can act on.
+// — which host, which table, and what it said — because "we could not prove it"
+// with nothing attached is the log line nobody can act on.
 //
 // Errors are RETURNED only for the failures that are about this node (no
-// database, an unreadable host table). A peer that cannot be reached is part of
-// the ANSWER, not an error: it is a host whose inventory could not be read, and
-// the proof simply does not hold.
-func (s *Server) proveNoPeerHoldsVMRowsWeLack(ctx context.Context, local corrosion.TableDigest) (bool, string, error) {
+// database, an unreadable host table). A peer that cannot be reached, or a
+// participant set that cannot be closed, is part of the ANSWER, not an error: it
+// is an inventory that could not be read, and the proof simply does not hold.
+func (s *Server) proveNoPeerHoldsInventoryRowsWeLack(ctx context.Context, local map[string]corrosion.TableDigest) (bool, string, error) {
 	if s.db == nil {
 		return false, "", fmt.Errorf("no cluster database")
 	}
-	peers, err := s.proofPeers(ctx)
+	peers, unclosed, err := s.closedProofPeers(ctx)
 	if err != nil {
 		return false, "", err
+	}
+	if unclosed != "" {
+		// The set of hosts that could be holding rows is not even known yet, so
+		// there is nobody for the digests below to have proved anything about.
+		return false, unclosed, nil
 	}
 	if len(peers) == 0 {
 		// This node stands alone, so its local database IS the cluster's. Not a
@@ -714,23 +760,27 @@ func (s *Server) proveNoPeerHoldsVMRowsWeLack(ctx context.Context, local corrosi
 		return true, "", nil
 	}
 
-	answers := s.gatherTableDigests(ctx, peers, vmsTableName)
-	for _, a := range answers {
-		switch {
-		case a.err != nil:
+	tables := adoptionInventoryTables()
+	for _, a := range s.gatherTableDigests(ctx, peers, tables) {
+		if a.err != nil {
 			return false, fmt.Sprintf("host %s could not be asked (%v)", a.host, a.err), nil
-		case !a.found:
-			// An older peer, or one whose digest set does not carry the table.
-			// Silence about `vms` is not a statement that it holds nothing.
-			return false, fmt.Sprintf("host %s reported no %s digest", a.host, vmsTableName), nil
-		case int(a.digest.GetCount()) > local.Count:
-			return false, fmt.Sprintf("host %s holds %d %s row(s) to this node's %d",
-				a.host, a.digest.GetCount(), vmsTableName, local.Count), nil
-		case int(a.digest.GetCount()) == local.Count &&
-			!corrosion.TableDigestsAgree(local, a.digest):
-			return false, fmt.Sprintf(
-				"host %s holds a DIFFERENT set of %d %s row(s) than this node's",
-				a.host, local.Count, vmsTableName), nil
+		}
+		// Walked in adoptionInventoryTables order, so which table a suspension
+		// names does not depend on map iteration: two runs over one divergence
+		// report the same reason.
+		for _, table := range tables {
+			remote, found := a.digests[table]
+			if !found {
+				// An older peer, or one whose digest set does not carry the
+				// table. Silence about a table is not a statement about what it
+				// holds.
+				return false, fmt.Sprintf("host %s reported no %s digest", a.host, table), nil
+			}
+			if !corrosion.TableDigestsAgree(local[table], remote) {
+				return false, fmt.Sprintf(
+					"host %s holds a different set of %s rows than this node (%d there, %d here)",
+					a.host, table, remote.GetCount(), local[table].Count), nil
+			}
 		}
 	}
 	return true, "", nil
@@ -741,37 +791,62 @@ func (s *Server) proveNoPeerHoldsVMRowsWeLack(ctx context.Context, local corrosi
 // comparison are produced by one piece of code rather than by a local row count
 // that would have to be kept in step with it by hand.
 func (s *Server) localTableDigest(ctx context.Context, table string) (corrosion.TableDigest, error) {
+	digests, err := s.localTableDigests(ctx, []string{table})
+	if err != nil {
+		return corrosion.TableDigest{}, err
+	}
+	return digests[table], nil
+}
+
+// localTableDigests reads THIS node's digests for several tables out of ONE
+// StateDigest call, so a proof spanning four tables compares four digests taken
+// from a single read rather than four reads a write could land between.
+//
+// A table this node cannot digest is reported as an ERROR rather than omitted,
+// so every caller fails closed instead of comparing against a zero-valued
+// digest — which would read as "empty, and agreeing with nobody".
+func (s *Server) localTableDigests(ctx context.Context, tables []string) (map[string]corrosion.TableDigest, error) {
 	if s.db == nil {
-		return corrosion.TableDigest{}, fmt.Errorf("no cluster database")
+		return nil, fmt.Errorf("no cluster database")
 	}
 	digests, err := s.db.StateDigest(ctx)
 	if err != nil {
-		return corrosion.TableDigest{}, fmt.Errorf("read local %s digest: %w", table, err)
+		return nil, fmt.Errorf("read local table digests: %w", err)
 	}
+	byName := make(map[string]corrosion.TableDigest, len(digests))
 	for _, d := range digests {
-		if d.Name == table {
-			return d, nil
-		}
+		byName[d.Name] = d
 	}
-	// A table this node cannot digest is one it cannot answer for. Reported as
-	// an error so every caller fails closed rather than comparing against a
-	// zero-valued digest, which would read as "empty and agreeing with nobody".
-	return corrosion.TableDigest{}, fmt.Errorf("this node reported no %s digest", table)
+	out := make(map[string]corrosion.TableDigest, len(tables))
+	for _, t := range tables {
+		d, ok := byName[t]
+		if !ok {
+			return nil, fmt.Errorf("this node reported no %s digest", t)
+		}
+		out[t] = d
+	}
+	return out, nil
 }
 
-// digestAnswer is one participant's reply about one table.
+// digestAnswer is one participant's reply about the tables it was asked for.
 type digestAnswer struct {
-	host   string
-	digest *pb.TableDigest
-	found  bool
-	err    error
+	host string
+	// digests carries ONLY the tables the peer actually reported, so a caller
+	// can tell "it holds no rows" from "it said nothing about that table" —
+	// which are the same number and opposite claims.
+	digests map[string]*pb.TableDigest
+	err     error
 }
 
-// gatherTableDigests asks each peer for its digest of one table, over the
+// gatherTableDigests asks each peer for its digest of several tables, over the
 // bounded worker pool and per-peer timeout the sweeper's proof fan-out already
-// uses. One GetStateDigest carries every table, so a caller needing two of them
-// pays for one round trip.
-func (s *Server) gatherTableDigests(ctx context.Context, peers []string, table string) []digestAnswer {
+// uses. One GetStateDigest carries every table, so asking for four costs one
+// round trip per peer — and all four come from one snapshot of that peer.
+func (s *Server) gatherTableDigests(ctx context.Context, peers []string, tables []string) []digestAnswer {
+	want := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		want[t] = true
+	}
 	answers := make([]digestAnswer, len(peers))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, orphanProofWorkers)
@@ -795,13 +870,13 @@ func (s *Server) gatherTableDigests(ctx context.Context, peers []string, table s
 				answers[i].err = rerr
 				return
 			}
+			got := make(map[string]*pb.TableDigest, len(tables))
 			for _, td := range resp.GetTables() {
-				if td.GetName() == table {
-					answers[i].digest = td
-					answers[i].found = true
-					break
+				if want[td.GetName()] {
+					got[td.GetName()] = td
 				}
 			}
+			answers[i].digests = got
 		}(i, h)
 	}
 	wg.Wait()

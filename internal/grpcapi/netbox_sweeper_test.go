@@ -148,7 +148,7 @@ func TestSweeperGraceIsInertOnANetBox3DateOnlyCreated(t *testing.T) {
 }
 
 // TestSweeperSameHostSetIsOrderSensitiveOnSortedInput pins the membership
-// comparison. Both samples come out of proofParticipants sorted, so a
+// comparison. Both samples come out of closedParticipantSet sorted, so a
 // positional compare is exact — and a set that differs anywhere must not
 // compare equal, because the difference is a host the proof never asked.
 func TestSweeperSameHostSetDetectsEveryDifference(t *testing.T) {

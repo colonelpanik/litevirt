@@ -189,7 +189,7 @@ func (s *Server) validateAndBindPrefix(ctx context.Context, netName string, pref
 		// REFUSAL would refuse the first bind on a young multi-node cluster with
 		// no way out. Suspended is neither: no claim is served, and the
 		// revalidation pass re-runs adoption and resumes it with no operator
-		// action. See corroborateVMInventory.
+		// action. See corroborateAdoptionInventory.
 		suspendReason = unhydratedSuspendReason(netName)
 	case len(pending) > 0:
 		suspendReason = adoptionSuspendReason(netName, len(pending))

@@ -401,16 +401,20 @@ the first address in the prefix is missing from it. Nothing in the schema record
 how much of a table a node has actually received, so no local read can tell the
 difference.
 
-So on **every** bind litevirt asks the cluster: each host reports its `vms`
-digest, and the local list is corroborated only when every host either agrees
-with it (the same rows, by the same comparison anti-entropy repairs on) or holds
-strictly fewer rows — a peer that is behind cannot be the reason this node's list
-is short. That costs one small request per peer.
+So on **every** bind litevirt asks the cluster. Each host reports its digest of
+the four tables an address can be recorded in — `vms`, `vm_nics`,
+`vm_interfaces` and `container_interfaces`; the address itself lives on the NIC
+rows, not in `vms` — and the local inventory is corroborated only when **every**
+host **agrees** on **every** one of them, by the same comparison anti-entropy
+repairs on. That costs one small request per peer. Fewer rows on a peer is not
+agreement: a peer holding one guest while this node holds two unrelated ones is
+not "behind", it is a peer holding a row this node has never seen.
 
 If the inventory **cannot** be corroborated — a host that could not be reached, a
-host that reports more rows than this node has, or one that reports the same
-number of *different* rows — the bind still succeeds, but the binding is created
-**suspended**:
+host that reports different rows in any of those tables (more, fewer, or the same
+number of different ones), a host that says nothing about one of them, or a host
+that some peer knows about and this node has never heard of — the bind still
+succeeds, but the binding is created **suspended**:
 
 ```
 $ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
@@ -430,7 +434,9 @@ from a node that has been up and replicating. `lv health` shows the suspension a
 The suspension is the one thing a bind can do here that is neither wrong: going
 live would make NetBox the authority over addresses running guests already hold,
 and refusing outright would refuse the first bind on any cluster with a peer that
-happens to be down, with no way forward.
+happens to be down, with no way forward. It is also what makes the strict
+comparison affordable — a lagging peer **delays** a bind and never fails one,
+because the pass finishes it as soon as the cluster agrees.
 
 Some states refuse the bind rather than being adopted around, and every refusal
 names the object so it can be dealt with:
@@ -1019,10 +1025,19 @@ so it happens only under a whole-cluster proof:
   making the two samples agree about a cluster neither of them saw whole.
   Membership converges in seconds and independently of every table, so a host it
   names is a host that exists;
-- that view of membership is itself corroborated: every host reports how many
-  `hosts` rows it holds, and a host that knows more of them than the sweeping
-  node does means the sweeping node cannot have asked everyone. Reclamation stops
-  there;
+- that set is then **closed under peer membership**: every participant is asked
+  which hosts *it* knows, the answers are folded in under the same exclusions,
+  and the fan-out repeats until the set stops growing. A holder any reachable
+  node knows about is therefore queried by name, whether or not this node's own
+  `hosts` table ever received its row. A participant that cannot answer, or that
+  answers with no membership view at all, leaves the set unclosed and stops the
+  reclamation. Counting host rows is not enough on its own — two nodes can each
+  know three hosts without knowing the same three;
+- and the count is still compared, for the one thing the closure cannot see: a
+  host row that is *tombstoned* on a peer is filtered out of what that peer
+  reports, yet `lv host rm --force` does not power a machine off. A peer holding
+  more `hosts` rows than the sweeping node — tombstones included — means the
+  sweeping node cannot have asked everyone. Reclamation stops there;
 - **every** eligible host must answer, and answer with a complete scan. One
   unreachable host, one incomplete answer, or a membership change mid-proof and
   the address is left alone;

@@ -62,10 +62,20 @@ func seedPeerHost(t *testing.T, s *Server, name string) {
 type agreeingPeer struct {
 	pb.LiteVirtClient
 	digest func() *pb.StateDigestResponse
+	hosts  func() *pb.ListHostsResponse
 }
 
 func (p *agreeingPeer) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
 	return p.digest(), nil
+}
+
+// ListHosts is the other half of agreeing: the participant-set closure asks each
+// participant which hosts IT knows, and a peer that names the same ones closes
+// the set in a single round. A peer that agreed about every table but could not
+// answer this would still leave the bind suspended — correctly, but for a reason
+// none of these scenarios is about.
+func (p *agreeingPeer) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
+	return p.hosts(), nil
 }
 
 // peerAgreesWithThisNode makes every peer answer with this node's own digest, so
@@ -86,6 +96,12 @@ func peerAgreesWithThisNode(t *testing.T, s *Server) {
 				resp.Tables = append(resp.Tables, &pb.TableDigest{
 					Name: d.Name, Count: int32(d.Count), Hash: d.Hash, HashV2: d.HashV2,
 				})
+			}
+			return resp
+		}, hosts: func() *pb.ListHostsResponse {
+			resp := &pb.ListHostsResponse{}
+			for _, name := range localHostNames(ctx, s) {
+				resp.Hosts = append(resp.Hosts, &pb.Host{Name: name})
 			}
 			return resp
 		}}, func() {}, nil

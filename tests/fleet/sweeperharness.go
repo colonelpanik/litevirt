@@ -159,9 +159,13 @@ func (c *Cluster) AddHostRow(t *testing.T, name string) {
 	ctx := context.Background()
 	for _, n := range c.Nodes {
 		if err := corrosion.InsertHost(ctx, n.DB, corrosion.HostRecord{
-			Name:          name,
-			Address:       "127.0.0.1",
-			GRPCPort:      1, // never dialed: the membership check aborts first
+			Name:    name,
+			Address: "127.0.0.1",
+			// A port nothing listens on. The host joins AFTER the proofs are
+			// gathered, so the second sample is where it shows up — either as a
+			// member the closure cannot reach or as a set that no longer matches
+			// the first. Both abort the reclamation, so it needs no daemon.
+			GRPCPort:      1,
 			SSHUser:       "root",
 			SSHPort:       22,
 			State:         "active",

@@ -64,10 +64,13 @@ func TestFleetSweepDoesNotFreeAnAddressAHostMissingFromTheHostTableHolds(t *test
 // is still SHORT: the peer knows about a third host this node has never received
 // a row for, and that host was therefore never asked. A host in neither the
 // local table nor gossip is invisible to both, so the only thing that can reveal
-// it is a peer saying it knows more hosts than we do.
+// it is a peer — either reporting more `hosts` rows than we hold, or naming the
+// host outright when the participant-set closure asks which hosts it knows.
 //
-// The third host is never dialled — the membership check aborts the reclamation
-// before any proof is gathered — so it needs no daemon.
+// The third host has no daemon, and either route to the refusal is correct: the
+// digest count leaves the view uncorroborated before anything is dialled, and
+// the closure adds "unseen" to the set and then cannot reach it. Both are the
+// fail-closed direction, and what this pins is that the address survives.
 func TestFleetSweepStopsWhenAPeerKnowsAHostThisNodeDoesNot(t *testing.T) {
 	nb, c := boundClusterWithOrphan(t, 2)
 
@@ -191,7 +194,19 @@ func TestFleetAPartiallyHydratedBindIsSuspendedUnderTheSelfLiftingReason(t *test
 
 	// …and it converges, with nobody running a command: the rows arrive over the
 	// production repair path and one pass adopts the address and resumes.
-	binder.DB.MergeStateBytesLWW(pullDump(t, c, holder))
+	//
+	// BOTH directions, because that is what anti-entropy does and what
+	// corroboration now asks for. Each node pulls from every peer, so the guest
+	// this binder never received arrives here AND the binder's own guest — which
+	// the holder has never received either — arrives there. A one-way pull
+	// leaves the two `vms` tables still different, which is not a converged
+	// cluster and must not corroborate as one: the earlier rule that read "the
+	// peer holds fewer rows, so it is merely behind" is exactly the arithmetic
+	// that handed an incumbent's address away.
+	holderDump := pullDump(t, c, holder)
+	binderDump := pullDump(t, c, binder)
+	binder.DB.MergeStateBytesLWW(holderDump)
+	holder.DB.MergeStateBytesLWW(binderDump)
 	if err := binder.Server.RevalidateBindingsOnce(ctx); err != nil {
 		t.Fatalf("RevalidateBindingsOnce: %v", err)
 	}

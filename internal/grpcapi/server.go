@@ -49,6 +49,17 @@ type Server struct {
 	invCacheAt time.Time
 	pkiDir     string
 	db         *corrosion.Client
+
+	// dualRunLeaseTerm is the fencing term of the dual-run detector's current
+	// lease incarnation, 0 when this node does not hold it. Recorded for
+	// observability only: the detector is alert-only and destroys nothing, so
+	// there is no protected write here to fence.
+	//
+	// Atomic because Server is shared across every gRPC handler goroutine; the
+	// detector loop is the only writer today, but an unguarded mutable field on
+	// this struct is a race waiting for its first reader.
+	dualRunLeaseTerm atomic.Int64
+
 	virt       LibvirtBackend
 	images     *image.Store
 	events     *events.Bus

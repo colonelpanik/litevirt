@@ -216,5 +216,25 @@ func HistoricalShapes() []HistoricalShape {
 	add(`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
 		        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`, "complete_vm_start_pre_epoch_v47")
 
+	// The failover coordinator's lease upsert with the key as a LITERAL. Every
+	// release on this line emitted it unchanged from the initial commit through
+	// schema v50; at v51 all three lease consumers moved to the shared
+	// corrosion.AcquireLeaseWithTerm, which BINDS the key, so the literal form
+	// now has no emitter in this tree — but a prior-release coordinator still
+	// emits it on every poll cycle, and a receiver that stopped recognising it
+	// would back-pressure that peer's whole replication stream.
+	//
+	// The other two consumers (rebalancer, dual-run detector) already bound the
+	// key, so their shape is the one the shared helper matched and stays live in
+	// the generated ledger. This entry is the coordinator's alone.
+	add(`INSERT INTO leader_election (key, holder, expires_at, updated_at)
+		 VALUES ('failover', ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE
+		   SET holder = excluded.holder,
+		       expires_at = excluded.expires_at,
+		       updated_at = excluded.updated_at
+		   WHERE leader_election.expires_at < ?
+		      OR leader_election.holder = excluded.holder`, "failover_lease_literal_key_v50")
+
 	return out
 }

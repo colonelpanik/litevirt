@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -87,6 +88,17 @@ type Rebalancer struct {
 
 	// Lease handle: rebalancer must hold this lease to act.
 	LeaseKey string
+
+	// leaseTerm is the fencing term of the lease incarnation this rebalancer
+	// currently holds, 0 when it holds none. Phase 1 records it; nothing
+	// enforces on it yet.
+	//
+	// Atomic because it has TWO concurrent writers, not as a precaution:
+	// HoldsLease is called both by this rebalancer's own loop and by the
+	// separate rebalance-executor loop (grpcapi/rebalance_executor.go), which is
+	// the whole reason HoldsLease is exported. A plain int64 assigned from both
+	// would be a data race.
+	leaseTerm atomic.Int64
 
 	// Now is the time source for lease TTL + proposal-expiry +
 	// audit-row timestamps. Defaults to time.Now; fleet scenarios
@@ -655,32 +667,32 @@ func (r *Rebalancer) HoldsLease(ctx context.Context) bool {
 // acquireLease returns true if this rebalancer holds the leader lease.
 // Reuses the same leader_election table as the failover coordinator (Phase
 // -1) but with a distinct key so the two coordinators run independently.
+//
+// The upsert, its read-back, and the RFC3339-vs-RFC3339 expiry compare now live
+// in corrosion.AcquireLeaseWithTerm, shared with the failover coordinator and
+// the dual-run detector. The 2*PollInterval TTL and r.now() stay this
+// rebalancer's own: the TTL sets how long a dead leader blocks takeover, and
+// r.now() is the virtual clock fleet scenarios override.
 func (r *Rebalancer) acquireLease(ctx context.Context) bool {
-	now := r.now().UTC().Format(time.RFC3339)
-	expires := r.now().Add(2 * r.PollInterval).UTC().Format(time.RFC3339)
-	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
-	// otherwise a dead rebalancer-leader's same-day lease never looks expired and
-	// no peer can take over until the UTC date rolls.
-	if err := r.db.Execute(ctx,
-		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(key) DO UPDATE
-		   SET holder = excluded.holder,
-		       expires_at = excluded.expires_at,
-		       updated_at = excluded.updated_at
-		   WHERE leader_election.expires_at < ?
-		      OR leader_election.holder = excluded.holder`,
-		r.LeaseKey, r.hostName, expires, now, now); err != nil {
+	held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, r.db, r.LeaseKey, r.hostName, 2*r.PollInterval, r.now())
+	if err != nil {
 		slog.Warn("rebalancer: lease write", "error", err)
+		r.leaseTerm.Store(0)
 		return false
 	}
-	rows, err := r.db.Query(ctx,
-		`SELECT holder FROM leader_election WHERE key = ?`, r.LeaseKey)
-	if err != nil || len(rows) == 0 {
+	if !held {
+		r.leaseTerm.Store(0)
 		return false
 	}
-	return rows[0].String("holder") == r.hostName
+	r.leaseTerm.Store(term)
+	return true
 }
+
+// LeaseTerm is the fencing term of the lease incarnation this rebalancer holds,
+// 0 when it holds none. Exported for the Phase-2 enforcement path and for tests;
+// nothing enforces on it yet.
+func (r *Rebalancer) LeaseTerm() int64 { return r.leaseTerm.Load() }
 
 // cloneSnapshot makes a shallow-but-mutation-safe copy of the maps the
 // rebalancer manipulates (CPUUsed, MemUsed, VMCount, VMHost).

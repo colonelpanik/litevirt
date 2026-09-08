@@ -231,7 +231,7 @@ func TestMintLeaseTerm_ReacquisitionNeverReusesAnOwnedTerm(t *testing.T) {
 		t.Fatalf("re-acquire: %v", err)
 	}
 	if term == 1 {
-		t.Fatalf("a NEW acquisition returned the holder's OWN OLD term 1 as success. No new "+
+		t.Fatalf("a NEW acquisition returned the holder's OWN OLD term 1 as success. No new " +
 			"incarnation was recorded, so every proof this leader stamps carries a term it " +
 			"held in a previous incarnation")
 	}

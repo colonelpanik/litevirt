@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -49,6 +50,10 @@ const (
 	// while this node is still demonstrably the leader, leaving room for the
 	// post-fence re-check to read the lease row before it expires.
 	leaseFenceMargin = 5 * time.Second
+	// failoverLeaseKey is this coordinator's row in leader_election. Named once
+	// so the acquire and the three read sites cannot drift apart; it used to be
+	// a bare 'failover' literal repeated in each of them.
+	failoverLeaseKey = "failover"
 	// healthFreshness is the maximum age of a host_health row that may count
 	// toward fencing quorum. Stale rows from dead observers must not fence
 	// hosts they last saw failing days ago.
@@ -106,6 +111,16 @@ type Coordinator struct {
 	fencer   Fencer
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
+	// leaseTerm is the fencing term of the lease incarnation this coordinator
+	// currently holds, 0 when it holds none. Recorded here in Phase 1 and read by
+	// the Phase-2 enforcement path; nothing enforces on it yet.
+	//
+	// Atomic because Phase 2 adds readers outside the poll loop. Today every
+	// access is on the single poll goroutine (acquireLease is reached only from
+	// the poll cycle and from holdLease within it), so the atomic is
+	// future-proofing rather than a fix for a live race — unlike the
+	// rebalancer's, which has two concurrent callers.
+	leaseTerm atomic.Int64
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -605,54 +620,39 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 //  2. Re-reading after the write and refusing to act if the holder changed.
 //  3. Re-validating before every destructive call (holdLease).
 //  4. Renewing well before expiry (leaseRenewBefore head-room).
+//
+// The guarded upsert, its read-back, and the same-day expiry-compare fix now
+// live in corrosion.AcquireLeaseWithTerm, shared with the rebalancer and the
+// dual-run detector. leaseDuration and c.now() stay this coordinator's own:
+// c.now() is the virtual clock the fleet harness overrides, and passing
+// time.Now() instead would make its scenarios unable to advance past lease
+// expiry without sleeping.
 func (c *Coordinator) acquireLease(ctx context.Context) bool {
-	now := c.now().UTC()
-	nowRFC := now.Format(time.RFC3339)
-	expiresAt := now.Add(leaseDuration).Format(time.RFC3339)
-	// The expired-check compares against a bound RFC3339 `now` (?), NOT
-	// datetime('now'): expires_at is stored RFC3339 ("…T…Z") and datetime('now')
-	// yields space-separated text, so a string compare breaks once the date
-	// matches ('T' > ' ') — a same-day lease NEVER looked expired, so a dead
-	// leader's lease could never transfer to another host (failover stalls
-	// cluster-wide until the UTC date rolls over). Same format on both sides
-	// fixes the compare; using c.now() also keeps virtual-time tests correct.
-	if err := c.db.Execute(ctx,
-		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
-		 VALUES ('failover', ?, ?, ?)
-		 ON CONFLICT(key) DO UPDATE
-		   SET holder = excluded.holder,
-		       expires_at = excluded.expires_at,
-		       updated_at = excluded.updated_at
-		   WHERE leader_election.expires_at < ?
-		      OR leader_election.holder = excluded.holder`,
-		c.hostName, expiresAt, nowRFC, nowRFC); err != nil {
+	held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
+	if err != nil {
+		// Covers both former error outcomes — the write failing and the
+		// read-back failing — which reported this same metric triple.
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
 		return false
 	}
-
-	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
-	if err != nil {
-		slog.Error("failover: lease read", "error", err)
-		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		return false
-	}
-	if len(rows) == 0 {
-		// Write succeeded but read returned nothing — abort cycle.
-		slog.Warn("failover: lease row missing after write")
-		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		return false
-	}
-	holder := rows[0].String("holder")
-	if holder != c.hostName {
+	if !held {
 		// Another coordinator holds it — the normal non-leader case.
+		c.leaseTerm.Store(0)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false
 	}
+	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true
 }
+
+// LeaseTerm is the fencing term of the lease incarnation this coordinator holds,
+// 0 when it holds none. Exported for the Phase-2 enforcement path and for tests;
+// nothing enforces on it yet.
+func (c *Coordinator) LeaseTerm() int64 { return c.leaseTerm.Load() }
 
 // holdLease re-validates that we still hold the failover lease and that the
 // remaining TTL is at least leaseRenewBefore. Renews if low. Returns false if
@@ -694,7 +694,7 @@ func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) 
 // node cannot prove it is the leader.
 func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) {
 	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
 	if err != nil || len(rows) == 0 {
 		return 0, false
 	}
@@ -713,7 +713,7 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 // snapshot (holder + expires_at), matching the plan's honest trust model.
 func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt string) {
 	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
 	if err != nil || len(rows) == 0 {
 		// An honesty record must not FABRICATE a holder on a read error — reporting self
 		// would falsely assert this node held the lease. Return empty (unknown).

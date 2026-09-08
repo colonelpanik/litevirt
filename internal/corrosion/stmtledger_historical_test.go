@@ -60,7 +60,16 @@ import (
 // shapes are receive-only on this integration line and were added as the
 // quota_reservations_upstream_v44 family. No previously accepted historical
 // identity was removed or changed.
-const compatibilityDigest = "23dbf172dc6f828aebf4cd8815412923e6852e685e9f95e2ad336e65eef75c73"
+//
+// Updated at schema v51, when the three leader_election consumers moved to the
+// shared corrosion.AcquireLeaseWithTerm. That helper BINDS the lease key; the
+// failover coordinator's own upsert had it as a literal, so its shape lost its
+// only emitter in this tree while a prior-release coordinator still emits it on
+// every poll cycle. It was ADDED as failover_lease_literal_key_v50 (receive-only)
+// rather than dropped — deleting it would have back-pressured that peer's whole
+// replication stream. No previously accepted historical identity was removed or
+// changed.
+const compatibilityDigest = "a67cbca8ff42d5f81821a125a453731f378d40f64799e3d06c038b3b6f8f7967"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -121,6 +130,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
 	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
 	"complete_vm_start_pre_epoch_v47":       1,   // reschedule completion before the Phase 4 owner-epoch mint
+	"failover_lease_literal_key_v50":        1,   // coordinator lease upsert with the key as a literal, before the shared bound-key helper
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

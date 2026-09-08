@@ -557,7 +557,7 @@ func TestAnUnreachableHostBlocksTheClosureWhateverItsFenceRecord(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+			closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 			if err != nil {
 				t.Fatalf("a host that cannot answer is part of the answer, not an error: %v", err)
 			}
@@ -577,7 +577,7 @@ func TestAnUnreachableHostBlocksTheClosureWhateverItsFenceRecord(t *testing.T) {
 				s.db.NowWall()); err != nil {
 				t.Fatalf("write fence confirmation: %v", err)
 			}
-			closed, _, unclosed, err = s.closedRuntimeProofSet(ctx)
+			closed, unclosed, err = s.closedRuntimeProofSet(ctx)
 			if err != nil {
 				t.Fatalf("an unreadable answer is not this node's error: %v", err)
 			}
@@ -620,55 +620,32 @@ func TestAnUnreachableHostBlocksTheClosureWhateverItsFenceRecord(t *testing.T) {
 func TestTheClosureRefusesToReturnAHostItNeverAsked(t *testing.T) {
 	s := newAdoptTestServer(t)
 	asked := map[string]bool{s.hostName: true, "answered": true}
-	// Nothing retired: the ordinary cluster, and the state every case below
-	// except the last one runs in.
-	var none membershipRetirements
 
 	if why := s.participantsThatNeverAnswered(participantSets{
 		corroborating: []string{s.hostName, "answered"},
 		runtime:       []string{s.hostName, "answered"},
-	}, asked, none); why != "" {
+	}, asked); why != "" {
 		t.Fatalf("every participant answered, so the gate must pass: %q", why)
 	}
 
+	// AN ANSWER IS THE ONLY THING THE GATE ACCEPTS. It takes the sets and the
+	// asked-map and nothing else, so there is no third argument through which a
+	// grant, manifest or attestation could account for a participant that never
+	// spoke. A prerelease permanent-loss exception was exactly such an argument;
+	// this loop is the refusal it had an exception for, with no exception left.
 	for _, sets := range []participantSets{
 		{corroborating: []string{s.hostName, "answered", "never-asked"},
 			runtime: []string{s.hostName, "answered"}},
 		{corroborating: []string{s.hostName, "answered"},
 			runtime: []string{s.hostName, "answered", "never-asked"}},
 	} {
-		why := s.participantsThatNeverAnswered(sets, asked, none)
+		why := s.participantsThatNeverAnswered(sets, asked)
 		if why == "" {
 			t.Fatalf("a participant whose membership view was never read must leave the set "+
 				"unclosed: %+v", sets)
 		}
 		if !strings.Contains(why, "never-asked") {
 			t.Fatalf("the reason must name the host an operator has to look at: %q", why)
-		}
-	}
-
-	// A MEMBERSHIP-RETIRED host is the ONE other thing the gate accepts in place
-	// of an answer, and it is accepted because the gate's subject is whether the
-	// premise was MET rather than whether an RPC happened. For a permanently
-	// lost machine the accounting is its manifest — an operator's assertion, not
-	// a machine's, which is the whole of the trust boundary here — and the
-	// identities it named are already in the universe these sets came from.
-	//
-	// Without this the recovery path would be self-defeating: the closure would
-	// skip dialling the retired host and then refuse its own answer on the
-	// grounds that it had not been dialled.
-	retired := membershipRetirements{"never-asked": corrosion.HostRetirement{
-		HostIncarnation: "an-incarnation", Premise: corrosion.PremiseMembership,
-	}}
-	for _, sets := range []participantSets{
-		{corroborating: []string{s.hostName, "answered", "never-asked"},
-			runtime: []string{s.hostName, "answered"}},
-		{corroborating: []string{s.hostName, "answered"},
-			runtime: []string{s.hostName, "answered", "never-asked"}},
-	} {
-		if why := s.participantsThatNeverAnswered(sets, asked, retired); why != "" {
-			t.Fatalf("a host whose MEMBERSHIP premise is retired has been accounted for and "+
-				"must not be reported as unanswered: %q", why)
 		}
 	}
 }
@@ -770,7 +747,7 @@ func TestTheClosureRefusesAPeerThatRejoinedBetweenTwoReachabilitySamples(t *test
 	g := &flippingReachabilityGate{}
 	s.gate = g
 
-	set, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	set, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatalf("a host that cannot answer is part of the answer, not an error: %v", err)
 	}
@@ -847,7 +824,7 @@ func TestTheClosureBoundHoldsWithWitnessesInTheFanOut(t *testing.T) {
 			&pb.MembershipHost{Name: fmt.Sprintf("witness-%d", n), Role: "witness"}), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("a growing set is part of the answer, not an error: %v", err)
 	}

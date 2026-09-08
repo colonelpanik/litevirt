@@ -760,6 +760,16 @@ func adoptionInventoryTables() []string {
 // database, an unreadable host table). A peer that cannot be reached, or a
 // participant set that cannot be closed, is part of the ANSWER, not an error: it
 // is an inventory that could not be read, and the proof simply does not hold.
+//
+// MACHINE EVIDENCE IS THE ONLY WAY TO SATISFY THIS PREMISE. There is no grant,
+// manifest or attestation an operator can record that excuses a participant from
+// producing its digest — a prerelease permanent-loss exception did exactly that
+// and was removed. The consequence is a real, documented limitation rather than
+// an oversight: a PERMANENTLY lost host can never produce a digest, so a bind or
+// adoption that needs one keeps withholding indefinitely and there is currently
+// no operator remedy. See docs/networking.md ("Permanent host loss") and the
+// frozen recovery contract in
+// docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md.
 func (s *Server) proveNoPeerHoldsInventoryRowsWeLack(ctx context.Context, local map[string]corrosion.TableDigest) (bool, string, error) {
 	if s.db == nil {
 		return false, "", fmt.Errorf("no cluster database")
@@ -772,43 +782,6 @@ func (s *Server) proveNoPeerHoldsInventoryRowsWeLack(ctx context.Context, local 
 		// The set of hosts that could be holding rows is not even known yet, so
 		// there is nobody for the digests below to have proved anything about.
 		return false, unclosed, nil
-	}
-	// THE INVENTORY PREMISE'S OWN RETIREMENTS, and the only place they are read.
-	//
-	// A permanently lost host cannot produce a digest, so without this the bind
-	// stays suspended forever exactly as it did before the recovery path existed.
-	// What excuses it here is an INVENTORY retirement and nothing else: a
-	// MEMBERSHIP retirement is invisible to this call, because
-	// inventoryRetirementsFor queries on the inventory premise and returns a
-	// type the membership resolver cannot produce.
-	//
-	// THAT SEPARATION IS THE ROUND-FIVE FINDING, REACHED THROUGH THE RECOVERY
-	// PATH. A lost machine's unique VM and NIC rows are precisely what this
-	// comparison exists to notice — they are the rows whose absence makes a held
-	// address invisible — so "we have recovered the list of hosts it knew about"
-	// is not evidence about them. Letting membership excuse this would hand the
-	// incumbent's live address to the next guest created, which is the collision
-	// this branch has already fixed once from the other side.
-	//
-	// What an inventory retirement asserts is that the lost host's unique
-	// address-bearing records have been recovered or independently accounted
-	// for. litevirt cannot check that. See internal/grpcapi/netbox_retirement.go
-	// for the trust boundary; it is a human premise, and an audit row does not
-	// make it true.
-	retired, rerr := s.inventoryRetirementsFor(ctx, peers)
-	if rerr != nil {
-		// Fail closed, and as an ERROR rather than a negative answer: this is a
-		// read of THIS node's own database, so it is about this node.
-		return false, "", rerr
-	}
-	if len(retired) > 0 {
-		remaining := make([]string, 0, len(peers))
-		for _, h := range peers {
-			if !retired.retired(h) {
-				remaining = append(remaining, h)
-			}
-		}
-		peers = remaining
 	}
 	if len(peers) == 0 {
 		// This node stands alone, so its local database IS the cluster's. Not a

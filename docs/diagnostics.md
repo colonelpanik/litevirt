@@ -688,35 +688,3 @@ The three-pass threshold is deliberately per-process state held by the lease
 holder: a daemon restart or a lease handover re-arms it, and three fresh passes
 re-raise the finding. Forgetting is the safe direction for a warning whose whole
 claim is "this has been stuck for a while".
-
-### A premise resting on an operator attestation
-
-`lv netbox retire-host` records that a host is permanently lost and retires the
-premises it can no longer answer for. It is the one premise in this subsystem
-that no machine verifies: it substitutes the operator's judgement for evidence a
-destroyed machine cannot produce, and **litevirt cannot check what was
-attested**. Recording it — attributed, audited, replicated, immutable — makes it
-reviewable and makes a wrong one traceable; it **does not make it true**. The
-two rows below make that substitution visible; they establish nothing about the
-attested facts and are not a substitute for reviewing them (`lv netbox
-retirements`). If a review finds one wrong, `lv netbox withdraw-retirement`
-removes trust in it — durably, and with no prerequisites, because withdrawing
-only ever puts a premise back to being owed. That records that trust was
-withdrawn; it does not establish what was true either.
-
-Every other premise here degrades loudly when it stops being provable: a peer
-that will not answer leaves the membership closure open, a digest that disagrees
-suspends the bind. A retirement degrades **silently**, by design — the proof
-completes and nothing refuses — so it gets a standing surface rather than a
-transition somebody had to be watching for.
-
-**Neither row gates anything** — no allocation, no quorum, no execution path —
-and neither is a fault report. `netbox_premise_attested` is **info** severity,
-so it does not show as DEGRADED and `lv health` keeps exiting 0 while it stands;
-a grant can be in force for months, and an amber cluster for all of it would
-train an operator to ignore the exit code.
-
-| Code | Subject | Raised when | Clears when |
-|---|---|---|---|
-| `netbox_premise_attested` | the host **incarnation** (its recorded certificate serial, never the reusable hostname — two machines that answered to one name must not share a row) | A retirement is **in force**: revalidated on this pass and currently supplying a premise. The evidence names the retirement and the incarnation it applies to, which premises it supplies right now (`membership`, `inventory`, or both — a membership-only grant never reads as supplying inventory), the recovery manifest it rests on, who attested it and when, and how to review it. **It is not evidence that the machine is powered off** and cannot become any: excluding a runtime still requires fencing evidence (`lv host fence-confirm`), which this grant does not supply. Only grants validated *now* appear — a revoked, superseded or invalidated one is not shown at all, because a grant that has stopped applying authorises nothing and showing it invites reasoning about an exception that is not there. | Two consecutive sweeps in which the grant is no longer in force — trust in it was **withdrawn**, a different machine was admitted under that name, the host record went away, or the host answered again. Only the first is durable: the others are re-derived from live state on every pass, so a grant that stopped applying because its host answered is dormant rather than ended and comes back if that machine goes unreachable again. A pass that could not *establish* the answer is not a clean pass and clears nothing. |
-| `netbox_attestation_unvalidatable` | `netbox` (cluster) | A recorded retirement's validity **could not be established** this pass — the cluster fingerprint, the retirement rows or the host record could not be read. Reported separately from the row above, never folded into it, because it means the opposite thing: an attestation that cannot be revalidated **supplies no premise**, so reclamation and bind/adoption keep withholding rather than proceeding. The evidence names what could not be read and the affected incarnations. This says nothing about whether what was attested is true; litevirt cannot check that either. | Two consecutive sweeps that revalidate every recorded retirement. |

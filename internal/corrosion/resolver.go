@@ -475,18 +475,6 @@ var capabilityMap = map[string]tableResolver{
 	// the mirror on a value the owning node is the only writer of, which is a
 	// worse answer than picking one of two values that node itself produced.
 	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
-	// v51 permanent-loss recovery. Both are append-only, so the apply path never
-	// LWW-gates them and a tie is only reachable through anti-entropy's row
-	// merge. The keys carry everything that identifies the assertion — a
-	// manifest's random id, and a retirement's (fingerprint, incarnation,
-	// premise) — so two rows under one key are the same assertion written twice
-	// and the default chain settles it.
-	"netbox_recovery_manifests": {category: "content", chain: contentDefaultChain()},
-	"netbox_host_retirements":   {category: "content", chain: contentDefaultChain()},
-	// Same shape, and the key carries the whole assertion: (fingerprint,
-	// incarnation, premise, manifest id) is one withdrawal of trust in one grant
-	// version, so two rows under one key are the same withdrawal written twice.
-	"netbox_retirement_withdrawals": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

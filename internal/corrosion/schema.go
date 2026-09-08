@@ -340,22 +340,19 @@ import (
 //	     that to). Also ip_allocations.netbox_ip_id / netbox_prefix_id — the
 //	     join keys linking a lease back to its NetBox IP/prefix — and
 //	     netbox_bindings.netbox_cluster, the cluster name the first bind pinned.
-//	     Plus the permanent-loss recovery path: netbox_recovery_manifests (the
-//	     immutable record of what an OPERATOR established about a permanently
-//	     lost host — append-only, so superseding one is a new record and the
-//	     trail shows what was attested when) and netbox_host_retirements (the
-//	     narrow per-host, PER-PREMISE grant that substitutes that human-
-//	     established evidence for the machine evidence the lost host can no
-//	     longer produce; PK (cluster_fingerprint, host_incarnation, premise), so
-//	     it can never widen into a cluster-wide "membership is complete"
-//	     switch) and netbox_retirement_withdrawals (the operator's withdrawal of
-//	     trust in ONE GRANT VERSION — PK (cluster_fingerprint, host_incarnation,
-//	     premise, manifest_id), where the manifest id IS the grant version, so a
-//	     withdrawal cannot reach a version attested after it and a replayed old
-//	     grant stays withdrawn; a separate append-only table rather than a
-//	     revocation column, because the grant is the operator's original
-//	     assertion and withdrawal is an addition to the record, not an edit).
-//	     Seven new tables + three ADD COLUMNs.
+//	     Four new tables + three ADD COLUMNs.
+//
+//	     There is deliberately NO table here for recovering from a permanent
+//	     host loss. Three prerelease v51 tables (netbox_recovery_manifests,
+//	     netbox_host_retirements, netbox_retirement_withdrawals) carried an
+//	     operator-attested substitute for machine evidence; they were removed
+//	     before release, together with the RPC and CLI surface that wrote them,
+//	     so every premise in this subsystem is machine-verified again. The
+//	     recovery lifecycle is specified in
+//	     docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md and will
+//	     arrive under its own schema version. A database that ran those
+//	     prerelease commits is healed on startup — see
+//	     healPrereleaseTrustTables in netbox_prerelease_trust.go.
 const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -461,6 +458,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// the v32 columns + recovery_code_sets are guaranteed present.
 	if err := applyV32DataFixes(ctx, c, now); err != nil {
 		return fmt.Errorf("schema init: v32 data fixes: %w", err)
+	}
+
+	// The prerelease permanent-loss trust tables, if this database ever carried
+	// them: every live binding is suspended pending re-proof and the tables are
+	// dropped. LOCAL-only and idempotent, for the reasons in
+	// netbox_prerelease_trust.go. It is an ERROR rather than a warning — coming
+	// up with a binding that may hold authority a removed mechanism granted is
+	// exactly what must not happen quietly.
+	if err := healPrereleaseTrustTables(ctx, c, now); err != nil {
+		return fmt.Errorf("schema init: prerelease trust removal: %w", err)
 	}
 
 	for _, idx := range schemaIndexes {
@@ -2206,151 +2213,6 @@ var schemaDDL = []string{
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT
 	)`,
-
-	// ═══════════ PERMANENT HOST LOSS: THE RECOVERY MANIFEST (v51) ═══════════
-	//
-	// THIS IS THE ONE PLACE IN THIS SUBSYSTEM WHERE THE PREMISE IS NOT MACHINE-
-	// VERIFIED. Every other premise the NetBox proofs rest on is read off the
-	// cluster itself: a peer's own membership view, a peer's own table digest, a
-	// runtime scan of a peer's libvirt. A row here is a HUMAN ASSERTION that
-	// stands in for evidence a permanently lost machine can no longer produce,
-	// and litevirt cannot check it. Recording it — signed, audited, replicated —
-	// makes it ATTRIBUTABLE and REVIEWABLE. It does not make it TRUE.
-	//
-	// APPEND-ONLY (see appendOnlyTables). A manifest is a record of what was
-	// attested at a moment, not a mutable row: superseding one is a NEW row, so
-	// the trail shows what was believed when. It is also why the read side takes
-	// the UNION of every manifest for an incarnation — a later record can only
-	// ever ADD host identities to discovery, never narrow it, so superseding is
-	// monotone in the safe direction.
-	`CREATE TABLE IF NOT EXISTS netbox_recovery_manifests (
-		id                  TEXT PRIMARY KEY,
-		-- WHICH CLUSTER. A retirement is scoped by the cluster identity the
-		-- NetBox objects are stamped with, so a manifest restored into another
-		-- installation excuses nothing there.
-		cluster_fingerprint TEXT NOT NULL,
-		-- The lost machine's hostname. RECORD ONLY, never the identity: a
-		-- hostname is reusable and a re-admitted machine answering to it is a
-		-- DIFFERENT incarnation. Matching is on host_incarnation.
-		host_name           TEXT NOT NULL,
-		-- WHICH INCARNATION: the hosts.cert_serial recorded for that machine.
-		-- AdmitHost refuses to re-admit a name with the certificate it was
-		-- removed under, so a machine re-admitted under the same hostname
-		-- necessarily presents a different serial — which is exactly the
-		-- property "not a reusable hostname" needs. See RecoveryManifest.
-		host_incarnation    TEXT NOT NULL,
-		-- WHICH PREMISE this accounting is for: 'membership' or 'inventory'.
-		-- They are separate premises and separate rows, because they excuse
-		-- different obligations and one is not evidence for the other.
-		premise             TEXT NOT NULL,
-		-- The accounting itself, newline-separated.
-		--
-		-- For 'membership': the host identities the lost machine knew about.
-		-- These stay INPUTS TO DISCOVERY — retiring the source retires the
-		-- obligation to ask THAT host, never the hosts it could have named — and
-		-- they are folded in as bare NAMES, never as role readings. An operator's
-		-- recollection of a role must not be able to excuse a host from a runtime
-		-- scan; naming a host can only ever cause it to be ASKED.
-		--
-		-- For 'inventory': what was established about the lost machine's unique
-		-- address-bearing records. NOT machine-checked, and deliberately not
-		-- parsed: it is the operator's account, kept for the audit trail.
-		accounting          TEXT NOT NULL,
-		attested_by         TEXT NOT NULL,
-		attested_at         TEXT NOT NULL,
-		created_at          TEXT NOT NULL,
-		updated_at          TEXT NOT NULL,
-		deleted_at          TEXT
-	)`,
-
-	// The PERMISSION half: one narrow grant, per host INCARNATION, per PREMISE.
-	//
-	// PER-HOST AND PER-PREMISE, NEVER CLUSTER-WIDE. There is deliberately no
-	// "membership is complete" row and no way to write one: the PK carries an
-	// incarnation, so several permanent losses compose as several narrow grants
-	// and never as a global bypass. A premise nothing has retired is a premise
-	// still owed, whatever else has been retired.
-	//
-	// THE PREMISE IS PART OF THE KEY because the permissions are distinct. A
-	// membership grant excuses the obligation to ask that host what it knew. It
-	// does NOT excuse its inventory digest, and NOTHING here ever excuses the
-	// runtime scan — that still needs fencing evidence, because knowing what a
-	// machine knew says nothing about whether its workloads are stopped.
-	//
-	// APPEND-ONLY, and no revocation column: a grant is not withdrawn, it stops
-	// APPLYING. Every read re-checks that the host is still unreachable and that
-	// the incarnation recorded on its `hosts` row still matches, so a rejoin or a
-	// hostname reuse invalidates it with nothing written.
-	`CREATE TABLE IF NOT EXISTS netbox_host_retirements (
-		cluster_fingerprint TEXT NOT NULL,
-		host_incarnation    TEXT NOT NULL,
-		premise             TEXT NOT NULL,
-		-- Record only, as above: the name is for an operator reading the row.
-		host_name           TEXT NOT NULL,
-		-- The manifest that supplied the substitute evidence, for the trail.
-		-- The read side unions every manifest for the incarnation rather than
-		-- following this one id, so a superseding record is picked up without
-		-- this immutable row having to change.
-		manifest_id         TEXT NOT NULL,
-		attested_by         TEXT NOT NULL,
-		attested_at         TEXT NOT NULL,
-		created_at          TEXT NOT NULL,
-		updated_at          TEXT NOT NULL,
-		deleted_at          TEXT,
-		PRIMARY KEY (cluster_fingerprint, host_incarnation, premise)
-	)`,
-
-	// THE WITHDRAWAL half: removing trust in ONE GRANT VERSION.
-	//
-	// WHY A SEPARATE TABLE AND NOT A COLUMN, AND NOT ANOTHER RETIREMENT ROW.
-	// Both of the obvious shapes are silent no-ops:
-	//
-	//   - Another row in netbox_host_retirements collides on that table's key
-	//     and its writer is INSERT OR IGNORE, so a "superseding void record"
-	//     inserts nothing at all and reports success.
-	//   - A revocation COLUMN would make the grant mutable, and the grant is the
-	//     operator's original assertion. Withdrawal is an ADDITION to the record:
-	//     who attested it, when and why survive untouched beside who withdrew it,
-	//     when and why.
-	//
-	// THE GRANT VERSION IS THE MANIFEST ID, and it is in the key. Each
-	// attestation mints a fresh manifest id (randid), so the manifests recorded
-	// for one (cluster, incarnation, premise) ARE that grant's version history —
-	// which is what makes "withdraw v1 without touching a later v2" expressible
-	// at all. A withdrawal names the exact versions it removes trust in, so a
-	// version attested afterwards is not covered by it and the grant rests on
-	// that instead. The discriminator is an identity, never a clock: a REPLAYED
-	// old manifest carries the id it always had and stays covered, while a
-	// genuinely new attestation carries an id no withdrawal names.
-	//
-	// APPEND-ONLY, like both halves above, and self-repairing for the same
-	// reason: a row deleted locally has nothing to conflict with, so anti-entropy
-	// re-inserts it from a peer with no bespoke merge rule.
-	//
-	// A TOMBSTONE ON A WITHDRAWAL DOES NOT RESTORE TRUST. deleted_at exists for
-	// schema uniformity and the replication machinery; the read side deliberately
-	// does NOT filter on it, because a deleted withdrawal row must not be able to
-	// put a grant back into force. Removing trust needs no evidence; restoring it
-	// needs a fresh attestation.
-	`CREATE TABLE IF NOT EXISTS netbox_retirement_withdrawals (
-		cluster_fingerprint TEXT NOT NULL,
-		host_incarnation    TEXT NOT NULL,
-		premise             TEXT NOT NULL,
-		-- The GRANT VERSION this withdrawal removes trust in: the id of the
-		-- recovery manifest that supplied that version's evidence.
-		manifest_id         TEXT NOT NULL,
-		-- Record only, as everywhere else here: for an operator reading the row.
-		host_name           TEXT NOT NULL,
-		withdrawn_by        TEXT NOT NULL,
-		withdrawn_at        TEXT NOT NULL,
-		-- The operator's reason, kept beside the original attestation so the
-		-- trail shows both halves of the decision.
-		reason              TEXT NOT NULL,
-		created_at          TEXT NOT NULL,
-		updated_at          TEXT NOT NULL,
-		deleted_at          TEXT,
-		PRIMARY KEY (cluster_fingerprint, host_incarnation, premise, manifest_id)
-	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2490,30 +2352,26 @@ var tablePrimaryKeys = map[string][]string{
 	"registry_credentials":       {"id"},
 	// Replicated tables with updated_at that previously lacked an entry, so LWW
 	// was silently skipped in both the merge and the Crescent apply path.
-	"vm_backups":                {"vm_name", "disk_name", "repo"},
-	"container_backups":         {"ct_name", "repo"},
-	"container_snapshots":       {"id"},
-	"container_restarts":        {"host_name", "name"},
-	"ip_sets":                   {"id"},
-	"cluster_firewall_rules":    {"id"},
-	"host_firewall_rules":       {"id"},
-	"firewall_defaults":         {"scope"},
-	"backup_repos":              {"name"},
-	"replication_checkpoints":   {"vm_name", "repo"},
-	"vm_nics":                   {"vm_name", "id"},
-	"vm_pci_intent":             {"vm_name", "device_id"},
-	"vm_pci_realizations":       {"vm_name", "device_id", "member_id"},
-	"audit_signing_keys":        {"key_id"},
-	"audit_chain_heads":         {"host_name", "epoch", "seq"},
-	"audit_key_lifecycle":       {"host_name", "key_id", "event", "by_key_id"},
-	"netbox_bindings":           {"prefix_id"},
-	"netbox_objects":            {"litevirt_kind", "litevirt_key"},
-	"netbox_sync_queue":         {"id"},
-	"netbox_host_config":        {"host_name"},
-	"netbox_recovery_manifests": {"id"},
-	"netbox_host_retirements":   {"cluster_fingerprint", "host_incarnation", "premise"},
-	"netbox_retirement_withdrawals": {"cluster_fingerprint", "host_incarnation", "premise",
-		"manifest_id"},
+	"vm_backups":              {"vm_name", "disk_name", "repo"},
+	"container_backups":       {"ct_name", "repo"},
+	"container_snapshots":     {"id"},
+	"container_restarts":      {"host_name", "name"},
+	"ip_sets":                 {"id"},
+	"cluster_firewall_rules":  {"id"},
+	"host_firewall_rules":     {"id"},
+	"firewall_defaults":       {"scope"},
+	"backup_repos":            {"name"},
+	"replication_checkpoints": {"vm_name", "repo"},
+	"vm_nics":                 {"vm_name", "id"},
+	"vm_pci_intent":           {"vm_name", "device_id"},
+	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
+	"audit_signing_keys":      {"key_id"},
+	"audit_chain_heads":       {"host_name", "epoch", "seq"},
+	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
+	"netbox_bindings":         {"prefix_id"},
+	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
+	"netbox_sync_queue":       {"id"},
+	"netbox_host_config":      {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2861,8 +2719,6 @@ var createTableUnits = []struct {
 	{50, "quota_reservations"},
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
-	{51, "netbox_recovery_manifests"}, {51, "netbox_host_retirements"},
-	{51, "netbox_retirement_withdrawals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

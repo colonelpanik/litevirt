@@ -24,31 +24,6 @@ var appendOnlyTables = map[string]bool{
 	// table safe to let any peer write to: a hostile row can only ever be a NEW
 	// number, never a rewrite of the one carrying the revocation a reader wants.
 	"cluster_crl": true,
-	// A recovery manifest is an operator's assertion about a fixed host
-	// INCARNATION and a fixed premise, recorded at a moment. It has no later
-	// revision: superseding one is a NEW record, which is what makes the trail
-	// show what was attested when rather than only what is believed now. The
-	// read side unions every manifest for an incarnation, so append-only also
-	// makes superseding MONOTONE — a later record can add host identities to
-	// discovery and can never narrow it.
-	"netbox_recovery_manifests": true,
-	// A retirement is an operator's assertion that a fixed (cluster, host
-	// incarnation, premise) may rest on human-established evidence. It has no
-	// later revision either, and there is deliberately no revocation column: a
-	// grant is not withdrawn, it stops APPLYING, because every read re-checks
-	// reachability and the incarnation recorded on the host's row. Append-only
-	// is also self-repairing, exactly as for audit_key_lifecycle: a row deleted
-	// locally has nothing to conflict with, so anti-entropy re-inserts it from a
-	// peer with no bespoke merge rule.
-	"netbox_host_retirements": true,
-	// A withdrawal is an operator's assertion that trust in ONE GRANT VERSION —
-	// a fixed (cluster, host incarnation, premise, manifest id) — is removed. It
-	// has no later revision either: withdrawing again is the same assertion, and
-	// restoring trust is a FRESH ATTESTATION under a new manifest id rather than
-	// an edit here. Append-only is also what makes a replayed grant unable to
-	// resurrect: the withdrawal row a peer re-inserts is the one that already
-	// covered that version.
-	"netbox_retirement_withdrawals": true,
 }
 
 // deriveDisposition classifies a parsed replicated statement into the disposition the apply

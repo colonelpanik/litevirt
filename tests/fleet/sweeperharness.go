@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -39,12 +38,6 @@ func (r *reachSet) add(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.names[name] = true
-}
-
-func (r *reachSet) remove(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.names, name)
 }
 
 func (r *reachSet) list() []string {
@@ -86,18 +79,6 @@ func (g *fleetGate) HealthyPeers(ctx context.Context) []string {
 // host is down", and a rejoin is what makes that attestation stale. The sweeper
 // must then go back to ASKING this host rather than assuming it away.
 func (n *Node) Rejoin() { n.cluster.reach.add(n.Name) }
-
-// GoUnreachableAgain undoes a Rejoin: the node stops being counted toward
-// quorum, as a machine that answered briefly and then went away for good does.
-//
-// It exists for ONE property that cannot be expressed without it. A retirement
-// whose host is reachable is merely SKIPPED by the resolver — nothing is written
-// — so the stored grant APPLIES AGAIN the moment that incarnation goes
-// unreachable once more. A dormant grant is a live grant, and the difference
-// between "paused" and "withdrawn" is only visible by pausing a grant and then
-// un-pausing it. Stop() cannot do this: it closes the listener, but the reach
-// overlay a Rejoin added keeps the name in HealthyPeers regardless.
-func (n *Node) GoUnreachableAgain() { n.cluster.reach.remove(n.Name) }
 
 // ── taking a node down ──────────────────────────────────────────────────────
 
@@ -169,19 +150,6 @@ func (n *Node) FailFencingLogRead(t *testing.T) {
 // OnProofCollected installs the hook the sweeper runs between its two
 // eligible-host samples.
 func (n *Node) OnProofCollected(fn func()) { n.Server.SetOnProofCollected(fn) }
-
-// OnProofsGathered installs the hook the sweeper runs with the runtime proofs it
-// collected, keyed by the host that was ASKED.
-//
-// It is the only way a scenario can assert that a particular host WAS QUERIED.
-// That matters wherever the safe outcome and the broken outcome are both "the
-// address survives": a sweep blocked before it asked anybody leaves the address
-// alone for the wrong reason, and an assertion on the address alone cannot tell
-// the two apart. Reading the gathered proofs distinguishes "asked the holder and
-// it claimed the address" from "never learned the holder existed".
-func (n *Node) OnProofsGathered(fn func(map[string]grpcapi.OrphanProof)) {
-	n.Server.SetOnProofsGathered(fn)
-}
 
 // AddHostRow registers a brand-new host in every node's database. Called from
 // OnProofCollected, it is a member joining DURING proof collection — a host the

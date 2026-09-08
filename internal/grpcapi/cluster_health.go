@@ -108,9 +108,7 @@ const evaluatorScanTTL = 5 * time.Minute
 //	           operator should be looking before the confirm lands);
 //	DEGRADED — active warning conditions, an evaluator without complete
 //	           coverage, a STALE evaluator (last scan past evaluatorScanTTL),
-//	           or an incomplete capacity observation. Active INFO conditions do
-//	           NOT degrade: they are advisories about a state an operator chose,
-//	           not faults (see the severity branch below);
+//	           or an incomplete capacity observation;
 //	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
 //	           last scan is stale (nothing is watching NOW, which is not the
 //	           same as nothing being wrong);
@@ -135,18 +133,6 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		}
 		if h.Severity == corrosion.SeverityCritical {
 			return HealthCritical
-		}
-		if h.Severity == corrosion.SeverityInfo {
-			// An INFO condition is an ADVISORY, not a fault: something an
-			// operator chose that has to stay visible for as long as it is in
-			// effect. The one writer is the NetBox attestation advisory, whose
-			// subject is a premise deliberately resting on a human assertion —
-			// it can stand for months, and degrading the roll-up for its whole
-			// life would make `lv health` exit non-zero indefinitely and train
-			// an operator to ignore the exit code. Conditions that MEAN
-			// something is wrong are warning or critical, and both still
-			// degrade below.
-			continue
 		}
 		degraded = true
 	}

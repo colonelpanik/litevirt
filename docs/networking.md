@@ -1124,220 +1124,69 @@ The fence attestation is time-bounded (24 hours) and ignored for a host that has
 come back, because it governs the scan for exactly as long as the machine is
 genuinely down.
 
-### Permanent host loss
+### Permanent host loss — a known limitation with no operator remedy
 
-A machine that is never coming back is a different problem. It cannot be made
-answerable, so the closure can never close, and without a way out reclamation and
-new bindings would stay suspended forever. `lv netbox retire-host` is that way
-out, and the rest of this section is mostly about what it does **not** mean.
+A machine that is never coming back is a different problem, and litevirt has no
+answer for it today. **Read this before concluding something is broken.**
 
-#### The trust boundary — read this first
+A permanently lost host cannot answer, so:
 
-Every other premise in this subsystem is **verified by machine**. Each host is
-asked which hosts *it* knows of; each host is asked for a digest of *its own*
-address-bearing tables; each host scans *its own* libvirt. litevirt believes a
-host about itself and checks nothing on anyone's word.
+* **reclamation stalls.** The membership closure can never close, so the sweeper
+  keeps withholding and the addresses it would have reclaimed stay allocated in
+  NetBox indefinitely.
+* **affected new bindings are suspended.** A bind or adoption has to corroborate
+  its inventory against every participant, and the lost host can never produce
+  its digest, so the binding is created suspended and stays suspended. Allocation
+  on that network refuses while it does.
 
-**A retirement is not like that. It substitutes human-established evidence for
-machine evidence that is permanently unavailable, and litevirt cannot check it.**
-When you retire a host you are asserting something about a machine that no longer
-exists. Nothing corroborates the assertion — not partially, not heuristically, not
-at all.
+**There is currently no operator remedy, and that is deliberate rather than an
+oversight.** In particular:
 
-The record is attributed to you, written to the audit log, replicated, and
-immutable. **Recording it does not make it true.** An audit entry establishes who
-claimed something and when; it does not establish that the claim was correct. If the
-assertion is wrong, the consequence is the one every other mechanism here exists
-to prevent: an address handed to a new guest while a running guest still holds
-it. This is stated at this length because the machinery around a retirement —
-the confirmation prompt, the audit row, the immutable manifest, the exact
-identity — is the machinery of a *verified* premise, and it would be easy to read
-it as evidence rather than as bookkeeping about an assertion.
+* `lv host fence-confirm <host>` does **not** unblock either one. It attests that
+  a machine's libvirt cannot be running a domain, which excuses that host from the
+  *runtime scan* — and says nothing about which hosts it alone knew existed or
+  which replicated rows it held. Excusing a fenced host from the *question* is
+  precisely what once freed a live guest's address, so power-off evidence is kept
+  separate from missing knowledge and can never substitute for it.
+* There is no command, flag or record that lets an operator assert what the lost
+  machine knew or what became of its rows. Every premise in this subsystem is
+  established by machine evidence, and nothing else satisfies one.
 
-Everything below is about keeping that assertion as narrow as possible.
+**What still works.** Claims a guest already holds are untouched — a suspension
+refuses *new* allocation and never disturbs a live address. Existing NetBox
+objects are untouched. Networks with no affected binding keep allocating
+normally, and `lv health` names the host the proof is waiting on, so the pause is
+never silent.
 
-#### Two premises are retirable, and a third is not
+**What to do meanwhile.** If the machine can be made answerable again — repaired,
+or replaced and rejoined under that name — everything resumes by itself: the
+closure closes, the sweeper reclaims, and the revalidation pass lifts the
+suspension without an operator command. If it genuinely cannot, the addresses it
+was holding stay leaked in NetBox and the affected bindings stay suspended. That
+is the trade this design makes on purpose: leaking an address a later pass can
+reclaim is always preferable to handing a running guest's address to a new one.
 
-A retirement is **per host and per premise**. There is no cluster-wide "the
-membership is complete" switch and no way to write one, so several permanent
-losses compose as several narrow grants rather than as a global bypass.
+A supported recovery path is specified — the operator-attested substitution, its
+authorization rules, and the withdrawal that takes one back — in
+[the frozen trust-recovery lifecycle scope](reviews/2026-09-08-trust-lifecycle-followup-scope.md).
+It is **not implemented**. An earlier prerelease build of this work carried one —
+a retire-host command under `lv netbox`, with a withdrawal and a listing beside
+it — and it was removed before release so that its authorization rules could be
+reviewed on their own terms rather than as a rider on an addressing change. No
+released version ever had it.
 
-* **What the host knew** (`--knew`, `--knew-nobody`) retires the obligation to
-  ask *that host* which hosts it knew of. **It does not retire the hosts it could
-  have told you about.** The names you pass stay *inputs to discovery* and are
-  queried by name, so a lost host that was the only node aware of a third machine
-  still causes that machine to be asked. List what it knew generously: naming one
-  host too many costs a query, naming one too few is how a running guest's
-  address gets freed. An empty list is a real claim — "it knew of nothing this
-  cluster does not already know of" — which is why it needs `--knew-nobody`
-  rather than an omitted flag.
-* **What became of its records** (`--inventory`) retires the obligation to
-  compare that host's copy of the address-bearing tables before a binding goes
-  live. It matters only for binding and adoption. Use it once you have
-  established what happened to any VM, NIC or address records that existed
-  **only** on the lost host.
-
-**These are separate premises and neither implies the other.** Knowing which
-hosts a machine knew of says nothing about the rows it held — and a lost host's
-unique VM and NIC rows are exactly what an inventory comparison exists to notice,
-since their absence is what makes a held address invisible. A membership-only
-retirement therefore leaves a bind suspended, deliberately.
-
-**Whether the machine's workloads are stopped is not retirable at all.** It has no
-flag on this command. Reclamation still requires fencing evidence: power the
-machine off, then run `lv host fence-confirm <host>`. `lv netbox retire-host`
-tells you when that is still outstanding, because having retired both retirable
-premises is exactly the point at which an operator concludes they are finished.
-
-So the two permissions are:
-
-| Operation | Premises it needs |
-|---|---|
-| Reclaiming an address | membership accounted for **+** power-off evidence |
-| A binding going live | membership accounted for **+** inventory accounted for |
-
-#### It names a machine, not a hostname
-
-A retirement records the **cluster fingerprint** and the lost host's
-**incarnation** — the certificate serial recorded on its `hosts` row. It never
-matches on the hostname, because a hostname is meant to be reused and an
-exception that transferred to whatever machine next answered to the name would be
-the whole failure mode. Admission enforces the property rather than hoping for
-it: a host cannot be re-admitted under the certificate it was removed with, so a
-replacement necessarily presents a different serial and matches no prior
-retirement.
-
-A host whose recorded serial cannot be read is refused rather than retired under a
-placeholder.
-
-#### A grant that stops applying is PAUSED, not withdrawn
-
-A retirement stops being honoured on its own, checked afresh every time it is
-read:
-
-* **the host answers again** — a machine that is responding refutes the
-  attestation that it is gone, and its live state governs, exactly as it does for
-  a fence attestation;
-* **a different machine is admitted under that name** — the grant names an
-  incarnation, so the replacement inherits nothing;
-* **the host's record disappears** — with no recorded incarnation there is
-  nothing to match against, so the premise goes back to being owed.
-
-All three fail closed: an unmet condition means the premise is still owed and the
-operation withholds. Certificate rotation on a host that later turns out to be
-recoverable has the same effect, which is the safe direction — re-attest against
-the new serial if the machine really is gone.
-
-**None of the three is a withdrawal.** They are re-derived from live state on
-every read, and nothing is written — so a grant whose host answered once is
-merely *dormant*, and it **applies again** the moment that same incarnation goes
-unreachable once more. A dormant grant is a live grant.
-
-`lv netbox retirements` lists every attestation, the accounting given, who gave
-it, whether it still applies, and whether trust in it has been withdrawn.
-Reviewing that list is the only check there is, which is the practical
-consequence of the trust boundary above. A row that is merely not applying is not
-something to clean up; it is the record of an exception that is currently
-dormant.
-
-#### Withdrawing one, for good
-
-`lv netbox withdraw-retirement <host> --incarnation <serial> --premise
-<membership|inventory> --reason <why>` removes trust in a recorded grant. It is
-the only durable way to end one, and it exists because an attestation nothing can
-check would otherwise stand indefinitely once it turned out to be wrong.
-
-**It has no prerequisites, and that asymmetry is the design.** Granting trust is
-guarded — an accounting, an exact identity, a host that is not answering, a
-re-check immediately before the write. *Removing* it is guarded by nothing,
-because every consequence of a withdrawal is a premise going back to being
-**owed**: reclamation and binding withhold rather than proceed. So the host need
-not be dead, unreachable, or currently matching, and it need not have a `hosts`
-record at all. It works on any recorded, unwithdrawn grant — active or dormant.
-
-It records that trust was withdrawn. **It does not establish what was true**, any
-more than the attestation did.
-
-**It names a machine and a premise.** `--incarnation` is required: a hostname is
-meant to be reused, so a withdrawal aimed by name would land on whichever grant
-that name carries now rather than the one you meant, leaving the mistake in
-place. `--premise` is required because the two premises are separate grants —
-withdrawing what a host *knew* does not withdraw what became of its *records*.
-
-**It is an addition to the record, not an edit of it.** Who attested what, when
-and why survives untouched; who withdrew it, when and why is recorded beside it,
-and the listing shows both.
-
-**It does not discard the host identities the attestation named.** Those remain
-inputs to discovery, exactly as they are while the grant stands, because naming a
-host can only ever cause it to be *asked*. This is the same rule that governs
-retirement itself, in the other direction, and it is the easiest thing here to
-expect wrongly: drop those identities and a still-running holder goes unqueried,
-so being *more* careful would end up freeing a live guest's address.
-
-**It targets a grant VERSION.** Each attestation records a new recovery manifest,
-and that manifest id is the grant's version. A withdrawal covers exactly the
-versions recorded when it ran, which is what makes two things true at once: a
-delayed or re-delivered copy of the old grant cannot resurrect it (a replay
-carries the version the withdrawal already named), and a withdrawal cannot cancel
-a *later* attestation (a re-attestation mints a version no withdrawal names). The
-discriminator is an identity, never a clock, so no skew or delivery order changes
-the answer.
-
-So re-attesting after a withdrawal works, and if somebody re-attested while a
-withdrawal was in flight the grant stays in force on the strength of that later
-record — the listing names the version holding it up, and withdrawing again
-covers it too. Nothing is silently swallowed in either direction.
-
-Repeating a withdrawal is safe: it is the same assertion about the same version,
-so it succeeds and reports that nothing new was recorded. Like `retire-host`, it
-is privileged, audited, and refuses to record anything until the cluster has
-finished rolling to a build that understands these records — which can never lock
-you out, because a grant can only exist if that latch has already formed and the
-latch is monotone.
-
-A withdrawn grant leaves the `netbox_premise_attested` advisory, because it
-supplies no premise any more.
-
-You do not have to remember to look. For as long as a grant is **in force** —
-revalidated now, and actually supplying a premise — `lv health` carries a
-standing `netbox_premise_attested` advisory naming it, and a grant whose validity
-cannot be established raises `netbox_attestation_unvalidatable` instead. Neither
-gates anything and the advisory is **info** severity, so the cluster does not
-read as degraded while a retirement stands; see
-[A premise resting on an operator attestation](diagnostics.md#a-premise-resting-on-an-operator-attestation).
-Like this listing, the advisory makes the substitution visible and establishes
-nothing about the attested facts.
-
-#### Recording one
-
-```bash
-# The machine is destroyed. It knew about two hosts this cluster can still reach,
-# and one it was the only node aware of.
-lv netbox retire-host <host> --knew <host-a>,<host-b>,<host-c>
-
-# Its unique address records were re-created on a surviving node, so a binding
-# may go live without comparing against it.
-lv netbox retire-host <host> --inventory "address records re-created on <host-a>"
-
-# Reclamation additionally needs power-off evidence, which is not retirable.
-lv host fence-confirm <host>
-
-# What has been attested, by whom, whether it still applies, and what has been
-# withdrawn.
-lv netbox retirements
-
-# That attestation was wrong. Remove trust in it — no prerequisites, and the
-# host identities it named stay inputs to discovery.
-lv netbox withdraw-retirement <host> --incarnation <serial> \
-    --premise membership --reason "the accounting named the wrong machine"
-```
-
-The command is privileged, audited on both outcomes, refuses a host that is still
-responding, re-checks that the host is still unreachable and still the same
-incarnation immediately before it writes, and refuses to record anything until
-the cluster has finished rolling to a build that understands these records — the
-records replicate, and a peer on an older build could not apply them.
+> **If you ran a prerelease build and recorded a retirement with it**, the daemon
+> suspends every live NetBox binding on first start after the upgrade and drops
+> the three grant tables, logging what they held. (A prerelease database that
+> never recorded one has nothing to suspend: the tables are dropped and every
+> binding is left exactly as it was.) A binding never recorded which evidence its
+> inventory proof rested on, so one that went live on a grant cannot be told apart
+> from one proved against every participant — and inheriting that authority
+> silently is worse than a suspension. Re-prove each binding with
+> `lv netbox resume <network>`; it requires every participant to answer for its own
+> address-bearing tables. Claims and NetBox objects are untouched, and a
+> reclamation that already rested on a grant has already deleted its NetBox
+> address and cannot be undone.
 
 **During a rolling upgrade, reclamation pauses.** A peer running a build that
 does not implement the proof RPC counts as unreachable, so no proof is complete

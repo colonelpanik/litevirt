@@ -362,17 +362,27 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		t.Fatalf("stored version after migration = %d, want %d", v, CurrentSchemaVersion)
 	}
 	// Every post-42 table healed, including the three v50 health tables and the
-	// seven v51 NetBox tables.
+	// four v51 NetBox tables.
 	for _, table := range []string{
 		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 		"cluster_crl", "host_networks",
 		"health_conditions", "health_evaluator_status", "host_capacity_observations",
 		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config",
-		"netbox_recovery_manifests", "netbox_host_retirements",
-		"netbox_retirement_withdrawals",
 	} {
 		if ok, _ := tableExists(ctx, c, table); !ok {
 			t.Errorf("table %s missing after v42→v51 migration", table)
+		}
+	}
+	// And NOT the three prerelease permanent-loss trust tables. They are gone
+	// from the DDL together with everything that read them, so a fresh or
+	// migrated database must not carry a table nothing has a reader for.
+	for _, table := range []string{
+		"netbox_recovery_manifests", "netbox_host_retirements",
+		"netbox_retirement_withdrawals",
+	} {
+		if ok, _ := tableExists(ctx, c, table); ok {
+			t.Errorf("table %s was created by the v42→v51 migration; the permanent-loss "+
+				"trust mechanism was removed and nothing may re-create its tables", table)
 		}
 	}
 	// Every post-42 column healed (spot-check one per version class).

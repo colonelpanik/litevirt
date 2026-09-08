@@ -114,22 +114,6 @@ var firstShapeAcks = map[string]string{
 	"netbox_host_config": "published only through netboxClusterComparable, which returns " +
 		"errNetBoxClusterNotYetComparable until DurablyLatched(netbox_ipam_v1) — the publication " +
 		"is deliberately withheld until the latch makes it safe to replicate",
-	"netbox_recovery_manifests": "written only by the RetireLostHost RPC, which refuses unless " +
-		"DurablyLatched(netbox_ipam_v1) — the same latch netbox_bindings relies on, needing " +
-		"`netbox.enabled` on every advertising node, so it cannot form while a peer is still on " +
-		"the old build. There is no background writer and no loop: the only path is an operator " +
-		"running `lv netbox retire-host`, and it refuses mid-roll with the latch named in the " +
-		"error. The table is append-only, so anti-entropy repairs a peer that missed a row " +
-		"without any further statement reaching it",
-	"netbox_host_retirements": "same RPC, same DurablyLatched(netbox_ipam_v1) refusal, in the " +
-		"same handler as the manifest above — a retirement is never written without one. " +
-		"Append-only and operator-driven only, so nothing re-emits the shape on a timer",
-	"netbox_retirement_withdrawals": "written only by the WithdrawHostRetirement RPC, which " +
-		"refuses unless DurablyLatched(netbox_ipam_v1) — the same latch the two tables above " +
-		"rely on. The gate can never lock an operator out of withdrawing something: recording " +
-		"a retirement required that same durable latch, and the latch is MONOTONE, so any " +
-		"grant that exists is proof the latch already formed and cannot un-form. Append-only " +
-		"and operator-driven only — no background writer, no timer, no loop re-emits it",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

@@ -624,7 +624,7 @@ func TestClosedParticipantSetReadsRowsFromAPeerThatHoldsMoreThanThisNode(t *test
 			workerRows(append(append([]string{}, known...), "peer-c")...), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +662,7 @@ func TestClosedParticipantSetLearnsAHostONLYAPEERSGOSSIPNames(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), []string{"gossip-only-holder"})
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +699,7 @@ func TestClosedParticipantSetClosesOnOneCallPerParticipant(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -785,7 +785,7 @@ func TestClosedParticipantSetFailsClosedOnAPeerThatCannotAnswer(t *testing.T) {
 			seedPeerHost(t, s, "peer-b")
 			tc.wire(t, s)
 
-			closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+			closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 			if err != nil {
 				t.Fatalf("a peer that cannot answer is part of the answer, not an error: %v", err)
 			}
@@ -916,7 +916,7 @@ func TestClosedParticipantSetLearnsAHostTOMBSTONEDOnAPeer(t *testing.T) {
 			workerRows(append(append([]string{}, known...), "tombstoned-holder")...), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -952,7 +952,7 @@ func TestClosedParticipantSetLearnsAHostOnlyAPeerKnows(t *testing.T) {
 		t.Fatalf("precondition: peer-c must be unknown to this node's own sources, got %v", local)
 	}
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close — every participant answered: %q (err %v)", unclosed, err)
 	}
@@ -983,7 +983,7 @@ func TestTheRuntimeExclusionAppliesToPeerNamedHostsToo(t *testing.T) {
 		return membershipNaming(host, workerRows("peer-b", "gone"), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1001,7 +1001,7 @@ func TestTheRuntimeExclusionAppliesToPeerNamedHostsToo(t *testing.T) {
 		s.db.NowWall()); err != nil {
 		t.Fatalf("write fence confirmation: %v", err)
 	}
-	closed, _, unclosed, err = s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err = s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must still close — the attested host answered: %q (err %v)",
 			unclosed, err)
@@ -1043,7 +1043,7 @@ func TestAPeersROWMayExcuseAWitnessNoRowHereRecords(t *testing.T) {
 			&pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1078,7 +1078,7 @@ func TestAWitnessNamedInGOSSIPBeforeAnyROWIsStillExcused(t *testing.T) {
 			append(workerRows("peer-b"), &pb.MembershipHost{Name: "a-witness", Role: "witness"}), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1132,7 +1132,7 @@ func TestTwoROWSThatDisagreeAboutAWitnessKeepTheHostIN(t *testing.T) {
 		return membershipNaming(host, workerRows(known...), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(ctx)
+	closed, unclosed, err := s.closedRuntimeProofSet(ctx)
 	if err != nil || unclosed != "" {
 		t.Fatalf("the set must close: %q (err %v)", unclosed, err)
 	}
@@ -1154,7 +1154,7 @@ func TestClosedParticipantSetWithholdsWhenAParticipantCannotAnswer(t *testing.T)
 	// nothing answers on.
 	seedPeerHost(t, s, "peer-b")
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("an unreachable peer is part of the answer, not an error: %v", err)
 	}
@@ -1181,7 +1181,7 @@ func TestClosedParticipantSetWithholdsOnAnEmptyMembershipView(t *testing.T) {
 		return membershipNaming(host, nil, nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("an empty view is part of the answer, not an error: %v", err)
 	}
@@ -1209,7 +1209,7 @@ func TestClosedParticipantSetIsBounded(t *testing.T) {
 		return membershipNaming(host, workerRows(fmt.Sprintf("peer-generated-%d", n)), nil)
 	})
 
-	closed, _, unclosed, err := s.closedRuntimeProofSet(context.Background())
+	closed, unclosed, err := s.closedRuntimeProofSet(context.Background())
 	if err != nil {
 		t.Fatalf("a growing set is part of the answer, not an error: %v", err)
 	}

@@ -318,6 +318,13 @@ row proven to be its own restore; `container_restore_timeout_sec`). See
 
 Scrape `http://<host>:7444/metrics` for:
 
+> That endpoint has **no authentication and no TLS**, and `metrics_bind`
+> defaults to all interfaces. Scraping it across a network means the cluster
+> inventory and this node's hardening posture are readable by anything that can
+> reach the port — see
+> [configuration.md → Metrics endpoint exposure](configuration.md#metrics-endpoint-exposure).
+
+
 - `litevirt_host_cpu_total`, `litevirt_host_memory_total_mib` — host resources
 - `litevirt_host_vm_count` — VMs per host
 - `litevirt_vm_state` — `1` if the VM is running, `0` otherwise

@@ -12,7 +12,7 @@ only.
 
 | Signal | System | Protocol | Endpoint |
 |---|---|---|---|
-| Metrics | Prometheus (`internal/metrics`) | pull | `:7444/metrics` |
+| Metrics | Prometheus (`internal/metrics`) | pull | `:7444/metrics` — **no auth, no TLS**, binds all interfaces by default ([exposure](configuration.md#metrics-endpoint-exposure)) |
 | Logs + traces | provide-telemetry (`internal/obs`) | OTLP push | your collector |
 
 ## Off by default

@@ -35,6 +35,28 @@ type Server struct {
 	ctStat   containerStatter
 	hostName string
 	httpSrv  *http.Server
+	// log is the logger the exposure warning goes to. nil means slog.Default().
+	// Injectable ONLY so a test can read what was logged without calling
+	// slog.SetDefault, which cannot be restored: SetDefault also rewires the
+	// std log package, and the restore path skips that when the previous
+	// handler is the default one — so a save/restore pair permanently routes
+	// std-log writes into the test's dead buffer for the rest of the binary.
+	log *slog.Logger
+}
+
+// logger is the injected logger or the process default. Never nil.
+func (s *Server) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
+}
+
+// Addr is the address the metrics listener binds, composed the one way. The
+// daemon's startup banner reads it from here rather than reassembling it, which
+// is how the banner came to claim 0.0.0.0 for a loopback-bound endpoint.
+func (s *Server) Addr() string {
+	return net.JoinHostPort(normalizeBind(s.bindAddr), strconv.Itoa(s.port))
 }
 
 // NewServer creates a metrics server. bindAddr is the interface to listen on
@@ -63,16 +85,16 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 
 	s.httpSrv = &http.Server{
-		// JoinHostPort, not Sprintf("%s:%d"): an IPv6 literal needs brackets and
-		// must not get them twice. See normalizeBind.
-		Addr:    net.JoinHostPort(normalizeBind(s.bindAddr), strconv.Itoa(s.port)),
+		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
+		// not get them twice. See normalizeBind.
+		Addr:    s.Addr(),
 		Handler: mux,
 	}
 
-	slog.Info("metrics server starting", "addr", s.httpSrv.Addr, "bind", s.bindAddr)
-	warnIfMetricsWorldReadable(s.bindAddr, s.port)
+	s.logger().Info("metrics server starting", "addr", s.httpSrv.Addr, "bind", s.bindAddr)
+	warnIfMetricsWorldReadable(s.logger(), s.bindAddr, s.port)
 	if err := s.httpSrv.ListenAndServe(); err != http.ErrServerClosed {
-		slog.Error("metrics server error", "error", err)
+		s.logger().Error("metrics server error", "error", err)
 	}
 }
 
@@ -161,18 +183,19 @@ func classifyMetricsBind(bindAddr string) metricsExposure {
 // it invisibly — the endpoint would simply stop answering. This repo's
 // convention for a behaviour change is a flag whose default keeps the existing
 // behaviour, so the flag stays and the exposure is stated instead.
-func warnIfMetricsWorldReadable(bindAddr string, port int) {
+func warnIfMetricsWorldReadable(log *slog.Logger, bindAddr string, port int) {
 	const what = "it serves VM and container names, host inventory and resource allocations, " +
 		"and litevirt_enforcement_* (which security kill-switches are off on this node)"
 	switch classifyMetricsBind(bindAddr) {
 	case metricsBindWildcard:
-		slog.Warn("metrics endpoint is bound to EVERY interface with NO authentication or TLS: "+
+		log.Warn("metrics endpoint is bound to EVERY interface with NO authentication or TLS: "+
 			what+". Set metrics_bind to 127.0.0.1, or to a management-network address, unless "+
 			"every network that can reach this port is trusted",
 			"port", port, "metrics_bind", bindAddr)
 	case metricsBindPublic:
-		slog.Warn("metrics endpoint is bound to a PUBLIC address with NO authentication or TLS: "+
-			what+". Anyone on the internet who can reach this address can read it",
+		log.Warn("metrics endpoint is bound to a PUBLIC address with NO authentication or TLS: "+
+			what+". Anyone who can route to this address can read it — set metrics_bind to "+
+			"127.0.0.1 or a management-network address",
 			"port", port, "metrics_bind", bindAddr)
 	}
 }

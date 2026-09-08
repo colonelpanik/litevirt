@@ -555,7 +555,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner := lxc.NewLxcRunner()
 	lxcRunner.HostName = d.cfg.HostName
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
-	go d.metrics.Start()
+	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
+	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
+	// and bound an EPHEMERAL port on every interface — an unauthenticated
+	// inventory endpoint on an unpredictable port, which is the opposite of
+	// what an operator setting 0 is asking for, and the exposure warning then
+	// named port 0, so the one datum needed to firewall it was useless.
+	if d.cfg.MetricsPort > 0 {
+		go d.metrics.Start()
+	} else {
+		slog.Info("metrics endpoint disabled (metrics_port: 0)")
+	}
 
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
@@ -1229,7 +1239,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("litevirtd starting",
 		"host", d.cfg.HostName,
 		"grpc", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort),
-		"metrics", fmt.Sprintf("0.0.0.0:%d", d.cfg.MetricsPort),
+		// From the metrics server, not reassembled: this line said 0.0.0.0
+		// unconditionally, so a host that had applied metrics_bind: 127.0.0.1
+		// got two startup lines asserting opposite things, and the louder one
+		// was wrong. Reads "disabled" when metrics_port is 0.
+		"metrics", d.metricsAddrForBanner(),
 		"ui", fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort),
 	)
 
@@ -2032,4 +2046,19 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			gc()
 		}
 	}
+}
+
+// metricsAddrForBanner is what the startup banner prints for the metrics
+// endpoint: the address the listener will actually bind, or "disabled".
+//
+// The banner used to hardcode 0.0.0.0, which contradicted both metrics_bind and
+// the exposure warning the metrics server logs a few lines later.
+func (d *Daemon) metricsAddrForBanner() string {
+	if d.cfg.MetricsPort <= 0 {
+		return "disabled"
+	}
+	if d.metrics == nil {
+		return fmt.Sprintf("%s:%d", d.cfg.MetricsBind, d.cfg.MetricsPort)
+	}
+	return d.metrics.Addr()
 }

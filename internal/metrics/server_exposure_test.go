@@ -2,11 +2,14 @@ package metrics
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // TestClassifyMetricsBind pins how far each bind spelling reaches.
@@ -103,14 +106,16 @@ func TestWarnIfMetricsWorldReadable(t *testing.T) {
 		{"a tailnet address stays quiet", "100.101.102.103", false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-			defer slog.SetDefault(prev)
+			// An INJECTED logger, never slog.SetDefault. SetDefault also rewires
+			// the std log package, and its restore path skips that when the
+			// previous handler is the default one — so a save/restore pair
+			// permanently routes std-log writes into this dead buffer for the
+			// rest of the test binary, silently swallowing diagnostics in every
+			// file that sorts after this one.
+			log, records := recordingLogger()
+			warnIfMetricsWorldReadable(log, tc.bind, 7444)
 
-			warnIfMetricsWorldReadable(tc.bind, 7444)
-
-			got := buf.String()
+			got := records()
 			if warned := strings.Contains(got, "level=WARN"); warned != tc.wantWarn {
 				t.Fatalf("warned = %v, want %v for metrics_bind=%q; log was %q",
 					warned, tc.wantWarn, tc.bind, got)
@@ -122,11 +127,111 @@ func TestWarnIfMetricsWorldReadable(t *testing.T) {
 				t.Errorf("warning does not say %q, so the two exposures read alike; got %q",
 					tc.wantWord, got)
 			}
-			for _, want := range []string{"metrics_bind", "litevirt_enforcement", "7444"} {
-				if !strings.Contains(got, want) {
-					t.Errorf("warning does not mention %q; got %q", want, got)
+			// Asserted per SOURCE, because the two halves can be gutted
+			// independently: the attributes alone satisfy a bare "7444" match,
+			// so a message reduced to slog.Warn("exposed", "port", port,
+			// "metrics_bind", bind) would still pass a combined check.
+			msg := messageOf(got)
+			for _, want := range []string{"authentication", "litevirt_enforcement", "metrics_bind"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the warning MESSAGE does not mention %q, so it no longer says what "+
+						"leaks or what to set; message was %q", want, msg)
 				}
 			}
+			// The attributes carry the two values an operator acts on. Dropping
+			// the bindAddr attribute leaves the log without the bad value.
+			for _, want := range []string{"port=7444", "metrics_bind="} {
+				if !strings.Contains(got, want) {
+					t.Errorf("warning is missing attribute %q; got %q", want, got)
+				}
+			}
+			// Exactly one record: the doc comment and configuration.md both say
+			// "at startup", and strings.Contains cannot count, so an
+			// implementation warning per scrape would otherwise pass.
+			if n := strings.Count(got, "level=WARN"); n != 1 {
+				t.Errorf("emitted %d warnings, want exactly 1 — this is a startup notice, "+
+					"not a per-request one", n)
+			}
 		})
+	}
+}
+
+// recordingLogger returns a logger writing to a buffer, and a reader for it.
+// Nothing global is touched — see the comment at the call site.
+func recordingLogger() (*slog.Logger, func() string) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	return slog.New(h), func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+// messageOf extracts the msg="..." field, so an assertion can target the
+// human-readable text rather than being satisfied by an attribute value.
+func messageOf(record string) string {
+	const key = `msg="`
+	i := strings.Index(record, key)
+	if i < 0 {
+		return ""
+	}
+	rest := record[i+len(key):]
+	if j := strings.Index(rest, `"`); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+// TestStart_EmitsTheExposureWarning is the test whose absence made the
+// "mutation-verified" claim in the previous commit false.
+//
+// Every other test here calls warnIfMetricsWorldReadable directly, so deleting
+// its CALL SITE in Start left the whole suite green — the function stayed
+// referenced by its own tests, so even an unused-code linter said nothing. The
+// entire operator-visible behaviour could be removed without a single failure.
+// CLAUDE.md's worked example for the mutation rule is this exact shape: a test
+// that passed with the wiring deleted.
+//
+// Start is called ONCE in this binary on purpose: it registers collectors on the
+// default Prometheus registry, and MustRegister panics on a second call.
+func TestStart_EmitsTheExposureWarning(t *testing.T) {
+	db := testDB(t)
+	log, records := recordingLogger()
+
+	// Port 0 so the listener takes an ephemeral port instead of colliding with
+	// anything real; the bind is what this test is about.
+	s := NewServer(0, "", db, nil, nil, "host-a")
+	s.log = log
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Start()
+	}()
+	t.Cleanup(func() {
+		s.Stop(context.Background())
+		<-done
+	})
+
+	// Start logs before it blocks in ListenAndServe, so the records are there as
+	// soon as the listener is up.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(records(), "level=WARN") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got := records()
+	if !strings.Contains(got, "level=WARN") {
+		t.Fatalf("Start() bound every interface and emitted no exposure warning; the wiring "+
+			"is what makes this feature exist, and every other test here would still pass "+
+			"with it deleted. Log was:\n%s", got)
+	}
+	if !strings.Contains(got, "metrics_bind") {
+		t.Errorf("the warning Start() emitted does not name the setting; got:\n%s", got)
 	}
 }

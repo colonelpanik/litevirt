@@ -15,15 +15,10 @@ grpc_port: 7443
 metrics_port: 7444
 
 # Address the /metrics endpoint listens on. Empty (default) binds ALL
-# interfaces, and the endpoint has no TLS and no authentication — anyone who
-# can reach the port reads VM and container names, host inventory, resource
-# allocations, and litevirt_enforcement_* (which security kill-switches are
-# off on this node). Note that ui_port below defaults to localhost and this
-# does not. Set "127.0.0.1" (scrape via a local exporter / SSH tunnel), or a
-# management-network address, unless every network that can reach the port is
-# trusted. The daemon warns at startup while this reaches every interface, and
-# also if it is set to a public address. Silence is not a safety claim.
-# See "Metrics endpoint exposure" below.
+# interfaces, and that endpoint has NO auth and NO TLS — set "127.0.0.1" or a
+# management-network address. See "Metrics endpoint exposure" below for what is
+# readable without a credential; the daemon warns at startup while this is
+# world-readable.
 metrics_bind: ""
 
 # Web UI port (HTTP).
@@ -630,17 +625,35 @@ and the bypass is audited.
 `metrics_bind` defaults to **all interfaces**. Anyone who can reach the port
 reads, without a credential:
 
-- every VM and container name on this host, with CPU, memory and disk
-  allocations and live I/O counters
-- this host's name, capacity and pressure
+- every VM and container name on this host, with CPU and memory allocations,
+  and for VMs live disk and network I/O counters (per-VM traffic volume)
+- host names, capacity and `litevirt_host_pressure{host,dim}` for **every host
+  in the cluster**, not only this one, plus every peer name via
+  `litevirt_peer_healthy`, `litevirt_cluster_clock_skew_seconds` and
+  `litevirt_replication_peer_pending_entries`
+- `litevirt_vm_snapshot_chain_depth{vm}`, which carries VM names from other hosts
 - `litevirt_enforcement_config_enabled{feature}` and
-  `litevirt_enforcement_latched{feature}` — which security kill-switches are
-  enabled on this node and which capabilities have latched
+  `litevirt_enforcement_latched{feature}` — which hardening kill-switches are
+  set on this node and which capability tokens have latched
+- `litevirt_auth_bearerless_client_admin_total`, whose own help text describes
+  it as the population strict mTLS would deny, plus
+  `litevirt_audit_chain_findings{kind}` and `litevirt_ha_degraded{reason}`
+- `go_info{version}` and `process_*` from the default registry — the exact Go
+  toolchain version, i.e. which runtime CVEs apply
 
-The last one is worth naming separately: it is a readout of which hardening
-features are **off**, which is exactly what an attacker choosing an approach
-would want. The gRPC API withholds the same facts from a caller without a host
-certificate; this endpoint does not.
+The enforcement gauges are worth naming separately: read together they say which
+hardening features are **not** in force here, which is what an attacker choosing
+an approach would want. The gRPC API withholds *that* — `PingResponse`'s
+enforcement posture goes only to a caller presenting a host certificate. It does
+**not** withhold the inventory: any CA-signed client certificate is treated as
+admin (see `authenticate` in `internal/grpcapi/auth.go`), and the `lv-cli`
+certificate is distributable. So this endpoint is a weaker gate than the API for
+posture, and roughly the same gate as a distributed operator credential for
+everything else.
+
+`/api/v1/status` is served on the same port and is also unauthenticated (and
+method-unrestricted). The same path on `rest_port` requires a bearer token.
+Fronting only `/metrics` with a proxy or a path ACL leaves it open.
 
 That default is reasonable on a trusted management network and poor anywhere
 else, and the daemon cannot tell which it is on — so it logs a warning at
@@ -656,31 +669,48 @@ address, or a hostname, which is deliberately not resolved (resolution at startu
 can block and can disagree with what the listener does). Whether the networks
 that can reach it are trusted is not something the daemon can know.
 
-Restrict it one of two ways:
+Restrict it by binding one interface — pick **one** of these:
 
 ```yaml
-metrics_bind: "127.0.0.1"      # scrape via a local exporter or an SSH tunnel
-metrics_bind: "10.13.200.5"    # or a management-network address only
+metrics_bind: "127.0.0.1"
 ```
 
-Both IPv6 wildcard spellings work — `"::"` and `"[::]"`. (Before this,
-`metrics_bind: "::"` composed an invalid address, `ListenAndServe` failed, and
-the daemon logged the error and served no metrics at all.)
+```yaml
+metrics_bind: "10.13.200.5"
+```
 
-Firewalling the port is equivalent and does not need a config change. Note that
-`ui_port` already defaults to localhost; this endpoint does not, which is a
-historical difference and not a judgement that it is less sensitive.
+The first scrapes via a local exporter or an SSH tunnel; the second exposes it on
+a management network only. Both IPv6 wildcard spellings also work — `"::"` and
+`"[::]"`.
+
+`metrics_port: 0` disables the endpoint entirely.
+
+A host firewall achieves the same thing without a config change, but litevirt
+ships no host-firewall guidance and `metrics_bind` is the supported route. Note
+that [firewall.md](firewall.md) is about the **guest** firewall — per-NIC
+security groups for VM traffic — and does nothing to the daemon's own listeners.
+
+`ui_port` already defaults to localhost and this does not, which is a historical
+difference rather than a judgement that this endpoint carries less.
 
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |
 |---------|---------|----------|---------|
-| `grpc_port` | 7443 | gRPC/mTLS | API (CLI, inter-host) |
-| `metrics_port` | 7444 | HTTP, **no auth** | Prometheus `/metrics` — see above |
-| `ui_port` | 7445 | HTTP | Web dashboard |
-| `rest_port` | 7446 | HTTP | REST API gateway |
-| `gossip_port` | 7946 | TCP+UDP | Cluster membership |
-| `dns_port` | 5354 | UDP | VM name DNS |
+| Setting | Default | Protocol | Authenticated? | Default bind | Purpose |
+|---------|---------|----------|----------------|--------------|---------|
+| `grpc_port` | 7443 | gRPC/mTLS | yes — mTLS, client cert required | all | API (CLI, inter-host) |
+| `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
+| `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
+| `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
+| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey` | **all** | Cluster membership |
+| `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |
+
+Three of these are unauthenticated, not one. `rest_port` and `ui_port` are
+protected by *binding to loopback* rather than by their credential, which is the
+same mechanism `metrics_bind` offers and the reason the bind column is here.
+Restricting `gossip_port` and `dns_port` is out of scope for this setting — they
+are listed so this table is not read as a claim that only `/metrics` is open.
 
 ## Environment variables
 

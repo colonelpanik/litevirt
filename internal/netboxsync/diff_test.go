@@ -620,10 +620,55 @@ func vmBodyForTest(t *testing.T, d DesiredVM) map[string]any {
 		_, _ = w.Write([]byte(`{}`))
 	})
 	if err := c.UpdateVM(context.Background(), 11, netbox.VirtualMachine{
-		Name: d.Name, VCPUs: d.VCPUs, MemoryMB: d.MemoryMB,
+		Name: d.Name, VCPUs: netbox.VCPUs(d.VCPUs), MemoryMB: d.MemoryMB,
 		DiskGB: d.DiskGB, Status: d.Status, DeviceID: d.DeviceID,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	return got
+}
+
+// TestDiffEmitsNothingForADecimalVCPUsThatEqualsTheDesiredCount is the other
+// half of the decimal-vcpus fix, and the half a decode-only test cannot reach.
+//
+// NetBox stores `vcpus` as a decimal and returns the two-vCPU guest above as
+// `2.0`. litevirt's desired value is the integer 2. If the diff compared those
+// through anything but a numeric widening — an int on one side, a rounded decode
+// on the other — the VM would look changed on every sweep and the mirror would
+// PATCH it forever, which is precisely what write-on-change exists to prevent.
+func TestDiffEmitsNothingForADecimalVCPUsThatEqualsTheDesiredCount(t *testing.T) {
+	actual := decodeActualFixture(t, `{"results":[{"id":11,"name":"vm-1","vcpus":2.0,`+
+		`"memory":2048,"disk":20,"status":{"value":"active"},"cluster":{"id":5},`+
+		`"device":{"id":9},"custom_fields":{"litevirt_identity":"`+vmIdent("u1")+`"}}],"next":""}`)
+
+	got := Diff([]DesiredVM{{
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
+		DiskGB: 20, Status: "active", DeviceID: 9,
+	}}, actual, fp)
+
+	if len(got) != 0 {
+		t.Fatalf("a decimal 2.0 must equal a desired 2, got %+v", got)
+	}
+}
+
+// TestDiffConvergesAGenuinelyFractionalVCPUs is the control that keeps the
+// comparison honest.
+//
+// NetBox's field permits 2.5 and litevirt's count is a whole number, so a
+// fractional value is drift and must be patched back — the outcome a decoder
+// that ROUNDED to an int would silently lose, by making 2.5 compare equal to a
+// desired 2 and leaving the fraction in NetBox for good.
+func TestDiffConvergesAGenuinelyFractionalVCPUs(t *testing.T) {
+	actual := decodeActualFixture(t, `{"results":[{"id":11,"name":"vm-1","vcpus":2.5,`+
+		`"memory":2048,"disk":20,"status":{"value":"active"},"cluster":{"id":5},`+
+		`"device":{"id":9},"custom_fields":{"litevirt_identity":"`+vmIdent("u1")+`"}}],"next":""}`)
+
+	got := Diff([]DesiredVM{{
+		Name: "vm-1", UUID: "u1", VCPUs: 2, MemoryMB: 2048,
+		DiskGB: 20, Status: "active", DeviceID: 9,
+	}}, actual, fp)
+
+	if len(got) != 1 || got[0].Op != "update" {
+		t.Fatalf("a fractional vcpus must converge to the desired integer, got %+v", got)
+	}
 }

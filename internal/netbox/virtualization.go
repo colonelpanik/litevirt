@@ -24,11 +24,58 @@ type VirtualMachine struct {
 	Name      string
 	ClusterID int
 	DeviceID  int // 0 when the host is not modelled as a DCIM device
-	VCPUs     int
+	VCPUs     VCPUs
 	MemoryMB  int
 	DiskGB    int
 	Status    string
 	Identity  string
+}
+
+// VCPUs is NetBox's `vcpus`, which is a DECIMAL on the model and an integer
+// count everywhere in litevirt.
+//
+// It is not an int here because it cannot be: `virtual_machine.vcpus` is a
+// DecimalField and NetBox does not coerce decimals to strings, so a real
+// response carries `"vcpus": 2.0`. Decoding that into an int fails the WHOLE
+// response — the create-response decode and every page of the inventory
+// enumeration — so an int made the mirror unable to read a live NetBox at all,
+// while the fake, which emitted a bare `2`, could not show it.
+//
+// FLOAT, not a rounded int, because the value has to survive the round trip for
+// the diff to be right: a NetBox that somehow holds 2.5 must compare UNEQUAL to
+// a desired 2 and be patched back to it. Truncating on decode would make the
+// two compare equal and leave the fractional value in NetBox forever.
+//
+// Only `vcpus` is decimal. `memory` and `disk` are PositiveIntegerFields on the
+// same model and arrive as JSON integers, so they stay ints — and a null in any
+// of the three is simply the zero value, which is what an unset field means to
+// the diff.
+type VCPUs float64
+
+// UnmarshalJSON accepts what NetBox and its neighbours actually put on the wire:
+// a JSON number (`2` or `2.0`), a JSON null, or a QUOTED decimal ("2.00").
+//
+// The quoted form is not hypothetical: it is what DRF emits for every decimal
+// field when COERCE_DECIMAL_TO_STRING is left at its framework default, which
+// NetBox overrides but an install fronting it need not. Accepting both costs one
+// branch and removes a whole class of "cannot read the server" failure.
+func (v *VCPUs) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "null" {
+		*v = 0
+		return nil
+	}
+	s = strings.Trim(s, `"`)
+	if s == "" {
+		*v = 0
+		return nil
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("netbox: vcpus %s is neither a number nor a decimal string: %w", b, err)
+	}
+	*v = VCPUs(f)
+	return nil
 }
 
 // VMInterface is one virtualization.vminterface. It is keyed on MAC, never on
@@ -45,7 +92,7 @@ type VMInterface struct {
 type vmJSON struct {
 	ID     int    `json:"id"`
 	Name   string `json:"name"`
-	VCPUs  int    `json:"vcpus"`
+	VCPUs  VCPUs  `json:"vcpus"`
 	Memory int    `json:"memory"`
 	Disk   int    `json:"disk"`
 	Status *struct {

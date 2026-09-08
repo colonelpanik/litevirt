@@ -349,9 +349,16 @@ func ownedBy(identity, fingerprint string) bool {
 // keeps the object — identity-keying guarantees that — so nothing else would
 // ever carry the new name across. Every field here must be populated by
 // vmJSON.toVM, or it differs on every sweep.
+// VCPUs is compared NUMERICALLY, against NetBox's decimal rather than against an
+// int. litevirt's desired value is a whole count and NetBox returns it as `2.0`,
+// so an identity comparison between two different types would either not compile
+// or, if the decode had rounded, hide a genuinely fractional NetBox value: 2.5
+// would round to 2, compare equal to a desired 2, and never be patched back.
+// Widened, `2.0 == 2` agrees and emits no PATCH, and 2.5 differs and converges
+// to the integer.
 func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 	return d.Name != a.Name ||
-		d.VCPUs != a.VCPUs ||
+		netbox.VCPUs(d.VCPUs) != a.VCPUs ||
 		d.MemoryMB != a.MemoryMB ||
 		d.DiskGB != a.DiskGB ||
 		d.Status != a.Status ||

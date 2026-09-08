@@ -841,10 +841,23 @@ type choiceRef struct {
 	Label string `json:"label"`
 }
 
+// decimalView renders a whole count the way NetBox renders a DecimalField:
+// `2.0`, never a bare `2`.
+//
+// It matters because the mirror DECODES this. `virtual_machine.vcpus` is a
+// decimal on the model and NetBox does not coerce decimals to strings, so a fake
+// that echoed the integer it was given would let a decoder that demands an int
+// pass every scenario here while failing against every real server.
+type decimalView int
+
+func (d decimalView) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(d), 'f', 1, 64)), nil
+}
+
 type vmView struct {
 	ID           int               `json:"id"`
 	Name         string            `json:"name"`
-	VCPUs        int               `json:"vcpus"`
+	VCPUs        decimalView       `json:"vcpus"`
 	Memory       int               `json:"memory"`
 	Disk         int               `json:"disk"`
 	Status       *choiceRef        `json:"status"`
@@ -855,7 +868,7 @@ type vmView struct {
 
 func vmJSONOf(vm fakeVM) vmView {
 	out := vmView{
-		ID: vm.ID, Name: vm.Name, VCPUs: vm.VCPUs, Memory: vm.Memory, Disk: vm.Disk,
+		ID: vm.ID, Name: vm.Name, VCPUs: decimalView(vm.VCPUs), Memory: vm.Memory, Disk: vm.Disk,
 		// NetBox always serializes status as a choice object, never as the bare
 		// string it accepts on a write. A fake echoing the string back would let
 		// a decoder that never unwrapped it pass.

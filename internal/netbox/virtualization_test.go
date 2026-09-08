@@ -91,7 +91,7 @@ func TestToVMPopulatesEveryComparedField(t *testing.T) {
 		t.Errorf("Name = %q, want vm-1", v.Name)
 	}
 	if v.VCPUs != 3 {
-		t.Errorf("VCPUs = %d, want 3", v.VCPUs)
+		t.Errorf("VCPUs = %v, want 3", v.VCPUs)
 	}
 	if v.MemoryMB != 2049 {
 		t.Errorf("MemoryMB = %d, want 2049", v.MemoryMB)

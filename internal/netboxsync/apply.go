@@ -309,7 +309,7 @@ func (r *Reconciler) createVM(ctx context.Context, a Action, idx desiredIndex, f
 			Name:      d.Name,
 			ClusterID: r.clusterID,
 			DeviceID:  r.deviceID(ctx, d),
-			VCPUs:     d.VCPUs,
+			VCPUs:     netbox.VCPUs(d.VCPUs),
 			MemoryMB:  d.MemoryMB,
 			DiskGB:    d.DiskGB,
 			Status:    d.Status,
@@ -342,7 +342,7 @@ func (r *Reconciler) updateVM(ctx context.Context, a Action, idx desiredIndex) e
 		// lookup here could write back the very link the diff decided to clear,
 		// and the next sweep would diff it again — forever.
 		DeviceID: d.DeviceID,
-		VCPUs:    d.VCPUs,
+		VCPUs:    netbox.VCPUs(d.VCPUs),
 		MemoryMB: d.MemoryMB,
 		DiskGB:   d.DiskGB,
 		Status:   d.Status,

@@ -906,10 +906,17 @@ var schemaDDL = []string{
 	// row, a bump cannot be lost and a tombstoned-then-recreated row cannot
 	// restart the counter. Same argument as audit_chain_heads.
 	//
-	// Registered exactly like audit_chain_heads: appendOnlyTables (a replicated
-	// INSERT applies as INSERT OR IGNORE and is never LWW-gated, so a row is
-	// immutable once written) plus the default content chain for an exact
-	// updated_at tie. No bespoke merge.
+	// Registered exactly like audit_chain_heads: appendOnlyTables plus the default
+	// content chain, with no bespoke merge.
+	//
+	// The immutability that buys is PATH-DEPENDENT, and worth stating precisely.
+	// On the WAL apply path appendOnlyTables makes a replicated INSERT apply as
+	// INSERT OR IGNORE, so an existing row cannot be rewritten. The anti-entropy
+	// DUMP path is different: it compares updated_at first and reaches the content
+	// chain (where tombstone dominance lives) only on an exact tie, so a live
+	// incoming row with a newer updated_at can replace a local tombstone. Both
+	// paths converge deterministically, which is the property that matters here;
+	// only the WAL path is strictly immutable.
 	//
 	// A term's HOLDER being immutable is what makes the executor's (term, holder)
 	// check meaningful: two partitioned nodes both computing MAX(term)+1 arrive at

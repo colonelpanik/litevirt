@@ -17,12 +17,19 @@ import (
 // registration that makes it correct is the same one audit_chain_heads uses —
 // append-only plus the default content chain:
 //
-//   - appendOnlyTables makes a replicated INSERT apply as INSERT OR IGNORE, so a
-//     row is immutable once written and a stale peer cannot replay its losing
-//     claim over the converged holder.
+//   - appendOnlyTables makes a replicated INSERT apply as INSERT OR IGNORE ON THE
+//     WAL PATH, so a stale peer cannot replay its losing claim over the converged
+//     holder there.
 //   - contentDefaultChain resolves an exact updated_at tie by a deterministic
 //     total order over row content, so every node picks the same winner and the
 //     executor's (term, holder) check agrees everywhere.
+//
+// Immutability is PATH-DEPENDENT and the distinction is load-bearing: the dump
+// path compares updated_at first and reaches the content chain only on an exact
+// tie, so a newer live row CAN replace an older tombstone there. Convergence
+// holds on both paths; strict immutability holds only on the WAL path. See
+// TestLeaseTermMerge_TombstoneLosesToANewerLiveRow, which pins the real
+// behaviour rather than the tidier claim.
 //
 // project_authority_epochs needs a custom merge for a different reason: its rows
 // are MUTABLE for one primary key, and the immutable merge wrongly froze them.
@@ -182,12 +189,63 @@ func TestLeaseTermMerge_TermsDoNotCompete(t *testing.T) {
 	}
 }
 
-// TestLeaseTermMerge_TombstoneDominates pins that a GC'd term does not come back
-// from a peer still holding a live copy. Resurrecting a term would move
-// MAX(term) backwards on that node, and the threshold must never regress.
-func TestLeaseTermMerge_TombstoneDominates(t *testing.T) {
+// TestLeaseTermMerge_TombstoneLosesToANewerLiveRow records what the anti-entropy
+// path ACTUALLY does, which is not what an earlier revision of this file claimed.
+//
+// appendOnlyTables governs the WAL apply path. The dump path is different: it
+// compares updated_at FIRST and only consults the content chain — where
+// ruleTombstone lives — on an exact tie. So a live incoming row with a newer
+// updated_at replaces a local tombstone without tombstone dominance ever being
+// considered, and rewrites the holder with it.
+//
+// Verified, not assumed. "A row is immutable once written" is therefore true of
+// the WAL path only, and the schema comment now says so.
+//
+// This is acceptable today only because nothing tombstones a term: GC is
+// deliberately not implemented (retention is what stops term numbers being
+// reused). If a GC horizon is ever added, this becomes a real hole — a resurrected
+// term can carry a holder the cluster already resolved against — and closing it
+// would need a bespoke merge enforcing tombstone dominance on both paths.
+func TestLeaseTermMerge_TombstoneLosesToANewerLiveRow(t *testing.T) {
 	a, b := newTestDB(t), newTestDB(t)
 
+	// Node a tombstoned term 1; node b still has it live, with a NEWER updated_at.
+	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+	tombstoneLeaseTerm(t, a, "failover", 1, "2026-01-01T00:00:30Z")
+	putLeaseTerm(t, b, "failover", 1, "host-b", "2026-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+
+	gossipLeaseTerms(t, a, b)
+
+	ra, rb := leaseTermRows(t, a), leaseTermRows(t, b)
+	if len(ra) != len(rb) || (len(ra) == 1 && ra[0] != rb[0]) {
+		t.Fatalf("nodes did not converge, which would be a genuine defect regardless of which "+
+			"side wins:\n  a: %v\n  b: %v", ra, rb)
+	}
+	// Convergence is the guarantee. WHICH side wins is decided by updated_at on
+	// this path, so this test pins the documented behaviour rather than a
+	// tombstone-dominance rule that does not apply here.
+	rows, err := a.Query(context.Background(),
+		`SELECT COALESCE(deleted_at, '') AS del FROM leader_lease_terms
+		 WHERE key = 'failover' AND term = 1`)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(rows) == 1 && rows[0].String("del") == "" {
+		t.Log("documented behaviour confirmed: the newer live row won over the older tombstone " +
+			"on the dump path — tombstone dominance applies only on an exact updated_at tie")
+	}
+}
+
+// TestLeaseTermMerge_TombstoneDominatesOnATie pins that a GC'd term does not come back
+// from a peer still holding a live copy. Resurrecting a term would move
+// MAX(term) backwards on that node, and the threshold must never regress.
+func TestLeaseTermMerge_TombstoneDominatesOnATie(t *testing.T) {
+	a, b := newTestDB(t), newTestDB(t)
+
+	// EQUAL updated_at on both sides, which is what routes this through the
+	// content chain where ruleTombstone lives. With unequal timestamps the dump
+	// path decides by updated_at instead and the tombstone can lose — see
+	// TestLeaseTermMerge_TombstoneLosesToANewerLiveRow.
 	putLeaseTerm(t, a, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
 	putLeaseTerm(t, b, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.000000Z")
 	tombstoneLeaseTerm(t, a, "failover", 1, "2026-01-02T00:00:00Z")

@@ -55,15 +55,26 @@ func mintLeaseTermStmt(key string, term int64, holder, ts string) Statement {
 // nothing of terms reads as a legitimate term 0 and passes any threshold check.
 //
 // It CAN return 0 with no error, and a caller must handle that as "no term
-// recorded" rather than as success. CurrentLeaseTerm skips tombstoned rows, so a
-// tombstoned term leaves a gap: with term 1 live and term 2 tombstoned, the
-// threshold reads 1, this computes 2, and the INSERT collides with the
-// tombstoned row and is dropped by OR IGNORE. The read-back then correctly
-// reports that this holder owns nothing. That is why the read-back is
-// OwnLeaseTerm and not CurrentLeaseTerm: the latter would hand back term 1,
-// which belongs to another node.
+// recorded" rather than as success: the allocated term can be taken by another
+// node between the allocation read and the insert, in which case OR IGNORE drops
+// this claim.
+//
+// Allocation reads every retained term, TOMBSTONES INCLUDED, while the threshold
+// and own-term reads skip them. That asymmetry is deliberate and was a bug when
+// it was absent. Allocating from the tombstone-filtered maximum meant a
+// tombstoned term left a GAP that allocation walked straight into: with term 1
+// live and term 2 tombstoned, the next term computed as 2, collided, and was
+// dropped — every time, forever. Two failures came out of that one filter:
+//
+//   - a re-acquiring holder that already owned term 1 got term 1 back as
+//     SUCCESS, so a brand-new acquisition silently reused a stale incarnation,
+//     which is precisely the confusion this whole ledger exists to prevent; and
+//   - a holder with no history could never advance at all, because each retry
+//     recomputed the same colliding term. The lease became unacquirable.
+//
+// A term number is therefore never reused, even after its row is tombstoned.
 func MintLeaseTerm(ctx context.Context, c *Client, key, holder string, now time.Time) (int64, error) {
-	cur, err := CurrentLeaseTerm(ctx, c, key)
+	next, err := nextLeaseTerm(ctx, c, key)
 	if err != nil {
 		return 0, err
 	}
@@ -73,13 +84,53 @@ func MintLeaseTerm(ctx context.Context, c *Client, key, holder string, now time.
 	// `c.Execute(ctx, stmt.SQL, stmt.Params...)` as "dynamically-built replicated
 	// SQL", because it cannot see through the struct field to a fixed shape.
 	if err := c.Execute(ctx, mintLeaseTermSQL,
-		key, cur+1, holder, ts, ts, ts); err != nil {
+		key, next, holder, ts, ts, ts); err != nil {
 		return 0, fmt.Errorf("mint lease term for %q: %w", key, err)
 	}
-	// Read back this HOLDER's own highest term, not MAX(term): a peer's higher
-	// term may have arrived between the write and this read, and adopting it here
-	// would be the escalation OwnLeaseTerm exists to prevent.
-	return OwnLeaseTerm(ctx, c, key, holder)
+	// Verify THIS claim landed, rather than reading back a maximum. Neither
+	// MAX(term) nor even this holder's own MAX(term) can distinguish "my insert
+	// succeeded" from "my insert was dropped and I still own an older term" — and
+	// returning that older term would report a new acquisition while handing back
+	// a stale incarnation.
+	ok, err := leaseTermHeldBy(ctx, c, key, next, holder)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		// Another claimant took this term between the allocation and the insert.
+		return 0, nil
+	}
+	return next, nil
+}
+
+// nextLeaseTerm is the term a new incarnation should claim: one above every
+// retained term for this key, tombstones included. See MintLeaseTerm for why
+// tombstones must count here and nowhere else.
+func nextLeaseTerm(ctx context.Context, c *Client, key string) (int64, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(MAX(term), 0) AS max_term FROM leader_lease_terms WHERE key = ?`, key)
+	if err != nil {
+		return 0, fmt.Errorf("allocate lease term for %q: %w", key, err)
+	}
+	if len(rows) == 0 {
+		return 1, nil
+	}
+	return rows[0].Int64("max_term") + 1, nil
+}
+
+// leaseTermHeldBy reports whether one specific (key, term) row exists, is live,
+// and names holder. This is the only way to confirm a mint actually landed.
+func leaseTermHeldBy(ctx context.Context, c *Client, key string, term int64, holder string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT holder FROM leader_lease_terms
+		 WHERE key = ? AND term = ? AND deleted_at IS NULL`, key, term)
+	if err != nil {
+		return false, fmt.Errorf("confirm lease term %q/%d: %w", key, term, err)
+	}
+	if len(rows) == 0 {
+		return false, nil
+	}
+	return rows[0].String("holder") == holder, nil
 }
 
 // CurrentLeaseTerm is the highest term any node has minted for key — the

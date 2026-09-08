@@ -183,18 +183,153 @@ func TestMintLeaseTerm_NeverReturnsAnotherHoldersTerm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if term != 0 {
-		// Whatever it returned, it must at minimum be a term host-a actually owns.
-		rows, qerr := c.Query(ctx,
-			`SELECT holder FROM leader_lease_terms WHERE key = 'failover' AND term = ?`, term)
-		owner := "<missing>"
-		if qerr == nil && len(rows) > 0 {
-			owner = rows[0].String("holder")
+	if term == 0 {
+		return // no term claimed is a safe outcome; the caller must handle it
+	}
+
+	// Whatever term came back, its row must name THIS holder. Returning any
+	// maximum — the cluster's or even this holder's own — cannot distinguish "my
+	// insert landed" from "my insert was dropped and some other row carries that
+	// number", and handing back a term another node holds means every proof this
+	// leader stamps passes the stale-term check while fencing nobody.
+	rows, err := c.Query(ctx,
+		`SELECT holder, COALESCE(deleted_at, '') AS del FROM leader_lease_terms
+		 WHERE key = 'failover' AND term = ?`, term)
+	if err != nil {
+		t.Fatalf("read back term %d: %v", term, err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("MintLeaseTerm returned term %d but no such row exists", term)
+	}
+	if got := rows[0].String("holder"); got != "host-a" {
+		t.Fatalf("MintLeaseTerm returned term %d, whose row names holder %q rather than the "+
+			"caller. The mint was dropped and a maximum was read back in its place", term, got)
+	}
+	if rows[0].String("del") != "" {
+		t.Fatalf("MintLeaseTerm returned term %d, whose row is tombstoned", term)
+	}
+}
+
+// TestMintLeaseTerm_ReacquisitionNeverReusesAnOwnedTerm is the case my first
+// attempt at the test above missed, because it used a holder with no history.
+//
+// A holder that already owns term 1 re-acquires. If allocation skips the
+// tombstoned term 2 and the insert is dropped, reading back this holder's own
+// maximum returns 1 — and a brand-new acquisition is reported as holding a
+// STALE incarnation. That is the exact confusion the ledger exists to remove,
+// reintroduced by the read-back.
+func TestMintLeaseTerm_ReacquisitionNeverReusesAnOwnedTerm(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	putLeaseTerm(t, c, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+	putLeaseTerm(t, c, "failover", 2, "host-a", "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z")
+	tombstoneLeaseTerm(t, c, "failover", 2, "2026-01-02T00:00:00Z")
+
+	term, err := MintLeaseTerm(ctx, c, "failover", "host-a", leaseTestNow)
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	if term == 1 {
+		t.Fatalf("a NEW acquisition returned the holder's OWN OLD term 1 as success. No new "+
+			"incarnation was recorded, so every proof this leader stamps carries a term it " +
+			"held in a previous incarnation")
+	}
+	if term <= 2 {
+		t.Fatalf("new term %d does not exceed every retained term (1 live, 2 tombstoned); "+
+			"reusing a term number makes two incarnations indistinguishable", term)
+	}
+}
+
+// TestMintLeaseTerm_AdvancesPastATombstonedTerm pins that allocation is not
+// blocked by a tombstone.
+//
+// With the threshold read used for allocation, a holder with no history retried
+// into the same collision indefinitely: the tombstone-filtered maximum never
+// advanced, so the computed term never changed and the lease could never be
+// acquired at all.
+func TestMintLeaseTerm_AdvancesPastATombstonedTerm(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	putLeaseTerm(t, c, "failover", 1, "host-b", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+	putLeaseTerm(t, c, "failover", 2, "host-b", "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z")
+	tombstoneLeaseTerm(t, c, "failover", 2, "2026-01-02T00:00:00Z")
+
+	term, err := MintLeaseTerm(ctx, c, "failover", "host-a", leaseTestNow)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if term == 0 {
+		t.Fatal("allocation could not get past the tombstoned term, so this holder can never " +
+			"acquire one. Retries recompute the same colliding term forever and the lease is " +
+			"permanently unacquirable")
+	}
+	if term <= 2 {
+		t.Errorf("term %d reuses a retained term number", term)
+	}
+}
+
+// TestMintLeaseTerm_RacingHoldersNeverBothClaimATerm asserts the invariant that
+// the post-insert verification exists for, across two holders racing one term.
+//
+// Coverage limit, stated rather than implied: this is PROBABILISTIC. The
+// verification's distinct value over reading back the holder's own maximum only
+// shows when a racing node takes the allocated term AND the loser already owns an
+// earlier term — then the read-back returns that earlier term as though the new
+// acquisition had succeeded, while the verification correctly returns 0. Forcing
+// that interleaving needs a hook between the allocation read and the insert,
+// which does not exist, so the mutation swapping verification for the read-back
+// is NOT caught by this suite. The assertion below is still sound and never
+// false-fails; it simply may not reach the collision on a given run.
+func TestMintLeaseTerm_RacingHoldersNeverBothClaimATerm(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+
+	// Give one racer a prior term, so a dropped mint has something stale to
+	// wrongly return.
+	putLeaseTerm(t, c, "failover", 1, "host-a", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+
+	type res struct {
+		holder string
+		term   int64
+	}
+	out := make(chan res, 2)
+	for _, h := range []string{"host-a", "host-b"} {
+		go func(holder string) {
+			term, err := MintLeaseTerm(ctx, c, "failover", holder, leaseTestNow)
+			if err != nil {
+				term = -1
+			}
+			out <- res{holder, term}
+		}(h)
+	}
+
+	seen := map[int64]string{}
+	for i := 0; i < 2; i++ {
+		r := <-out
+		if r.term <= 0 {
+			continue // no term claimed, or an error — both safe outcomes
 		}
-		t.Fatalf("MintLeaseTerm returned term %d, whose holder is %q, not host-a. The mint was "+
-			"dropped by INSERT OR IGNORE, so this holder owns no term — returning the cluster "+
-			"maximum hands it another node's incarnation and every proof it stamps passes the "+
-			"stale-term check", term, owner)
+		if prev, dup := seen[r.term]; dup {
+			t.Errorf("term %d was returned to BOTH %s and %s; two holders believing they own "+
+				"one incarnation is the split this ledger exists to make impossible",
+				r.term, prev, r.holder)
+		}
+		seen[r.term] = r.holder
+
+		rows, err := c.Query(ctx,
+			`SELECT holder FROM leader_lease_terms WHERE key = 'failover' AND term = ?`, r.term)
+		if err != nil || len(rows) == 0 {
+			t.Fatalf("read back term %d: err=%v rows=%d", r.term, err, len(rows))
+		}
+		if got := rows[0].String("holder"); got != r.holder {
+			t.Errorf("%s was handed term %d, whose row names %q", r.holder, r.term, got)
+		}
+		if r.term == 1 && r.holder == "host-a" {
+			t.Errorf("host-a's NEW acquisition returned its pre-existing term 1; the mint was " +
+				"dropped and a stale incarnation was reported as success")
+		}
 	}
 }
 

@@ -35,6 +35,14 @@ type Server struct {
 	ctStat   containerStatter
 	hostName string
 	httpSrv  *http.Server
+	// reg is where the collector registers. nil means
+	// prometheus.DefaultRegisterer, which is what the daemon uses.
+	// Injectable ONLY so a test can drive the real Start more than once in a
+	// process: MustRegister panics on a duplicate, and Stop shuts the HTTP
+	// server down without unregistering, so `go test -count=2` would panic on
+	// the second run. promhttp still serves the default registry, so an
+	// injected one isolates registration, not the served output.
+	reg prometheus.Registerer
 	// log is the logger the exposure warning goes to. nil means slog.Default().
 	// Injectable ONLY so a test can read what was logged without calling
 	// slog.SetDefault, which cannot be restored: SetDefault also rewires the
@@ -42,6 +50,14 @@ type Server struct {
 	// handler is the default one — so a save/restore pair permanently routes
 	// std-log writes into the test's dead buffer for the rest of the binary.
 	log *slog.Logger
+}
+
+// registerer is the injected registry or the process default. Never nil.
+func (s *Server) registerer() prometheus.Registerer {
+	if s.reg != nil {
+		return s.reg
+	}
+	return prometheus.DefaultRegisterer
 }
 
 // logger is the injected logger or the process default. Never nil.
@@ -77,7 +93,7 @@ func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Cl
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
-	prometheus.MustRegister(collector)
+	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
 	mux := http.NewServeMux()

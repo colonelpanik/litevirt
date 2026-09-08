@@ -644,12 +644,20 @@ reads, without a credential:
 The enforcement gauges are worth naming separately: read together they say which
 hardening features are **not** in force here, which is what an attacker choosing
 an approach would want. The gRPC API withholds *that* — `PingResponse`'s
-enforcement posture goes only to a caller presenting a host certificate. It does
-**not** withhold the inventory: any CA-signed client certificate is treated as
-admin (see `authenticate` in `internal/grpcapi/auth.go`), and the `lv-cli`
-certificate is distributable. So this endpoint is a weaker gate than the API for
-posture, and roughly the same gate as a distributed operator credential for
-everything else.
+enforcement posture goes only to a caller presenting a host certificate.
+
+The inventory is a different gate, and how much weaker this endpoint is depends
+on one flag:
+
+- with `auth.strict_mtls_identity` **off** (the default), a bearerless
+  CA-signed client certificate is treated as admin, so the API inventory is
+  gated by a credential distributed to every operator — roughly what
+  `/metrics` gives away for free
+- with it **on**, that same certificate is refused without a session
+  (`run lv login`), so the API inventory needs a real identity while
+  `/metrics` still needs nothing. **Enforcing strict mTLS widens this gap
+  rather than closing it** — the metrics endpoint becomes the weakest path to
+  the inventory, and `metrics_bind` is the only thing narrowing it
 
 `/api/v1/status` is served on the same port and is also unauthenticated (and
 method-unrestricted). The same path on `rest_port` requires a bearer token.

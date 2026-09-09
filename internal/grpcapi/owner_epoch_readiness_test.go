@@ -290,46 +290,77 @@ func TestOwnershipTieCategory_FailsClosedOnAnUnknownCategory(t *testing.T) {
 	}
 }
 
-// TestOwnershipTieCategory_ClassifiesTheCategoriesCorrosionEmits pins the verdict
-// for every category the resolver and the merges actually produce today, with
-// the four Task 0 got wrong called out.
-//
-// The category strings are the contract between the two packages. A rename in
-// corrosion without a change here would silently reclassify a tie — in the
-// fail-closed direction, which is why this is a table rather than a derivation:
-// see the note in the test body.
+// TestOwnershipTieCategory_ClassifiesTheCategoriesCorrosionEmits pins the
+// verdict for every category the resolver and the merges actually produce, and
+// says why for each — including the four this phase got wrong twice.
 func TestOwnershipTieCategory_ClassifiesTheCategoriesCorrosionEmits(t *testing.T) {
-	// Deriving this list dynamically — driving every capabilityMap chain with an
-	// all-columns-differ rowView — was considered and rejected. It is possible
-	// (newRowView is reachable from a corrosion test), but the only drift it
-	// would catch beyond the table below is a NEW category that should have been
-	// non-ownership being left unclassified, and that direction fails closed:
-	// it over-withholds, which is visible and recoverable. The dangerous
-	// direction — a table that carries an owner epoch not being recognised — is
-	// caught in corrosion by
-	// TestOwnershipBearingTables_CoverEveryOwnerEpochColumn, derived from
-	// schemaDDL.
 	for _, tc := range []struct {
 		category  string
 		withholds bool
 		why       string
 	}{
-		{"runtime_owned", true, "vms.host_name / pending_action_id, containers"},
-		{"tenancy", true, "a project ownership split"},
-		{"control_plane", true, "hosts.state IS the voting roster this latch is derived from"},
-		{"immutable_ownership_conflict", true, "operations, operation_steps — owner_epoch is in the PK"},
-		{"identity_content_conflict", true, "a workload identity conflict"},
-		{"workload_identity_conflict", true, "the anti-entropy authority guard's identity fault"},
-		{"uncategorized", true, "the resolver could not classify it ⇒ unknown ⇒ closed"},
+		{corrosion.TieCategoryRuntimeOwned, true, "vms.host_name / pending_action_id, containers"},
+		{corrosion.TieCategoryTenancy, true, "a project ownership split"},
+		{corrosion.TieCategoryControlPlane, true, "hosts.state IS the voting roster this latch is derived from"},
+		{corrosion.TieCategoryImmutableOwnership, true, "operations, operation_steps — owner_epoch is in the PK"},
+		{corrosion.TieCategoryIdentityContent, true, "a workload identity conflict"},
+		{corrosion.TieCategoryWorkloadIdentity, true, "the anti-entropy authority guard's identity fault"},
+		{corrosion.TieCategoryUncategorized, true, "the resolver could not classify it ⇒ unknown ⇒ closed"},
 
-		{"immutable_ledger_conflict", false, "a contested lease term is not evidence about a workload's owner epoch"},
-		{"opaque", false, "a differing spec/create_spec blob, no ownership column"},
-		{"content", false, "benign content convergence"},
-		{"policy", false, "a policy blob"},
+		// Reclassified after review. policyChain is an UNCONDITIONAL
+		// fail-to-human over projects, project_quotas, roles, role_bindings,
+		// users, tokens and the rest — not the "policy blob" this table used to
+		// call it. A `projects` divergence is a tenancy dispute, and the same
+		// dispute on vms.project is categorised tenancy and withholds.
+		{corrosion.TieCategoryPolicy, true, "projects/roles/role_bindings — a tenancy and authorization dispute"},
+		// opaque is vms.spec and containers.create_spec: workload rows. It is
+		// also where a vms tie lands when ruleNumericMax declines to decide on
+		// an unparseable vm_owner_epoch.
+		{corrosion.TieCategoryOpaque, true, "vms.spec / containers.create_spec, and the unparseable-epoch fallthrough"},
+
+		{corrosion.TieCategoryImmutableLedger, false, "a contested lease term is not evidence about a workload's owner epoch"},
+		// These three were absent from BOTH maps, so they withheld by the
+		// fail-closed default — permanently, because all three are
+		// fail-to-human chains that never auto-converge.
+		{corrosion.TieCategoryAuthFactor, false, "a differing 2FA secret or recovery code"},
+		{corrosion.TieCategoryAuthPointer, false, "a differing auth pointer column"},
+		{corrosion.TieCategoryLBToken, false, "a differing LB bearer token"},
 	} {
 		if got := ownershipTieCategory(tc.category); got != tc.withholds {
 			t.Errorf("ownershipTieCategory(%q) = %v, want %v — %s",
 				tc.category, got, tc.withholds, tc.why)
+		}
+	}
+}
+
+// TestOwnershipTieCategory_PartitionsEveryKnownCategory is what makes the
+// partition claim in the two maps' doc comments mean anything.
+//
+// It failed to mean anything before: the allowlist map was never read by any
+// code, so "the two sets together are a partition and a new category cannot be
+// silently absent from both" was enforced by nothing — and was already false,
+// with auth_factor, auth_pointer and lb_token absent from both while corrosion
+// emitted all three, and "content" present in the denylist while nothing
+// emitted it at all.
+//
+// Both maps are now read by ownershipTieCategory, and this derives its input
+// from corrosion.KnownTieCategories rather than restating it.
+func TestOwnershipTieCategory_PartitionsEveryKnownCategory(t *testing.T) {
+	if len(corrosion.KnownTieCategories) < 10 {
+		t.Fatalf("corrosion.KnownTieCategories has %d entries; too few to be the real set, so "+
+			"this test would pass vacuously", len(corrosion.KnownTieCategories))
+	}
+	for _, category := range corrosion.KnownTieCategories {
+		in, out := ownershipTieCategories[category], nonOwnershipTieCategories[category]
+		if in == out {
+			state := "NEITHER map"
+			if in {
+				state = "BOTH maps"
+			}
+			t.Errorf("category %q is in %s. Every category corrosion can emit must be "+
+				"classified in exactly one: an unclassified one withholds owner_epoch_v1 by a "+
+				"fail-closed default nobody chose, and the latch is monotone and never re-opens",
+				category, state)
 		}
 	}
 }

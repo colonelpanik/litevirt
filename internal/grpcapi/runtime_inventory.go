@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -64,7 +65,10 @@ type runtimeInventory struct {
 	// OwnershipTies counts unresolved ties on the ownership tables ONLY. A
 	// readiness predicate answers a narrower question than the digest does —
 	// "could a tie be hiding the ownership row I am about to certify?" — and only
-	// these tables can. See ownershipTieTables.
+	// these categories can. See ownershipTieCategory.
+	//
+	// Carried over the wire since v53 (ownership_tie_count), so a peer's count is
+	// a real answer rather than a fabricated zero.
 	OwnershipTies int
 	Complete      bool
 	Errors        []string
@@ -85,45 +89,86 @@ type runtimeInventory struct {
 //
 // The resolver already computes a category per conflict and corrosion splits its
 // immutable-row conflicts into an ownership and a ledger flavour, so the
-// classification now lives beside the schema and is tested against it
-// (TestOwnershipBearingTables_CoverEveryOwnerEpochColumn).
+// classification is expressed in categories the emitting package defines
+// (corrosion.KnownTieCategories) and is checked against them by
+// TestOwnershipTieCategory_PartitionsEveryKnownCategory.
 //
 // An UNRECOGNISED category counts as ownership — fail closed. This latch is
 // monotone and never re-opens, so withholding it wrongly is recoverable while
 // latching over a live ownership dispute is not.
 var ownershipTieCategories = map[string]bool{
-	"runtime_owned":                true,
-	"tenancy":                      true, // a project ownership split
-	"control_plane":                true, // hosts.state IS the voting roster this latch is derived from
-	"immutable_ownership_conflict": true,
-	"identity_content_conflict":    true,
-	"workload_identity_conflict":   true,
-	"uncategorized":                true, // unclassified by the resolver ⇒ unknown ⇒ closed
+	corrosion.TieCategoryRuntimeOwned:       true, // host_name, pending_action_id, active_operation_id
+	corrosion.TieCategoryTenancy:            true, // a project ownership split
+	corrosion.TieCategoryControlPlane:       true, // hosts.state IS the voting roster this latch is derived from
+	corrosion.TieCategoryImmutableOwnership: true,
+	corrosion.TieCategoryIdentityContent:    true,
+	corrosion.TieCategoryWorkloadIdentity:   true,
+	corrosion.TieCategoryUncategorized:      true, // unclassified by the resolver ⇒ unknown ⇒ closed
+	corrosion.TieCategoryPolicy:             true, // see below — this one was wrong
+	corrosion.TieCategoryOpaque:             true, // and so was this one
 }
 
-// nonOwnershipTieCategories are the categories deliberately EXCLUDED, listed
-// explicitly so the two sets together are a partition and a new category cannot
-// be silently absent from both.
+// nonOwnershipTieCategories are the categories deliberately EXCLUDED. Both maps
+// are READ, and TestOwnershipTieCategory_PartitionsEveryKnownCategory fails if
+// any corrosion.KnownTieCategories entry is missing from both — which is the
+// only reason the partition claim means anything. The previous version of this
+// comment claimed "a new category cannot be silently absent from both" while
+// the allowlist above was never read by anything, and three emitted categories
+// were absent from both on arrival.
 //
 //   - immutable_ledger_conflict: a contested lease term. Two nodes claiming one
 //     tenure is real and must stay visible, but it is not evidence about any
-//     workload's owner epoch — this is the whole point of the fix that scoped
-//     this predicate in the first place.
-//   - opaque / content / policy: a differing spec, label or policy blob. No
-//     ownership column is involved.
+//     workload's owner epoch — the whole point of the fix that scoped this
+//     predicate in the first place.
+//   - auth_factor: a differing 2FA secret or recovery code (user_2fa,
+//     recovery_codes). Fail-to-human by design and never auto-converging, so
+//     leaving it in the withholding set — which the missing entry did, via the
+//     fail-closed default — withheld the capability permanently for a reason
+//     that has nothing to do with any workload's ownership.
+//   - auth_pointer, lb_token: the same, for an auth pointer column and an LB
+//     bearer token.
+//
+// Two entries were moved OUT of this map, both of them wrong:
+//
+//   - policy is not "a policy blob". policyChain is
+//     {ruleTombstone(), ruleUnresolved(TieCategoryPolicy)} — an unconditional
+//     fail-to-human on any tied difference — and it covers projects,
+//     project_quotas, roles, role_bindings, users, tokens, security_groups,
+//     sg_rules, ip_sets, the firewall tables, registry_credentials and the
+//     notification tables. Two nodes disagreeing about a `projects` row IS a
+//     tenancy dispute, and the identical dispute seen on vms.project is
+//     categorised tenancy and withholds — so excluding policy made the
+//     predicate answer differently depending on which side of the relation
+//     diverged.
+//   - opaque is vms.spec and containers.create_spec, which are workload rows.
+//     It is also where a vms tie LANDS when ruleNumericMax passes on an
+//     unparseable vm_owner_epoch (cellStr returns "" for a nil cell and
+//     ParseInt fails, so the rule declines to decide) — the one case the
+//     narrowing was asserted to be safe against.
+//
+// "content" is deliberately absent from both maps: the content chains end in
+// ruleContentMax and resolve, so no tie is ever tracked under it. It used to
+// sit here, which is what made the partition claim look satisfied.
 var nonOwnershipTieCategories = map[string]bool{
-	"immutable_ledger_conflict": true,
-	"opaque":                    true,
-	"content":                   true,
-	"policy":                    true,
+	corrosion.TieCategoryImmutableLedger: true,
+	corrosion.TieCategoryAuthFactor:      true,
+	corrosion.TieCategoryAuthPointer:     true,
+	corrosion.TieCategoryLBToken:         true,
 }
 
 // ownershipTieCategory reports whether a category withholds the owner-epoch
-// regime. Unknown ⇒ true (closed).
+// regime. Unknown ⇒ true (closed), and loudly: the latch is monotone and never
+// re-opens, so an unclassified category means this build shipped past the
+// partition test.
 func ownershipTieCategory(category string) bool {
 	if nonOwnershipTieCategories[category] {
 		return false
 	}
+	if ownershipTieCategories[category] {
+		return true
+	}
+	slog.Warn("unclassified unresolved-tie category withholding owner_epoch_v1 by default",
+		"category", category)
 	return true
 }
 

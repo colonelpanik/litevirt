@@ -1193,7 +1193,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	// keep local AND surface it as an unresolved tie for operator/reconciler review,
 	// never silently diverge.
 	if proofRank(localStatus) == 2 && proofRank(incomingStatus) == 2 && localStatus != incomingStatus {
-		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "runtime_owned")
+		c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryRuntimeOwned)
 		return true, nil
 	}
 
@@ -1563,7 +1563,7 @@ func (c *Client) trackIdentityFault(table string, natVals []interface{}, localCo
 	if enc, err := encodeRowCellsV2(localCols, localFull); err == nil {
 		pair = enc
 	}
-	c.trackUnresolvedPair(table, identityFaultPK(natVals), pair, path, "identity_content_conflict")
+	c.trackUnresolvedPair(table, identityFaultPK(natVals), pair, path, TieCategoryIdentityContent)
 }
 
 // clearIdentityFault drops any tracked identity fault for this natural key — called on a resolved

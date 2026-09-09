@@ -228,7 +228,7 @@ func ruleLBGeneration(col string) tieRule {
 		case lg == "" && ig != "":
 			return decideTakeIncoming("lb_generation")
 		default:
-			return decideUnresolved("lb_token")
+			return decideUnresolved(TieCategoryLBToken)
 		}
 	}
 }
@@ -276,20 +276,20 @@ func contentDefaultChain() []tieRule { return []tieRule{ruleTombstone(), ruleCon
 func contentOpaqueChain(opaqueCols ...string) []tieRule {
 	chain := []tieRule{ruleTombstone()}
 	if len(opaqueCols) > 0 {
-		chain = append(chain, ruleAnyColUnresolved(opaqueCols, "opaque"))
+		chain = append(chain, ruleAnyColUnresolved(opaqueCols, TieCategoryOpaque))
 	}
 	return append(chain, ruleContentMax())
 }
 func tenancyOpaqueChain(projectCol string, opaqueCols ...string) []tieRule {
-	chain := []tieRule{ruleColUnresolved(projectCol, "tenancy"), ruleTombstone()}
+	chain := []tieRule{ruleColUnresolved(projectCol, TieCategoryTenancy), ruleTombstone()}
 	if len(opaqueCols) > 0 {
-		chain = append(chain, ruleAnyColUnresolved(opaqueCols, "opaque"))
+		chain = append(chain, ruleAnyColUnresolved(opaqueCols, TieCategoryOpaque))
 	}
 	return append(chain, ruleContentMax())
 }
-func policyChain() []tieRule { return []tieRule{ruleTombstone(), ruleUnresolved("policy")} }
+func policyChain() []tieRule { return []tieRule{ruleTombstone(), ruleUnresolved(TieCategoryPolicy)} }
 func authPointerChain(pointerCol string) []tieRule {
-	return []tieRule{ruleTombstone(), ruleColUnresolved(pointerCol, "auth_pointer"), ruleContentMax()}
+	return []tieRule{ruleTombstone(), ruleColUnresolved(pointerCol, TieCategoryAuthPointer), ruleContentMax()}
 }
 func lbChain() []tieRule {
 	return []tieRule{ruleTombstone(), ruleLBGeneration("generation"), ruleContentMax()}
@@ -305,21 +305,21 @@ var capabilityMap = map[string]tableResolver{
 	// Runtime-owned: an ownership column on the PK row. host_name diff or a
 	// tenancy diff has no safe row-level winner → defer to runtime repair / human.
 	"vms": {category: "runtime-owned", chain: []tieRule{
-		ruleColUnresolved("host_name", "runtime_owned"),
-		ruleColUnresolved("project", "tenancy"),
+		ruleColUnresolved("host_name", TieCategoryRuntimeOwned),
+		ruleColUnresolved("project", TieCategoryTenancy),
 		// v38: pending_action_id is a control-plane pointer to the authorizing
 		// runtime_action_proofs row. On an exact-ts tie a differing pointer has no
 		// safe winner (content-max could pick a stale/other proof) → unresolved.
-		ruleColUnresolved("pending_action_id", "runtime_owned"),
+		ruleColUnresolved("pending_action_id", TieCategoryRuntimeOwned),
 		// v41: monotonic per-VM counters — the higher value is authoritative (a newer
 		// ownership transfer / spec mutation), so an exact-ts tie converges to the max
 		// rather than coin-flipping content. active_operation_id is a control-plane
 		// pointer to the in-flight operations row → unresolved on a differing tie.
 		ruleNumericMax("vm_owner_epoch"),
 		ruleNumericMax("spec_generation"),
-		ruleColUnresolved("active_operation_id", "runtime_owned"),
+		ruleColUnresolved("active_operation_id", TieCategoryRuntimeOwned),
 		ruleTombstone(),
-		ruleAnyColUnresolved([]string{"spec"}, "opaque"), // never content-max the VM definition
+		ruleAnyColUnresolved([]string{"spec"}, TieCategoryOpaque), // never content-max the VM definition
 		ruleContentMax(),
 	}},
 	// containers: host_name is part of the PK (an ownership split is two distinct
@@ -329,12 +329,12 @@ var capabilityMap = map[string]tableResolver{
 	// are a surfaced runtime-ownership fault. The tenancy and opaque create-spec
 	// carve-outs remain ahead of benign content convergence.
 	"containers": {category: "runtime-owned", chain: []tieRule{
-		ruleColUnresolved("project", "tenancy"),
+		ruleColUnresolved("project", TieCategoryTenancy),
 		ruleNumericMax("owner_epoch"),
 		ruleNumericMax("spec_generation"),
-		ruleColUnresolved("active_operation_id", "runtime_owned"),
+		ruleColUnresolved("active_operation_id", TieCategoryRuntimeOwned),
 		ruleTombstone(),
-		ruleAnyColUnresolved([]string{"create_spec"}, "opaque"),
+		ruleAnyColUnresolved([]string{"create_spec"}, TieCategoryOpaque),
 		ruleContentMax(),
 	}},
 
@@ -368,14 +368,14 @@ var capabilityMap = map[string]tableResolver{
 	// Auth factor/code tables — per-table converging rules, then fail-to-human.
 	"user_2fa": {category: "auth", chain: []tieRule{
 		ruleTombstone(),
-		ruleNumericMax("last_step"),      // TOTP replay ratchet — never decrease
-		ruleTimestampMax("last_used_at"), // informational, parsed-instant max
-		ruleUnresolved("auth_factor"),    // a differing secret/epoch is fail-to-human
+		ruleNumericMax("last_step"),           // TOTP replay ratchet — never decrease
+		ruleTimestampMax("last_used_at"),      // informational, parsed-instant max
+		ruleUnresolved(TieCategoryAuthFactor), // a differing secret/epoch is fail-to-human
 	}},
 	"recovery_codes": {category: "auth", chain: []tieRule{
 		ruleTombstone(),
 		ruleNonNullWins("used_at"), // consume is irreversible
-		ruleUnresolved("auth_factor"),
+		ruleUnresolved(TieCategoryAuthFactor),
 	}},
 	// Active-set pointers: a tie naming two different live sets could re-expose a
 	// superseded factor/code set → unresolved (never coin-flip).
@@ -400,7 +400,7 @@ var capabilityMap = map[string]tableResolver{
 			"state", "address", "ssh_user", "ssh_port", "grpc_port", "cert_serial",
 			"ipmi_address", "ipmi_user", "ipmi_pass", "watchdog_dev", "fence_strategy",
 			"role", "schema_version", "capacity_policy_hash",
-		}, "control_plane"),
+		}, TieCategoryControlPlane),
 		ruleContentMax(),
 	}},
 	"host_labels": {category: "content", chain: contentDefaultChain()},
@@ -522,7 +522,7 @@ func (c *Client) resolveTie(table string, cols []string, local, incoming []inter
 	tr, ok := capabilityMap[table]
 	if !ok {
 		// Unreachable if the coverage test passes; fail safe (keep local + alert).
-		return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, "uncategorized") }
+		return true, true, func() { c.trackUnresolved(table, pk, local, incoming, path, TieCategoryUncategorized) }
 	}
 	rv := newRowView(cols, local, incoming)
 	for _, rule := range tr.chain {

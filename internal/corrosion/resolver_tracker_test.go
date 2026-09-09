@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -57,9 +61,9 @@ func TestUnresolvedTieCategories_ClearRemovesFromItsCategory(t *testing.T) {
 // and consumers filter on the category alone.
 func TestImmutableConflict_SeparatesOwnershipFromTheLeaseLedger(t *testing.T) {
 	for _, tc := range []struct{ table, wantCategory string }{
-		{"operation_steps", tieCategoryImmutableOwnership},
-		{"operations", tieCategoryImmutableOwnership},
-		{"leader_lease_terms", tieCategoryImmutableLedger},
+		{"operation_steps", TieCategoryImmutableOwnership},
+		{"operations", TieCategoryImmutableOwnership},
+		{"leader_lease_terms", TieCategoryImmutableLedger},
 	} {
 		if got := immutableTieCategory(tc.table); got != tc.wantCategory {
 			t.Errorf("immutableTieCategory(%q) = %q, want %q", tc.table, got, tc.wantCategory)
@@ -67,56 +71,112 @@ func TestImmutableConflict_SeparatesOwnershipFromTheLeaseLedger(t *testing.T) {
 	}
 }
 
-// TestOwnershipBearingTables_CoverEveryOwnerEpochColumn makes it impossible to
-// add an owner-epoch-bearing table without classifying it.
+// TestImmutableMergeTables_AreAllClassified replaces a test that tested nothing.
 //
-// This is the test the original design COULD NOT have: the classification lived
-// in internal/grpcapi while schemaDDL lives here, so nothing could compare them.
-// Moving the classification into this package is what makes the completeness of
-// a fail-closed, monotone, irreversible predicate checkable rather than a
-// promise in a comment.
-func TestOwnershipBearingTables_CoverEveryOwnerEpochColumn(t *testing.T) {
-	found := tablesWithOwnerEpochColumn()
-	if len(found) < 4 {
-		t.Fatalf("scanned schemaDDL and found only %v owner-epoch tables; the scan itself is "+
-			"broken, so this test would pass vacuously", found)
+// The old one derived every owner-epoch-bearing table from schemaDDL and
+// asserted each appeared in ownershipBearingTables. But immutableTieCategory
+// consulted that map and then returned the SAME category whether the lookup hit
+// or missed, so the assertion could not fail for any reason a caller cared
+// about — and the map was wrong anyway about project_authority_epochs, which
+// merges through authorityMergeRow: that converges deterministically and calls
+// observeTieBreak, never trackUnresolved, so it contributes no ties at all.
+//
+// What actually needs guarding is the real input to the classification: the set
+// of tables whose merge IS immutableMergeKeepLocalRow. Derived from
+// customMergeTables by function identity, so adding a fourth immutable table
+// fails here until someone classifies it deliberately.
+func TestImmutableMergeTables_AreAllClassified(t *testing.T) {
+	want := map[string]string{
+		"operations":         TieCategoryImmutableOwnership,
+		"operation_steps":    TieCategoryImmutableOwnership,
+		"leader_lease_terms": TieCategoryImmutableLedger,
 	}
-	for _, table := range found {
-		if !ownershipBearingTables[table] {
-			t.Errorf("%s carries an owner-epoch column but is not in ownershipBearingTables, so "+
-				"an unresolved tie there would let owner_epoch_v1 latch over a live ownership "+
-				"dispute — and the latch is monotone and never re-opens", table)
+
+	immutable := reflect.ValueOf((*Client).immutableMergeKeepLocalRow).Pointer()
+	got := map[string]string{}
+	for table, fn := range customMergeTables {
+		if reflect.ValueOf(fn).Pointer() == immutable {
+			got[table] = immutableTieCategory(table)
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("found no tables merging through immutableMergeKeepLocalRow; the function-identity " +
+			"comparison is broken and this test would pass vacuously")
+	}
+	for table, wantCat := range want {
+		gotCat, ok := got[table]
+		if !ok {
+			t.Errorf("%s no longer merges through immutableMergeKeepLocalRow; this test's "+
+				"expectations are stale", table)
+			continue
+		}
+		if gotCat != wantCat {
+			t.Errorf("immutableTieCategory(%q) = %q, want %q", table, gotCat, wantCat)
+		}
+	}
+	for table := range got {
+		if _, expected := want[table]; !expected {
+			t.Errorf("%s newly merges through immutableMergeKeepLocalRow and inherits the "+
+				"fail-closed ownership category by default. Decide deliberately: does a "+
+				"conflict on that table hide an ownership decision? Then add it here", table)
 		}
 	}
 }
 
-// tablesWithOwnerEpochColumn derives, from schemaDDL, every table declaring a
-// column that IS an owner epoch. Derived rather than hand-written so
-// ownershipBearingTables cannot silently fall behind the schema — the failure
-// mode the previous grpcapi-side table map could not be protected from.
-func tablesWithOwnerEpochColumn() []string {
-	var out []string
-	for _, stmt := range schemaDDL {
-		m := createTableRe.FindStringSubmatch(stmt)
-		if m == nil {
+// TestKnownTieCategories_CoverEveryEmissionSite scans this package's own source
+// for the categories the emission sites actually name, and fails if one is
+// missing from KnownTieCategories.
+//
+// A source scan rather than a hand-written list because that list was the bug:
+// the grpcapi-side classification shipped missing auth_factor, auth_pointer and
+// lb_token, all three emitted here, while its comment claimed "a new category
+// cannot be silently absent from both" maps. The consumer is a monotone latch
+// that never re-opens, so a category nobody classified must be a build failure.
+func TestKnownTieCategories_CoverEveryEmissionSite(t *testing.T) {
+	known := map[string]bool{}
+	for _, c := range KnownTieCategories {
+		known[c] = true
+	}
+
+	// A bare string literal in a category position is exactly what this
+	// enumeration exists to prevent, so the scan looks for the constant NAMES
+	// and reports any emitter argument that is not one.
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	emitter := regexp.MustCompile(
+		`(?:ruleUnresolved|ruleColUnresolved|ruleAnyColUnresolved|decideUnresolved|trackUnresolved|trackUnresolvedPair)\(`)
+	literal := regexp.MustCompile(`"([a-z][a-z_]{2,})"\s*\)`)
+
+	scanned := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
 			continue
 		}
-		for _, col := range []string{"owner_epoch", "vm_owner_epoch", "authority_epoch"} {
-			// Match a column DECLARATION: the name at the start of a line in the
-			// column list, not a mention inside a comment or another identifier.
-			for _, line := range strings.Split(stmt, "\n") {
-				f := strings.Fields(strings.TrimSpace(line))
-				if len(f) >= 2 && f[0] == col {
-					out = append(out, m[1])
-					break
-				}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, line := range strings.Split(string(src), "\n") {
+			if !emitter.MatchString(line) {
+				continue
 			}
-			if len(out) > 0 && out[len(out)-1] == m[1] {
-				break
+			scanned++
+			// The category is the last argument. A literal there must still be
+			// a known category — this catches a new emitter added with a raw
+			// string instead of a constant.
+			if m := literal.FindStringSubmatch(line); m != nil && !known[m[1]] {
+				t.Errorf("%s names tie category %q, which is not in KnownTieCategories:\n  %s\n"+
+					"add a TieCategory constant and classify it in grpcapi, or the owner-epoch "+
+					"latch decides it by a fail-closed default nobody chose", f, m[1], strings.TrimSpace(line))
 			}
 		}
 	}
-	return out
+	if scanned < 10 {
+		t.Fatalf("scanned only %d emitter call site(s); the scan is broken and this test would "+
+			"pass vacuously", scanned)
+	}
 }
 
 // contestedTermFixture builds a REAL contested-term tie the way a partition

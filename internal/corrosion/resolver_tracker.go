@@ -124,54 +124,89 @@ type unresolvedTie struct {
 	category string
 }
 
-// The two categories immutableMergeKeepLocalRow splits its conflicts into.
+// Tie categories: what a tie is ABOUT. A consumer decides which of these
+// disqualify it; nothing here decides that.
 //
-// One category was not enough, and that is the whole reason this split exists.
-// immutableMergeKeepLocalRow serves operations, operation_steps AND
-// leader_lease_terms. A contested lease term must NOT withhold owner_epoch_v1 —
-// it is not evidence about any workload's owner epoch — while an
-// operation_steps conflict MUST, because owner_epoch is part of that table's
-// primary key, so a conflict there is by construction a conflict about an owner
-// epoch. A single "immutable_conflict" category forced every consumer to answer
-// that question from the table name instead, in a package that cannot see this
-// schema.
+// Constants, and enumerated in KnownTieCategories, because the consumer that
+// matters — the owner-epoch readiness latch — is monotone and never re-opens,
+// so a category it has never heard of must be a build failure rather than a
+// silent default. They were bare string literals at a dozen emission sites, and
+// the grpcapi-side classification was missing three of them on arrival.
+//
+// These are RULE-level categories, the ones that actually reach trackUnresolved.
+// They are not the table-level `category:` field in resolverTables: "content"
+// and "host-control-plane" appear there but can never be tracked, because those
+// chains end in ruleContentMax and resolve.
 const (
-	tieCategoryImmutableOwnership = "immutable_ownership_conflict"
-	tieCategoryImmutableLedger    = "immutable_ledger_conflict"
+	TieCategoryRuntimeOwned     = "runtime_owned"              // host_name, pending_action_id, active_operation_id
+	TieCategoryTenancy          = "tenancy"                    // a project column
+	TieCategoryControlPlane     = "control_plane"              // hosts.state/address/role — the voting roster itself
+	TieCategoryPolicy           = "policy"                     // projects, roles, role_bindings, users, tokens, ...
+	TieCategoryOpaque           = "opaque"                     // vms.spec, containers.create_spec
+	TieCategoryAuthFactor       = "auth_factor"                // user_2fa, recovery_codes
+	TieCategoryAuthPointer      = "auth_pointer"               // an auth pointer column
+	TieCategoryLBToken          = "lb_token"                   // an LB bearer token
+	TieCategoryUncategorized    = "uncategorized"              // the resolver's own fallback
+	TieCategoryIdentityContent  = "identity_content_conflict"  // an identity fault
+	TieCategoryWorkloadIdentity = "workload_identity_conflict" // an authority-merge identity hash split
+
+	// The two categories immutableMergeKeepLocalRow splits its conflicts into,
+	// and one category was not enough — that split is the whole reason this
+	// enumeration got written down.
+	//
+	// immutableMergeKeepLocalRow serves operations, operation_steps AND
+	// leader_lease_terms. A contested lease term must NOT withhold
+	// owner_epoch_v1 — it is not evidence about any workload's owner epoch —
+	// while an operation_steps conflict MUST, because owner_epoch is part of
+	// that table's primary key, so a conflict there is by construction a
+	// conflict about an owner epoch. A single "immutable_conflict" category
+	// forced every consumer to answer that question from a table name, in a
+	// package that cannot see this schema.
+	TieCategoryImmutableOwnership = "immutable_ownership_conflict"
+	TieCategoryImmutableLedger    = "immutable_ledger_conflict"
 )
 
-// ownershipBearingTables are the tables whose rows carry a workload's or
-// project's owner epoch. A tie on one of them can hide an ownership decision
-// from a reader of that epoch.
+// KnownTieCategories is every category an emission site can pass to
+// trackUnresolved. TestKnownTieCategories_CoverEveryEmissionSite scans this
+// package's source and fails if a site names one that is not here, and
+// grpcapi's TestOwnershipTieCategory_PartitionsEveryKnownCategory fails if a
+// category here is classified by neither of its maps.
 //
-// It lives HERE, beside schemaDDL, so its completeness is testable against the
-// schema — TestOwnershipBearingTables_CoverEveryOwnerEpochColumn derives the
-// expected set by scanning the DDL. The previous version of this classification
-// lived in internal/grpcapi as a table-name map whose own comment admitted the
-// hazard ("Adding an owner_epoch column to a table WITHOUT adding it here
-// silently narrows one") with nothing able to enforce it from there.
-var ownershipBearingTables = map[string]bool{
-	"vms":                      true, // vms.vm_owner_epoch
-	"containers":               true, // containers.owner_epoch
-	"operations":               true, // operations.vm_owner_epoch
-	"operation_steps":          true, // operation_steps.owner_epoch, IN the primary key
-	"project_authority_epochs": true, // project_authority_epochs.authority_epoch
-	"runtime_action_proofs":    true, // runtime_action_proofs.owner_epoch
+// The two exported-by-value immutable categories are included: a consumer
+// filters on the string, so a partition test has to see all of them.
+var KnownTieCategories = []string{
+	TieCategoryRuntimeOwned, TieCategoryTenancy, TieCategoryControlPlane,
+	TieCategoryPolicy, TieCategoryOpaque, TieCategoryAuthFactor,
+	TieCategoryAuthPointer, TieCategoryLBToken, TieCategoryUncategorized,
+	TieCategoryIdentityContent, TieCategoryWorkloadIdentity,
+	TieCategoryImmutableOwnership, TieCategoryImmutableLedger,
 }
 
-// immutableTieCategory classifies one immutable-row conflict by whether the
-// table carries an owner epoch. An UNKNOWN table gets the ownership category:
-// fail closed, because the consumer of this answer is a monotone latch that
-// never re-opens, and withholding a capability is recoverable while latching
-// over a live ownership dispute is not.
+// immutableTieCategory classifies one immutable-row conflict.
+//
+// immutableMergeKeepLocalRow has exactly three tables (customMergeTables):
+// operations and operation_steps, whose rows carry an owner epoch —
+// operation_steps has it IN the primary key, so a conflict there is by
+// construction a conflict about an owner epoch — and leader_lease_terms, which
+// carries none. The only question is therefore whether this is the lease
+// ledger, and an unknown table fails closed to ownership, because the consumer
+// is a monotone latch that never re-opens: withholding a capability wrongly is
+// recoverable, latching over a live ownership dispute is not.
+//
+// An earlier version asked ownershipBearingTables first, which was a lookup
+// that could not change the answer — both that branch and the fallthrough
+// returned the ownership category — so the map, and the schema-completeness
+// test built on it, tested nothing. Worse, the map was wrong about
+// project_authority_epochs, which merges through authorityMergeRow: that
+// converges deterministically and calls observeTieBreak, never trackUnresolved,
+// so it contributes no ties at all and the map's claim about it was false.
+// TestImmutableMergeTables_AreAllClassified is the guard that replaces it, and
+// it derives its table set from customMergeTables.
 func immutableTieCategory(table string) string {
-	if ownershipBearingTables[table] {
-		return tieCategoryImmutableOwnership
-	}
 	if table == "leader_lease_terms" {
-		return tieCategoryImmutableLedger
+		return TieCategoryImmutableLedger
 	}
-	return tieCategoryImmutableOwnership
+	return TieCategoryImmutableOwnership
 }
 
 // trackUnresolved records an unresolved tie. It increments lww_tie_unresolved and

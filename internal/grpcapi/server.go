@@ -1037,6 +1037,14 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.LeaseTermLedgerV1:
+		// No kill switch, like SplitBrainGateV1: the token means "this build
+		// understands the term ledger's statement shapes", which is a fact about
+		// the binary, not a policy an operator chooses. It also must return true
+		// unconditionally for the latch to be DRIVEN at all — driveCapabilityLatches
+		// skips an unlatched token whose flag is off, so a flag-gated ledger token
+		// would never latch and terms would never be minted.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.IsolationEpochV1:

@@ -68,6 +68,22 @@ func (s *Server) LeaseTermReadiness(ctx context.Context) (bool, string) {
 			capabilities.SplitBrainGateV1)
 	}
 
+	// lease_term_ledger_v1 must be DURABLY latched, because until it is this node
+	// mints no term at all (corrosion.SetLeaseTermLedgerGate). Advertising
+	// readiness to enforce ON terms while producing none would latch the fleet
+	// into refusing every reschedule: the executor refuses term 0, and term 0 is
+	// all this node can hand it. Durable rather than in-memory for the same
+	// reason the mint gate is: a restart that reloads no marker would silently
+	// stop minting under a latched enforcement regime.
+	//
+	// Also a local in-memory read, so it is safe on the Ping path.
+	if !s.db.MayMintLeaseTerm() {
+		return false, fmt.Sprintf(
+			"%s has not durably latched; this node mints no lease term yet, so enforcing on "+
+				"terms would refuse every reschedule it coordinates",
+			capabilities.LeaseTermLedgerV1)
+	}
+
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
 		return false, "cannot read host table: " + err.Error()

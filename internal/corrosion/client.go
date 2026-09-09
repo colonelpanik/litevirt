@@ -236,6 +236,13 @@ type Client struct {
 	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
 	digestV2Enabled func() bool
 
+	// leaseTermLedger, when non-nil and returning true, permits a WRITE to
+	// leader_lease_terms. Injected via SetLeaseTermLedgerGate, wired to
+	// DurablyLatched(LeaseTermLedgerV1). Nil or false means the lease is still
+	// taken but no term is minted — see SetLeaseTermLedgerGate for why this one
+	// predicate fails CLOSED when unset.
+	leaseTermLedger func() bool
+
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
 	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1
@@ -351,6 +358,32 @@ func (c *Client) SetDigestV2Enabled(fn func() bool) { c.digestV2Enabled = fn }
 
 // digestV2On reports whether digest_v2 emission is enabled on this node (nil-safe).
 func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digestV2Enabled() }
+
+// SetLeaseTermLedgerGate injects the predicate that permits WRITING to
+// leader_lease_terms. Wired at daemon start to
+// `checker.DurablyLatched(LeaseTermLedgerV1)`.
+//
+// Nil-safe and FAIL CLOSED, unlike the other predicates here: an unset gate
+// means no mint. That is the legacy behaviour — before this work the ledger did
+// not exist — and it is the safe side, because the mint emits a statement shape
+// a previous-release peer cannot resolve, which back-pressures its whole
+// replication stream rather than degrading. A wiring omission then costs terms
+// (and, downstream, refused reschedules) instead of costing the fleet its
+// replication.
+//
+// The test constructors wire it open: a test cluster is single-version by
+// construction, and this gate answers a rolling-upgrade question.
+func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn }
+
+// MayMintLeaseTerm reports whether this node may write a term row (nil-safe,
+// fail closed).
+//
+// Exported because lease_term_v1 readiness must answer for the same fact: a node
+// that mints no term must not advertise readiness to enforce on one. Reading the
+// gate itself keeps that from becoming a second, drifting copy of the predicate.
+func (c *Client) MayMintLeaseTerm() bool {
+	return c.leaseTermLedger != nil && c.leaseTermLedger()
+}
 
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset

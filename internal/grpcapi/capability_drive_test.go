@@ -56,20 +56,37 @@ func (g *recordingGate) drivenUnique() map[string]bool {
 // optional token, never for an advertised-but-disabled token, and at most one still-
 // unlatched token per cycle (bounded pre-latch fan-out).
 func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
-	// (a) all flags off → only the mandatory split_brain_gate_v1 is ever driven; a
+	// (a) all flags off → only the tokens with NO kill switch are ever driven; a
 	// flag-off advertised token is NEVER driven, so it never latches (advertised ≠
 	// enforcing). Run many cycles to be sure.
+	//
+	// The flag-less set is deliberately spelled out rather than derived from
+	// tokenEnabled: deriving it would make this assertion a tautology that passes
+	// however many tokens quietly become mandatory. Adding one here is a decision
+	// to be made once, in the open — each entry drives a latch on every cluster
+	// with no operator opt-in.
+	mandatory := map[string]bool{
+		capabilities.SplitBrainGateV1: true,
+		// lease_term_ledger_v1 has no flag because it states a fact about the
+		// BINARY — "this build can decode the term ledger's statement shapes" —
+		// which no operator should be able to misreport. See its comment in
+		// internal/capabilities.
+		capabilities.LeaseTermLedgerV1: true,
+	}
+
 	g := &recordingGate{}
 	s := &Server{gate: g}
 	for i := 0; i < 10; i++ {
 		s.driveCapabilityActivation(context.Background())
 	}
 	got := g.drivenUnique()
-	if !got[capabilities.SplitBrainGateV1] {
-		t.Error("mandatory split_brain_gate_v1 must be driven even with all flags off")
+	for tok := range mandatory {
+		if !got[tok] {
+			t.Errorf("kill-switch-free token %q was never driven; it must latch with all flags off", tok)
+		}
 	}
 	for _, tok := range capabilities.Supported() {
-		if tok == capabilities.SplitBrainGateV1 {
+		if mandatory[tok] {
 			continue
 		}
 		if got[tok] {

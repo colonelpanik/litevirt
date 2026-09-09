@@ -536,6 +536,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
+
+	// Mint a leader-lease term only once lease_term_ledger_v1 is DURABLY latched.
+	// The mint is the first replicated statement shape leader_lease_terms ever
+	// had, and an unregistered shape back-pressures a previous-release peer's
+	// whole replication stream instead of degrading — so the write waits for a
+	// latch that cannot form while such a peer is still listening. No config flag
+	// (the token has no kill switch): terms begin on their own once the roll
+	// completes. Unwired, the gate fails closed and no term is minted, which is
+	// the pre-ledger behaviour.
+	d.db.SetLeaseTermLedgerGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
+	})
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.

@@ -308,3 +308,116 @@ func TestLeaseTermHolder_AQueryFailureIsNotAnUnseenTerm(t *testing.T) {
 		t.Error("found = true alongside an error")
 	}
 }
+
+// TestAcquireLeaseWithTerm_LedgerGateClosed_TakesLeaseButMintsNothing is the
+// rolling-upgrade contract: while lease_term_ledger_v1 has not durably latched,
+// a peer on the previous release cannot resolve the mint's statement shape, and
+// an unregistered shape back-pressures its whole replication stream rather than
+// degrading. So the mint waits — but the LEASE must still transfer, because
+// failover, rebalancing and dual-run detection all depend on it and predate
+// terms entirely.
+//
+// Asserting "no row was written" is the load-bearing half. A version that
+// returned term 0 to the caller while still writing the row would pass any test
+// that only checked the returned term, and would still stall the peer.
+func TestAcquireLeaseWithTerm_LedgerGateClosed_TakesLeaseButMintsNothing(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetLeaseTermLedgerGate(func() bool { return false })
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "node-a", time.Minute, leaseTestNow)
+	if err != nil {
+		t.Fatalf("AcquireLeaseWithTerm: %v", err)
+	}
+	if !held {
+		t.Fatal("lease not held with the ledger gate closed; the gate withholds the TERM, " +
+			"not the lease — failover predates terms and must keep working mid-roll")
+	}
+	if term != 0 {
+		t.Errorf("term = %d with the ledger gate closed, want 0 (the "+
+			"minted-without-a-term sentinel the executor refuses on)", term)
+	}
+
+	rows, err := c.Query(ctx, `SELECT term FROM leader_lease_terms WHERE key = ?`, LeaseKeyFailover)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("%d term row(s) written with the ledger gate closed; the mint's statement "+
+			"shape would have replicated to a peer that cannot resolve it", len(rows))
+	}
+
+	// And the lease itself is really recorded, not merely reported.
+	holder, _, err := leaseRow(ctx, c, LeaseKeyFailover)
+	if err != nil {
+		t.Fatalf("leaseRow: %v", err)
+	}
+	if holder != "node-a" {
+		t.Errorf("leader_election holder = %q, want node-a", holder)
+	}
+}
+
+// TestAcquireLeaseWithTerm_UnwiredGateFailsClosed: the gate is nil-safe, and its
+// nil answer is NO MINT. Unlike every other injected predicate on Client — which
+// default to the legacy path in the permissive direction — a wiring omission
+// here must cost terms, not cost the fleet its replication.
+func TestAcquireLeaseWithTerm_UnwiredGateFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetLeaseTermLedgerGate(nil)
+
+	if c.MayMintLeaseTerm() {
+		t.Fatal("MayMintLeaseTerm() = true with no gate wired; an unwired daemon would emit " +
+			"a shape a previous-release peer stalls on")
+	}
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyRebalancer, "node-a", time.Minute, leaseTestNow)
+	if err != nil {
+		t.Fatalf("AcquireLeaseWithTerm: %v", err)
+	}
+	if !held || term != 0 {
+		t.Errorf("held=%v term=%d, want held=true term=0", held, term)
+	}
+	rows, err := c.Query(ctx, `SELECT term FROM leader_lease_terms WHERE key = ?`, LeaseKeyRebalancer)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("%d term row(s) written with no gate wired", len(rows))
+	}
+}
+
+// TestAcquireLeaseWithTerm_GateOpensAfterALeaselessTenure: the fleet finishes
+// rolling while a node already holds a lease it took without a term. The next
+// acquisition pass must mint one rather than wait for the lease to lapse —
+// otherwise enforcement latches onto a ledger with no row for the current
+// holder, and every reschedule that holder coordinates is refused for the length
+// of its tenure.
+//
+// This exercises the ourTenure/newest.Term==0 fall-through, which is the branch
+// the pre-existing comment calls "the rolling-upgrade case".
+func TestAcquireLeaseWithTerm_GateOpensAfterALeaselessTenure(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	open := false
+	c.SetLeaseTermLedgerGate(func() bool { return open })
+
+	if _, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "node-a", time.Minute, leaseTestNow); err != nil || term != 0 {
+		t.Fatalf("pre-latch acquire: term=%d err=%v, want term 0", term, err)
+	}
+
+	open = true // the roll completed and the latch formed
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "node-a",
+		time.Minute, leaseTestNow.Add(time.Second))
+	if err != nil {
+		t.Fatalf("post-latch acquire: %v", err)
+	}
+	if !held {
+		t.Fatal("lost our own unexpired lease across the latch")
+	}
+	if term != 1 {
+		t.Errorf("term = %d after the latch formed, want 1 minted on the SAME tenure; a "+
+			"holder that waits for its lease to lapse has every reschedule refused until then", term)
+	}
+}

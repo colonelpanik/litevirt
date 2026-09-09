@@ -121,6 +121,25 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
+		// The ledger is not writable yet: take the lease the pre-ledger way and
+		// report no term. This is the mid-rolling-upgrade state — a peer on the
+		// previous release cannot resolve the mint's statement shape, and an
+		// unregistered shape back-pressures its entire replication stream — so the
+		// mint waits for DurablyLatched(lease_term_ledger_v1), which cannot form
+		// while such a peer is still listening. See SetLeaseTermLedgerGate.
+		//
+		// Availability is deliberately unaffected: the lease itself still
+		// transfers, so failover, rebalancing and dual-run detection keep working
+		// exactly as they did before terms existed. Only enforcement is withheld,
+		// and it refuses on term 0 by design.
+		if !c.MayMintLeaseTerm() {
+			held, err := renewLease(ctx, c, key, holder, expires, nowRFC)
+			if err != nil {
+				return false, 0, err
+			}
+			return held, 0, nil
+		}
+
 		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, now)
 		if err != nil {
 			return false, 0, err
@@ -142,8 +161,13 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 // slot was taken) rather than a terminal one (someone else holds the lease).
 const leaseContended int64 = -1
 
-// renewLease extends a lease this node already holds and reports whether it
-// still holds it afterwards.
+// renewLease runs the guarded upsert alone — no term — and reports whether this
+// node holds the lease afterwards.
+//
+// Named for its common caller, but the statement takes an EXPIRED lease from
+// another holder just as it renews our own (see leaseUpsertSQL's WHERE), which
+// is what makes it the whole pre-ledger acquisition path as well: it is what
+// AcquireLeaseWithTerm falls back to while the term ledger is not yet writable.
 func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC string) (bool, error) {
 	if err := c.Execute(ctx, leaseUpsertSQL,
 		key, holder, expires, c.NowTS(), nowRFC); err != nil {

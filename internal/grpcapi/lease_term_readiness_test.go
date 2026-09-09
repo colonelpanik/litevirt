@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -248,5 +249,55 @@ func TestTokenEnabled_KnowsLeaseTerm(t *testing.T) {
 	if !s.tokenEnabled(capabilities.LeaseTermV1) {
 		t.Error("tokenEnabled does not know lease_term_v1, so the latch-driver would never " +
 			"drive it and the token could never activate")
+	}
+}
+
+// TestLeaseTermReadiness_WithholdsWhileTheLedgerGateIsClosed: enforcement
+// decides ON terms, so a node that mints none must not advertise readiness to
+// enforce. If it did, the fleet would latch and then refuse every reschedule
+// this node coordinates — the executor refuses term 0, and term 0 is all a
+// node with a closed mint gate can produce.
+//
+// The predicate reads the mint gate itself (corrosion.MayMintLeaseTerm) rather
+// than re-deriving DurablyLatched, so readiness cannot drift from what the
+// writer actually does.
+func TestLeaseTermReadiness_WithholdsWhileTheLedgerGateIsClosed(t *testing.T) {
+	s := leaseTermServer(t, 3)
+	s.db.SetLeaseTermLedgerGate(func() bool { return false })
+
+	ready, reason := s.LeaseTermReadiness(context.Background())
+	if ready {
+		t.Fatal("ready while the term ledger is not writable; the fleet would latch " +
+			"enforcement onto a node that mints nothing to enforce on")
+	}
+	if !strings.Contains(reason, capabilities.LeaseTermLedgerV1) {
+		t.Errorf("reason = %q; it must name %s so an operator knows the roll is what "+
+			"is outstanding, not the config", reason, capabilities.LeaseTermLedgerV1)
+	}
+}
+
+// TestLeaseTermReadiness_ReadyOnceTheLedgerGateOpens is the positive half: the
+// gate is the ONLY thing the test above changes, so a green result here proves
+// the refusal came from that predicate and not from an incidentally broken
+// fixture.
+func TestLeaseTermReadiness_ReadyOnceTheLedgerGateOpens(t *testing.T) {
+	s := leaseTermServer(t, 3)
+	s.db.SetLeaseTermLedgerGate(func() bool { return true })
+
+	if ready, reason := s.LeaseTermReadiness(context.Background()); !ready {
+		t.Fatalf("not ready with the ledger gate open: %s", reason)
+	}
+}
+
+// TestLeaseTermLedgerToken_HasNoKillSwitch: the ledger token must report enabled
+// with no config flag set. driveCapabilityLatches skips an UNLATCHED token whose
+// tokenEnabled is false, so a flag-gated ledger token would never latch, no term
+// would ever be minted, and the whole mechanism would sit inert with nothing in
+// the logs to say why.
+func TestLeaseTermLedgerToken_HasNoKillSwitch(t *testing.T) {
+	s := testServer(t)
+	if !s.tokenEnabled(capabilities.LeaseTermLedgerV1) {
+		t.Fatal("tokenEnabled(lease_term_ledger_v1) = false on a server with no enforcement " +
+			"flags set; the latch would never be driven and terms would never be minted")
 	}
 }

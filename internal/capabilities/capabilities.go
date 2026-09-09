@@ -47,6 +47,31 @@ const (
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
 
+	// LeaseTermLedgerV1 gates WRITING to the term ledger at all — one step below
+	// LeaseTermV1, which gates deciding on what is written.
+	//
+	// It exists for the replication contract, not for policy. leader_lease_terms
+	// gained the first replicated statement shape of its life in this work, and a
+	// peer on the previous release has no ledger entry for that fingerprint: an
+	// unregistered shape BACK-PRESSURES rather than degrading (the apply is
+	// rejected, the batch rolls back, and that peer's replication watermark
+	// stalls, head-of-line blocking the stream into every not-yet-rolled node).
+	// The pre-stage migration pass does not help — it equalizes DB schema, and
+	// the statement ledger is a property of the BINARY.
+	//
+	// So the mint waits for proof that no such peer is listening, and a
+	// capability latch is exactly that proof: a node on the old build cannot
+	// advertise a token it has never heard of, so this latch CANNOT form
+	// mid-roll.
+	//
+	// Deliberately advertised UNCONDITIONALLY — no config flag, in the
+	// SplitBrainGateV1 style — so terms begin minting on their own the moment the
+	// roll completes. Gating the mint on LeaseTermV1 instead would have been
+	// cheaper, but no term would exist until an operator enabled enforcement, so
+	// enforcement would latch onto an empty ledger; a term is meant to be an
+	// audit fact before anything decides on one (docs/operating-model.md).
+	LeaseTermLedgerV1 = "lease_term_ledger_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -419,9 +444,16 @@ var supported = []string{
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
 	OwnerEpochV1,
+	// LeaseTermLedgerV1 is advertised UNCONDITIONALLY: it has no config flag, and
+	// its whole purpose is to tell peers "this build understands the term
+	// ledger's statement shapes". Withholding it on a flag would keep the latch
+	// from forming on a fleet that is fully rolled.
+	LeaseTermLedgerV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
-	// SplitBrainGateV1 latched). See grpcapi.LeaseTermReadiness.
+	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
+	// cannot mint a term must not advertise readiness to enforce on one). See
+	// grpcapi.LeaseTermReadiness.
 	LeaseTermV1,
 	// IsolationEpochV1 is advertised CONDITIONALLY on enforcement.isolation_epoch,
 	// like OperationProtocolV1: the regime REFUSES a peer's replication, so the
@@ -435,7 +467,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

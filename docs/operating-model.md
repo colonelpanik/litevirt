@@ -103,6 +103,27 @@ whenever the holder changes. These all mint:
 - once per lease key, ever: a node upgraded from a build with no term ledger
   comes back still holding its lease with no term recorded, and mints one.
 
+Nothing mints until the cluster has finished rolling. Minting waits for
+`lease_term_ledger_v1` to latch durably on the node doing it — a token with no
+config flag, advertised by every build that has the ledger, so nothing is
+required of you: it latches on its own once the last host is upgraded, and terms
+begin at the next tenure change. Before it latches, leases are taken exactly as
+they were before terms existed; you will see `leader_election` move with an
+empty `leader_lease_terms`.
+
+It gates the mint rather than the read because the mint is the first write this
+table ever replicated, and a host still on the previous release cannot decode
+it: the write would not be ignored, it would stall that host's replication
+entirely. So the latch is the proof that no such host is listening any more.
+
+Two operational consequences. A cluster stuck mid-roll — one host held back —
+mints no terms at all, which is by design and is visible as an empty ledger
+rather than as an error. And `lease_term_v1` will not advertise ready on a host
+whose ledger token has not latched, because enforcing on terms while producing
+none would refuse every reschedule that host coordinates. The withheld-readiness
+reason names the token, so a host that looks stuck says which of the two is
+outstanding.
+
 So an ordinary rolling restart of an N-host cluster mints roughly 3N terms —
 each of the three leases moves once per host — on **every** roll. Size a
 term-growth alert against that, not against the one-off upgrade backfill.

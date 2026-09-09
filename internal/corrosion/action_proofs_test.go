@@ -322,18 +322,70 @@ func TestActionProof_LeaseTermRoundTrips(t *testing.T) {
 	}
 }
 
-// TestActionProof_LeaseTermDefaultsToZero: an existing row written by a
-// pre-Phase-2 peer has no term. It must read back as 0 — the "pre-term proof"
-// sentinel the executor refuses post-latch — and never as a valid term.
-func TestActionProof_LeaseTermDefaultsToZero(t *testing.T) {
+// TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless is a COMPATIBILITY
+// test, not a plumbing one. It inserts through the pre-v52 22-column proof shape
+// — the one a not-yet-upgraded peer still emits, retained as
+// proof_insert_pre_lease_term_v51 in HistoricalShapes() — and requires it to
+// (a) still apply against the v52 schema and (b) yield the termless sentinel.
+//
+// READ THIS BEFORE COUNTING IT AS COVERAGE. The 0 assertion is UNFALSIFIABLE by
+// any mutation of the lease_term plumbing, and an earlier version of this test
+// was written as though it were not. It used WriteActionProof with LeaseTerm
+// unset and asserted the read-back was 0 — which passes with lease_term deleted
+// from proofInsertParams AND from the GetActionProof SELECT, because Row.Int64
+// maps an absent column to 0 and the column DEFAULT is also 0. Verified by
+// mutation: the column was removed from both paths and this test still passed.
+// A reviewer caught it; the mutation table had only ever mapped mutations onto
+// LeaseTermRoundTrips, which is where the plumbing coverage actually lives.
+//
+// What this version does buy, which the old one did not: it is the only place
+// the DEFAULT is on the path at all. Change the ALTER to NOT NULL without a
+// default, or let the historical shape stop applying, and this goes red.
+func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 	ctx := context.Background()
 	c := apTestClient(t)
-	if err := WriteActionProof(ctx, c, ActionProof{
-		ID: "p2", Action: ActionPromote, TargetKind: "vm", TargetName: "vm2",
-		DestHost: "node-b", Coordinator: "node-a",
-	}); err != nil {
-		t.Fatalf("write: %v", err)
+
+	// The pre-v52 shape verbatim: 22 columns, no lease_term. execLocal, because
+	// this is a receive-side compatibility contract, not something to replicate.
+	if err := c.execLocal(ctx,
+		`INSERT OR IGNORE INTO runtime_action_proofs
+			(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+			 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,
+			 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+			 created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
+		"p2", ActionPromote, "vm", "vm2", "node-b", "node-a", "", "", 0, 0, "", "", "",
+		c.NowTS(), c.NowTS()); err != nil {
+		t.Fatalf("apply the pre-v52 proof shape against a v52 schema: %v — a supported peer "+
+			"still emits this and a receiver that cannot apply it back-pressures that peer's "+
+			"whole stream", err)
 	}
+
+	// Ask SQL whether the cell is NULL, rather than reading it through Row.Int64.
+	// This is the only assertion here that any mutation can reach. Row.Int64 maps
+	// BOTH an absent column and a SQL NULL to 0, so through the accessor a column
+	// declared `INTEGER` with no default is indistinguishable from
+	// `INTEGER NOT NULL DEFAULT 0` — verified by mutation, which is how a SECOND
+	// vacuous version of this test was caught after the first one was fixed.
+	//
+	// It matters beyond tidiness: 0 is the enforcement sentinel for "minted
+	// without a term". If the column can arrive NULL, a proof with no term and a
+	// proof whose term failed to decode both read as 0, and the executor cannot
+	// tell a pre-v52 peer from a broken one.
+	rows, err := c.Query(ctx,
+		`SELECT lease_term IS NULL AS is_null, lease_term AS term
+		   FROM runtime_action_proofs WHERE id = 'p2'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read lease_term column: err=%v rows=%d", err, len(rows))
+	}
+	if rows[0].Int("is_null") != 0 {
+		t.Errorf("the pre-v52 shape left lease_term NULL; it must take a non-NULL DEFAULT 0, "+
+			"or the termless sentinel is indistinguishable from a decode failure")
+	}
+	if n := rows[0].Int64("term"); n != 0 {
+		t.Errorf("the pre-v52 shape left lease_term = %d, want the DEFAULT 0", n)
+	}
+
 	got, ok, err := GetActionProof(ctx, c, "p2")
 	if err != nil || !ok {
 		t.Fatalf("read: ok=%v err=%v", ok, err)

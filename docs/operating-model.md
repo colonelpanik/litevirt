@@ -107,13 +107,25 @@ So an ordinary rolling restart of an N-host cluster mints roughly 3N terms —
 each of the three leases moves once per host — on **every** roll. Size a
 term-growth alert against that, not against the one-off upgrade backfill.
 
-**Nothing refuses an action based on a term.** This is not split-brain
+**No term is compared against any other term.** This is not split-brain
 prevention and it is not a working fencing token yet: keeping two nodes from
 each believing they hold the lease requires consensus, which a CRDT row store
 does not provide, and everything in *CRDT is not linearizable* above still
 holds in full. Enforcement is a separate change and will latch behind a
 capability token the way other cluster-wide behaviour changes do. Until then a
 term is an audit fact — make no availability decision on the strength of one.
+
+One narrow exception, so the earlier absolute is not misread. Since schema v52
+a runtime-action proof carries the term of the tenure that minted it, and that
+term is part of the field-match an executor runs between the proof it was
+handed and the proof row it has persisted — alongside the coordinator, the
+destination, the relocation token and the owner epoch. A mismatch there refuses
+the action, ungated, exactly as a mismatched relocation token already did. That
+is a check for a DIVERGENT PROOF ROW, not term enforcement: nothing compares the
+term against the lease ledger, against a quorum-observed maximum, or against
+any other node's view, and no proof-minting site sets a term yet, so both sides
+are 0 and the comparison is inert in practice. Real enforcement — refusing a
+superseded term — still arrives behind `lease_term_v1`.
 
 To read the current terms:
 

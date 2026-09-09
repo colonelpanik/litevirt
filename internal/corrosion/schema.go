@@ -1007,7 +1007,7 @@ var schemaDDL = []string{
 		-- lease_term (v52) is LAST deliberately, after deleted_at, so this DDL
 		-- produces the SAME physical column order as the ALTER in
 		-- schemaMigrations. The v1 state digest hashes SELECT * positionally
-		-- (sync.go tableRowKeys → encodeRowCells) and anti-entropy only prefers
+		-- (sync.go digestTableRows → encodeRowCells) and anti-entropy only prefers
 		-- the order-invariant v2 hash when BOTH peers emit one
 		-- (antientropy.go:181). A mid-DDL column would therefore make a
 		-- freshly-initialised v52 node and a v51→v52 upgraded node disagree

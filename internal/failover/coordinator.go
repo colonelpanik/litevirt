@@ -1195,6 +1195,38 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
+	// Recovery is a separate, independently retryable step. It is reached from
+	// here after a fence, and again from recoverStrandedWorkloads for a host
+	// already fenced whose workloads a refusal left behind — see there for why
+	// that second caller has to exist.
+	c.recoverWorkloads(ctx, h)
+}
+
+// recoverWorkloads moves every recoverable workload off a host that is already
+// fenced: VMs by replica promotion or reschedule, containers by relocation.
+//
+// It performs NO fencing and must not, because it has two callers with
+// different histories. failover calls it having just fenced h. Retries call it
+// for a host fenced on an earlier cycle, where re-running the fence would
+// power-cycle a machine that is already down and mint a second fence epoch for
+// the same outage.
+//
+// Everything it needs is re-derived from persisted state rather than passed in,
+// which is what makes the second caller possible: fenceEpoch comes from
+// fencing_log via proofGradeFenceRef, the candidate set from healthyHosts, and
+// the work itself from the rows still pointing at h. That also makes it
+// idempotent — a successful reschedule re-homes the VM row and a successful
+// relocation tombstones the source row, so a workload already recovered is
+// simply not in the list on the next pass.
+//
+// One consequence is deliberate and worth stating: proofGradeFenceRef only
+// counts a fence inside recentFenceWindow, so a retry after that window finds
+// fenceEpoch empty and a VM with a writable shared disk fails CLOSED at the
+// shared-storage gate. That is the correct outcome — the evidence of power-off
+// has aged out, and transferring a shared disk on stale evidence is the
+// split-brain this gate exists to prevent — while a local-disk VM still
+// recovers whenever its blocker clears.
+func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRecord) {
 	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
 	// shared disk the executor requires a proof-grade power-off of the old owner
 	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""

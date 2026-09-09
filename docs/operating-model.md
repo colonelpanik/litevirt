@@ -253,6 +253,15 @@ coordinator on an older build, and nothing can tell those apart. Narrowing that
 needs a decision about whether container cold migration may require the
 coordinator.
 
+A proof's term and key are also part of a check that is INDEPENDENT of term
+enforcement and runs whether or not it is switched on. An executor field-matches
+the proof it was handed against the proof row it has persisted — action, target
+kind and name, coordinator, destination, relocation token, fence epoch, owner
+epoch, and now the lease term and key; `corrosion.ProofBindingEqual` is the one
+definition of that set. A mismatch refuses the action ungated, exactly as a
+mismatched relocation token already did. That catches a DIVERGENT PROOF ROW,
+which is a different question from whether the term is current.
+
 A carried proof's term and key are persisted on receipt and replicate from
 there, so the executor validates the key against the closed set of lease names
 before storing it, and refuses a negative term outright. An unknown key would

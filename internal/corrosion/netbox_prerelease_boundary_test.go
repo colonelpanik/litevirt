@@ -30,9 +30,17 @@ import (
 // seedPrereleaseTrustTables re-creates the three removed tables exactly as the
 // prerelease DDL did, so a scenario starts from the database an operator who ran
 // those commits actually has.
+//
+// It also writes the MIGRATION LEDGER rows that build wrote, because they are
+// part of the same database state: the tables were created by schemaDDL and then
+// recorded as create-table units by the ledger loop, in one startup. A seed that
+// created the tables without the ledger rows would model a database no build has
+// ever produced — and would leave the ledger signal untested against the shape it
+// exists for.
 func seedPrereleaseTrustTables(t *testing.T, c *Client) {
 	t.Helper()
 	ctx := context.Background()
+	seedPrereleaseTrustLedger(t, c)
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS netbox_recovery_manifests (
 			id TEXT PRIMARY KEY, cluster_fingerprint TEXT NOT NULL, host_name TEXT NOT NULL,
@@ -55,6 +63,35 @@ func seedPrereleaseTrustTables(t *testing.T, c *Client) {
 		if err := c.execLocal(ctx, ddl); err != nil {
 			t.Fatalf("seed a prerelease trust table: %v", err)
 		}
+	}
+}
+
+// seedPrereleaseTrustLedger records the create-table units the prerelease build
+// wrote into applied_migrations when it created the three removed tables.
+//
+// This is the artifact the removal path CANNOT erase: it drops the tables and
+// never touches the ledger, and the migration loop only reads and inserts, so
+// these ids outlive every later upgrade.
+func seedPrereleaseTrustLedger(t *testing.T, c *Client) {
+	t.Helper()
+	ctx := context.Background()
+	for _, id := range prereleaseTrustLedgerIDs {
+		if err := c.execLocal(ctx,
+			`INSERT OR IGNORE INTO applied_migrations (id, applied_at, checksum)
+			 VALUES (?, '2026-09-08T00:00:00Z', '')`, id); err != nil {
+			t.Fatalf("seed the prerelease ledger entry %s: %v", id, err)
+		}
+	}
+}
+
+// seedPrereleaseSuspension writes the suspension the rejected automatic
+// migration left on every live binding.
+func seedPrereleaseSuspension(t *testing.T, c *Client) {
+	t.Helper()
+	if err := c.execLocal(context.Background(),
+		`UPDATE netbox_bindings SET suspended = 1, suspend_reason = ?, updated_at = ?`,
+		prereleaseTrustSuspendPrefix+", which have been removed", "2026-09-08T20:00:00Z"); err != nil {
+		t.Fatalf("seed the removed migration's suspension: %v", err)
 	}
 }
 
@@ -351,6 +388,129 @@ func TestAResolvedOrphanedConditionStillRefuses(t *testing.T) {
 	if err := InitSchema(ctx, c); err == nil {
 		t.Fatal("a resolved removed-evaluator condition let the daemon start; resolving a row " +
 			"is not a way to unrecord that the mechanism was used in this database")
+	}
+}
+
+// TestTheMigrationLedgerAloneRefuses is the shape the first two signals both
+// miss, and the reason the third one is built from schema history rather than
+// from another observable side effect.
+//
+// The rejected migration could run BEFORE the advisory had ever been evaluated:
+// an advisory needs a running leader to write a condition row, and schema init
+// runs first. Such a database ends up with no trust tables (dropped) and no
+// condition rows (never written) — and it was accepted here. What it still has is
+// the ledger entries recording that those tables were created in it, because
+// dropping a table does not unrecord its creation and nothing has ever deleted a
+// row from applied_migrations.
+//
+// The suspension marker is deliberately NOT seeded: this database's bindings were
+// suspended, but the same gap can leave a database with no live binding to
+// suspend at all, and the ledger has to stand on its own.
+func TestTheMigrationLedgerAloneRefuses(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedPrereleaseTrustLedger(t, c)
+	seedLiveBindingAndClaim(t, c)
+
+	if got := tablesPresent(t, c); len(got) != 0 {
+		t.Fatalf("precondition: the tables must be absent for this shape, found %v", got)
+	}
+	before := bindingRows(t, c)
+
+	err := InitSchema(ctx, c)
+	if err == nil {
+		t.Fatal("a database whose prerelease trust tables and condition rows are BOTH gone " +
+			"started, although its migration ledger still records that those tables were " +
+			"created in it. That is the database of an operator whose migration ran before " +
+			"the advisory ever wrote a row — neither of the other two signals can see it")
+	}
+	for _, id := range prereleaseTrustLedgerIDs {
+		if !strings.Contains(err.Error(), id) {
+			t.Errorf("the refusal must name the ledger entry %q it found: %v", id, err)
+		}
+	}
+	if after := bindingRows(t, c); after != before {
+		t.Errorf("the refusal modified a binding row.\nbefore: %s after:  %s", before, after)
+	}
+	// The ledger rows are evidence too, and evidence is never consumed by the
+	// check that reads it.
+	rows, qerr := c.Query(ctx,
+		`SELECT COUNT(*) AS n FROM applied_migrations WHERE id LIKE 't_netbox_%'`)
+	if qerr != nil || len(rows) == 0 || rows[0].Int("n") < len(prereleaseTrustLedgerIDs) {
+		t.Errorf("a prerelease ledger entry went away: err=%v rows=%v", qerr, rows)
+	}
+}
+
+// TestADatabaseHealedWithoutAnAdvisoryStillRefuses is the state the rejected
+// automatic migration actually left behind, reproduced from its own two data
+// changes: suspend every live binding, then drop the three tables.
+//
+// It is the shape that escaped: the migration could run before the advisory had
+// ever been evaluated, so this database has NEITHER trust tables NOR condition
+// rows. Both signals that existed came up empty and it started. What it does
+// have is the ledger entries recording that those tables were created in it, and
+// the migration's own suspension reason on the binding — two artifacts written
+// when the mechanism was installed and when it was removed, neither of which the
+// removal path can erase.
+func TestADatabaseHealedWithoutAnAdvisoryStillRefuses(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedPrereleaseTrustTables(t, c)
+	recordPrereleaseGrant(t, c, "a-lost-host", "inventory")
+	seedLiveBindingAndClaim(t, c)
+	seedPrereleaseSuspension(t, c)
+	for _, name := range prereleaseTrustTables {
+		if err := c.execLocal(ctx, "DROP TABLE "+name); err != nil {
+			t.Fatalf("drop %s the way the rejected migration did: %v", name, err)
+		}
+	}
+	if got := tablesPresent(t, c); len(got) != 0 {
+		t.Fatalf("precondition: the tables must be gone for this shape, found %v", got)
+	}
+	before := bindingRows(t, c)
+
+	if err := InitSchema(ctx, c); err == nil {
+		t.Fatal("an already-healed trust database started because no advisory had ever " +
+			"written a condition row. Advisory history is not migration history: the tables " +
+			"were created in this database and the removal has already run against it, and " +
+			"both of those are recorded in artifacts the removal cannot erase")
+	}
+	if after := bindingRows(t, c); after != before {
+		t.Errorf("the refusal modified a binding row.\nbefore: %s after:  %s", before, after)
+	}
+	if !claimSurvives(t, c) {
+		t.Error("the refusal disturbed an existing claim; it must write nothing at all")
+	}
+}
+
+// TestTheRemovedMigrationsOwnSuspensionRefuses is the fourth signal on its own.
+//
+// A binding suspended under that reason was suspended by the rejected migration
+// and by nothing else, so it is a durable record that the removal has already
+// been run against this database — the one state that must never be started on
+// and rewritten a second time.
+func TestTheRemovedMigrationsOwnSuspensionRefuses(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedLiveBindingAndClaim(t, c)
+	seedPrereleaseSuspension(t, c)
+
+	if got := tablesPresent(t, c); len(got) != 0 {
+		t.Fatalf("precondition: the tables must be absent for this shape, found %v", got)
+	}
+	before := bindingRows(t, c)
+
+	err := InitSchema(ctx, c)
+	if err == nil {
+		t.Fatal("a database carrying the removed migration's own suspension reason started; " +
+			"that reason is written by that migration and by nothing else, so it records that " +
+			"this database has already been rewritten once")
+	}
+	if !strings.Contains(err.Error(), "already run") {
+		t.Errorf("the refusal must say the removed migration has already run here: %v", err)
+	}
+	if after := bindingRows(t, c); after != before {
+		t.Errorf("the refusal modified a binding row.\nbefore: %s after:  %s", before, after)
 	}
 }
 

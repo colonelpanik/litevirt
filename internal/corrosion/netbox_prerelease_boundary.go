@@ -39,7 +39,8 @@ import (
 // a deliberate offline recovery, which is where a decision that needs an
 // operator's judgement belongs.
 //
-// TWO SHAPES ARE DETECTED, because there are two ways to be carrying this.
+// FOUR SHAPES ARE DETECTED, because there are four ways to be carrying this and
+// the removal path erases the first two.
 //
 //  1. THE TABLES. A database that ran the prerelease commits has them, and they
 //     are the whole record: the grant rows were append-only and nothing ever
@@ -52,16 +53,44 @@ import (
 //     will ever resolve them. A tables-only check would let exactly that
 //     database start, and it is the one that has already been rewritten once.
 //
-// Neither signal is filtered on `deleted_at` or on lifecycle. A tombstoned grant
-// is still a grant that was recorded, and a resolved advisory is still an
-// advisory that stood — deleting or resolving a row was never a way to establish
-// that the mechanism had not been used. Fail closed, and leak over collision:
-// refusing a database that turns out to have been harmless costs an operator one
-// deliberate procedure, and starting on one that was not costs a live guest's
-// address.
+//  3. THE MIGRATION LEDGER, which is the DURABLE one and the reason this list
+//     stopped growing. The two signals above are both artifacts the removal path
+//     can destroy: it drops the tables, and the condition rows only exist if the
+//     advisory ever WROTE one — an advisory has to be evaluated by a running
+//     leader, and the rejected migration could run first, on a database whose
+//     leader never got that far. That database has no tables and no condition
+//     rows, and it was accepted here. So the third signal is not another guess
+//     at a surviving side effect: `applied_migrations` records every schema unit
+//     this database has ever applied, INCLUDING the three create-table units for
+//     the removed tables, and nothing has ever deleted a row from it. Dropping a
+//     table does not unrecord its creation. The ledger is also LOCAL-ONLY and
+//     never replicated, so a row there is a statement about THIS database's own
+//     history rather than about a peer's.
 //
-// NOTHING HERE WRITES. Two catalogue lookups per signal and one COUNT per code,
-// before any DDL, any ledger heal and any data fix — so the refusal is reached
+//  4. THE SUSPENSION MARKER. The rejected migration's other data change was to
+//     suspend every live binding under a reason naming the removed mechanism. A
+//     binding carrying that reason is a durable record, written by that migration
+//     and by nothing else, that this database has already been rewritten once.
+//     Kept alongside the ledger because it is evidence of a different fact — not
+//     "the tables were created here" but "the removal already ran here" — and
+//     because an operator reading the refusal is told which of the two it is.
+//
+// ADVISORY HISTORY IS NOT MIGRATION HISTORY, which is the mistake this file made
+// twice. A signal that depends on some later component having observed the
+// mechanism is absent exactly when that component never ran; a signal written by
+// the schema machinery at the moment the mechanism was INSTALLED cannot be.
+// Prefer artifacts the removal path cannot erase.
+//
+// No signal is filtered on `deleted_at` or on lifecycle. A tombstoned grant is
+// still a grant that was recorded, and a resolved advisory is still an advisory
+// that stood — deleting or resolving a row was never a way to establish that the
+// mechanism had not been used. Fail closed, and leak over collision: refusing a
+// database that turns out to have been harmless costs an operator one deliberate
+// procedure, and starting on one that was not costs a live guest's address.
+//
+// NOTHING HERE WRITES. A catalogue lookup per signal, one COUNT per condition
+// code, one SELECT over the ledger ids and one COUNT of marked bindings — all
+// before any DDL, any ledger heal and any data fix, so the refusal is reached
 // with the database in precisely the state the daemon found it in, and the
 // message can say so without qualification.
 
@@ -72,6 +101,37 @@ var prereleaseTrustTables = []string{
 	"netbox_recovery_manifests",
 	"netbox_retirement_withdrawals",
 }
+
+// prereleaseTrustLedgerIDs are the applied_migrations ids the prerelease build
+// wrote when it created those three tables.
+//
+// DERIVED from the table names rather than written out, because the id is the
+// schema machinery's own construction — createTableUnits become "t_" + table
+// (see the init in schema.go) — and two hand-maintained lists of the same three
+// names is one edit away from a signal that silently matches nothing.
+//
+// These rows are the durable artifact. Every DDL unit this database has applied
+// is recorded here, the removal path drops tables and never touches the ledger,
+// and nothing in the codebase deletes a ledger row at all — the migration loop
+// only ever reads and inserts, and it ignores stored ids it does not recognise,
+// which is why these three survive every subsequent upgrade.
+var prereleaseTrustLedgerIDs = func() []string {
+	out := make([]string, 0, len(prereleaseTrustTables))
+	for _, t := range prereleaseTrustTables {
+		out = append(out, "t_"+t)
+	}
+	return out
+}()
+
+// prereleaseTrustSuspendPrefix is the leading text of the suspension reason the
+// rejected migration wrote onto every live binding.
+//
+// A PREFIX, not the whole sentence. The full reason ran on into the remedy and
+// the reassurance, and matching it whole would turn a later reword of that tail
+// — or a row written by an intermediate build of it — into a signal that no
+// longer matches. The opening clause is the part that identifies the mechanism.
+const prereleaseTrustSuspendPrefix = "suspended by upgrade: this database recorded prerelease " +
+	"permanent-loss trust grants"
 
 // prereleaseTrustConditionCodes are the health condition codes the removed
 // attestation evaluator wrote. Nothing writes or resolves them now, so a row
@@ -95,13 +155,20 @@ type prereleaseTrustFinding struct {
 	// Conditions are the orphaned condition codes found, each with its row
 	// count, in declared order.
 	Conditions []string
+	// Ledger are the applied_migrations ids recording that the removed tables
+	// were created in this database, in declared order.
+	Ledger []string
+	// Suspensions is how many bindings carry the rejected migration's own
+	// suspension reason.
+	Suspensions int
 }
 
 func (f prereleaseTrustFinding) empty() bool {
-	return len(f.Tables) == 0 && len(f.Conditions) == 0
+	return len(f.Tables) == 0 && len(f.Conditions) == 0 &&
+		len(f.Ledger) == 0 && f.Suspensions == 0
 }
 
-// findPrereleaseTrustSchema looks for both shapes. It reads and never writes.
+// findPrereleaseTrustSchema looks for all four shapes. It reads and never writes.
 //
 // A lookup that FAILS is reported as a failure, never as absence: concluding
 // "not present" from an unreadable catalogue would start a daemon on exactly the
@@ -115,6 +182,48 @@ func findPrereleaseTrustSchema(ctx context.Context, c *Client) (prereleaseTrustF
 		}
 		if ok {
 			f.Tables = append(f.Tables, t)
+		}
+	}
+
+	// The THIRD shape, and the one that does not depend on any component other
+	// than the schema machinery having run. No applied_migrations table means a
+	// database that has never been migrated by a ledgered build at all — which
+	// includes every fresh one, since this check runs before the ledger is
+	// created — so there is nothing recorded either way. A real answer.
+	hasLedger, err := tableExists(ctx, c, "applied_migrations")
+	if err != nil {
+		return f, fmt.Errorf("look for applied_migrations: %w", err)
+	}
+	if hasLedger {
+		for _, id := range prereleaseTrustLedgerIDs {
+			var n int
+			row := c.db.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM applied_migrations WHERE id = ?`, id)
+			if err := row.Scan(&n); err != nil {
+				return f, fmt.Errorf("look for the prerelease migration ledger entry %s: %w", id, err)
+			}
+			if n > 0 {
+				f.Ledger = append(f.Ledger, id)
+			}
+		}
+	}
+
+	// The FOURTH shape: the rejected migration's own suspension marker. Only
+	// that migration ever wrote this reason, so a binding carrying it is a
+	// database the removal has already been run against.
+	hasBindings, err := tableExists(ctx, c, "netbox_bindings")
+	if err != nil {
+		return f, fmt.Errorf("look for netbox_bindings: %w", err)
+	}
+	if hasBindings {
+		// LIKE on the opening clause, and no deleted_at filter: a tombstoned
+		// binding still carries the record that it was suspended by that
+		// migration.
+		row := c.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM netbox_bindings WHERE suspend_reason LIKE ?`,
+			prereleaseTrustSuspendPrefix+"%")
+		if err := row.Scan(&f.Suspensions); err != nil {
+			return f, fmt.Errorf("count bindings suspended by the removed migration: %w", err)
 		}
 	}
 
@@ -165,6 +274,16 @@ func (f prereleaseTrustFinding) refusal() string {
 	if len(f.Conditions) > 0 {
 		found = append(found, "health conditions from the removed attestation evaluator, "+
 			"which nothing writes and nothing will resolve: "+strings.Join(f.Conditions, ", "))
+	}
+	if len(f.Ledger) > 0 {
+		found = append(found, "migration ledger entries recording that the removed tables were "+
+			"created in THIS database (applied_migrations is local-only and never replicated, "+
+			"and dropping a table does not unrecord its creation): "+strings.Join(f.Ledger, ", "))
+	}
+	if f.Suspensions > 0 {
+		found = append(found, fmt.Sprintf(
+			"%d NetBox binding(s) suspended by the removed automatic migration, under its own "+
+				"reason — so that migration has already run against this database", f.Suspensions))
 	}
 
 	var b strings.Builder

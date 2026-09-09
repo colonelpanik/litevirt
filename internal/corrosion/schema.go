@@ -381,6 +381,36 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 	checksum   TEXT NOT NULL
 )`
 
+// acknowledgedTiesDDL records which observed merge conflicts an operator has
+// stated they have seen, so the acknowledgement survives a daemon restart.
+//
+// Created by the framework rather than listed in schemaDDL, following
+// appliedMigrationsDDL above and for the same two reasons: it does not trip the
+// CI growth guard, so it costs no schema version, and it is LOCAL-ONLY. Every
+// write goes through execLocal (no mutation_log row) and the table is absent
+// from sync.go's tableNames, so peers never replicate it. That is deliberate,
+// not an oversight: an acknowledgement is a statement by one operator about
+// what ONE node's register showed, and replicating it would silence the same
+// conflict on nodes whose operator never looked at it.
+//
+// Durability is what makes the acknowledgement worth anything. Without it a
+// restart empties the in-memory register, the next anti-entropy sweep
+// re-registers the same tie — the two rows still disagree, which is the whole
+// point — and the operator is back where they started. The register alone is
+// not a remedy; the register plus this table is.
+//
+// content_pair is part of the identity, not just the payload: an acknowledgement
+// describes ONE observed divergence. A different divergence on the same row must
+// still surface, so a changed pair supersedes the row rather than matching it.
+const acknowledgedTiesDDL = `CREATE TABLE IF NOT EXISTS acknowledged_ties (
+	table_name      TEXT NOT NULL,
+	pk              TEXT NOT NULL,
+	content_pair    TEXT NOT NULL,
+	acknowledged_at TEXT NOT NULL,
+	acknowledged_by TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (table_name, pk)
+)`
+
 // InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
 // broadcast — each node migrates its own DB on startup.
 //
@@ -419,6 +449,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// The ledger meta-table itself.
 	if err := c.execLocal(ctx, appliedMigrationsDDL); err != nil {
 		return fmt.Errorf("create applied_migrations: %w", err)
+	}
+	// The local-only acknowledgement store, and the in-memory register it
+	// primes. Loaded here rather than lazily so a tie that arrives before
+	// anything asks about acknowledgements is still suppressed — the first
+	// anti-entropy sweep can land well before the first operator query.
+	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
+		return fmt.Errorf("create acknowledged_ties: %w", err)
+	}
+	if err := c.loadAcknowledgedTies(ctx); err != nil {
+		return fmt.Errorf("load acknowledged_ties: %w", err)
 	}
 	applied, err := loadAppliedMigrations(ctx, c)
 	if err != nil {

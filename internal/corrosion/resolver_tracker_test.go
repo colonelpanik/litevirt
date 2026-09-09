@@ -1,7 +1,9 @@
 package corrosion
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -162,11 +164,12 @@ func contestedTermFixture(t *testing.T) (local, peer *Client) {
 // clears it and the next sweep re-registers. Before this there was no remedy at
 // all.
 func TestAcknowledgeLeaseTermTie_SurvivesTheNextAntiEntropySweep(t *testing.T) {
+	ctx := context.Background()
 	local, peer := contestedTermFixture(t)
 
-	if !local.AcknowledgeLeaseTermTie(LeaseKeyFailover, 1) {
-		t.Fatal("acknowledging a tracked contested term reported no such tie; the PK spelling " +
-			"must match what the merge produced")
+	if ok, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "op"); err != nil || !ok {
+		t.Fatalf("acknowledging a tracked contested term failed (ok=%v err=%v); the PK spelling "+
+			"must match what the merge produced", ok, err)
 	}
 	if n := local.UnresolvedTieCount(); n != 0 {
 		t.Fatalf("register still holds %d tie(s) immediately after acknowledgement", n)
@@ -197,7 +200,9 @@ func TestAcknowledgeLeaseTermTie_LeavesBothClaimsInTheLedger(t *testing.T) {
 	if err != nil || len(before) != 1 {
 		t.Fatalf("read term 1 before: rows=%d err=%v", len(before), err)
 	}
-	local.AcknowledgeLeaseTermTie(LeaseKeyFailover, 1)
+	if _, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "op"); err != nil {
+		t.Fatalf("acknowledge: %v", err)
+	}
 
 	after, err := local.Query(ctx,
 		`SELECT holder FROM leader_lease_terms WHERE key = ? AND term = 1`, LeaseKeyFailover)
@@ -215,7 +220,7 @@ func TestAcknowledgeLeaseTermTie_LeavesBothClaimsInTheLedger(t *testing.T) {
 // reports false rather than failing an operator's command.
 func TestAcknowledgeLeaseTermTie_UnknownTieIsNotAnError(t *testing.T) {
 	c := testClient(t)
-	if c.AcknowledgeLeaseTermTie(LeaseKeyFailover, 99) {
+	if ok, err := c.AcknowledgeLeaseTermTie(context.Background(), LeaseKeyFailover, 99, "op"); err != nil || ok {
 		t.Error("reported acknowledging a tie that was never tracked")
 	}
 }
@@ -227,8 +232,8 @@ func TestAcknowledgeLeaseTermTie_UnknownTieIsNotAnError(t *testing.T) {
 func TestAcknowledgeUnresolvedTie_DoesNotSuppressADifferentDivergence(t *testing.T) {
 	c := testClient(t)
 	c.trackUnresolvedPair("vms", "vm1", "pair-a", pathAE, "runtime_owned")
-	if !c.AcknowledgeUnresolvedTie("vms", "vm1") {
-		t.Fatal("acknowledging a tracked tie reported none")
+	if ok, err := c.AcknowledgeUnresolvedTie(context.Background(), "vms", "vm1", "op"); err != nil || !ok {
+		t.Fatalf("acknowledging a tracked tie: ok=%v err=%v", ok, err)
 	}
 	// The same divergence stays quiet...
 	c.trackUnresolvedPair("vms", "vm1", "pair-a", pathAE, "runtime_owned")
@@ -240,5 +245,144 @@ func TestAcknowledgeUnresolvedTie_DoesNotSuppressADifferentDivergence(t *testing
 	if n := c.UnresolvedTieCount(); n != 1 {
 		t.Errorf("a DIFFERENT divergence on the same row did not register (%d); an "+
 			"acknowledgement must describe one observation, not mute the row", n)
+	}
+}
+
+// TestAcknowledgeLeaseTermTie_SurvivesADaemonRestart is the property the
+// durable table exists for, and the one the in-memory-only version failed.
+//
+// A restart empties the register, so the tie looks gone — and then the next
+// anti-entropy sweep re-registers it, because the two rows still disagree by
+// design. Without durability an operator re-acknowledges the same historical
+// partition after every restart, forever.
+//
+// The "restart" is a second Client over the SAME database, which is what
+// actually exercises the mechanism: a fresh process reads acknowledged_ties in
+// InitSchema and primes its register from it. (A literal process restart is a
+// fleet-test concern; this pins the load path, which is where the logic is.)
+func TestAcknowledgeLeaseTermTie_SurvivesADaemonRestart(t *testing.T) {
+	ctx := context.Background()
+	dsn := fmt.Sprintf("ackrestart%d", testDBCounter.Add(1))
+
+	before, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer before.Close()
+	if err := InitSchema(ctx, before); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// A real contested term, tracked through the merge.
+	peer := testClient(t)
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	if held, term, err := AcquireLeaseWithTerm(ctx, before, LeaseKeyFailover, "host-a", 30*time.Second, now); err != nil || !held || term != 1 {
+		t.Fatalf("local acquire: held=%v term=%d err=%v", held, term, err)
+	}
+	if held, term, err := AcquireLeaseWithTerm(ctx, peer, LeaseKeyFailover, "host-b", 30*time.Second, now); err != nil || !held || term != 1 {
+		t.Fatalf("peer acquire: held=%v term=%d err=%v", held, term, err)
+	}
+	if err := before.MergeStateBytesLWW(peer.DumpStateBytes()); err != nil {
+		t.Fatalf("anti-entropy: %v", err)
+	}
+	if n := before.UnresolvedTieCount(); n != 1 {
+		t.Fatalf("fixture produced %d ties, want 1", n)
+	}
+
+	if ok, err := before.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+
+	// The restarted daemon: a new Client over the same DB, running InitSchema
+	// exactly as startup does.
+	after, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer after.Close()
+	if err := InitSchema(ctx, after); err != nil {
+		t.Fatalf("InitSchema after restart: %v", err)
+	}
+	if n := after.UnresolvedTieCount(); n != 0 {
+		t.Fatalf("the restarted node starts with %d tracked tie(s); it should start clean", n)
+	}
+
+	// The sweep that used to undo everything.
+	if err := after.MergeStateBytesLWW(peer.DumpStateBytes()); err != nil {
+		t.Fatalf("post-restart anti-entropy: %v", err)
+	}
+	if n := after.UnresolvedTieCount(); n != 0 {
+		t.Errorf("the acknowledged tie re-registered after a restart (count=%d). The rows still "+
+			"disagree by design, so without a durable acknowledgement the operator has to "+
+			"re-acknowledge the same historical partition after every restart", n)
+	}
+
+	// And the record says who.
+	rows, err := after.Query(ctx, `SELECT acknowledged_by FROM acknowledged_ties`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("acknowledged_ties rows = %d (err=%v), want 1", len(rows), err)
+	}
+	if got := rows[0].String("acknowledged_by"); got != "tim" {
+		t.Errorf("acknowledged_by = %q, want %q", got, "tim")
+	}
+}
+
+// TestAcknowledgedTies_IsNotReplicated: the table is local-only, so an
+// acknowledgement on one node must never silence the same conflict on a node
+// whose operator never looked at it.
+func TestAcknowledgedTies_IsNotReplicated(t *testing.T) {
+	ctx := context.Background()
+	local, _ := contestedTermFixture(t)
+	if ok, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+
+	// Nothing about the acknowledgement may appear in the replication log...
+	rows, err := local.Query(ctx,
+		`SELECT COUNT(*) AS n FROM mutation_log WHERE stmts LIKE '%acknowledged_ties%'`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	if n := rows[0].Int("n"); n != 0 {
+		t.Errorf("%d acknowledgement write(s) reached mutation_log; the table is local-only and "+
+			"replicating it would suppress a conflict on a node nobody inspected", n)
+	}
+	// ...nor in the state dump peers merge from.
+	if bytes.Contains(local.DumpStateBytes(), []byte("acknowledged_ties")) {
+		t.Error("acknowledged_ties appears in the anti-entropy state dump; it must be absent " +
+			"from the sync table list")
+	}
+}
+
+// TestAcknowledgeUnresolvedTie_ADurableWriteFailureIsNotSuccess: if the
+// acknowledgement cannot be recorded, it has not happened.
+//
+// Clearing the register on a failed write would be the worst of both worlds —
+// the operator sees the tie disappear, believes it is handled, and it returns
+// on the next restart with no record of anyone having looked at it.
+func TestAcknowledgeUnresolvedTie_ADurableWriteFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	c.trackUnresolvedPair("vms", "vm1", "pair-a", pathAE, "runtime_owned")
+
+	// Take the store away underneath it.
+	if err := c.execLocal(ctx, `DROP TABLE acknowledged_ties`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+
+	ok, err := c.AcknowledgeUnresolvedTie(ctx, "vms", "vm1", "tim")
+	if err == nil {
+		t.Error("a failed durable write reported no error; the operator would believe the " +
+			"acknowledgement stuck")
+	}
+	if ok {
+		t.Error("a failed durable write reported success")
+	}
+	if n := c.UnresolvedTieCount(); n != 1 {
+		t.Errorf("the tie was cleared from the register (%d left) despite the acknowledgement "+
+			"not being recorded; it must stay visible", n)
 	}
 }

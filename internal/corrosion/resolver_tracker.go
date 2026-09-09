@@ -1,10 +1,13 @@
 package corrosion
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Unresolved-tie tracking.
@@ -161,8 +164,13 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 			return
 		}
 		// A different divergence on the same row: the acknowledgement described
-		// something else and must not cover this.
+		// something else and must not cover this. The durable row is superseded
+		// too, best-effort — leaving it would re-suppress the OLD pair after a
+		// restart even though the row has moved on. Deleted without ctx because
+		// this runs inside a merge; a failure here costs a stale suppression of a
+		// pair that is no longer observed, never a missed live tie.
 		delete(c.acknowledgedTies, key)
+		c.deleteAcknowledgedTieRow(table, pk)
 	}
 	prev, existed := c.unresolvedTies[key]
 	isNew := !existed || prev.pair != pair
@@ -259,22 +267,67 @@ func (c *Client) UnresolvedTieCount() int {
 // acknowledged what. DO NOT extend this to delete a losing row: nothing here
 // knows which claim was legitimate, and implying otherwise is the one thing
 // this table's merge exists to avoid.
-func (c *Client) AcknowledgeUnresolvedTie(table, pk string) bool {
+func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by string) (bool, error) {
 	key := unresolvedKey(table, pk)
+
+	c.tieMu.Lock()
+	t, ok := c.unresolvedTies[key]
+	c.tieMu.Unlock()
+	if !ok {
+		return false, nil
+	}
+
+	// Persist FIRST, and fail the whole operation if it does not stick. An
+	// acknowledgement that cleared the register but not the table would look
+	// like it worked and silently come back on the next restart — the exact
+	// failure this table exists to prevent, made harder to notice.
+	//
+	// execLocal: local-only, never replicated. See acknowledgedTiesDDL.
+	if err := c.execLocal(ctx,
+		`INSERT INTO acknowledged_ties (table_name, pk, content_pair, acknowledged_at, acknowledged_by)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(table_name, pk) DO UPDATE SET
+		   content_pair = excluded.content_pair,
+		   acknowledged_at = excluded.acknowledged_at,
+		   acknowledged_by = excluded.acknowledged_by`,
+		table, pk, t.pair, time.Now().UTC().Format(time.RFC3339), by); err != nil {
+		return false, fmt.Errorf("persist acknowledgement of %s/%s: %w", table, pk, err)
+	}
+
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
-	t, ok := c.unresolvedTies[key]
-	if !ok {
-		return false
-	}
+	// Re-check: a concurrent clearUnresolved (a real repair) may have removed it
+	// while the write was in flight. The durable row is harmless then — the pair
+	// it names is no longer tracked, and a future different divergence
+	// supersedes it.
 	if c.acknowledgedTies == nil {
 		c.acknowledgedTies = make(map[string]string, 1)
 	}
 	c.acknowledgedTies[key] = t.pair
-	delete(c.unresolvedTies, key)
-	c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
-	c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
-	return true
+	if _, still := c.unresolvedTies[key]; still {
+		delete(c.unresolvedTies, key)
+		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
+	}
+	return true, nil
+}
+
+// loadAcknowledgedTies primes the in-memory acknowledgement set from the
+// local-only table. Called by InitSchema.
+func (c *Client) loadAcknowledgedTies(ctx context.Context) error {
+	rows, err := c.Query(ctx, `SELECT table_name, pk, content_pair FROM acknowledged_ties`)
+	if err != nil {
+		return err
+	}
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
+	if c.acknowledgedTies == nil {
+		c.acknowledgedTies = make(map[string]string, len(rows))
+	}
+	for _, r := range rows {
+		c.acknowledgedTies[unresolvedKey(r.String("table_name"), r.String("pk"))] = r.String("content_pair")
+	}
+	return nil
 }
 
 // AcknowledgeLeaseTermTie acknowledges the contested-term tie for (key, term).
@@ -283,8 +336,8 @@ func (c *Client) AcknowledgeUnresolvedTie(table, pk string) bool {
 // when the merge tracked the tie — so callers name the lease and the term and
 // never construct it. A caller that built its own string would silently
 // acknowledge nothing the day the encoding changed.
-func (c *Client) AcknowledgeLeaseTermTie(key string, term int64) bool {
-	return c.AcknowledgeUnresolvedTie("leader_lease_terms", pkKey([]interface{}{key, term}))
+func (c *Client) AcknowledgeLeaseTermTie(ctx context.Context, key string, term int64, by string) (bool, error) {
+	return c.AcknowledgeUnresolvedTie(ctx, "leader_lease_terms", pkKey([]interface{}{key, term}), by)
 }
 
 // UnresolvedTieCategories totals the live unresolved ties by CATEGORY.
@@ -320,4 +373,17 @@ func (c *Client) UnresolvedTieTables() map[string]int {
 		}
 	}
 	return out
+}
+
+// deleteAcknowledgedTieRow drops one durable acknowledgement. Best-effort and
+// deliberately without a caller-supplied context: the only caller runs inside a
+// merge, where a failed delete costs a stale suppression of a content pair that
+// is no longer observed — never the suppression of a live tie, because the
+// in-memory entry has already been removed by then.
+func (c *Client) deleteAcknowledgedTieRow(table, pk string) {
+	if err := c.execLocal(context.Background(),
+		`DELETE FROM acknowledged_ties WHERE table_name = ? AND pk = ?`, table, pk); err != nil {
+		slog.Warn("could not drop a superseded tie acknowledgement",
+			"table", table, "pk", pk, "error", err)
+	}
 }

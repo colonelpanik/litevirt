@@ -47,7 +47,17 @@ func (s *Server) AcknowledgeLeaseTermTie(ctx context.Context, req *pb.Acknowledg
 			"term %d is not a real lease term (allocation starts at 1)", req.GetTerm())
 	}
 
-	acked := s.db.AcknowledgeLeaseTermTie(key, req.GetTerm())
+	// The principal is recorded in the durable row as well as the audit log: the
+	// audit chain answers "who acknowledged this", and the acknowledgement row
+	// answers "why is this tie suppressed on this node" without a log search.
+	acked, err := s.db.AcknowledgeLeaseTermTie(ctx, key, req.GetTerm(), callerUsername(ctx))
+	if err != nil {
+		// The acknowledgement could not be made durable, so it was not made at
+		// all. Reporting success here would hand the operator a suppression that
+		// silently returns on the next restart.
+		return nil, status.Errorf(codes.Unavailable,
+			"could not record the acknowledgement of %s term %d: %v", key, req.GetTerm(), err)
+	}
 	if acked {
 		// Audited only when something was actually cleared, so a retry does not
 		// produce a second record of one operator decision.

@@ -365,17 +365,116 @@ func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
 	close(release)
 	wg.Wait()
 
-	if got := atomic.LoadInt64(&served); got != 1 {
-		t.Errorf("%d callers produced %d peer fan-outs, want 1. Each unshared sweep pays the "+
-			"full %s budget when a peer is unreachable, which is exactly the failover case",
-			callers, got, leaseBarrierBudget)
+	// Sharing is bounded by SWEEP GENERATIONS, not by callers, and a burst costs
+	// at most a small constant number of them. It is deliberately not exactly
+	// one: admission to a batch closes when that batch begins its reads, because
+	// a caller that arrived afterwards cannot be ACCEPTED on evidence gathered
+	// before it existed (see leaseBarrierSweep.startedAt). Callers that miss a
+	// batch queue up and are served by the NEXT one together — which is what
+	// keeps this O(generations) instead of O(callers).
+	const maxGenerations = 3
+	if got := atomic.LoadInt64(&served); got < 1 || got > maxGenerations {
+		t.Errorf("%d callers produced %d peer fan-outs, want between 1 and %d. Each unshared "+
+			"sweep pays the full %s budget when a peer is unreachable, which is exactly "+
+			"the failover case", callers, got, maxGenerations, leaseBarrierBudget)
 	}
 	for i, v := range verdicts {
 		if v != leaseTermStale {
-			t.Errorf("caller %d got %v, want stale — every caller must get the shared sweep's "+
-				"real answer, not a degraded one", i, v)
+			t.Errorf("caller %d got %v, want stale — every caller must get a real sweep's "+
+				"answer, not a degraded one", i, v)
 		}
 	}
+}
+
+// TestLeaseTermBarrier_ALateCallerIsNotAcceptedOnAPreArrivalSweep: joining an
+// in-flight sweep must not accept a proof against evidence gathered before that
+// proof was being judged.
+//
+// The sharing optimisation reintroduced, one layer up, the exact defect the
+// cache asymmetry exists to prevent. leaseTermBarrier's whole premise is that a
+// threshold may REFUSE however old it is — the true maximum only rises, so an
+// old observation is a lower bound — but may only ACCEPT if it is current.
+// Letting any arriving caller reuse an already-reading sweep's result made
+// every late arrival an accept from a lower bound.
+//
+// Here the quorum's high water moves from 4 to 6 while the first sweep is still
+// blocked on a peer. The early caller is legitimately accepted at term 5: when
+// its validation began, 4 really was the truth. The late caller must not be,
+// because by the time it arrived the cluster had already minted 6.
+func TestLeaseTermBarrier_ALateCallerIsNotAcceptedOnAPreArrivalSweep(t *testing.T) {
+	s := barrierNode(t, 4, 2, "node-c")
+
+	peer := &steppedPeer{
+		entered: make(chan struct{}),
+		gate:    make(chan struct{}),
+		first:   4,
+		later:   6,
+	}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return peer, func() {}, nil
+	}
+
+	var early, late leaseTermVerdict
+	var earlyThr, lateThr int64
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		early, earlyThr = s.leaseTermBarrier(context.Background(), corrosion.LeaseKeyFailover, 5)
+	}()
+
+	// Block until the first sweep has actually begun reading. Everything after
+	// this point arrives strictly later than that sweep's recorded start.
+	<-peer.entered
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		late, lateThr = s.leaseTermBarrier(context.Background(), corrosion.LeaseKeyFailover, 5)
+	}()
+	time.Sleep(50 * time.Millisecond) // let the late caller reach the barrier and queue
+
+	close(peer.gate) // the first sweep answers 4; every later sweep answers 6
+	wg.Wait()
+
+	if early != leaseTermCurrent || earlyThr != 4 {
+		t.Errorf("early caller got %v against threshold %d, want current against 4 — it began "+
+			"validating before the sweep read, so that sweep's evidence authorises it",
+			early, earlyThr)
+	}
+	if late != leaseTermStale {
+		t.Errorf("late caller got %v against threshold %d, want stale against 6. It arrived "+
+			"after the first sweep had already read, so sharing that answer accepted a "+
+			"term-5 proof on a pre-term-6 observation — an accept from a lower bound, "+
+			"which is the one thing this barrier must never do", late, lateThr)
+	}
+}
+
+// steppedPeer answers a different term on its first call than on every later
+// one, so a test can move the cluster's high water between sweep generations.
+// The first call blocks until `gate` closes, and `entered` reports when it has
+// begun — which is when the first sweep has committed to its reads.
+type steppedPeer struct {
+	pb.LiteVirtClient
+	calls        int64
+	entered      chan struct{}
+	gate         chan struct{}
+	first, later int64
+	once         sync.Once
+}
+
+func (p *steppedPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption) (*pb.GetLeaseTermHighWaterResponse, error) {
+	if atomic.AddInt64(&p.calls, 1) == 1 {
+		p.once.Do(func() { close(p.entered) })
+		select {
+		case <-p.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &pb.GetLeaseTermHighWaterResponse{Key: req.GetKey(), Term: p.first, Holder: "node-c"}, nil
+	}
+	return &pb.GetLeaseTermHighWaterResponse{Key: req.GetKey(), Term: p.later, Holder: "node-c"}, nil
 }
 
 // blockingPeer answers only once `gate` is closed, so a test can hold a sweep

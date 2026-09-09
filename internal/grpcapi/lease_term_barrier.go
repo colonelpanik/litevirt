@@ -70,10 +70,22 @@ type leaseBarrierEntry struct {
 //
 // Without this, a host loss with 40 workloads runs 40 independent fan-outs,
 // each paying the full budget whenever any peer is unreachable — and an
-// unreachable peer is the defining condition of a failover. Every caller wants
-// the same answer to the same question at the same moment, so they wait on one.
+// unreachable peer is the defining condition of a failover. Callers that want
+// the same answer to the same question at the same moment wait on one.
+//
+// startedAt is what makes "at the same moment" checkable rather than assumed.
+// A sweep's answer is evidence gathered from startedAt onwards, and the
+// asymmetry leaseTermBarrier is built on says a threshold may be used to REFUSE
+// however old it is, but may only be used to ACCEPT if it was gathered after
+// the accepting caller began validating: the true maximum only rises, so an
+// older observation is a lower bound, and accepting from a lower bound admits
+// work the current truth would have fenced. A caller that arrived after this
+// sweep's reads began is in exactly that position, so it does not share this
+// answer — it waits for the next one. Without the timestamp the sharing quietly
+// reintroduced the defect the cache asymmetry exists to prevent, one layer up.
 type leaseBarrierSweep struct {
 	done      chan struct{}
+	startedAt time.Time
 	threshold int64
 	ok        bool
 }
@@ -170,34 +182,56 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 		return 0, false
 	}
 
+	// The instant this caller began validating. Only evidence gathered from here
+	// onwards can authorise it; see leaseBarrierSweep.startedAt.
+	arrived := time.Now()
+
 	// Join an in-flight sweep for this key, or become the one that runs it.
-	s.leaseBarrierMu.Lock()
-	if fl, ok := s.leaseBarrierFlight[key]; ok {
-		s.leaseBarrierMu.Unlock()
-		select {
-		case <-fl.done:
-			return fl.threshold, fl.ok
-		case <-ctx.Done():
-			// The caller gave up first. Unconfirmed, not a pass.
-			return 0, false
-		}
-	}
-	fl := &leaseBarrierSweep{done: make(chan struct{})}
-	if s.leaseBarrierFlight == nil {
-		s.leaseBarrierFlight = make(map[string]*leaseBarrierSweep, 1)
-	}
-	s.leaseBarrierFlight[key] = fl
-	s.leaseBarrierMu.Unlock()
-
-	defer func() {
+	//
+	// The loop exists for the caller that arrives mid-sweep. It waits out the
+	// running sweep, discards that answer as predating it, and goes round to
+	// either start a fresh sweep or join one that began after it arrived. It
+	// terminates after at most one such wait — once the running sweep is gone,
+	// the next flight this caller sees was necessarily created later than
+	// `arrived` — and ctx bounds it regardless.
+	for {
 		s.leaseBarrierMu.Lock()
-		delete(s.leaseBarrierFlight, key)
+		if fl, ok := s.leaseBarrierFlight[key]; ok {
+			s.leaseBarrierMu.Unlock()
+			select {
+			case <-fl.done:
+				if !fl.startedAt.Before(arrived) {
+					return fl.threshold, fl.ok
+				}
+				// Its reads began before we did. Reusing it here would accept
+				// against a bound that may already have been superseded.
+				continue
+			case <-ctx.Done():
+				// The caller gave up first. Unconfirmed, not a pass.
+				return 0, false
+			}
+		}
+		if s.leaseBarrierFlight == nil {
+			s.leaseBarrierFlight = make(map[string]*leaseBarrierSweep, 1)
+		}
+		// startedAt is stamped here, under the lock that publishes the flight,
+		// so it is never LATER than the first read runLeaseTermSweep issues.
+		// Erring early is the safe direction: it can only make a joiner decide
+		// the evidence predates it and pay for another sweep.
+		fl := &leaseBarrierSweep{done: make(chan struct{}), startedAt: time.Now()}
+		s.leaseBarrierFlight[key] = fl
 		s.leaseBarrierMu.Unlock()
-		close(fl.done)
-	}()
 
-	fl.threshold, fl.ok = s.runLeaseTermSweep(ctx, key)
-	return fl.threshold, fl.ok
+		defer func() {
+			s.leaseBarrierMu.Lock()
+			delete(s.leaseBarrierFlight, key)
+			s.leaseBarrierMu.Unlock()
+			close(fl.done)
+		}()
+
+		fl.threshold, fl.ok = s.runLeaseTermSweep(ctx, key)
+		return fl.threshold, fl.ok
+	}
 }
 
 // runLeaseTermSweep is one actual fan-out. Only ever called with this key's

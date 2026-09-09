@@ -216,6 +216,7 @@ const (
 	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
+	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
@@ -548,6 +549,15 @@ type LiteVirtClient interface {
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
+	// AcknowledgeLeaseTermTie records that an operator has seen a contested
+	// lease term on THIS node and drops it from the node's unresolved-tie
+	// register. Both claims stay in the ledger; only the evidence tracking is
+	// cleared, and the acknowledgement itself is written to the audit log.
+	//
+	// Per-node by design and deliberately NOT peer-callable: the register is
+	// node-local, and a node must not acknowledge its own contest. An operator
+	// acknowledges on each host the ha.lww.unresolved condition names.
+	AcknowledgeLeaseTermTie(ctx context.Context, in *AcknowledgeLeaseTermTieRequest, opts ...grpc.CallOption) (*AcknowledgeLeaseTermTieResponse, error)
 	GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -2862,6 +2872,16 @@ func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, 
 	return out, nil
 }
 
+func (c *liteVirtClient) AcknowledgeLeaseTermTie(ctx context.Context, in *AcknowledgeLeaseTermTieRequest, opts ...grpc.CallOption) (*AcknowledgeLeaseTermTieResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcknowledgeLeaseTermTieResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AcknowledgeLeaseTermTie_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDumpResponse)
@@ -3624,6 +3644,15 @@ type LiteVirtServer interface {
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
+	// AcknowledgeLeaseTermTie records that an operator has seen a contested
+	// lease term on THIS node and drops it from the node's unresolved-tie
+	// register. Both claims stay in the ledger; only the evidence tracking is
+	// cleared, and the acknowledgement itself is written to the audit log.
+	//
+	// Per-node by design and deliberately NOT peer-callable: the register is
+	// node-local, and a node must not acknowledge its own contest. An operator
+	// acknowledges on each host the ha.lww.unresolved condition names.
+	AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error)
 	GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -4355,6 +4384,9 @@ func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *C
 }
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
+}
+func (UnimplementedLiteVirtServer) AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeLeaseTermTie not implemented")
 }
 func (UnimplementedLiteVirtServer) GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDump not implemented")
@@ -7787,6 +7819,24 @@ func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AcknowledgeLeaseTermTie_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcknowledgeLeaseTermTieRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AcknowledgeLeaseTermTie(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AcknowledgeLeaseTermTie_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AcknowledgeLeaseTermTie(ctx, req.(*AcknowledgeLeaseTermTieRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDump_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -9221,6 +9271,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStateDigest",
 			Handler:    _LiteVirt_GetStateDigest_Handler,
+		},
+		{
+			MethodName: "AcknowledgeLeaseTermTie",
+			Handler:    _LiteVirt_AcknowledgeLeaseTermTie_Handler,
 		},
 		{
 			MethodName: "GetStateDump",

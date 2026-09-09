@@ -152,6 +152,18 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	if c.unresolvedTies == nil {
 		c.unresolvedTies = make(map[string]unresolvedTie)
 	}
+	// An acknowledged pair is not a tie any more, as far as the register is
+	// concerned. Checked BEFORE the map is touched so an acknowledged conflict
+	// costs no gauge movement and no repeated warning on every sweep.
+	if ack, ok := c.acknowledgedTies[key]; ok {
+		if ack == pair {
+			c.tieMu.Unlock()
+			return
+		}
+		// A different divergence on the same row: the acknowledgement described
+		// something else and must not cover this.
+		delete(c.acknowledgedTies, key)
+	}
 	prev, existed := c.unresolvedTies[key]
 	isNew := !existed || prev.pair != pair
 	if isNew {
@@ -228,6 +240,51 @@ func (c *Client) UnresolvedTieCount() int {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	return len(c.unresolvedTies)
+}
+
+// AcknowledgeUnresolvedTie records that an operator has seen the tie currently
+// tracked for (table,PK), and drops it from the live register. Reports whether
+// such a tie was tracked.
+//
+// It exists because one class of tie can never clear on its own.
+// clearUnresolved fires when a remediating write lands on the row — the right
+// contract for a mutable table — but leader_lease_terms rows are immutable by
+// design, so no such write is ever coming. Without this the register, the state
+// digest and the ha.lww.unresolved health condition stay dirty for as long as
+// the two rows disagree, which is forever, and no restart helps (see
+// acknowledgedTies).
+//
+// It clears EVIDENCE TRACKING, never the conflict. Both rows stay exactly as
+// they are, and the caller is expected to write an audit record naming who
+// acknowledged what. DO NOT extend this to delete a losing row: nothing here
+// knows which claim was legitimate, and implying otherwise is the one thing
+// this table's merge exists to avoid.
+func (c *Client) AcknowledgeUnresolvedTie(table, pk string) bool {
+	key := unresolvedKey(table, pk)
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
+	t, ok := c.unresolvedTies[key]
+	if !ok {
+		return false
+	}
+	if c.acknowledgedTies == nil {
+		c.acknowledgedTies = make(map[string]string, 1)
+	}
+	c.acknowledgedTies[key] = t.pair
+	delete(c.unresolvedTies, key)
+	c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+	c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
+	return true
+}
+
+// AcknowledgeLeaseTermTie acknowledges the contested-term tie for (key, term).
+//
+// The PK key spelling belongs to this package — it is whatever pkKeyAt produced
+// when the merge tracked the tie — so callers name the lease and the term and
+// never construct it. A caller that built its own string would silently
+// acknowledge nothing the day the encoding changed.
+func (c *Client) AcknowledgeLeaseTermTie(key string, term int64) bool {
+	return c.AcknowledgeUnresolvedTie("leader_lease_terms", pkKey([]interface{}{key, term}))
 }
 
 // UnresolvedTieCategories totals the live unresolved ties by CATEGORY.

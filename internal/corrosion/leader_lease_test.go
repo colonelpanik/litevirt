@@ -258,3 +258,22 @@ func TestLeaseTermHolder_IgnoresTombstonedRows(t *testing.T) {
 		t.Errorf("tombstoned term 1 = (%q, %v), want (\"\", false)", holder, found)
 	}
 }
+
+// TestValidLeaseKey_RejectsAnythingNotALease is why accepting a lease key from a
+// caller can be safe: it may name which of the three real ledgers it means, and
+// nothing else. An unknown key would read an empty ledger, find MAX(term) = 0,
+// and make anything naming it look current.
+func TestValidLeaseKey_RejectsAnythingNotALease(t *testing.T) {
+	for _, k := range []string{LeaseKeyFailover, LeaseKeyRebalancer, LeaseKeyDualRun} {
+		if !ValidLeaseKey(k) {
+			t.Errorf("%q is a real lease key and must validate", k)
+		}
+	}
+	// Near-misses must NOT be normalised into a match: each is a bug or an
+	// attack, and accepting it would hide which.
+	for _, k := range []string{"", " failover", "failover ", "FAILOVER", "Failover", "'; DROP", "unknown"} {
+		if ValidLeaseKey(k) {
+			t.Errorf("%q must not validate as a lease key", k)
+		}
+	}
+}

@@ -1638,6 +1638,17 @@ message RuntimeActionProof {
     int64  lease_term       = 14;
 }
 
+message AcknowledgeLeaseTermTieRequest {
+    string key  = 1; // lease key, e.g. "failover"
+    int64  term = 2; // the contested term
+}
+message AcknowledgeLeaseTermTieResponse {
+    // acknowledged is false when no such tie was tracked on this node — an
+    // already-acknowledged term, a term that never contested, or a node that
+    // restarted since. Not an error: the command is idempotent.
+    bool acknowledged = 1;
+}
+
 message PromoteReplicaRequest {
     string vm_name     = 1; // VM whose replica to promote
     string target_pool = 2; // optional — pool holding the replica; defaults to the VM's replication schedule
@@ -2402,6 +2413,15 @@ service LiteVirt {
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);
+    // AcknowledgeLeaseTermTie records that an operator has seen a contested
+    // lease term on THIS node and drops it from the node's unresolved-tie
+    // register. Both claims stay in the ledger; only the evidence tracking is
+    // cleared, and the acknowledgement itself is written to the audit log.
+    //
+    // Per-node by design and deliberately NOT peer-callable: the register is
+    // node-local, and a node must not acknowledge its own contest. An operator
+    // acknowledges on each host the ha.lww.unresolved condition names.
+    rpc AcknowledgeLeaseTermTie(AcknowledgeLeaseTermTieRequest) returns (AcknowledgeLeaseTermTieResponse);
     rpc GetStateDump(google.protobuf.Empty)         returns (StateDumpResponse);
     // StreamStateDump is the chunked replacement for GetStateDump: it streams
     // the gzipped dump in bounded slices so it survives at scale. GetStateDump

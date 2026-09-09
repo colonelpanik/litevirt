@@ -32,7 +32,10 @@ const (
 
 // dualRunLeaseKey elects the single node that runs the detector, so a fleet-wide
 // split-brain pages once (from the leader), not once per node.
-const dualRunLeaseKey = "dual_run_detector"
+// It aliases corrosion.LeaseKeyDualRun rather than re-spelling the string, so
+// this detector and anything that reasons about its lease ledger can never
+// disagree about which key it holds.
+const dualRunLeaseKey = corrosion.LeaseKeyDualRun
 
 // dualRunDebounce is the number of consecutive passes a finding must persist before it
 // pages: a real dual-run holds for >=1 interval; a migration/cutover clears within one.

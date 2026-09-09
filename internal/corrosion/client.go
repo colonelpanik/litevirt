@@ -170,6 +170,22 @@ type Client struct {
 	// schema. It used to be passed in and dropped, which is what forced
 	// internal/grpcapi to maintain one.
 	unresolvedTies map[string]unresolvedTie
+	// acknowledgedTies records, per (table,PK), the content pair an operator has
+	// stated they have seen. A re-observation of the SAME pair is then not
+	// tracked at all.
+	//
+	// Stickiness is the entire point and was not optional. An acknowledgement
+	// that merely deleted the register entry was undone by the next anti-entropy
+	// sweep: the two rows still disagree, so the merge re-compares them,
+	// rowFactsEqual is still false, and trackUnresolved re-registers within
+	// seconds. Verified empirically before this was written. It also means a
+	// daemon restart is not a remedy either — the register is in-memory, so a
+	// restart clears it, and the next sweep brings the tie straight back.
+	//
+	// Keyed on the PAIR, not just the row, so a genuinely DIFFERENT conflict on
+	// the same row still surfaces. An acknowledgement is a statement about one
+	// observed divergence, never a standing mute on a row.
+	acknowledgedTies map[string]string
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.

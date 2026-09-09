@@ -32,7 +32,7 @@ const (
 	defaultPerVMCooldown = 5 * time.Minute
 	defaultMaxConcurrent = 2
 	defaultMaxPerHour    = 10
-	defaultLeaseKey      = "rebalancer"
+	defaultLeaseKey      = corrosion.LeaseKeyRebalancer
 )
 
 // Mode mirrors compose's RebalanceDef.Mode.

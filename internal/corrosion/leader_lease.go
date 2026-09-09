@@ -12,6 +12,30 @@ import (
 // check a ledger the coordinator never writes and pass every proof.
 const LeaseKeyFailover = "failover"
 
+// The other two lease keys, here for the same reason: an enforcement or
+// diagnostic path outside their packages must ask about the SAME key its
+// consumer acquires, and a second copy of the string in a second package is a
+// divergence nothing would catch.
+const (
+	LeaseKeyRebalancer = "rebalancer"
+	LeaseKeyDualRun    = "dual_run_detector"
+)
+
+// leaseKeys is the closed set of real lease keys.
+var leaseKeys = map[string]bool{
+	LeaseKeyFailover:   true,
+	LeaseKeyRebalancer: true,
+	LeaseKeyDualRun:    true,
+}
+
+// ValidLeaseKey reports whether key names one of the three real leases.
+//
+// EXACT match only — no trimming, no case folding. A near-miss is a bug or an
+// attack and normalising it would hide both. An unknown key must never be
+// treated as valid: a reader would find an empty ledger for it, MAX(term) = 0,
+// and conclude that anything naming it is current.
+func ValidLeaseKey(key string) bool { return leaseKeys[key] }
+
 // mintLeaseTermSQL records one lease incarnation.
 //
 // The term is a BOUND PARAMETER, computed by a separate read, rather than a

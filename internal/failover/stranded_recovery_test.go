@@ -39,11 +39,93 @@ func TestVMNeedsFailover(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec})
+			db := newTestDB(t)
+			c := newTestCoordinator("coord", db)
+			got := c.vmNeedsFailover(context.Background(), corrosion.VMRecord{Name: "vm1", Spec: tc.spec})
 			if got != tc.want {
 				t.Errorf("vmNeedsFailover = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestVMNeedsFailover_AutoPromoteOverridesPolicyNone: a VM whose owner opted into
+// replica auto-promotion is recoverable even with on_host_failure=none.
+//
+// The reschedule loop attempts promotion BEFORE it consults on_host_failure, so
+// judging this VM on policy alone made the sweep's predicate NARROWER than what
+// the loop acts on — and narrower means stranded, because the sweep is the only
+// thing that comes back. It stranded exactly the VMs whose owners had opted into
+// the stronger recovery mechanism.
+func TestVMNeedsFailover_AutoPromoteOverridesPolicyNone(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+
+	vm := corrosion.VMRecord{Name: "vm1", Spec: `{"on_host_failure":"none"}`}
+
+	// No promoter wired: nothing can promote, so there is nothing to wait for.
+	if c.vmNeedsFailover(ctx, vm) {
+		t.Error("policy=none with no Promoter wired is not recoverable work")
+	}
+
+	c.Promoter = stubPromoter{}
+	if c.vmNeedsFailover(ctx, vm) {
+		t.Error("policy=none with a Promoter but no replication schedule is not recoverable work")
+	}
+
+	// Enrol it in replication with auto-promote.
+	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+		VMName: "vm1", Repo: "dr", Scope: "vm", Cron: "* * * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr", TargetHost: "live", KeepReplicas: 3,
+		AutoPromote: true,
+	}); err != nil {
+		t.Fatalf("UpsertBackupSchedule: %v", err)
+	}
+	if !c.vmNeedsFailover(ctx, vm) {
+		t.Error("a VM enrolled in replication with auto_promote is recoverable by PROMOTION " +
+			"regardless of on_host_failure, and the reschedule loop reaches promotion first. " +
+			"Reporting no work here retires its host from the sweep for good")
+	}
+}
+
+// TestVMNeedsFailover_UnreadableSchedulesAssumeWork pins the direction this
+// predicate fails in.
+//
+// autoPromoteEnabled reports "not enrolled" when it cannot read the schedules,
+// which is right for the reschedule loop: it falls through and reschedules the VM
+// anyway, so the VM is still recovered. It is wrong here. The sweep is the only
+// thing that ever comes back to a fenced host, so answering "no work" on a
+// transient read error retires that host permanently — turning a DB blip into the
+// exact stranding this sweep exists to end.
+//
+// The rule is that this predicate must never be NARROWER than what
+// recoverWorkloads will act on. Too broad costs one no-op pass; too narrow strands
+// the workload forever.
+func TestVMNeedsFailover_UnreadableSchedulesAssumeWork(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	c.Promoter = stubPromoter{}
+
+	// policy=none, so the answer hinges entirely on the schedule read.
+	vm := corrosion.VMRecord{Name: "vm1", Spec: `{"on_host_failure":"none"}`}
+	if c.vmNeedsFailover(ctx, vm) {
+		t.Fatal("premise check: with readable schedules and no enrolment there is no work")
+	}
+
+	if err := db.Execute(ctx, `DROP TABLE backup_schedules`); err != nil {
+		t.Fatalf("drop backup_schedules: %v", err)
+	}
+	if _, err := c.autoPromoteEnabled(ctx, "vm1"); err == nil {
+		t.Fatal("schedule read still succeeds; this test is not injecting the error it claims to")
+	}
+
+	if !c.vmNeedsFailover(ctx, vm) {
+		t.Error("an unreadable schedule was read as 'no work'. The sweep is the only thing " +
+			"that returns to a fenced host, so this retires it permanently and strands any " +
+			"auto-promote VM on it — a transient DB error turned into the stranding this " +
+			"sweep exists to end")
 	}
 }
 
@@ -222,52 +304,75 @@ func TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay(t *testing.T) {
 	}
 }
 
-// TestRecoverStrandedWorkloads_IgnoresAHostItNeverFenced: being offline is not
-// authority to evacuate.
+// TestRecoverStrandedWorkloads_OfflineIsNotAuthorityToEvacuate covers both ways
+// the earlier fencing_log-based admission was wrong.
 //
-// The sweep's whole premise is "we powered this host off and did not finish
-// moving its workloads". A host that is merely offline — shut down by an
-// operator, or never yet fenced — is not that, and moving its VMs would be this
-// coordinator inventing an eviction nobody ordered.
-func TestRecoverStrandedWorkloads_IgnoresAHostItNeverFenced(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
+// The sweep keys on hosts.state == "fenced", which the fence path writes only when
+// the fence actually succeeded on a non-manual strategy. State "offline" covers a
+// fence that FAILED, a manual fence, and an operator's own shutdown — none of
+// which authorize this coordinator to move anything.
+//
+// The stale-evidence case is the dangerous one and the reason the rule changed. A
+// host fenced successfully in an EARLIER outage, returned to service by
+// recoverHosts, and then hit by a second outage whose fence failed still carries
+// that old success in fencing_log. An admission reading the newest logged attempt
+// would evacuate a host nothing had powered off — one still running the VMs it was
+// about to be evacuated of. hosts.state cannot lie that way: a failed fence writes
+// "offline".
+func TestRecoverStrandedWorkloads_OfflineIsNotAuthorityToEvacuate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		withStale bool
+	}{
+		{name: "never fenced at all", withStale: false},
+		{name: "stale success from an earlier outage", withStale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			ctx := context.Background()
 
-	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-		Name: "quiet", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "offline", FenceStrategy: "best-effort",
-	}); err != nil {
-		t.Fatalf("InsertHost quiet: %v", err)
-	}
-	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
-	}); err != nil {
-		t.Fatalf("InsertHost live: %v", err)
-	}
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name: "vm1", HostName: "quiet", State: "running",
-		Spec: `{"on_host_failure":"restart-any"}`,
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	// Deliberately NO fencing_log row for "quiet".
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: "quiet", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+				GRPCPort: 7443, State: "offline", FenceStrategy: "best-effort",
+			}); err != nil {
+				t.Fatalf("InsertHost quiet: %v", err)
+			}
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
+				GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+			}); err != nil {
+				t.Fatalf("InsertHost live: %v", err)
+			}
+			if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+				Name: "vm1", HostName: "quiet", State: "running",
+				Spec: `{"on_host_failure":"restart-any"}`,
+			}, nil, nil); err != nil {
+				t.Fatalf("InsertVM: %v", err)
+			}
+			if tc.withStale {
+				// A successful fence on record, from an outage that is over.
+				recordFence(t, ctx, db, "quiet")
+			}
 
-	c := newTestCoordinator("coord", db)
-	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
-	if !c.acquireLease(ctx) {
-		t.Fatal("must acquire an unheld lease")
-	}
+			c := newTestCoordinator("coord", db)
+			c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+			if !c.acquireLease(ctx) {
+				t.Fatal("must acquire an unheld lease")
+			}
 
-	c.recoverStrandedWorkloads(ctx)
+			c.recoverStrandedWorkloads(ctx)
 
-	vm, err := corrosion.GetVM(ctx, db, "vm1")
-	if err != nil || vm == nil {
-		t.Fatalf("GetVM: %v", err)
-	}
-	if vm.HostName != "quiet" {
-		t.Errorf("the sweep moved vm1 to %q off a host this cluster never fenced. Nothing "+
-			"powered that host off and nothing asked for its workloads to move", vm.HostName)
+			vm, err := corrosion.GetVM(ctx, db, "vm1")
+			if err != nil || vm == nil {
+				t.Fatalf("GetVM: %v", err)
+			}
+			if vm.HostName != "quiet" {
+				t.Errorf("the sweep moved vm1 to %q off a host in state offline. Nothing "+
+					"proved that host is powered off — its fence may have failed, or an "+
+					"operator may simply have shut it down — so its VMs may now be "+
+					"running in two places", vm.HostName)
+			}
+		})
 	}
 }
 
@@ -288,25 +393,27 @@ func recordFence(t *testing.T, ctx context.Context, db *corrosion.Client, host s
 //
 // The safe-fence and split-brain gates used to sit inline in failover ABOVE the
 // recovery steps, so they were not part of the function the sweep calls. A sweep
-// that went straight to recoverWorkloads would have evacuated a host whose fence
-// never succeeded and whose operator confirmation never arrived — the exact
-// split-brain the safe-fence default exists to prevent, reintroduced by the retry
-// that was supposed to make recovery safer.
+// that went straight to recoverWorkloads would have evacuated a host on the
+// strength of its state alone — the exact split-brain the safe-fence default
+// exists to prevent, reintroduced by the retry meant to make recovery safer.
+//
+// The gate exercised here is the safe-fence one, because it is the gate that
+// survives a state=="fenced" admission. A best-effort fence reports success even
+// when the power-off never landed (lenient SSH), so under the safe-fence policy it
+// needs an operator fence-confirm before anything moves.
 func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
 
-	// strategy=manual with no operator confirmation: the split-brain guard must
-	// refuse, on the first pass and on every retry.
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "dead", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "offline", FenceStrategy: "manual",
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
 	}); err != nil {
 		t.Fatalf("InsertHost dead: %v", err)
 	}
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
 	}); err != nil {
 		t.Fatalf("InsertHost live: %v", err)
 	}
@@ -316,16 +423,15 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	// The fence was ATTEMPTED and did not succeed. "partial" is fencing_log's
-	// spelling of that, and it is what the guard keys on.
-	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
-		ID: "f1", HostName: "dead", Method: "manual", Result: "partial", Detail: "unconfirmed",
-	}); err != nil {
-		t.Fatalf("InsertFenceLog: %v", err)
-	}
+	recordFence(t, ctx, db, "dead")
 
 	c := newTestCoordinator("coord", db)
-	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+	// Safe-fence policy enforced, and no operator has confirmed the power-off.
+	c.SafeFenceEnforce = true
+	c.Gate = fakeFailoverGate{
+		supports: map[string]bool{"live": true},
+		enforced: map[string]bool{capabilities.SafeFenceDefaultV1: true},
+	}
 	if !c.acquireLease(ctx) {
 		t.Fatal("must acquire an unheld lease")
 	}
@@ -337,10 +443,11 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 		t.Fatalf("GetVM: %v", err)
 	}
 	if vm.HostName != "dead" {
-		t.Errorf("the sweep moved vm1 to %q off a host whose manual fence was never confirmed. "+
-			"Nothing proved that host is powered off, so the VM may now be running in two "+
-			"places — the split-brain the safe-fence policy exists to prevent, reintroduced by "+
-			"the retry path", vm.HostName)
+		t.Errorf("the sweep moved vm1 to %q off a host whose best-effort fence was never "+
+			"confirmed under the safe-fence policy. A lenient SSH fence reports success "+
+			"without proving the power-off, so the VM may now be running in two places — "+
+			"the split-brain the policy exists to prevent, reintroduced by the retry path",
+			vm.HostName)
 	}
 }
 
@@ -356,8 +463,12 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 //	4 | vmNeedsFailover ignores firmware state          | KILLED VMNeedsFailover × 2
 //	5 | containerNeedsFailover ignores the triage       | KILLED ContainerNeedsFailover
 //	  |   marker                                        |
-//	6 | recordedFenceOutcome reads "partial" as success | KILLED HonoursTheSplitBrain-
-//	  |                                                 |   Authorization
+//	6 | recordedFenceOutcome reads "partial" as success | (rule replaced — see below)
+//	7 | sweep admits state=="offline" as well as        | KILLED OfflineIsNotAuthority-
+//	  |   "fenced"                                      |   ToEvacuate, both cases
+//	8 | vmNeedsFailover ignores auto-promote enrolment  | KILLED AutoPromoteOverrides-
+//	  |                                                 |   PolicyNone
+//	9 | an unreadable schedule reports "no work"        | SURVIVED at first, then KILLED
 //
 // Mutations 2 and 3 both survived the first run, and both were the tests' fault
 // rather than the code's.
@@ -375,3 +486,34 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 // shut down by an operator, never fenced — is left alone. Being offline is not
 // authority to evacuate, and the sweep would have invented an eviction nobody
 // ordered.
+
+// stubPromoter satisfies ReplicaPromoter without doing anything. The predicate
+// only asks whether a promoter EXISTS, so nothing here needs to work.
+type stubPromoter struct{}
+
+func (stubPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
+	return nil
+}
+
+//
+// Mutations 7-9 come from a second crossexam, of the commit these tests first
+// shipped in. It upheld three findings, and the first two were the same mistake
+// seen from both sides: the admission rule read fencing_log, which this package
+// treats as a best-effort audit trail whose write is explicitly allowed to fail.
+// Requiring a row stranded any host whose row was lost; trusting the newest row
+// was not scoped to an outage, so a host fenced months ago, recovered, and then
+// hit by a second outage whose fence FAILED still presented that old success —
+// and the sweep would have evacuated a live host. Both collapse into keying on
+// hosts.state == "fenced", which the fence path writes only on real success and
+// which, being the current state, is scoped to the current outage for free.
+// Mutation 6 tested the rule that replaced.
+//
+// The third finding was a predicate narrower than the loop it had to agree with.
+// recoverWorkloads tries replica auto-promotion BEFORE consulting
+// on_host_failure, so a VM with auto_promote and the default policy of "none" is
+// recoverable by promotion; judging it on policy alone stranded exactly the VMs
+// whose owners had opted into the stronger mechanism. The invariant is now
+// written down: this predicate may be broader than the loop but never narrower,
+// because broad costs one no-op pass and narrow strands forever. Mutation 9 is
+// that invariant on the error path, and it needed its own test — the review found
+// the gap, but nothing was asserting the direction.

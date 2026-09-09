@@ -531,12 +531,31 @@ func (c *Coordinator) run(ctx context.Context) {
 // re-homed and a recovered container's source row tombstoned, so what remains
 // pointing at a fenced host IS the outstanding work.
 //
-// Two conditions bound it. A successful fence must be on record for the host,
-// which distinguishes a host this cluster powered off from one that is merely
-// offline and whose workloads are nobody's to move. And the host must still hold
-// workloads that vmNeedsFailover / containerNeedsFailover consider candidates, so
-// the sweep goes quiet instead of spinning on the opted-out and Secure Boot VMs a
-// fenced host keeps forever.
+// Two conditions bound it, and the first is the whole safety argument.
+//
+// The host must be in state "fenced". That state is written by the fence path and
+// ONLY when the fence actually succeeded on a non-manual strategy, so it is both
+// the authoritative record of the outcome and — being the CURRENT state — scoped
+// to the current outage for free.
+//
+// An earlier version read fencing_log instead, and that was wrong in two
+// directions at once. fencing_log is an audit trail whose write the fence path
+// deliberately treats as non-fatal ("a lost audit row must not strand the VMs"),
+// so requiring a row abandoned any host whose row was lost. And reading the
+// NEWEST row is not scoped to an outage: a host fenced successfully months ago,
+// returned to service by recoverHosts, and then hit by a second outage whose
+// fence FAILED and whose failure row also failed to write, still presents that old
+// success. The sweep would then evacuate a host nothing had powered off — a live
+// host, running the VMs it was about to be evacuated of. hosts.state cannot lie
+// that way, because a failed fence writes "offline", not "fenced".
+//
+// The cost is that a MANUAL-strategy fence is recorded as "offline" even when it
+// succeeds, so those hosts are not retried here. An operator is already required
+// to confirm such a fence, so a human is in that loop regardless.
+//
+// Second, the host must still hold workloads vmNeedsFailover /
+// containerNeedsFailover consider candidates, so the sweep goes quiet instead of
+// spinning on the opted-out and Secure Boot VMs a fenced host keeps forever.
 //
 // Leader-gated by run's lease, like resolvePendingRelocations.
 func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
@@ -547,21 +566,21 @@ func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
 		return
 	}
 	for _, h := range hosts {
-		if h.State != "offline" && h.State != "fenced" {
-			continue
-		}
-		// Evidence this cluster fenced it. Without this the sweep would try to
-		// evacuate any host an operator had simply taken offline.
-		succeeded, found := c.recordedFenceOutcome(ctx, h.Name)
-		if !found {
+		// "fenced" and not "offline": see above. offline covers a failed fence, a
+		// manual fence, and an operator's own shutdown, none of which authorize
+		// this coordinator to move anything.
+		if h.State != "fenced" {
 			continue
 		}
 		host := h
-		// The same split-brain authorization the fencing pass had to clear, asked
-		// again from the recorded outcome. Silent: this runs every cycle, and a
-		// host waiting on an operator fence-confirm must not re-log its refusal
-		// forever.
-		if !c.recoveryAuthorized(ctx, &host, succeeded, "recorded fence outcome", false) {
+		// The same split-brain authorization the fencing pass had to clear. The
+		// state proves the fence succeeded, so fenceSucceeded is true here and the
+		// split-brain guard is satisfied; what remains live is the safe-fence gate,
+		// which still refuses an unconfirmed best-effort fence under policy.
+		//
+		// Silent: this runs every cycle, and a host waiting on an operator
+		// fence-confirm must not re-log its refusal forever.
+		if !c.recoveryAuthorized(ctx, &host, true, "recorded by hosts.state", false) {
 			continue
 		}
 		if !c.hostHasRecoverableWorkloads(ctx, host.Name) {
@@ -572,47 +591,6 @@ func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		c.recoverWorkloads(ctx, &host)
 	}
-}
-
-// recordedFenceOutcome reports how this cluster's most recent fence of host
-// turned out: succeeded is the recorded equivalent of fr.Success, and found is
-// false when no fence was ever attempted.
-//
-// The vocabulary is fencing_log's, not this function's invention: the fence
-// writes result "fenced" when it succeeded and "partial" when it did not. Rows
-// with any other result are operator confirmations rather than fence attempts,
-// and manualFenceConfirmed is what reads those.
-//
-// Deliberately unbounded, unlike recentlyFenced's window. That window answers
-// "may we skip re-fencing", where staleness argues for fencing again. This
-// answers "what happened when we fenced", and that does not expire. Bounding it
-// would abandon a local-disk VM whose blocker cleared an hour later for no safety
-// gain, since the shared-disk gate applies its own proof-grade window separately
-// and fails closed on its own terms.
-func (c *Coordinator) recordedFenceOutcome(ctx context.Context, host string) (succeeded, found bool) {
-	rows, err := c.db.Query(ctx,
-		`SELECT result, timestamp FROM fencing_log WHERE host_name = ?`, host)
-	if err != nil {
-		// Fail closed: a coordinator that cannot read the fence record must not
-		// evacuate a host on the assumption that it did power it off.
-		slog.Warn("failover: fencing_log read for stranded-workload sweep", "host", host, "error", err)
-		return false, false
-	}
-	var best time.Time
-	for _, r := range rows {
-		result := r.String("result")
-		if result != "fenced" && result != "partial" {
-			continue
-		}
-		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
-		if perr != nil {
-			continue
-		}
-		if !found || ts.After(best) {
-			best, found, succeeded = ts, true, result == "fenced"
-		}
-	}
-	return succeeded, found
 }
 
 // hostHasRecoverableWorkloads reports whether host still holds a workload some
@@ -628,7 +606,7 @@ func (c *Coordinator) hostHasRecoverableWorkloads(ctx context.Context, host stri
 		return true
 	}
 	for _, vm := range vms {
-		if vmNeedsFailover(vm) {
+		if c.vmNeedsFailover(ctx, vm) {
 			return true
 		}
 	}
@@ -1138,17 +1116,23 @@ func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) strin
 // autoPromoteEnabled reports whether vmName has a replication schedule with
 // auto_promote set. Best-effort: a query error returns false (fall back to a
 // bare reschedule rather than risk an unwanted promotion).
-func (c *Coordinator) autoPromoteEnabled(ctx context.Context, vmName string) bool {
+// Returns the error rather than swallowing it, because the two callers must fail
+// in OPPOSITE directions. The reschedule loop treats an unreadable schedule as
+// "not enrolled" and falls through to a reschedule, which still recovers the VM.
+// The stranded-workload sweep must treat it as "there may be work here", since
+// concluding otherwise retires the host from the sweep permanently — and the sweep
+// is the only thing that ever comes back.
+func (c *Coordinator) autoPromoteEnabled(ctx context.Context, vmName string) (bool, error) {
 	rows, err := corrosion.ListBackupSchedules(ctx, c.db)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, r := range rows {
 		if r.Type == "replication" && r.AutoPromote && r.VMName == vmName {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // countLiveHosts returns the number of hosts whose state is neither offline,
@@ -1519,7 +1503,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		// promoting the freshest replica defines + starts the VM on the host
 		// holding it and re-homes the record. On success, move to the next VM.
 		// On failure, fall through to the policy-based reschedule below.
-		if c.Promoter != nil && c.autoPromoteEnabled(ctx, vm.Name) {
+		if enrolled, aerr := c.autoPromoteEnabled(ctx, vm.Name); c.Promoter != nil && aerr == nil && enrolled {
 			// Split-brain gate (Phase 1, decide site): promoting a replica is a
 			// runtime-ownership action; once enforced, re-check DecisionGate before
 			// initiating so an isolated minority coordinator can't promote. The
@@ -2142,10 +2126,21 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 //
 // The distinction is what lets recoverStrandedWorkloads terminate. A fenced host
 // keeps its opted-out and Secure Boot VMs forever, so a sweep asking merely "are
-// there VMs here" would never go quiet. Both callers ask through this predicate so
-// the sweep and the reschedule loop cannot drift into disagreeing about which
-// workloads are waiting on something.
-func vmNeedsFailover(vm corrosion.VMRecord) bool {
+// there VMs here" would never go quiet.
+//
+// It must never be NARROWER than what recoverWorkloads will actually act on, and
+// that asymmetry is the invariant to hold onto. Too broad costs one no-op pass:
+// the sweep runs, the loop skips the VM, nothing happens. Too narrow strands the
+// workload forever, because the sweep is the only thing that ever comes back. So
+// when the two disagree, err toward true.
+//
+// It is a method rather than a pure function for exactly that reason. The
+// reschedule loop tries replica auto-promotion BEFORE it consults
+// on_host_failure, so a VM with auto_promote and the default policy of "none" IS
+// recoverable — by promotion, not by reschedule. Judging it on policy alone made
+// this predicate narrower than the loop and stranded precisely the VMs whose
+// owners had opted into the stronger recovery mechanism.
+func (c *Coordinator) vmNeedsFailover(ctx context.Context, vm corrosion.VMRecord) bool {
 	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
 	// the host. Neither a reschedule nor a disk-only replica promotion reconstructs
 	// it, so this is not work that becomes possible later — recovery is an operator
@@ -2153,8 +2148,22 @@ func vmNeedsFailover(vm corrosion.VMRecord) bool {
 	if vmUsesFirmwareState(vm) {
 		return false
 	}
-	p := vmFailurePolicy(vm)
-	return p != "" && p != "none"
+	if p := vmFailurePolicy(vm); p != "" && p != "none" {
+		return true
+	}
+	// Opted out of reschedule, but auto-promotion is a separate opt-in on the
+	// replication schedule and the loop reaches it first. No Promoter wired means
+	// no promotion can happen, so there is nothing for the sweep to wait on.
+	if c.Promoter == nil {
+		return false
+	}
+	enrolled, err := c.autoPromoteEnabled(ctx, vm.Name)
+	if err != nil {
+		slog.Warn("failover: read replication schedules for stranded-workload sweep",
+			"vm", vm.Name, "error", err)
+		return true
+	}
+	return enrolled
 }
 
 // containerNeedsFailover is the container half of vmNeedsFailover.

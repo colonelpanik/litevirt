@@ -537,17 +537,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
 
-	// Mint a leader-lease term only once lease_term_ledger_v1 is DURABLY latched.
-	// The mint is the first replicated statement shape leader_lease_terms ever
-	// had, and an unregistered shape back-pressures a previous-release peer's
-	// whole replication stream instead of degrading — so the write waits for a
-	// latch that cannot form while such a peer is still listening. No config flag
-	// (the token has no kill switch): terms begin on their own once the roll
-	// completes. Unwired, the gate fails closed and no term is minted, which is
-	// the pre-ledger behaviour.
-	d.db.SetLeaseTermLedgerGate(func() bool {
-		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
-	})
+	d.wireLeaseTermLedgerGate()
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -2172,4 +2162,25 @@ func (d *Daemon) metricsAddrForBanner() string {
 		return fmt.Sprintf("%s:%d", d.cfg.MetricsBind, d.cfg.MetricsPort)
 	}
 	return d.metrics.Addr()
+}
+
+// wireLeaseTermLedgerGate lets corrosion mint a leader-lease term only once
+// lease_term_ledger_v1 is DURABLY latched.
+//
+// The mint is the first replicated statement shape leader_lease_terms ever had,
+// and an unregistered shape back-pressures a previous-release peer's whole
+// replication stream instead of degrading — so the write waits for a latch that
+// cannot form while such a peer is still listening. No config flag (the token
+// has no kill switch): terms begin on their own once the roll completes.
+//
+// Extracted from Run so a test can reach it. Its absence is SILENT: this is the
+// one injected predicate on the corrosion client that fails CLOSED, so an
+// unwired gate mints nothing forever and looks exactly like a legitimate
+// mid-roll — the same signature as a starved latch. Deleting this call left the
+// corrosion, grpcapi and daemon suites all green, because every test injects the
+// gate directly and the test constructors hardcode it open.
+func (d *Daemon) wireLeaseTermLedgerGate() {
+	d.db.SetLeaseTermLedgerGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
+	})
 }

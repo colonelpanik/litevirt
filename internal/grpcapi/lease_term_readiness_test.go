@@ -290,7 +290,7 @@ func TestLeaseTermReadiness_ReadyOnceTheLedgerGateOpens(t *testing.T) {
 }
 
 // TestLeaseTermLedgerToken_HasNoKillSwitch: the ledger token must report enabled
-// with no config flag set. driveCapabilityLatches skips an UNLATCHED token whose
+// with no config flag set. activateOneUnlatched skips an UNLATCHED token whose
 // tokenEnabled is false, so a flag-gated ledger token would never latch, no term
 // would ever be minted, and the whole mechanism would sit inert with nothing in
 // the logs to say why.

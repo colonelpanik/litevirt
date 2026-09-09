@@ -209,6 +209,22 @@ func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.Bindin
 			"adopted", adopted, "error", ref.unread)
 		return
 	}
+	if np, notPersisted := activationNotPersisted(aerr); notPersisted {
+		// EVERYTHING WORKED EXCEPT THE WRITE. The addresses are adopted, the
+		// preconditions were re-read after the last of them and they hold, and
+		// the only step that failed is the one that records the flag.
+		//
+		// The row is left EXACTLY as it is, which is what keeps this binding in
+		// the self-lifting class: re-stating the reason as owed adoption — which
+		// is what a generic error here used to do — would move a suspension that
+		// heals on the next pass into the class that waits for an operator, over
+		// a transient this pass has already survived the hard part of.
+		slog.Warn("netbox: adopted every existing address and re-validated cleanly, but the "+
+			"activation could not be written down; the binding stays suspended under the reason "+
+			"it already carries and the next pass retries",
+			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", np.cause)
+		return
+	}
 	if errors.Is(aerr, errAdoptionUncorroborated) {
 		// Still no standing to enumerate. Nothing changes — not the row, not the
 		// reason — so the next pass asks again. INFO rather than WARN: the bind
@@ -810,6 +826,19 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 				"prefix %d was not activated; it stays suspended, re-run to finish: %w",
 			b.PrefixID, aerr)
 	}
+	if np, notPersisted := activationNotPersisted(aerr); notPersisted {
+		// The gate passed and the write did not land — the lease lapsed across
+		// the adoption's round trips, or the local upsert failed. The adoption is
+		// NOT owed, so the reason on the row is not re-stated: re-run the re-key
+		// and it activates.
+		slog.Warn("netbox binding re-keyed and re-validated, but the activation could not be "+
+			"written down; it stays suspended under the reason it already carries",
+			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", np.cause)
+		return counts, fmt.Errorf(
+			"identities re-keyed and every existing address adopted, but the binding for "+
+				"prefix %d was not activated; it stays suspended, re-run to finish: %w",
+			b.PrefixID, aerr)
+	}
 	if aerr != nil {
 		reason := fmt.Sprintf(
 			"identities re-keyed, but the addresses this network's guests already hold are not "+
@@ -1319,6 +1348,16 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 		// someone hunting one.
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"network %q stays suspended: %v", req.GetNetwork(), ref)
+	}
+	if _, notPersisted := activationNotPersisted(aerr); notPersisted {
+		// The gate passed; the write did not land. Reported as what it is rather
+		// than as owed adoption — Internal, because a local write that failed is
+		// a fault to fix and not a precondition to repair — and the row keeps the
+		// reason it already carries, so a self-lifting suspension stays one.
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d adopted=%d not-persisted", b.PrefixID, adopted), "error")
+		return nil, status.Errorf(codes.Internal,
+			"network %q stays suspended: %v", req.GetNetwork(), aerr)
 	}
 	if aerr != nil {
 		s.audit(ctx, "netbox.resume", req.GetNetwork(),

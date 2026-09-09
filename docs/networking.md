@@ -431,6 +431,14 @@ can be corroborated. To finish it immediately, run `lv netbox resume <network>`
 from a node that has been up and replicating. `lv health` shows the suspension as
 `netbox_binding_suspended` while it lasts.
 
+Only a **drift** takes this suspension out of that self-resuming class — a
+re-CIDRed prefix, a VRF that stopped enforcing uniqueness, a moved fingerprint,
+an adoption that NetBox refused. A pass that adopted everything, re-validated
+cleanly and then failed on the local write that lifts the flag leaves the reason
+exactly as it is, so the next pass retries: an operational failure after the
+adoption finished is not an adoption that is owed, and it does not convert an
+automatic recovery into one that waits for you.
+
 The suspension is the one thing a bind can do here that is neither wrong: going
 live would make NetBox the authority over addresses running guests already hold,
 and refusing outright would refuse the first bind on any cluster with a peer that

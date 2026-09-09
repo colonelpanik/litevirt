@@ -303,6 +303,57 @@ func TestTheBindFinisherKeepsTheUnhydratedReason(t *testing.T) {
 	}
 }
 
+// TestTheFinisherDoesNotCallAFailedActivationWriteAnOwedAdoption is the same
+// distinction at the OTHER door — the one `lv netbox resume` and the network
+// create both go through.
+//
+// The defect was in what a NON-refusal from the activation gate is taken to
+// mean, and every door took it to mean "adoption is owed". A fix verified at one
+// door proves nothing about the rest, so this is what makes adoptionOwed
+// non-vacuous at the finisher.
+//
+// THE SUSPENSION HERE IS DELIBERATELY NOT THE SELF-LIFTING ONE. This door
+// short-circuits on that class before it ever reaches the gate (see
+// finishAdoptionAndResume), so a scenario built on it would assert the early
+// return and prove nothing about the gate at all — which is precisely the shape
+// of masked test this round exists to remove. The producible sequence is the
+// ordinary one: a binding suspended for drift the operator has repaired,
+// `lv netbox resume`, nothing owed, and the activating write fails. What must not
+// happen is the row being restated as an incomplete adoption, because the
+// adoption finished.
+func TestTheFinisherDoesNotCallAFailedActivationWriteAnOwedAdoption(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+
+	// A live bind (no peer, so the empty read corroborates itself), then a
+	// suspension of a class this door acts on.
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
+		t.Fatal(err)
+	}
+	const repairedDrift = "prefix re-CIDRed from 10.0.5.0/24 to 10.0.5.0/25"
+	if err := corrosion.SuspendBinding(ctx, s.db, adoptTestPrefix, repairedDrift); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `CREATE TRIGGER fail_finisher_activation
+		BEFORE UPDATE ON netbox_bindings WHEN NEW.suspended = 0
+		BEGIN SELECT RAISE(ABORT, 'transient activation write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.finishAdoptionAndResume(ctx, "shared", adoptTestPrefix)
+	if err == nil {
+		t.Fatal("the finisher must report that the activation did not land")
+	}
+	b, berr := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if berr != nil || b == nil || !b.Suspended {
+		t.Fatalf("binding row: %+v (err %v)", b, berr)
+	}
+	if b.SuspendReason != repairedDrift {
+		t.Fatalf("the finisher rewrote a post-adoption write failure as an incomplete adoption, "+
+			"which is a claim about work that finished: %q", b.SuspendReason)
+	}
+}
+
 // TestRevalidationLeavesAnUnhydratedBindingSuspendedWhileStillUncorroborated:
 // the pass may only resume what it can prove, so a pass that still cannot
 // corroborate changes nothing.
@@ -356,6 +407,75 @@ func TestRevalidationResumesAnUnhydratedBindingOnceItCanCorroborate(t *testing.T
 	if b.Suspended {
 		t.Fatalf("the revalidation pass must resume the binding once it can corroborate, got %q",
 			b.SuspendReason)
+	}
+}
+
+// TestATransientActivationWriteFailureKeepsTheSuspensionSelfLifting.
+//
+// The activation gate's LAST step is a local write, and the two failures that
+// happen after the gate has passed — a lapsed lease, and an upsert that failed —
+// used to come back as plain errors. Every caller read a plain error as a failed
+// ADOPTION and replaced the reason on the row with "adoption … is incomplete",
+// which is a reason no pass may lift. So one transient write failure permanently
+// converted the ONE self-lifting suspension in this tree into one that waits for
+// an operator — and the reason text it wrote recorded, in the same sentence,
+// that the adoption and the revalidation had both succeeded.
+//
+// The distinction is between an adoption that is OWED and an operational failure
+// AFTER adoption finished. Nothing is owed here, nothing is wrong, and the row
+// must keep the reason it already carries so the next pass retries by itself.
+//
+// The failure is injected as a trigger on the activating UPDATE and then
+// removed, which is what makes it a transient rather than a permanent condition:
+// the property is not "it survived one failure" but "it was still eligible for
+// the automatic retry that follows".
+func TestATransientActivationWriteFailureKeepsTheSuspensionSelfLifting(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
+		t.Fatal(err)
+	}
+	seedVMInState(t, s, "arrived", "other-net", "aa:bb:cc:00:05:01", "",
+		"77777777-7777-7777-7777-777777777777", "running")
+	peerAgreesWithThisNode(t, s)
+
+	// Fail exactly the write that lifts the flag, and nothing else: the
+	// predicate is `suspended = 0`, so the adoption's own writes and every
+	// re-statement of a suspension still go through.
+	if err := s.db.Execute(ctx, `CREATE TRIGGER fail_activation_write
+		BEFORE UPDATE ON netbox_bindings WHEN NEW.suspended = 0
+		BEGIN SELECT RAISE(ABORT, 'transient activation write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatalf("a write failure on one binding must not fail the pass: %v", err)
+	}
+
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil || b == nil || !b.Suspended {
+		t.Fatalf("the binding must stay suspended: b=%+v err=%v", b, err)
+	}
+	// THE PROPERTY: the reason is untouched, so the binding is still in the
+	// class the pass completes by itself.
+	if !isUnhydratedSuspension(b.SuspendReason) {
+		t.Fatalf("a post-adoption write failure replaced the self-lifting reason with a manual "+
+			"one, so no pass will ever lift it: %q", b.SuspendReason)
+	}
+
+	// The transient goes away, and the very next pass finishes the job with no
+	// operator action at all.
+	if err := s.db.Execute(ctx, `DROP TRIGGER fail_activation_write`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b, err = corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil || b == nil || b.Suspended {
+		t.Fatalf("the pass after the transient cleared must activate the binding: b=%+v err=%v",
+			b, err)
 	}
 }
 

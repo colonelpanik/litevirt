@@ -1117,10 +1117,9 @@ func (s *Server) activateBinding(ctx context.Context, b corrosion.BindingRecord,
 	// holds is live while that node may be partway through a rewrite of its own.
 	if lease != nil {
 		if lerr := lease.check(ctx); lerr != nil {
-			return adopted, fmt.Errorf(
-				"the addresses on network %s were adopted (%d this pass) and re-validated, but "+
-					"the binding for prefix %d was not activated; it stays suspended, re-run to "+
-					"finish: %w", b.Network, adopted, b.PrefixID, lerr)
+			return adopted, activationNotPersistedError{
+				network: b.Network, prefixID: b.PrefixID, adopted: adopted, cause: lerr,
+			}
 		}
 	}
 
@@ -1128,10 +1127,15 @@ func (s *Server) activateBinding(ctx context.Context, b corrosion.BindingRecord,
 	next.Suspended = false
 	next.SuspendReason = ""
 	if uerr := corrosion.UpsertBinding(ctx, s.db, next); uerr != nil {
-		return adopted, fmt.Errorf(
-			"every existing address on network %s was adopted (%d this pass) and the binding "+
-				"for prefix %d re-validated cleanly, but activating it failed: %w",
-			b.Network, adopted, b.PrefixID, uerr)
+		// A POST-ADOPTION OPERATIONAL FAILURE, not an adoption failure, and the
+		// distinction is the whole of activationNotPersistedError. Everything
+		// this binding was waiting for happened: the addresses are adopted, the
+		// preconditions were re-read and hold. The only thing that did not is
+		// the local write, and the caller must not describe that as owed
+		// adoption — see there.
+		return adopted, activationNotPersistedError{
+			network: b.Network, prefixID: b.PrefixID, adopted: adopted, cause: uerr,
+		}
 	}
 	return adopted, nil
 }
@@ -1185,6 +1189,78 @@ func activationRefused(err error) (activationRefusedError, bool) {
 	var ref activationRefusedError
 	ok := errors.As(err, &ref)
 	return ref, ok
+}
+
+// activationNotPersistedError is an adoption that succeeded, a post-adoption
+// revalidation that HELD, and an activation that could not be written down.
+//
+// A THIRD OUTCOME, not a variant of the refusal above, and the reason it is its
+// own type is what happened to the binding before it existed. Every path here
+// used to return a plain error for the two ways activation fails after passing
+// its gate — a lease that lapsed across the adoption's round trips, and a local
+// UpsertBinding that failed — and the callers read any non-refusal as a failed
+// ADOPTION. So they replaced the reason on the row with "adoption … is
+// incomplete". For the ONE self-lifting suspension in this tree (see
+// isUnhydratedSuspension) that is not merely inaccurate: it takes the binding out
+// of the class the revalidation pass completes by itself, so a single transient
+// write failure converted a suspension that heals in fifteen minutes into one
+// that waits for an operator — with the reason text itself recording that
+// adoption and revalidation had both succeeded.
+//
+// NOTHING IS OWED AND NOTHING IS WRONG, which is why the correct handling is to
+// leave the row exactly as it is. The adopted claims stand, the preconditions
+// were read and held, and the next pass through the same gate re-reads them and
+// writes the flag again. Re-stating the reason is the only thing that can make
+// this permanent, so no caller does it.
+//
+// It is NOT in adoptionRefused: a local write that failed is a fault to fix, not
+// a precondition an operator repairs, so the RPCs keep reporting Internal for it.
+type activationNotPersistedError struct {
+	network  string
+	prefixID int
+	adopted  int
+	cause    error
+}
+
+func (e activationNotPersistedError) Error() string {
+	return fmt.Sprintf(
+		"every existing address on network %s was adopted (%d this pass) and the binding for "+
+			"prefix %d re-validated cleanly, but activating it could not be persisted; it stays "+
+			"suspended under the reason it already carries and the next pass retries: %v",
+		e.network, e.adopted, e.prefixID, e.cause)
+}
+
+func (e activationNotPersistedError) Unwrap() error { return e.cause }
+
+// activationNotPersisted reports whether an error is that third outcome.
+func activationNotPersisted(err error) (activationNotPersistedError, bool) {
+	var np activationNotPersistedError
+	ok := errors.As(err, &np)
+	return np, ok
+}
+
+// adoptionOwed reports whether an activateBinding failure leaves ADOPTION
+// outstanding — which is the only case a caller may re-state the row's
+// suspension reason for.
+//
+// ONE PREDICATE FOR ALL FOUR DOORS. The gate has three failure outcomes and only
+// one of them means "the addresses guests hold are not all in NetBox"; the other
+// two happen AFTER the adoption finished, and describing either as owed adoption
+// is a false operator claim — and, on the self-lifting suspension, a permanent
+// one. Asking here rather than at each door is what stops a fourth outcome from
+// being handled correctly in three places and wrongly in the fourth, which is
+// exactly how this defect reached two of them.
+func adoptionOwed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, refused := activationRefused(err); refused {
+		return false
+	}
+	if _, notPersisted := activationNotPersisted(err); notPersisted {
+		return false
+	}
+	return true
 }
 
 // finishAdoptionAndResume adopts what a bind left owed and resumes the binding.
@@ -1268,12 +1344,14 @@ func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, pr
 		// partway has still created objects in NetBox, so "nothing happened" is
 		// the wrong thing for the trail to imply.
 		s.audit(ctx, "netbox.adopt", netName, detail, "error")
-		if _, refused := activationRefused(aerr); refused {
-			// THE GATE REFUSED, having adopted everything. It owns the reason on
-			// the row — the drift it read, or the previous one when it could not
-			// read at all — so nothing is re-stated here. Calling the adoption
-			// "incomplete" would be false and would send an operator to finish
-			// work that is finished.
+		if !adoptionOwed(aerr) {
+			// THE ADOPTION FINISHED. Either the gate refused — it owns the reason
+			// on the row, the drift it read or the previous one when it could not
+			// read at all — or the activation passed its gate and could not be
+			// written down, which leaves the reason already there correct and the
+			// retry automatic. Nothing is re-stated for either: calling the
+			// adoption "incomplete" would be false and would send an operator to
+			// finish work that is finished.
 			return aerr
 		}
 		// Re-state the suspension with what is actually outstanding. The bind

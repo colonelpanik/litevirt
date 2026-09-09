@@ -504,6 +504,145 @@ func (c *Coordinator) run(ctx context.Context) {
 	// fence path (an already-fenced host is skipped above, so relocateContainers
 	// won't re-run for it) — so a deferred restore still gets resolved.
 	c.resolvePendingRelocations(ctx)
+
+	// Finish recovery for hosts already fenced whose workloads a refusal left
+	// behind. Same reason the sweep above exists, generalised: every post-fence
+	// refusal returns while the host is already powered off and skipped, so
+	// without this the workload waits for an operator. resolvePendingRelocations
+	// covers only containers that got as far as a restore marker.
+	c.recoverStrandedWorkloads(ctx)
+}
+
+// recoverStrandedWorkloads finishes recovery for hosts this cluster already
+// fenced but whose workloads a refusal left behind.
+//
+// It exists because every proof stamp site in recoverWorkloads is reached AFTER
+// the fence, and a fenced host is processed only once. By the time any of those
+// refusals fire — a lost quorum, an ungated target, a superseded lease term, a
+// transient DB error on the proof write — c.fenced names the host and its row is
+// persisted offline, so run() skips it on this coordinator, on every later cycle,
+// and on any coordinator that replaces this one. Nothing came back. The workload
+// stayed assigned to a powered-off machine until an operator noticed.
+//
+// So the retry cannot live in the fence loop: that loop's whole job is to decide
+// what to fence, and its skip rules are correct for that question. This asks a
+// different one — which hosts have unfinished recovery — and answers it from the
+// rows themselves, with no marker to keep in step. A recovered VM has been
+// re-homed and a recovered container's source row tombstoned, so what remains
+// pointing at a fenced host IS the outstanding work.
+//
+// Two conditions bound it. A successful fence must be on record for the host,
+// which distinguishes a host this cluster powered off from one that is merely
+// offline and whose workloads are nobody's to move. And the host must still hold
+// workloads that vmNeedsFailover / containerNeedsFailover consider candidates, so
+// the sweep goes quiet instead of spinning on the opted-out and Secure Boot VMs a
+// fenced host keeps forever.
+//
+// Leader-gated by run's lease, like resolvePendingRelocations.
+func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		slog.Warn("failover: list hosts for stranded-workload sweep", "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return
+	}
+	for _, h := range hosts {
+		if h.State != "offline" && h.State != "fenced" {
+			continue
+		}
+		// Evidence this cluster fenced it. Without this the sweep would try to
+		// evacuate any host an operator had simply taken offline.
+		succeeded, found := c.recordedFenceOutcome(ctx, h.Name)
+		if !found {
+			continue
+		}
+		host := h
+		// The same split-brain authorization the fencing pass had to clear, asked
+		// again from the recorded outcome. Silent: this runs every cycle, and a
+		// host waiting on an operator fence-confirm must not re-log its refusal
+		// forever.
+		if !c.recoveryAuthorized(ctx, &host, succeeded, "recorded fence outcome", false) {
+			continue
+		}
+		if !c.hostHasRecoverableWorkloads(ctx, host.Name) {
+			continue
+		}
+		slog.Warn("failover: finishing recovery for a fenced host with workloads left behind",
+			"host", host.Name)
+		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
+		c.recoverWorkloads(ctx, &host)
+	}
+}
+
+// recordedFenceOutcome reports how this cluster's most recent fence of host
+// turned out: succeeded is the recorded equivalent of fr.Success, and found is
+// false when no fence was ever attempted.
+//
+// The vocabulary is fencing_log's, not this function's invention: the fence
+// writes result "fenced" when it succeeded and "partial" when it did not. Rows
+// with any other result are operator confirmations rather than fence attempts,
+// and manualFenceConfirmed is what reads those.
+//
+// Deliberately unbounded, unlike recentlyFenced's window. That window answers
+// "may we skip re-fencing", where staleness argues for fencing again. This
+// answers "what happened when we fenced", and that does not expire. Bounding it
+// would abandon a local-disk VM whose blocker cleared an hour later for no safety
+// gain, since the shared-disk gate applies its own proof-grade window separately
+// and fails closed on its own terms.
+func (c *Coordinator) recordedFenceOutcome(ctx context.Context, host string) (succeeded, found bool) {
+	rows, err := c.db.Query(ctx,
+		`SELECT result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		// Fail closed: a coordinator that cannot read the fence record must not
+		// evacuate a host on the assumption that it did power it off.
+		slog.Warn("failover: fencing_log read for stranded-workload sweep", "host", host, "error", err)
+		return false, false
+	}
+	var best time.Time
+	for _, r := range rows {
+		result := r.String("result")
+		if result != "fenced" && result != "partial" {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil {
+			continue
+		}
+		if !found || ts.After(best) {
+			best, found, succeeded = ts, true, result == "fenced"
+		}
+	}
+	return succeeded, found
+}
+
+// hostHasRecoverableWorkloads reports whether host still holds a workload some
+// later cycle could move.
+//
+// Fails closed on a read error — reporting "no work" on an unreadable DB would
+// retire the host from the sweep permanently, which is the stranding this exists
+// to end.
+func (c *Coordinator) hostHasRecoverableWorkloads(ctx context.Context, host string) bool {
+	vms, err := corrosion.ListVMs(ctx, c.db, "", host)
+	if err != nil {
+		slog.Warn("failover: list VMs for stranded-workload sweep", "host", host, "error", err)
+		return true
+	}
+	for _, vm := range vms {
+		if vmNeedsFailover(vm) {
+			return true
+		}
+	}
+	cts, err := corrosion.ListContainers(ctx, c.db, host)
+	if err != nil {
+		slog.Warn("failover: list containers for stranded-workload sweep", "host", host, "error", err)
+		return true
+	}
+	for _, ct := range cts {
+		if containerNeedsFailover(ct) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
@@ -1139,10 +1278,49 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
 	}
 
+	// Authorization to RECOVER is separate from the fence itself, and every
+	// caller of recoverWorkloads must pass it — see recoveryAuthorized.
+	if !c.recoveryAuthorized(ctx, h, fr.Success, fr.Detail, true) {
+		return
+	}
+
+	// Recovery is a separate, independently retryable step. It is reached from
+	// here after a fence, and again from recoverStrandedWorkloads for a host
+	// already fenced whose workloads a refusal left behind — see there for why
+	// that second caller has to exist.
+	c.recoverWorkloads(ctx, h)
+}
+
+// recoveryAuthorized reports whether workloads may be moved off h at all.
+//
+// This is the split-brain authorization, and it is deliberately NOT part of the
+// fence: it is a question about the fence's OUTCOME, which is why it can be asked
+// again later from a recorded result. Both gates can refuse. The safe-fence
+// default refuses a best-effort fence with no operator confirmation, because a
+// lenient SSH fence reports success even when the power-off never landed. The
+// split-brain guard then refuses a fence that did not succeed, unless the
+// strategy says to proceed anyway or an operator has confirmed it.
+//
+// Every caller of recoverWorkloads must clear this first, and that is the whole
+// reason it is a function. These checks used to sit inline in failover above the
+// recovery steps, so a second caller reaching recoverWorkloads directly would
+// have evacuated a host whose fence was never confirmed — precisely the
+// split-brain the safe-fence policy exists to prevent.
+//
+// fenceSucceeded is fr.Success on the fencing path, and the recorded outcome of
+// the last fence on the retry path. They are the same fact: the fence writes
+// result "fenced" on success and "partial" otherwise.
+//
+// report distinguishes the two CALLERS, not two situations. The fencing pass must
+// tell the operator what it refused and how to unblock it. The retry sweep asks
+// the same question every cycle and has to stay silent, or a host legitimately
+// waiting on a fence-confirm would emit an identical refusal every few seconds
+// for as long as it waits.
+func (c *Coordinator) recoveryAuthorized(ctx context.Context, h *corrosion.HostRecord, fenceSucceeded bool, detail string, report bool) bool {
 	// Safe-fence default (gated by SafeFenceDefaultV1). A best-effort fence is
 	// fire-and-forget SSH: it reports Success=true even when the poweroff never
 	// landed (fence.fenceSSH lenient mode), so it can NEVER confirm the host is
-	// actually down. This check must therefore run BEFORE the !fr.Success guard
+	// actually down. This check must therefore run BEFORE the fenceSucceeded guard
 	// below — a lenient best-effort success would otherwise sail straight through
 	// to reschedule. Once the policy is enforced cluster-wide, a best-effort fence
 	// is treated like "manual": reschedule only with an operator fence-confirm,
@@ -1150,15 +1328,19 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// not enforced) this is a no-op, so a mixed-version roll keeps today's behavior.
 	if fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.safeFenceRequiresProof(ctx, h) {
 		if !c.manualFenceConfirmed(ctx, h.Name) {
-			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
-				"host", h.Name, "detail", fr.Detail,
-				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
-					"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
-			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-			return
+			if report {
+				slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
+					"host", h.Name, "detail", detail,
+					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off, "+
+						"or set host label "+corrosion.LabelUnsafeAutoFailover+"=true to opt into legacy proceed-anyway")
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			}
+			return false
 		}
-		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
-		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+		if report {
+			slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
+			c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+		}
 	}
 
 	// Split-brain guard. Reschedule only if:
@@ -1170,36 +1352,38 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// Manual fence used to claim Success=true unconditionally; it now reports
 	// Success=false and the coordinator must see an explicit confirmation row
 	// in fencing_log (written by `lv host fence-confirm`) before rescheduling.
-	if !fr.Success {
+	if !fenceSucceeded {
 		switch h.FenceStrategy {
 		case "best-effort":
-			slog.Warn("failover: best-effort fence did not fully succeed, proceeding anyway",
-				"host", h.Name, "detail", fr.Detail)
-			c.mAttempt(PhaseSplitBrain, ResultOK, ErrBestEffort)
+			if report {
+				slog.Warn("failover: best-effort fence did not fully succeed, proceeding anyway",
+					"host", h.Name, "detail", detail)
+				c.mAttempt(PhaseSplitBrain, ResultOK, ErrBestEffort)
+			}
 		case "manual":
 			if !c.manualFenceConfirmed(ctx, h.Name) {
-				slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
-					"host", h.Name, "detail", fr.Detail,
-					"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
-				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
-				return
+				if report {
+					slog.Error("failover: manual fence not confirmed by operator, NOT rescheduling",
+						"host", h.Name, "detail", detail,
+						"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off")
+					c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+				}
+				return false
 			}
-			slog.Info("failover: operator confirmed manual fence, proceeding",
-				"host", h.Name)
-			c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+			if report {
+				slog.Info("failover: operator confirmed manual fence, proceeding", "host", h.Name)
+				c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+			}
 		default:
-			slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
-				"host", h.Name, "strategy", h.FenceStrategy, "detail", fr.Detail)
-			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
-			return
+			if report {
+				slog.Error("failover: CRITICAL — fencing failed, NOT rescheduling VMs to prevent split-brain",
+					"host", h.Name, "strategy", h.FenceStrategy, "detail", detail)
+				c.mAttempt(PhaseSplitBrain, ResultRefused, ErrFenceFailed)
+			}
+			return false
 		}
 	}
-
-	// Recovery is a separate, independently retryable step. It is reached from
-	// here after a fence, and again from recoverStrandedWorkloads for a host
-	// already fenced whose workloads a refusal left behind — see there for why
-	// that second caller has to exist.
-	c.recoverWorkloads(ctx, h)
+	return true
 }
 
 // recoverWorkloads moves every recoverable workload off a host that is already
@@ -1945,6 +2129,43 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 		}
 	}
 	return out, nil
+}
+
+// vmNeedsFailover reports whether this VM is one the coordinator would ever move
+// off a dead host.
+//
+// It answers only the PERMANENT question — is this workload a failover candidate
+// at all — and deliberately not "can it move right now", which depends on quorum,
+// gates, candidate hosts and this coordinator's lease term. A VM this returns
+// false for stays on its dead host by design, and no later cycle will change
+// that.
+//
+// The distinction is what lets recoverStrandedWorkloads terminate. A fenced host
+// keeps its opted-out and Secure Boot VMs forever, so a sweep asking merely "are
+// there VMs here" would never go quiet. Both callers ask through this predicate so
+// the sweep and the reschedule loop cannot drift into disagreeing about which
+// workloads are waiting on something.
+func vmNeedsFailover(vm corrosion.VMRecord) bool {
+	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
+	// the host. Neither a reschedule nor a disk-only replica promotion reconstructs
+	// it, so this is not work that becomes possible later — recovery is an operator
+	// restore from a backup that carried the firmware.
+	if vmUsesFirmwareState(vm) {
+		return false
+	}
+	p := vmFailurePolicy(vm)
+	return p != "" && p != "none"
+}
+
+// containerNeedsFailover is the container half of vmNeedsFailover.
+func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
+	if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
+		return false
+	}
+	// Already triaged as unrecoverable on an earlier pass (no re-pullable image and
+	// no usable backup) and left in place on purpose so an operator can see it.
+	// Re-processing it would loop on a decision already made.
+	return ct.StateDetail != corrosion.ContainerRelocateSkippedDetail
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.

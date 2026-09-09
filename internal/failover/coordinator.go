@@ -175,6 +175,16 @@ type Coordinator struct {
 	// regressed target can never receive an unfenced shared-disk transfer. Wired by
 	// the daemon.
 	SharedStorageFenceEnforce bool
+	// LeaseTermEnforce is the per-node kill-switch for leader-lease term
+	// enforcement (config.Enforcement.LeaseTerm). Enforcement is this flag AND the
+	// LeaseTermV1 capability latch, matching the executor's own predicate
+	// (grpcapi's leaseTermEnforced) — the two halves of one decision, and they
+	// must agree. When enforced, the coordinator refuses to stamp a proof whose
+	// term has been superseded, failing fast at the SOURCE before any destructive
+	// work. It is a precheck, not the guarantee: the executor's quorum barrier is,
+	// because a stale coordinator can skip this and nothing can skip that. Wired
+	// by the daemon.
+	LeaseTermEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -751,9 +761,92 @@ func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) 
 	return expiresAt.Sub(c.now()), true
 }
 
+// leaseTermEnforced reports whether this coordinator refuses to stamp on the
+// strength of its lease term: the config flag AND the cluster-wide latch, the
+// same `flag && Enforced` model as the rest of this family.
+//
+// Both halves are load-bearing, and the latch half especially. An operator sets
+// enforcement.lease_term ahead of the latch during a roll — that is the intended
+// order — and pre-latch a perfectly healthy leader holds term 0, because the
+// ledger mint gate is still closed and AcquireLeaseWithTerm deliberately reports
+// no term. Enforcing on the flag alone would therefore stand this coordinator
+// down from every action it drives, on every node, for the whole rollout, while
+// the executor (which gates on the same latch) went on accepting term-0 proofs.
+// All cost, no safety.
+func (c *Coordinator) leaseTermEnforced(ctx context.Context) bool {
+	return c.LeaseTermEnforce && c.Gate != nil && c.Gate.Enforced(ctx, capabilities.LeaseTermV1)
+}
+
+// leaseTermStampAllowed reports whether this coordinator may stamp a proof with
+// its recorded term.
+//
+// The term is c.LeaseTerm() — the incarnation this coordinator actually acquired
+// — and NEVER a fresh ledger read. Deriving it here would let a displaced holder
+// that has received the winner's term row stamp proofs with the winner's term,
+// the privilege escalation Phase 1 closed. The ledger read below is the
+// THRESHOLD, used only to reject, never to adopt.
+func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
+	if !c.leaseTermEnforced(ctx) {
+		// Nothing to check: pre-latch there is no term to be stale, and with the
+		// flag off the operator has taken enforcement off this node deliberately.
+		// Stamp whatever term we hold — 0 pre-latch — so the term is observable
+		// before the flip rather than appearing for the first time with it.
+		return true
+	}
+	term := c.LeaseTerm()
+	if term <= 0 {
+		// Enforcing, so the ledger has latched and a real holder has a real term.
+		// No term here means this coordinator holds no lease incarnation — never
+		// acquired one, or holdLease cleared it on a loss path — and acting as
+		// leader without one produces exactly the unfenced write the term exists
+		// to prevent.
+		c.mAttempt(PhaseLease, ResultSkipped, ErrLeaseLost)
+		return false
+	}
+	threshold, err := corrosion.CurrentLeaseTerm(ctx, c.db, failoverLeaseKey)
+	if err != nil {
+		slog.Error("failover: read lease term threshold", "error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		return false
+	}
+	if term < threshold {
+		slog.Warn("failover: this coordinator's lease term is superseded — refusing to stamp",
+			"term", term, "threshold", threshold)
+		c.mAttempt(PhaseLease, ResultSkipped, ErrStaleLeaseTerm)
+		return false
+	}
+	return true
+}
+
+// leaseStamp returns everything a proof records about this coordinator's tenure:
+// the holder and expiry read from the lease row, and the fencing term from
+// c.LeaseTerm(). ok is false when this coordinator must not stamp at all, and the
+// caller must abandon the action rather than stamp a partial record.
+//
+// All three stamp sites go through this, and that is the point of it existing.
+// The term is RETURNED rather than read at each site, so a site cannot silently
+// omit it. And the holder comes from the lease row, not from c.hostName: two of
+// the three sites previously wrote their own identity into LeaseHolder, which
+// asserts "I hold the lease" on the authority of the process making the claim —
+// precisely the assertion the fencing term exists to stop trusting. leaseSnapshot
+// returns empty on a read error, so this field can be blank on a perfectly valid
+// proof; blank is correct and self-reporting was a fabrication.
+func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, ok bool) {
+	if !c.leaseTermStampAllowed(ctx) {
+		return "", "", 0, false
+	}
+	holder, expiresAt = c.leaseSnapshot(ctx)
+	return holder, expiresAt, c.LeaseTerm(), true
+}
+
 // leaseSnapshot returns the current failover-lease holder + expiry to record in a
-// proof. leader_election has no lease TERM column, so the proof captures the
-// snapshot (holder + expires_at), matching the plan's honest trust model.
+// proof, as the human-readable record of the tenure.
+//
+// It is NOT the proof's enforceable token: that is ActionProof.LeaseTerm, which
+// comes from c.LeaseTerm() via leaseStamp. This snapshot deliberately returns
+// empty on a read error — an honesty record must not FABRICATE a holder — so it
+// can be blank on a perfectly valid proof, which is exactly why the executor's
+// equal-term check compares against Coordinator rather than LeaseHolder.
 func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt string) {
 	rows, err := c.db.Query(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
@@ -1356,7 +1449,6 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				continue
 			}
 			_, live, needed := c.Gate.QuorumProof(ctx)
-			leaseHolder, leaseExp := c.leaseSnapshot(ctx)
 			// The fencing term of THIS tenure, taken from what the coordinator
 			// recorded at acquisition — never from a fresh MAX(term) read, which
 			// would let a displaced holder adopt the winner's term.
@@ -1368,13 +1460,19 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			// VM is never started and sits pending forever. Nothing detected
 			// that, because LeaseTermReadiness checks whether this node can MINT
 			// a term, not whether its producers STAMP one.
+			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			if !ok {
+				c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
+				c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
+				continue
+			}
 			proof := corrosion.ActionProof{
 				ID: randid.New(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
-				LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
+				LeaseTerm:  leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1497,12 +1595,19 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 				return
 			}
+			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			if !ok {
+				c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
+				c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+				return
+			}
 			proof := corrosion.ActionProof{
 				ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
-				LeaseHolder: c.hostName, RelocationToken: token,
-				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
-				LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
+				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
+				RelocationToken: token,
+				OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
+				LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1649,13 +1754,20 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 			return
 		}
+		leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+		if !ok {
+			c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
+			c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+			return
+		}
 		relocToken = randid.New()
 		proof := corrosion.ActionProof{
 			ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
-			LeaseHolder: c.hostName, RelocationToken: relocToken,
-			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
-			LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
+			LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
+			RelocationToken: relocToken,
+			OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
+			LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)

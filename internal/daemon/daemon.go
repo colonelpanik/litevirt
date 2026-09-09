@@ -1220,6 +1220,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
 	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
+	// The coordinator half of lease-term enforcement: a local precheck that
+	// refuses to stamp a superseded term. svc.SetLeaseTermEnforce above is the
+	// executor half, and both read this one flag so the source and the enforcer
+	// can never disagree about whether enforcement is on.
+	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

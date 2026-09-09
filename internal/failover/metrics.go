@@ -45,6 +45,7 @@ const (
 	ErrDestUngated       = "dest_ungated" // target no longer advertises the split-brain gate
 	ErrSelfFenced        = "self_fenced"  // this coordinator self-fenced; skips driving failover until reboot
 	ErrLeaseLost         = "lease_lost"
+	ErrStaleLeaseTerm    = "stale_lease_term" // still named holder locally, but a peer's term has superseded ours
 	ErrNotLeader         = "not_leader"
 	ErrTerminalState     = "terminal_state"
 	ErrAlreadyFenced     = "already_fenced"

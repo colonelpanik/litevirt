@@ -136,9 +136,20 @@ func adoptRefuseCausef(cause error, format string, args ...any) error {
 // with none. That second class comes back through the allocator, so it cannot be
 // one of this package's own error types, and reporting it as Internal would send
 // an operator hunting a daemon bug over an object they can see in NetBox.
+//
+// THE FINAL GATE'S REFUSAL IS IN HERE TOO, both halves of it. A drift the gate
+// read after the adoption is a repair an operator makes in NetBox; an answer it
+// could not read is a retry of the same command once NetBox answers. Neither is
+// a fault in the daemon, so neither may be reported as one — and keeping it in
+// this one predicate is what stops the four doors from disagreeing about the
+// code they return for the identical outcome.
 func adoptionRefused(err error) bool {
-	var refused adoptionRefusedError
-	return errors.As(err, &refused) || errors.Is(err, network.ErrAddressNotOurs)
+	var (
+		refused     adoptionRefusedError
+		unactivated activationRefusedError
+	)
+	return errors.As(err, &refused) || errors.As(err, &unactivated) ||
+		errors.Is(err, network.ErrAddressNotOurs)
 }
 
 // errAdoptionUncorroborated is the sentinel for the one adoption that cannot be
@@ -975,6 +986,207 @@ func adoptionSuspendReason(network string, pending int) string {
 			"claims until every one of them is recorded", pending, network)
 }
 
+// ── THE FINAL ACTIVATION GATE ───────────────────────────────────────────────
+//
+// activateBinding is the ONE door onto a live binding, and the only place in
+// this tree that clears a suspension.
+//
+// WHY IT EXISTS AT ALL, stated precisely because a previous round audited this
+// and left it alone on reasoning that turned out to be wrong. Every activation
+// path used to validate the binding, then adopt, then resume — and the argument
+// for that order was "the premise is the bind's own validation in the same RPC".
+// Same RPC does not mean unchanged external state. Adoption itself performs
+// intervening NetBox requests: up to 256 POSTs, each a round trip an operator or
+// another system can act across. Disabling a VRF's uniqueness enforcement during
+// an adoption POST therefore left the binding LIVE on every one of the four
+// doors — the precise condition each of them had just checked for.
+//
+// So the premise an activation rests on is re-read AFTER the last adoption
+// write, and this function owns that ordering. It is the ADOPTION WINDOW that
+// closes here.
+//
+// WHAT THIS DOES NOT BUY, and nothing in it should be read as implying
+// otherwise: it does NOT make NetBox changes atomic with local activation. There
+// is no transaction spanning the two, and there cannot be — NetBox is a separate
+// system with no lock this daemon can hold. Uniqueness enforcement switched off
+// one millisecond after the revalidation read returns still leaves the binding
+// live, and the periodic revalidation pass is what catches that (it suspends,
+// which is the one direction that pass is allowed to move). What closes here is
+// the window with a KNOWN, BOUNDED duration and a KNOWN cause: the adoption's
+// own requests, which are this daemon's doing and can be read across.
+//
+// ONE GATE, NOT FOUR CHECKS THAT AGREE. Four call sites are how this diverged in
+// the first place, and an earlier round already had to unify the bind and the
+// sweeper for the same reason. So all four paths — the bind's own finisher,
+// `lv netbox resume`, the re-key's tail, and the automatic unhydrated completion
+// — call THIS, and none of them writes `Suspended = false` itself. That is
+// pinned structurally (TestOnlyTheActivationGateClearsASuspension and
+// TestTheActivationGateRevalidatesAfterItAdopts), the same way the
+// activation-door guard pins the unread drift answer.
+//
+// FAIL CLOSED, AND KEEP THE WORK. Drift that was READ re-states the suspension
+// under the current cause. Drift that could NOT be read leaves the row exactly
+// as it is. In both cases the adopted claims STAND — the NetBox objects and the
+// local leases behind them are not rolled back, because adoption is the work a
+// retry must not have to redo and discarding it would hand a running guest's
+// address back to `/available-ips/`. Refusing to activate is not a reason to
+// un-adopt.
+//
+// The count is returned ALONGSIDE the error for the same reason
+// adoptExistingAddresses returns one: a pass that stopped here has still created
+// objects in NetBox, and the audit trail may not imply nothing happened.
+func (s *Server) activateBinding(ctx context.Context, b corrosion.BindingRecord, lease *rekeyLease) (int, error) {
+	adopted, aerr := s.adoptExistingAddresses(ctx, b, lease)
+	if aerr != nil {
+		// The adoption's own failure, returned unwrapped so every caller's
+		// existing branch still reads it: errAdoptionUncorroborated for the
+		// automatic path, adoptionRefused for the RPC codes.
+		return adopted, aerr
+	}
+
+	// NO NETBOX, NO ACTIVATION. bindingDrift reads the prefix and its VRF
+	// through s.netbox and would dereference a nil one; every door onto this
+	// function establishes that it is non-nil, and the adoption itself refuses
+	// without it — but a binding may not go live on a check that could not be
+	// made, and a nil client is the most complete version of "could not be
+	// made". Fail closed rather than trust the callers to keep doing it.
+	if s.netbox == nil {
+		return adopted, activationRefusedError{
+			network: b.Network, prefixID: b.PrefixID, adopted: adopted,
+			unread: fmt.Errorf(
+				"this node has no netbox configuration, so the binding's preconditions cannot "+
+					"be re-checked; activate it from a node that does, with "+
+					"`lv netbox resume %s`", b.Network),
+		}
+	}
+
+	// THE FRESH REVALIDATION, after the last adoption write and before anything
+	// that could be mistaken for one.
+	//
+	// The LIVE fingerprint, derived here rather than taken from the caller, so a
+	// fingerprint that moved DURING the adoption is caught too — that is the
+	// same class of intervening change as the VRF, and a caller-supplied value
+	// read before the adoption would be exactly the stale premise this function
+	// exists to remove.
+	fp, ferr := corrosion.ClusterFingerprint(ctx, s.db)
+	if ferr != nil {
+		return adopted, activationRefusedError{
+			network: b.Network, prefixID: b.PrefixID, adopted: adopted,
+			unread: fmt.Errorf("derive cluster fingerprint: %w", ferr),
+		}
+	}
+	reason, derr := s.bindingDrift(ctx, b, fp)
+	if derr != nil {
+		// AN UNREADABLE ANSWER IS NOT A CLEAN ONE. The row is left untouched —
+		// not re-stated, not re-suspended — because nothing was learned: a
+		// binding waiting on its inventory stays in the class the revalidation
+		// pass lifts by itself, and every other suspension keeps the reason an
+		// operator is already acting on.
+		return adopted, activationRefusedError{
+			network: b.Network, prefixID: b.PrefixID, adopted: adopted, unread: derr,
+		}
+	}
+	if reason != "" {
+		// READ, and it does not hold. Re-state the suspension under the CURRENT
+		// cause: the reason on the row was written before the adoption and now
+		// names something that may no longer be the problem. This also takes an
+		// unhydrated suspension out of the self-lifting class, which is correct
+		// — a VRF that stopped enforcing uniqueness is an operator's repair, not
+		// a pass's.
+		if serr := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); serr != nil {
+			slog.Error("netbox: could not re-state why a binding stays suspended after its "+
+				"post-adoption revalidation refused activation; it stays suspended under its "+
+				"previous reason",
+				"network", b.Network, "prefix", b.PrefixID, "reason", reason, "error", serr)
+		} else {
+			s.nbMetrics().IncBindingSuspended()
+		}
+		return adopted, activationRefusedError{
+			network: b.Network, prefixID: b.PrefixID, adopted: adopted, reason: reason,
+		}
+	}
+
+	// THE LAST LEASE PROOF, immediately before the write and after the
+	// revalidation's round trips.
+	//
+	// The re-key is the only caller that holds one, and its own comments state
+	// why this belongs here: the adoption above may have spent tens of seconds
+	// in NetBox against a lease with a one-minute TTL, and the revalidation has
+	// just added two more reads on top. A proof taken before either is not a
+	// statement about now, and a binding activated under a lease another node
+	// holds is live while that node may be partway through a rewrite of its own.
+	if lease != nil {
+		if lerr := lease.check(ctx); lerr != nil {
+			return adopted, fmt.Errorf(
+				"the addresses on network %s were adopted (%d this pass) and re-validated, but "+
+					"the binding for prefix %d was not activated; it stays suspended, re-run to "+
+					"finish: %w", b.Network, adopted, b.PrefixID, lerr)
+		}
+	}
+
+	next := b
+	next.Suspended = false
+	next.SuspendReason = ""
+	if uerr := corrosion.UpsertBinding(ctx, s.db, next); uerr != nil {
+		return adopted, fmt.Errorf(
+			"every existing address on network %s was adopted (%d this pass) and the binding "+
+				"for prefix %d re-validated cleanly, but activating it failed: %w",
+			b.Network, adopted, b.PrefixID, uerr)
+	}
+	return adopted, nil
+}
+
+// activationRefusedError is an adoption that SUCCEEDED and an activation the
+// final gate then refused.
+//
+// A distinct type because the two halves of the outcome have to be reported
+// together and each caller says so differently: the adopted claims STAND, and
+// the binding did NOT go live. Read as an ordinary failure it would suggest the
+// adoption is owed again, which would send an operator looking for work that is
+// already done.
+//
+// reason and unread are mutually exclusive, and which one is set is the whole
+// distinction the callers act on: a reason is a repair an operator makes, and an
+// unread answer is a retry.
+type activationRefusedError struct {
+	network  string
+	prefixID int
+	adopted  int
+	reason   string
+	unread   error
+}
+
+func (e activationRefusedError) Error() string {
+	if e.unread != nil {
+		return fmt.Sprintf(
+			"the addresses network %s's guests already hold were adopted (%d this pass) and "+
+				"those claims stand, but the binding for prefix %d was NOT activated: its "+
+				"NetBox preconditions could not be re-checked AFTER the adoption, and an "+
+				"activation may not rest on a validation the adoption's own requests could "+
+				"have outlived. It stays suspended — re-run once NetBox answers: %v",
+			e.network, e.adopted, e.prefixID, e.unread)
+	}
+	return fmt.Sprintf(
+		"the addresses network %s's guests already hold were adopted (%d this pass) and those "+
+			"claims stand, but the binding for prefix %d was NOT activated: re-checked after "+
+			"the adoption, %s",
+		e.network, e.adopted, e.prefixID, e.reason)
+}
+
+func (e activationRefusedError) Unwrap() error { return e.unread }
+
+// activationRefused reports whether an error is the final gate's refusal, and
+// returns it.
+//
+// Callers use it to keep their OWN suspension reason off the row: the gate has
+// already written the one that names the current cause, and re-stating it as
+// "the adoption is incomplete" would be false — the adoption finished.
+func activationRefused(err error) (activationRefusedError, bool) {
+	var ref activationRefusedError
+	ok := errors.As(err, &ref)
+	return ref, ok
+}
+
 // finishAdoptionAndResume adopts what a bind left owed and resumes the binding.
 //
 // It is a NO-OP on a binding that is not suspended, which is the common case: a
@@ -989,11 +1201,13 @@ func adoptionSuspendReason(network string, pending int) string {
 // performed; it is repeated rather than carried across, because the plan is only
 // valid against the rows as they are now and the binding is persisted in between.
 //
-// RESUME LAST, and only on a pass that adopted everything. Everything before the
-// resume is safe to interrupt: the binding stays suspended, no claim is served,
-// and the addresses already adopted are recorded on their leases so a re-run
-// skips them. The resume is the single step that makes the binding live, so it
-// may not rest on a pass that did not finish.
+// RESUME LAST, and only on a pass that adopted everything AND re-validated
+// afterwards. Everything before the activation is safe to interrupt: the binding
+// stays suspended, no claim is served, and the addresses already adopted are
+// recorded on their leases so a re-run skips them. Activation is the single step
+// that makes the binding live, so it may not rest on a pass that did not finish
+// — nor on the bind's own validation, which the adoption's NetBox requests are
+// interleaved with. Both rules live in activateBinding, which this calls.
 func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, prefixID int) error {
 	b, err := corrosion.GetBindingByPrefix(ctx, s.db, prefixID)
 	if err != nil {
@@ -1047,13 +1261,21 @@ func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, pr
 
 	// No leader lease. Neither of the two doors that reach this function may
 	// require cluster leadership — see adoptExistingAddresses.
-	adopted, aerr := s.adoptExistingAddresses(ctx, *b, nil)
+	adopted, aerr := s.activateBinding(ctx, *b, nil)
 	detail := fmt.Sprintf("prefix=%d adopted=%d", prefixID, adopted)
 	if aerr != nil {
 		// Audited on BOTH outcomes, the way a re-key is: a pass that failed
 		// partway has still created objects in NetBox, so "nothing happened" is
 		// the wrong thing for the trail to imply.
 		s.audit(ctx, "netbox.adopt", netName, detail, "error")
+		if _, refused := activationRefused(aerr); refused {
+			// THE GATE REFUSED, having adopted everything. It owns the reason on
+			// the row — the drift it read, or the previous one when it could not
+			// read at all — so nothing is re-stated here. Calling the adoption
+			// "incomplete" would be false and would send an operator to finish
+			// work that is finished.
+			return aerr
+		}
 		// Re-state the suspension with what is actually outstanding. The bind
 		// wrote a reason from the PRE-claim plan; by now some of it is done, and
 		// a reason naming the original count would send an operator looking for
@@ -1069,15 +1291,6 @@ func (s *Server) finishAdoptionAndResume(ctx context.Context, netName string, pr
 		return aerr
 	}
 
-	next := *b
-	next.Suspended = false
-	next.SuspendReason = ""
-	if uerr := corrosion.UpsertBinding(ctx, s.db, next); uerr != nil {
-		s.audit(ctx, "netbox.adopt", netName, detail, "error")
-		return fmt.Errorf(
-			"every existing address on network %s was adopted (%d), but resuming the binding "+
-				"failed: %w — re-run `lv netbox resume %s`", netName, adopted, uerr, netName)
-	}
 	s.audit(ctx, "netbox.adopt", netName, detail, "ok")
 	slog.Info("netbox binding resumed after adopting existing addresses",
 		"network", netName, "prefix", prefixID, "adopted", adopted)

@@ -109,6 +109,17 @@ type NetBoxFake struct {
 	// finish.
 	onClaimSpecific func(address string) error
 
+	// onPrefixRead runs before a prefix READ is answered. A non-nil error fails
+	// that one request and nothing else, which is what makes "the answer could
+	// not be read" reachable at a chosen POINT in an operation rather than for
+	// the whole of it (SetDown is the whole-of-it form).
+	//
+	// The prefix read specifically, because it is the FIRST thing bindingDrift
+	// asks: a hook here is how a test drives the unread drift answer at, say,
+	// the revalidation the activation gate makes after an adoption, while every
+	// read before it answers normally.
+	onPrefixRead func(id int) error
+
 	// down makes every request fail at the transport layer. A test flips it from
 	// its own goroutine while the httptest server reads it from the handler's,
 	// so it is unexported and reached only through SetDown/IsDown under f.mu.
@@ -141,6 +152,13 @@ func (f *NetBoxFake) SetOnClaimSpecific(h func(address string) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onClaimSpecific = h
+}
+
+// SetOnPrefixRead installs (or, with nil, clears) the prefix-read hook.
+func (f *NetBoxFake) SetOnPrefixRead(h func(id int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onPrefixRead = h
 }
 
 // AddressRequests is how many requests the ipam address surface has served, any
@@ -695,7 +713,17 @@ func (f *NetBoxFake) getPrefix(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	p, known := f.prefixes[id]
+	hook := f.onPrefixRead
 	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(id); err != nil {
+			// A 500, so the client reports it as an ERROR rather than as an
+			// answer. bindingDrift's third answer is "I could not look", and a
+			// 404 would be a definite one.
+			writeErr(w, http.StatusInternalServerError, "prefix %d unreadable: %v", id, err)
+			return
+		}
+	}
 	if !known {
 		writeErr(w, http.StatusNotFound, "no prefix %d", id)
 		return

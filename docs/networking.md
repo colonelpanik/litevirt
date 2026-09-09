@@ -568,6 +568,29 @@ it again once NetBox answers. The same rule holds for the tail of
 `lv netbox rekey` and for the automatic completion the maintenance pass performs:
 a binding goes live only on preconditions something actually read.
 
+**And the check that counts is the one made *after* the adoption.** Adoption
+issues up to 256 NetBox requests of its own, and NetBox is a system other people
+change: a VRF whose uniqueness enforcement is switched off partway through an
+adoption was enforcing it when the operation started and is not when the binding
+would go live. So every path that activates a binding — the bind's own finisher,
+`lv netbox resume`, the tail of `lv netbox rekey`, and the automatic completion —
+re-runs the full check once the last adoption write has landed, and the
+suspension comes off only if that check passes. Drift found there re-states the
+suspension under the new cause, for you to repair and resume; a check that could
+not be read leaves the suspension exactly as it was, for a retry.
+
+Either way **the adopted addresses stay adopted**: the NetBox objects and the
+local leases behind them are kept, refusing to activate is not a reason to
+un-record a running guest's address, and a re-run skips what is already done.
+Both outcomes report `FailedPrecondition` and both say the adoption finished —
+so if you see one, do not go looking for un-adopted addresses.
+
+This closes the window during the adoption. It does **not** make a NetBox change
+atomic with the local activation, and nothing about it should be read that way:
+uniqueness switched off a moment after that final check still leaves the binding
+live, and what catches that is the periodic revalidation pass, which suspends it
+on its next sweep.
+
 It also finishes any adoption the bind left owed — see
 [Binding a subnet that already has VMs on it](#binding-a-subnet-that-already-has-vms-on-it).
 That is not a separate mode: the same gate that refuses to lift a suspension over

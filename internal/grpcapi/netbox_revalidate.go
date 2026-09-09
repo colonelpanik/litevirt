@@ -134,13 +134,19 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 // live, which serves no claim; without this it would stay that way until an
 // operator noticed. A refusal never converges; a pass does.
 //
-// ORDER: drift first, then adoption, then the resume — the same order the re-key's
-// tail and ResumeBinding both use, and for the same reason. A binding waiting for
-// its inventory can ALSO have been re-CIDRed or moved out of its VRF while it
-// waited, and resuming on the strength of the adoption alone would lift a
-// suspension over a prefix that no longer validates. A drift REPLACES the reason,
-// which is what takes the binding out of the self-lifting class and puts it in
-// front of an operator.
+// ORDER: drift first, then adoption, then a FRESH drift re-check, then the
+// activation — the same order the re-key's tail and ResumeBinding both use, and
+// for the same reason. A binding waiting for its inventory can ALSO have been
+// re-CIDRed or moved out of its VRF while it waited, and resuming on the
+// strength of the adoption alone would lift a suspension over a prefix that no
+// longer validates. A drift REPLACES the reason, which is what takes the binding
+// out of the self-lifting class and puts it in front of an operator.
+//
+// THE FIRST CHECK IS THE CHEAP ONE, NOT THE PREMISE. It refuses before the
+// adoption spends up to 256 NetBox POSTs on a binding that already cannot go
+// live. The premise the activation rests on is the SECOND check, which
+// activateBinding makes after the last of those POSTs — because the adoption's
+// own requests are a window across which the answer to the first one can change.
 //
 // NO LEADER LEASE, and no nbPassMu of its own. Both follow the rule
 // adoptExistingAddresses already states: adoption's exclusion is nbPassMu, which
@@ -184,7 +190,25 @@ func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.Bindin
 		return
 	}
 
-	adopted, aerr := s.adoptExistingAddresses(ctx, b, nil)
+	adopted, aerr := s.activateBinding(ctx, b, nil)
+	if ref, refused := activationRefused(aerr); refused {
+		// THE FINAL GATE refused, having adopted everything. It owns the row: a
+		// drift it READ is already written there (which takes this binding out
+		// of the self-lifting class, correctly — that one needs an operator),
+		// and an answer it could NOT read leaves the reason untouched so the
+		// next pass asks again. Either way the adopted claims stand.
+		if ref.reason != "" {
+			slog.Warn("netbox: adopted every existing address, but the post-adoption "+
+				"revalidation refused to activate the binding", "network", b.Network,
+				"prefix", b.PrefixID, "adopted", adopted, "reason", ref.reason)
+			return
+		}
+		slog.Warn("netbox: adopted every existing address, but the binding stays suspended — "+
+			"its preconditions could not be re-checked AFTER the adoption, so activation was "+
+			"refused; the next pass asks again", "network", b.Network, "prefix", b.PrefixID,
+			"adopted", adopted, "error", ref.unread)
+		return
+	}
 	if errors.Is(aerr, errAdoptionUncorroborated) {
 		// Still no standing to enumerate. Nothing changes — not the row, not the
 		// reason — so the next pass asks again. INFO rather than WARN: the bind
@@ -210,16 +234,6 @@ func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.Bindin
 			return
 		}
 		s.nbMetrics().IncBindingSuspended()
-		return
-	}
-
-	next := b
-	next.Suspended = false
-	next.SuspendReason = ""
-	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
-		slog.Error("netbox: adopted every existing address but could not resume the binding; "+
-			"the next pass retries", "network", b.Network, "prefix", b.PrefixID,
-			"adopted", adopted, "error", err)
 		return
 	}
 	s.audit(ctx, "netbox.adopt", b.Network,
@@ -769,7 +783,33 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// already spends one NetBox round trip per object it rewrites, and the scan
 	// is what makes the resume below unable to be a second door around the
 	// adoption gate.
-	adopted, aerr := s.adoptExistingAddresses(ctx, next, lease)
+	// THE ACTIVATION GATE owns everything from here: the adoption, the FRESH
+	// post-adoption re-check the activation actually rests on, the last lease
+	// proof, and the write that lifts the flag. The drift check above is the
+	// cheap refusal that keeps a doomed re-key from POSTing 256 times; it is not
+	// the premise, because the adoption's own requests are exactly the window
+	// across which its answer can change. See activateBinding.
+	adopted, aerr := s.activateBinding(ctx, next, lease)
+	if ref, refused := activationRefused(aerr); refused {
+		if ref.reason != "" {
+			// The gate has already re-stated the suspension under the drift it
+			// READ. Reported as stillDriftedError so `lv netbox rekey` names the
+			// same class of outcome it does for a pre-adoption drift: the
+			// rewrite finished, the binding did not go live, and the remaining
+			// reason is an operator's to repair.
+			slog.Warn("netbox binding re-keyed but its post-adoption revalidation refused "+
+				"activation", "network", b.Network, "prefix", b.PrefixID,
+				"adopted", adopted, "reason", ref.reason)
+			return counts, stillDriftedError{reason: ref.reason}
+		}
+		slog.Warn("netbox binding re-keyed but not activated — its preconditions could not be "+
+			"re-checked after the adoption", "network", b.Network, "prefix", b.PrefixID,
+			"adopted", adopted, "error", ref.unread)
+		return counts, fmt.Errorf(
+			"identities re-keyed and every existing address adopted, but the binding for "+
+				"prefix %d was not activated; it stays suspended, re-run to finish: %w",
+			b.PrefixID, aerr)
+	}
 	if aerr != nil {
 		reason := fmt.Sprintf(
 			"identities re-keyed, but the addresses this network's guests already hold are not "+
@@ -780,30 +820,6 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 		slog.Warn("netbox binding re-keyed but its existing addresses are not all adopted",
 			"network", b.Network, "prefix", b.PrefixID, "adopted", adopted, "error", aerr)
 		return counts, stillDriftedError{reason: reason}
-	}
-
-	// THE LAST PROOF, immediately before the resume itself.
-	//
-	// Everything after this line is the RESUME, and it is the one step that makes
-	// a half-rewritten cluster live again. The adoption above may have spent tens
-	// of seconds in NetBox against a lease with a one-minute TTL, so the proof
-	// taken before it is no longer a statement about now — and a binding resumed
-	// under a lease another node holds is live while that node may be partway
-	// through a rewrite of its own. Nothing here is lost by stopping: the
-	// addresses adopted stay adopted and recorded, and the binding stays
-	// suspended and re-runnable.
-
-	if err := lease.check(ctx); err != nil {
-		return counts, fmt.Errorf(
-			"the addresses on network %s were adopted (%d this pass) but the binding for "+
-				"prefix %d was not resumed; it stays suspended, re-run to finish: %w",
-			b.Network, adopted, b.PrefixID, err)
-	}
-
-	next.Suspended = false
-	next.SuspendReason = ""
-	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
-		return counts, fmt.Errorf("resume binding for prefix %d: %w", b.PrefixID, err)
 	}
 	slog.Info("netbox binding re-keyed", "network", b.Network, "prefix", b.PrefixID,
 		"addresses_rewritten", counts.addresses, "vms_rewritten", counts.vms,
@@ -1288,7 +1304,22 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 	// No leader lease: a resume must not require cluster leadership, so this
 	// door's exclusion is the nbPassMu above and nothing else. See
 	// adoptExistingAddresses.
-	adopted, aerr := s.adoptExistingAddresses(ctx, *b, nil)
+	// Everything the pin records is written back UNCHANGED. An activation clears
+	// a flag; it never re-observes the prefix into the binding, because that
+	// would turn "the drift is gone" into "adopt whatever NetBox says now" — the
+	// very silent re-identification the pin exists to prevent. activateBinding
+	// upserts the record it is HANDED for exactly that reason.
+	adopted, aerr := s.activateBinding(ctx, *b, nil)
+	if ref, refused := activationRefused(aerr); refused {
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d adopted=%d refused: post-adoption revalidation", b.PrefixID, adopted), "error")
+		// FailedPrecondition for BOTH halves. A drift the gate READ is an
+		// operator's repair; an answer it could not read is a retry of this same
+		// command. Neither is a fault in the daemon, and Internal would send
+		// someone hunting one.
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"network %q stays suspended: %v", req.GetNetwork(), ref)
+	}
 	if aerr != nil {
 		s.audit(ctx, "netbox.resume", req.GetNetwork(),
 			fmt.Sprintf("prefix=%d adopted=%d", b.PrefixID, adopted), "error")
@@ -1300,20 +1331,6 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 			"network %q stays suspended: the addresses its guests already hold are not all "+
 				"recorded in NetBox (adopted %d this pass): %v",
 			req.GetNetwork(), adopted, aerr)
-	}
-
-	// Everything the pin records is written back UNCHANGED. Resume clears a
-	// flag; it never re-observes the prefix into the binding, because that would
-	// turn "the drift is gone" into "adopt whatever NetBox says now" — the very
-	// silent re-identification the pin exists to prevent.
-	next := *b
-	next.Suspended = false
-	next.SuspendReason = ""
-	if err := corrosion.UpsertBinding(ctx, s.db, next); err != nil {
-		s.audit(ctx, "netbox.resume", req.GetNetwork(),
-			fmt.Sprintf("prefix=%d", b.PrefixID), "error")
-		return nil, status.Errorf(codes.Internal,
-			"resume binding for network %q: %v", req.GetNetwork(), err)
 	}
 	slog.Info("netbox binding resumed", "network", b.Network, "prefix", b.PrefixID,
 		"adopted", adopted)

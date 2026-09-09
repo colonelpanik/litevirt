@@ -852,22 +852,60 @@ so a handover mid-sweep stops the outgoing leader instead of letting two nodes
 write the same objects. It writes only on change: a sweep over inventory that
 already matches issues no writes at all.
 
-**A VM recreated under the same name converges.** Delete a VM and recreate it
-under the same name and the new incarnation has a new uuid, so a new identity,
-so the mirror has to create a new object — while the old object still holds the
-name NetBox allows only one of. The mirror resolves that by replacing the old
-object first, and only on proof taken from the identity: the object holding the
-name carries **this** cluster's fingerprint and a uuid that is **not** in the
-desired set, which makes it a superseded incarnation of that name. That one
-removal is the only one that runs ahead of the creates.
+**A reused VM name converges, whether a create or a rename needs it.** Delete a
+VM and recreate it under the same name and the new incarnation has a new uuid, so
+a new identity, so the mirror has to create a new object — while the old object
+still holds the name NetBox allows only one of. The same collision is reached
+without any create at all: rename a VM away, delete it, and rename a second VM
+into the name it vacated, all inside one sweep interval. NetBox never saw the
+first rename, so its object still holds the original name, and the survivor needs
+an **update** onto it — and NetBox's rule constrains the name, so a rename onto a
+taken one is refused exactly as a create is.
+
+The mirror resolves both by replacing the occupying object first, and only on
+proof taken from the identity: the object holding the name carries **this**
+cluster's fingerprint and a uuid that is **not** in the desired set, which makes
+it a superseded incarnation of that name. That one removal is the only one that
+runs ahead of the creates and updates, and it takes the interfaces under it with
+it — NetBox cascades them, so the mirror does not ask for them separately.
 
 Two things it will never touch, both refused twice over (once when the action is
 planned, once again before the delete is issued): an object whose identity **is**
 in the desired set — a live VM of this cluster, which freeing a name may never
 remove — and an object carrying a **different** cluster's fingerprint, which
-belongs to another installation. A sweep that cannot prove its own view of the
-cluster is complete withholds the replacement along with its deletes, so the
-create collides for that one VM and the next healthy sweep converges it.
+belongs to another installation. Two VMs swapping names is the first case: each
+one's occupant is the other, both are live, and the mirror waits for one of the
+two renames to land rather than removing either.
+
+#### A withheld replacement, and the collision it leaves behind
+
+Half the replacement proof is "this uuid is absent from the desired set", which
+is only as good as that read is whole. So a sweep that cannot prove its own view
+of the cluster is complete withholds the replacement along with its deletes — the
+same gate, for the same reason — and the create or rename then collides for that
+one VM. That is deliberate: a stalled mirror is fixed by the next healthy sweep,
+an object removed on partial evidence is not.
+
+What you see is a failed sweep whose error is a NetBox refusal for a name
+litevirt can see is free:
+
+```
+netbox mirror: sync failed error="netboxsync: phase 1: netboxsync: update VM 4002:
+netbox: HTTP 400: {\"name\":[\"A virtual machine with this name already exists in
+this cluster.\"]} — this sweep withheld the replacement of the superseded
+object(s) holding [web-01], because this node holds no local record — tombstone
+included — for 2 of the NetBox object(s) this sweep would have removed, so its
+view of the cluster is partial"
+```
+
+The withheld replacement is also logged in its own right, whatever the apply then
+does, naming the names it did not free and the incomplete inventory behind it. So
+the condition to act on is the **partial read**, not the collision: it is the same
+condition the withheld-delete warnings describe, and it clears the same way —
+usually on its own, once the missing rows replicate. If it persists past a few
+sweeps, treat it as [a withheld removal that does not clear
+itself](#when-a-withheld-removal-does-not-clear-itself) and repair it in NetBox by
+hand.
 
 **Two litevirt clusters, one NetBox.** Give each one a NetBox cluster of its own
 with `netbox.cluster_name`. NetBox allows one VM name per cluster, so two

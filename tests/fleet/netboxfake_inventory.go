@@ -841,6 +841,29 @@ func (f *NetBoxFake) VMIdentity(id int) string {
 	return vm.Identity
 }
 
+// VMIdentityByName is the identity carried by the object holding this NAME, or
+// "" when no object — or more than one — does.
+//
+// It answers the question a reused name raises and VMCount cannot: WHICH
+// incarnation ended up with the name. A scenario that frees a name for another
+// object converges just as well by removing the wrong one, and a count of 1
+// cannot tell the two apart.
+func (f *NetBoxFake) VMIdentityByName(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var found string
+	seen := 0
+	for _, vm := range f.vms {
+		if vm.Name == name {
+			found, seen = vm.Identity, seen+1
+		}
+	}
+	if seen != 1 {
+		return ""
+	}
+	return found
+}
+
 // PatchCount is how many PATCH requests the fake has served, over every
 // endpoint.
 //

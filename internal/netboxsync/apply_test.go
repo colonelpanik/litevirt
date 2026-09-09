@@ -778,6 +778,10 @@ type stubVirt struct {
 	createErr map[string]error
 	deleteErr error
 
+	// enforceNames turns on NetBox's one-VM-name-per-cluster rule for creates
+	// and renames alike. See nameConflictLocked.
+	enforceNames bool
+
 	// The NetBox-side state a sweep reads back, served by the collection half
 	// below. Empty by default, so every existing scenario is untouched.
 	listVMs    []netbox.VirtualMachine
@@ -825,6 +829,9 @@ func (s *stubVirt) CreateVM(_ context.Context, vm netbox.VirtualMachine) (netbox
 	if err := s.createErr[vm.Identity]; err != nil {
 		return netbox.VirtualMachine{}, err
 	}
+	if err := s.nameConflictLocked(vm.Name, 0); err != nil {
+		return netbox.VirtualMachine{}, err
+	}
 	s.createCalls++
 	vm.ID = s.nextObjectID()
 	s.created = append(s.created, vm)
@@ -834,8 +841,45 @@ func (s *stubVirt) CreateVM(_ context.Context, vm netbox.VirtualMachine) (netbox
 func (s *stubVirt) UpdateVM(_ context.Context, id int, vm netbox.VirtualMachine) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.nameConflictLocked(vm.Name, id); err != nil {
+		return err
+	}
 	s.updatedVMs = append(s.updatedVMs, updatedVM{ID: id, VM: vm})
 	return nil
+}
+
+// nameConflictLocked models NetBox's one-VM-name-per-cluster rule, which is a
+// constraint on the NAME and therefore refuses a rename exactly as it refuses a
+// create.
+//
+// Off unless enforceNames is set, so every existing scenario is untouched. `self`
+// is the object being patched, which of course may keep its own name.
+//
+// A 400 with the `name` field named, which is what NetBox actually answers —
+// the annotation that explains a withheld replacement keys off the status and
+// the field, not the sentence.
+func (s *stubVirt) nameConflictLocked(name string, self int) error {
+	if !s.enforceNames || name == "" {
+		return nil
+	}
+	for _, v := range s.listVMs {
+		if v.Name == name && v.ID != self && !s.deletedLocked(v.ID) {
+			return &netbox.APIError{
+				Status: 400,
+				Body:   `{"name":["A virtual machine with this name already exists in this cluster."]}`,
+			}
+		}
+	}
+	return nil
+}
+
+func (s *stubVirt) deletedLocked(id int) bool {
+	for _, d := range s.deleted {
+		if d == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *stubVirt) DeleteVM(_ context.Context, id int) error {

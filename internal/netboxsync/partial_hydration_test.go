@@ -2,6 +2,7 @@ package netboxsync
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -219,5 +220,91 @@ func TestGenuinelyDetachedNICIsStillRetired(t *testing.T) {
 	}
 	if len(vms) != 0 {
 		t.Fatalf("deleted VMs = %v; every VM is in the desired set", vms)
+	}
+}
+
+// ── the CAUSE of a withheld replacement ─────────────────────────────────────
+
+// TestWithheldReplacementReportsTheIncompleteInventoryAsItsCause.
+//
+// Withholding the replacement is right: half its proof is "this UUID is absent
+// from the desired set", which is only as good as the desired read is whole, so
+// a pass that cannot prove its read whole must not act on it. The stall that
+// produces is agreed and stays.
+//
+// What an operator saw was only the collision — `HTTP 400: a virtual machine
+// with this name already exists in this cluster` — for a name litevirt can see
+// is free, with nothing connecting it to the partial read that is the actual
+// cause. So the failure has to name it.
+//
+// The scenario is the partially hydrated leader: one of the cluster's three VMs
+// has reached this node, and it has been RENAMED onto a name another of our
+// NetBox objects still holds. The replace that would free it is dropped with the
+// unproven deletes, and the rename then collides.
+func TestWithheldReplacementReportsTheIncompleteInventoryAsItsCause(t *testing.T) {
+	nb, r, _ := hydrationReconciler(t)
+	nb.enforceNames = true
+	// The one local row: uuid-1's VM, renamed onto vm-2 — a name NetBox still
+	// holds under uuid-2, whose own row has not replicated here.
+	seedHydratedVM(t, r, "vm-2", "uuid-1", macH1)
+
+	err := r.SyncOnce(context.Background())
+	if err == nil {
+		t.Fatal("the rename must collide: the name is held by an object this pass may not remove")
+	}
+	// THE COLLISION IS STILL THERE — the fail-closed stall is the agreed
+	// behaviour and must not have been traded away for a nicer message.
+	if !strings.Contains(err.Error(), "already exists in this cluster") {
+		t.Fatalf("want the NetBox name refusal preserved, got: %v", err)
+	}
+	// …and it now says WHY the replacement that would have cleared it was
+	// withheld.
+	for _, want := range []string{"withheld the replacement", "vm-2", "partial"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the failure must name %q as part of the cause; got: %v", want, err)
+		}
+	}
+	// Nothing was removed on the partial evidence, which is the property the
+	// message is explaining.
+	if vms, ifaces := deletes(nb); len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("a pass that admitted its read was partial removed VMs %v and interfaces %v",
+			vms, ifaces)
+	}
+}
+
+// TestAProvenReplacementIsNotReportedAsWithheld is the negative control: without
+// it, an annotation applied unconditionally would satisfy the test above and
+// attach a partial-read explanation to a pass that withheld nothing.
+func TestAProvenReplacementIsNotReportedAsWithheld(t *testing.T) {
+	nb, r, _ := hydrationReconciler(t)
+	nb.enforceNames = true
+	ctx := context.Background()
+	// FULLY hydrated, and uuid-2's VM destroyed and recreated under the same
+	// name — so its old object is a superseded incarnation this pass CAN prove,
+	// and the create onto its name goes through.
+	seedHydratedVM(t, r, "vm-1", "uuid-1", macH1)
+	seedHydratedVM(t, r, "vm-2", "uuid-2", macH2)
+	seedHydratedVM(t, r, "vm-3", "uuid-3", macH3)
+	if err := corrosion.DeleteVM(ctx, r.db, "vm-2"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	seedHydratedVM(t, r, "vm-2", "uuid-2b", macDetached)
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatalf("a proven replacement must free the name and let the new incarnation land: %v", err)
+	}
+
+	// The superseded object is gone and the new incarnation took its name.
+	if vms, _ := deletes(nb); len(vms) != 1 || vms[0] != 12 {
+		t.Fatalf("deleted VMs = %v, want exactly the superseded object holding the name", vms)
+	}
+	var landed bool
+	for _, v := range nb.created {
+		if v.Name == "vm-2" {
+			landed = true
+		}
+	}
+	if !landed {
+		t.Fatalf("the new incarnation was never created onto the freed name, got %+v", nb.created)
 	}
 }

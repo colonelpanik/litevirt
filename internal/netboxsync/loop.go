@@ -3,6 +3,7 @@ package netboxsync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -388,13 +389,18 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"vms", collided, "netbox_cluster", r.clusterID)
 		converged = false
 	}
+	// What a withholding gate took away from THIS pass, kept so the collision it
+	// causes can be reported with its cause rather than on its own. See
+	// withheldReplacementCause.
+	planned := actions
+	var partialRead string
 	if why := r.deleteBlocker(ctx, desired, skipped, actual); why != "" {
 		kept, withheld := withoutDestructive(actions)
 		slog.Warn("netbox mirror: withholding this sweep's deletes — the desired state is not whole",
 			"reason", why, "withheld_actions", withheld,
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
-		actions, converged = kept, false
+		actions, converged, partialRead = kept, false, why
 	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual); unprovenDeletes+unprovenClears > 0 {
 		// The whole-pass gate above answers "is this read whole?", which a
 		// PARTIALLY hydrated database passes: some of the cluster's rows are
@@ -421,12 +427,101 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			kept, _ = withoutDestructive(kept)
 		}
 		actions, converged = kept, false
+		partialRead = fmt.Sprintf(
+			"this node holds no local record — tombstone included — for %d of the NetBox "+
+				"object(s) this sweep would have removed, so its view of the cluster is partial",
+			unprovenDeletes+unprovenClears)
+	}
+
+	// THE CAUSE OF A WITHHELD REPLACEMENT, said out loud.
+	//
+	// Withholding it is right (see destructive), but the operator-visible
+	// consequence is a NetBox 400 on a name they can see is free — and the
+	// collision error alone names neither the withheld replacement nor the
+	// partial read behind it. Reported here as its own condition, so it is on
+	// the record whatever the apply below then does.
+	withheldNames := withheldReplacements(planned, actions)
+	if len(withheldNames) > 0 {
+		slog.Warn("netbox mirror: WITHHOLDING the replacement of the superseded NetBox "+
+			"object(s) holding these names, because this pass could not prove its own view of "+
+			"the cluster is whole. Every create or rename onto one of them will be refused by "+
+			"NetBox until the replacement can be proven — the mirror stalls for those VMs "+
+			"rather than removing an object on partial evidence. It clears itself once the "+
+			"local database has replicated the missing rows; a condition that persists past a "+
+			"few sweeps is an object to remove in NetBox by hand",
+			"names", withheldNames, "cause", partialRead,
+			"desired_vms", len(desired), "netbox_vms", len(actual.VMs))
 	}
 
 	if err := r.applyPhases(ctx, actions, indexDesired(desired, fp), fp); err != nil {
-		return false, err
+		return false, withheldReplacementCause(err, withheldNames, partialRead)
 	}
 	return converged, nil
+}
+
+// withheldReplacements is the desired names whose vm/replace a withholding gate
+// dropped from this pass, sorted.
+//
+// Diffed from the two action lists rather than counted inside the gates: both
+// gates drop a replace through the same `destructive` filter, and asking the
+// lists what actually went is one answer instead of two places to keep in step.
+func withheldReplacements(planned, kept []Action) []string {
+	if len(planned) == len(kept) {
+		return nil
+	}
+	survived := make(map[string]bool, len(kept))
+	for _, a := range kept {
+		if a.Op == opReplace {
+			survived[a.Key] = true
+		}
+	}
+	var out []string
+	for _, a := range planned {
+		if a.Op == opReplace && !survived[a.Key] {
+			out = append(out, a.FreesName)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// withheldReplacementCause annotates a NetBox name collision with the reason the
+// replacement that would have cleared it was withheld.
+//
+// An operator reading the raw failure sees `HTTP 400: a virtual machine with
+// this name already exists in this cluster` for a name that is, as far as
+// litevirt is concerned, free — and nothing connecting it to the partial read
+// that is the actual cause. The stall is deliberate and stays; what it needed
+// was to say why.
+//
+// Only a NAME refusal is annotated. Wrapping every failure of a pass that
+// happened to withhold a replacement would attach the explanation to unrelated
+// errors, which is how an accurate message becomes a misleading one. The log
+// line in sweep carries the condition unconditionally, so nothing is lost if
+// NetBox ever words this differently.
+func withheldReplacementCause(err error, names []string, why string) error {
+	if len(names) == 0 || !nameAlreadyTaken(err) {
+		return err
+	}
+	return fmt.Errorf("%w — this sweep withheld the replacement of the superseded object(s) "+
+		"holding %v, because %s. The name cannot be freed until that removal can be proven "+
+		"from the local database, so this VM stays unmirrored rather than having an object "+
+		"removed on evidence the pass has already admitted is partial",
+		err, names, why)
+}
+
+// nameAlreadyTaken reports whether a NetBox refusal is the one-VM-name-per-
+// cluster rule.
+//
+// A 400 (NetBox ANSWERED, and said no) whose body names the `name` field. Not
+// matched on the sentence, which is a NetBox release's wording, and not on the
+// status alone, which every other validation refusal shares.
+func nameAlreadyTaken(err error) bool {
+	var ae *netbox.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.Status == 400 && strings.Contains(ae.Body, `"name"`)
 }
 
 // deleteBlocker reports WHY this sweep may not delete, or "" when its evidence

@@ -85,15 +85,27 @@ type Action struct {
 // on the 400 before ever reaching it. Three consecutive passes fail identically:
 // a permanent stall on an ordinary operation.
 //
+// A CREATE IS NOT THE ONLY WAY TO NEED A NAME, which is the half this originally
+// missed. NetBox's rule constrains the NAME, so a PATCH that moves an existing
+// object onto a taken name gets the same 400. Rename a VM to something else,
+// delete it, and rename a second VM into the name it vacated — all within one
+// sweep interval, which is minutes by default — and the survivor needs an
+// UPDATE. Applying the proof only ahead of creates left that case stalling
+// exactly as before, so it is applied ahead of a name-changing update too, from
+// the same function under the same proof (freeReusedName).
+//
 // WHY NOT SIMPLY RUN DELETES FIRST. That ordering is load-bearing — a VM delete
 // cascades its interfaces, and an address must be released before anything
 // claims it — and reordering it wholesale would undo reasons earlier rounds
 // established. This moves exactly ONE removal, of ONE object, proven to be a
-// superseded incarnation of the exact name a create needs.
+// superseded incarnation of the exact name the upsert needs — and, with it, the
+// interfaces NetBox cascades away under that object, which the same removal now
+// owns rather than leaving to a separate action in a later phase.
 //
-// THE PROOF, and every clause is load-bearing (see supersededIncarnation, which
-// makes it, and Reconciler.replaceSuperseded, which makes it again from the
-// applier's own index before it touches anything):
+// THE PROOF, and every clause is load-bearing — the same one whether a create or
+// a rename is what needs the name (see supersededIncarnation, which makes it,
+// and Reconciler.replaceSuperseded, which makes it again from the applier's own
+// index before it touches anything):
 //
 //   - the occupying object carries THIS cluster's identity fingerprint, and
 //   - the UUID in that identity is NOT in the desired set.
@@ -239,8 +251,8 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		desiredIDs[netbox.Identity(fingerprint, d.UUID, "")] = true
 	}
 	ownedByName := ownedVMsByName(actual)
-	// The identities a create is taking over from, so the delete half below does
-	// not ALSO emit a delete for them. One removal, one owner.
+	// The identities a create or a rename is taking over from, so the delete
+	// half below does not ALSO emit a delete for them. One removal, one owner.
 	replaced := map[string]bool{}
 
 	for _, d := range desired {
@@ -266,20 +278,35 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		}
 
 		a, ok := actual.VMs[vmID]
-		if !ok {
+		switch {
+		case !ok:
 			// A SUPERSEDED INCARNATION of this name, if there is one: ours, and
 			// with a UUID this cluster no longer has. Emitted BEFORE the create
 			// in the list and, more importantly, in an earlier PHASE — see
 			// opReplace for why this one removal moves and no other does.
-			if occ, proven := supersededIncarnation(d.Name, ownedByName, desiredIDs, fingerprint); proven {
-				out = append(out, Action{
-					Kind: "vm", Op: opReplace, Key: occ.Identity,
-					NetBoxID: occ.ID, FreesName: d.Name,
-				})
-				replaced[occ.Identity] = true
-			}
+			out = freeReusedName(out, replaced, d.Name, ownedByName, desiredIDs, fingerprint)
 			out = append(out, Action{Kind: "vm", Op: "create", Key: vmID})
-		} else if vmDiffers(d, a) {
+		case vmDiffers(d, a):
+			// A NAME-CHANGING UPDATE NEEDS THE SAME NAME FREED, and needs it in
+			// the same earlier phase.
+			//
+			// NetBox's one-VM-name-per-cluster rule is a constraint on the NAME,
+			// not on the operation, so a PATCH that moves an object onto a taken
+			// name is the identical 400 a create gets — and the object holding
+			// it is in this sweep's delete set, which runs four phases later.
+			// The shape is ordinary: rename a VM to something else, delete it,
+			// and rename a second VM into the name it vacated, all inside one
+			// sweep interval. The survivor then needs an UPDATE, not a create,
+			// and without this the pass fails on that 400 every time — a
+			// permanent stall, exactly the one the create half already fixed.
+			//
+			// Gated on the name actually changing. An update that only moves a
+			// CPU count or a host link cannot collide with anything, so paying
+			// for the proof there would be a removal considered over an
+			// operation that could never need one.
+			if d.Name != a.Name {
+				out = freeReusedName(out, replaced, d.Name, ownedByName, desiredIDs, fingerprint)
+			}
 			out = append(out, Action{Kind: "vm", Op: "update", Key: vmID, NetBoxID: a.ID})
 		}
 
@@ -370,16 +397,78 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 		}
 		out = append(out, Action{Kind: "vm", Op: "delete", Key: id, NetBoxID: actual.VMs[id].ID})
 	}
+	// The NetBox objects a vm/replace is removing. Their interfaces go with them,
+	// so the replace owns those removals too — see the loop below.
+	replacedObjects := make(map[int]bool, len(replaced))
+	for id := range replaced {
+		replacedObjects[actual.VMs[id].ID] = true
+	}
 	for _, id := range sortedIdentities(actual.NICs) {
 		if seenNIC[id] || !ownedBy(id, fingerprint) {
 			continue
 		}
 		n := actual.NICs[id]
+		if replacedObjects[n.VMID] {
+			// A vm/replace ALREADY REMOVES THIS, by cascade. DeleteVM takes
+			// every vminterface under it, and the replace runs in the FIRST
+			// phase — so by the time nic-delete phase came round this action's
+			// target would be gone and it would be asking NetBox to delete an
+			// object twice.
+			//
+			// The inversion is what makes this different from an ordinary VM
+			// delete, where the child delete IS wanted: there the parent goes
+			// LAST, and detaching children before it is the documented ordering.
+			// A replace puts the parent first, so the ordinary ordering does not
+			// apply and the cascade is the removal.
+			//
+			// It is not merely redundant, which is the reason it has to be
+			// skipped rather than tolerated. A nic delete carries its OWN,
+			// weaker evidence question — the local database's record for
+			// (owning VM name, MAC), where the name comes from the NetBox object
+			// — and a replaced object is exactly the case where that name can be
+			// stale: rename-then-delete leaves NetBox holding the pre-rename
+			// name while the local tombstone carries the post-rename one, so the
+			// evidence lookup misses and the removal is withheld. A withheld
+			// delete escalates to withholding every destructive action in the
+			// pass, the proven vm/replace included — which puts the mirror back
+			// in the permanent collision stall the replace exists to end, over
+			// an object the cascade was going to remove anyway.
+			continue
+		}
 		out = append(out, Action{
 			Kind: "nic", Op: "delete", Key: id,
 			NetBoxID: n.ID, ParentNetBoxID: n.VMID,
 		})
 	}
+	return out
+}
+
+// freeReusedName appends the one removal that frees `name` for the VM about to
+// take it, when — and only when — the occupant is provably a superseded
+// incarnation of this cluster's own.
+//
+// ONE SPELLING FOR BOTH CALLERS, which is the point of it being a function. The
+// create half and the name-changing-update half need the identical removal under
+// the identical proof, and two copies of it is how one of them would come to
+// accept an occupant the other refuses. It records `replaced` for the same
+// reason the create half always has: one object, one removal, one owner — the
+// delete half below skips whatever is in there, so an object cannot be taken
+// away by two actions in two phases with two gates deciding independently
+// whether to withhold them.
+//
+// The proof itself is supersededIncarnation's and is not restated here.
+func freeReusedName(out []Action, replaced map[string]bool, name string,
+	ownedByName map[string][]netbox.VirtualMachine, desiredIDs map[string]bool,
+	fingerprint string) []Action {
+	occ, proven := supersededIncarnation(name, ownedByName, desiredIDs, fingerprint)
+	if !proven {
+		return out
+	}
+	out = append(out, Action{
+		Kind: "vm", Op: opReplace, Key: occ.Identity,
+		NetBoxID: occ.ID, FreesName: name,
+	})
+	replaced[occ.Identity] = true
 	return out
 }
 
@@ -521,11 +610,12 @@ func nicDiffers(d DesiredNIC, a netbox.VMInterface) bool {
 // does not order EXECUTION. Only a phase boundary does.
 //
 // Within a phase, actions are independent and may run in parallel.
-// THE FIRST PHASE IS THE ONLY REMOVAL AHEAD OF A CREATE, and it is there because
-// a create cannot use a name another object still holds. It admits exactly one
-// action shape — vm/replace, whose target is proven twice over to be a superseded
-// incarnation of this cluster's own — and every other delete stays in the last
-// two phases where the cascade and the address-release ordering need it.
+// THE FIRST PHASE IS THE ONLY REMOVAL AHEAD OF THE UPSERTS, and it is there
+// because neither a create nor a rename can use a name another object still
+// holds. It admits exactly one action shape — vm/replace, whose target is proven
+// twice over to be a superseded incarnation of this cluster's own — and every
+// other delete stays in the last two phases where the cascade and the
+// address-release ordering need it.
 const (
 	PhaseVMSupersede = 0 // free a reused name from its superseded incarnation
 	PhaseVMUpsert    = 1 // parents first

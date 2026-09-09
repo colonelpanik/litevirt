@@ -126,6 +126,83 @@ func TestSameNameRecreationConvergesRatherThanStallingTheMirror(t *testing.T) {
 	}
 }
 
+// TestRenameIntoAFreedNameConvergesRatherThanStallingTheMirror is the same
+// permanent stall reached by an UPDATE instead of a create.
+//
+// NetBox's one-VM-name-per-cluster rule constrains the NAME, so a PATCH that
+// moves an object onto a taken name gets the identical 400. The sequence is
+// ordinary and needs no operator error: rename a VM away, delete it, and rename
+// a second VM into the name it vacated — all inside one sweep interval, which is
+// fifteen minutes by default. Because NetBox never saw the first rename, its
+// object still holds the original name; the survivor needs an UPDATE onto it;
+// and the removal that would clear it is four phases later, so the pass aborts
+// on the 400 first. Three passes are driven here for the same reason the create
+// scenario drives three: the failure is permanent, not transient.
+//
+// TWO things have to hold for this to converge, and both are properties of the
+// diff rather than of the applier:
+//
+//   - the occupant proof runs ahead of a NAME-CHANGING UPDATE, not only ahead of
+//     a create; and
+//   - the vm/replace OWNS the interfaces its cascade removes. Without that, the
+//     superseded object's interface produces a nic/delete whose evidence is
+//     keyed on the owning VM's NetBox NAME — stale here, because the rename was
+//     never mirrored — so it is withheld, and a withheld delete escalates to
+//     withholding every destructive action in the pass, the proven replace
+//     included.
+func TestRenameIntoAFreedNameConvergesRatherThanStallingTheMirror(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustCreateVM(t, n, "vm-2", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	if nb.VMCount("vm-1") != 1 || nb.VMCount("vm-2") != 1 {
+		t.Fatalf("precondition: both VMs must be mirrored, got %d/%d",
+			nb.VMCount("vm-1"), nb.VMCount("vm-2"))
+	}
+	survivor := vmIdentityOf(t, nb, "vm-2")
+
+	// No mirror pass anywhere in here, which is the whole window.
+	mustRenameVM(t, n, "vm-1", "vm-retired")
+	mustDeleteVM(t, n, "vm-retired")
+	mustRenameVM(t, n, "vm-2", "vm-1")
+
+	for i := 0; i < 3; i++ {
+		if err := n.SyncNetBoxMirror(); err != nil {
+			t.Fatalf("mirror pass %d cannot free the name the rename needs: %v", i, err)
+		}
+	}
+
+	// CONVERGED: one object under the reused name, it is the SURVIVOR, and the
+	// name it came from is gone.
+	if got := nb.VMCount("vm-1"); got != 1 {
+		t.Fatalf("virtual_machine objects named vm-1 = %d, want exactly 1", got)
+	}
+	if got := nb.VMCount("vm-2"); got != 0 {
+		t.Fatalf("%d object(s) still hold the name the survivor was renamed away from", got)
+	}
+	if got := vmIdentityOf(t, nb, "vm-1"); got != survivor {
+		t.Fatalf("the object named vm-1 carries %s, want the survivor's own identity %s — the "+
+			"name was freed for the wrong object", got, survivor)
+	}
+	if got := nb.InterfaceCount(); got != 1 {
+		t.Fatalf("interface objects = %d, want 1 — the superseded VM's interface goes with it "+
+			"and the survivor keeps its own", got)
+	}
+}
+
+// vmIdentityOf is the identity NetBox holds on the object with this name, and a
+// fatal if the name is not held exactly once.
+func vmIdentityOf(t *testing.T, nb *NetBoxFake, name string) string {
+	t.Helper()
+	id := nb.VMIdentityByName(name)
+	if id == "" {
+		t.Fatalf("no single NetBox object holds the name %s (count %d)", name, nb.VMCount(name))
+	}
+	return id
+}
+
 func TestRenameDoesNotForkAnInterface(t *testing.T) {
 	nb, c := boundMirrorCluster(t, 1)
 	n := c.Nodes[0]

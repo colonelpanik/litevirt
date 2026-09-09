@@ -217,3 +217,53 @@ func TestFleetAPartiallyHydratedBindIsSuspendedUnderTheSelfLiftingReason(t *test
 			b.SuspendReason)
 	}
 }
+
+// TestFleetAMirrorOnAShortInventoryCannotCorroborateIt is the same short view on
+// the third path that acts on it: the inventory mirror's removal-evidence
+// policy.
+//
+// One removal record — the mirror's own `netbox_objects` mapping row — identifies
+// the incarnation an object was created for and says NOTHING about whether that
+// incarnation stopped existing. It is also the only record left after a VM is
+// deleted and recreated under the same name, because the re-create drops the old
+// incarnation's tombstone. So the mirror concludes an absence from it only once
+// the read that absence is measured against is corroborated as the cluster's —
+// the same digest agreement the bind above requires, asked by the same function.
+//
+// THIS NEEDS TWO REAL DATABASES. The policy's unit scenarios inject the
+// corroboration's answer, which is right for testing the policy and says nothing
+// about what the production function answers when a peer genuinely holds VM rows
+// this node has not received. That is what this asserts, over the real fan-out.
+//
+// THE CONTROL RUNS FIRST, on the very same two nodes: with both inventories
+// agreeing the corroboration passes, so the refusal afterwards is produced by
+// the divergence and not by a fan-out this fixture cannot complete.
+func TestFleetAMirrorOnAShortInventoryCannotCorroborateIt(t *testing.T) {
+	_, c, holder, short := unhydratedCluster(t)
+	ctx := context.Background()
+
+	if ok, why := short.Server.CorroborateMirrorInventoryOnce(ctx); !ok {
+		t.Fatalf("with nothing diverging, the corroboration must pass — otherwise the "+
+			"assertion below is satisfied by a fan-out that never completes in this "+
+			"fixture: %s", why)
+	}
+
+	// A guest only the holder knows about. The short node's `vms` table is now
+	// missing a row a peer holds, which is exactly the state that makes "this
+	// incarnation is nowhere" unprovable from a local read.
+	mustCreateUnboundNetwork(t, c, holder, adoptNetName, adoptSubnet)
+	mustCreateVMHoldingIP(t, c, holder, "incumbent", adoptNetName, adoptFirstIP)
+
+	ok, why := short.Server.CorroborateMirrorInventoryOnce(ctx)
+	if ok {
+		t.Fatal("a node whose inventory is short of a peer's VM rows corroborated its read " +
+			"as the cluster's; a mapping-row-only removal would then be taken as a proven " +
+			"absence for an incarnation that may be running on that peer")
+	}
+	// The reason has to name the host and the table, because a withheld removal
+	// whose log line says only "not corroborated" is one an operator cannot act
+	// on.
+	if !strings.Contains(why, holder.Name) {
+		t.Fatalf("the reason must name the host that disagrees, got: %q", why)
+	}
+}

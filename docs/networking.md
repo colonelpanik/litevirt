@@ -795,15 +795,36 @@ is not a proof — it is the same 15 minutes whether the database has hydrated o
 not, and a node still replicating when the tick arrives gets no second grace
 period. So each removal is asked for its own proof:
 
-- a **delete** needs a local row for the VM or NIC it retires — live or
-  tombstoned. litevirt soft-deletes, so a destroyed workload leaves one; a row
-  that has not replicated leaves nothing.
+- a **VM delete** needs a record of the **incarnation** NetBox holds — the uuid
+  inside the object's identity, never the name it sits under — and that record
+  has to support the conclusion, not merely name the machine. A **tombstone** for
+  that uuid does: litevirt soft-deletes, so a destroyed incarnation leaves one,
+  and no cluster runs a VM whose row it has tombstoned. A **live** row for it
+  says the opposite — the incarnation exists, so nothing removes its object — with
+  one exception, a VM converted to a **template**: the mirror deliberately does
+  not represent one, and that is readable off the row. The mirror's **own record
+  of having created the object** is the case that needs more, and it is the
+  ordinary one after a VM is deleted and recreated under the same name, because
+  the re-create drops the old incarnation's tombstone: it identifies the
+  incarnation without saying anything about whether it stopped existing, so it
+  authorizes a removal only once this node's inventory read is **corroborated as
+  the cluster's** — the same digest agreement across the same closed participant
+  set that a prefix binding requires before it hands out an address. With none of
+  those, the removal is withheld.
+- an **interface delete** needs a local row for the (VM, MAC) it retires — live
+  or tombstoned, in either NIC table.
 - a **clear** needs a local lease row naming that NetBox address — again live or
   tombstoned. A release keeps the address id on the row it tombstones, so a
   genuinely stale assignment is always provable. This matters because
   anti-entropy repairs *per table*: with VM and interface rows repaired but
   leases not yet, every NIC resolves to "holds no address", which would otherwise
   route every litevirt-owned address in the cluster into the clear branch.
+
+The VM rule is **one rule for both removals** — the ordinary delete and the
+replacement that frees a reused name (below) — because they differ in when they
+run, never in what would justify removing an object. Each of them once had a
+premise of its own, and each of those premises was answered by the name rather
+than by the incarnation.
 
 A pass that withheld a delete withholds its clears too — having proven its
 inventory read partial, it does not then act destructively on it. A withheld
@@ -836,6 +857,20 @@ copied by hand, a whole-cluster database rebuild that kept the same identity
 fingerprint, a rename that happened while the mirror was down. Every sweep
 withholds that one removal, forever: the staleness gauge never advances and the
 error counter increments every sweep interval.
+
+Two more shapes are permanent for a different reason — the record exists and
+does not support the conclusion:
+
+- an object whose incarnation the cluster holds a **live** row for that is not a
+  template. The mirror's inventory read says the VM is not there and its record
+  read says it is, which is a contradiction rather than a removal, so it acts on
+  neither half.
+- an object whose only record is the mirror's own, on a cluster with a
+  **permanently lost host**. The corroboration that would turn that record into
+  an absence needs a digest from every participant, and a destroyed machine never
+  produces one.
+
+Both take the same repair as the rest of this section.
 
 That is the intended direction — the mirror will not remove what it cannot prove
 — but the alarm does not stop on its own, and there is no force, prune or
@@ -917,12 +952,23 @@ one VM. That is deliberate: a stalled mirror is fixed by the next healthy sweep,
 an object removed on partial evidence is not.
 
 The evidence the gate asks for names the **incarnation being replaced**, not the
-name it occupies: either a `vms` row of any kind — tombstone included — carrying
-that uuid, or the mirror's own record of having created that exact object. A name
-cannot answer the question, because the name a replacement frees is always a name
-some local row holds: the VM taking it. So a node that has never held the
-occupant's incarnation withholds the replacement, whatever else is sitting under
-that name.
+name it occupies, and it is the same rule an ordinary delete obeys — see the
+removal proofs above. A name cannot answer the question, because the name a
+replacement frees is always a name some local row holds: the VM taking it. So a
+node that has never held the occupant's incarnation withholds the replacement,
+whatever else is sitting under that name.
+
+The **same-name re-create is the case that needs the corroboration**, and it is
+the commonest reason a replacement is withheld on a healthy cluster. Recreating a
+VM under a name that was used before drops the previous incarnation's tombstone,
+so the only record left of it is the mirror's own — which identifies it and does
+not say it is gone. The mirror therefore asks the cluster whether this node's
+inventory read is the whole of it before concluding the old incarnation exists
+nowhere. While rows are in flight the digests disagree, so the replacement waits
+and the create or rename collides for another sweep; it converges once
+replication settles. A **permanently lost host** can never produce a digest, so
+that agreement never comes — the same limitation a binding has, with the same
+repair: remove the object in NetBox by hand.
 
 What you see is a failed sweep whose error is a NetBox refusal for a name
 litevirt can see is free:
@@ -1278,6 +1324,12 @@ A permanently lost host cannot answer, so:
   its inventory against every participant, and the lost host can never produce
   its digest, so the binding is created suspended and stays suspended. Allocation
   on that network refuses while it does.
+* **one class of inventory-mirror removal keeps withholding.** The mirror asks
+  the same corroboration before concluding that an incarnation whose only local
+  record is its own mapping row exists nowhere — the delete-and-recreate-under-
+  the-same-name case. Every other removal it makes is proven from a local row and
+  is unaffected. See [When a withheld removal does not clear
+  itself](#when-a-withheld-removal-does-not-clear-itself) for the repair.
 
 **There is currently no operator remedy, and that is deliberate rather than an
 oversight.** In particular:

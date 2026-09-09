@@ -232,10 +232,14 @@ func TestSweepWithholdsTheNameReplacementOnAPartialRead(t *testing.T) {
 // The same-name re-create is the case that costs the superseded incarnation its
 // `vms` tombstone — InsertVMWithHardware purges it to free the name for the new
 // row — so the incarnation record this pass proves the replacement from is the
-// mirror's own mapping row, seeded here because a caught-up node holds it.
+// mirror's own mapping row, seeded here because a caught-up node holds it, plus
+// the corroboration that makes the uuid's absence from this read a fact about
+// the cluster rather than about one node's replication progress. A caught-up
+// node has both; see vmRemovalProven for why the row alone is not enough.
 func TestSweepReplacesTheSupersededNameHolderOnWholeEvidence(t *testing.T) {
 	nb, r, fingerprint := guardReconciler(t)
 	ctx := context.Background()
+	withCorroboratedInventory(r)
 	seedMirroredObjectRef(t, r, netbox.Identity(fingerprint, "uuid-1", ""), 11)
 	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-new","cpu":2,"memory_mib":1024}`, macGuard)
 

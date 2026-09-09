@@ -429,6 +429,12 @@ func TestAProvenReplacementIsNotReportedAsWithheld(t *testing.T) {
 	// under the same name purges the `vms` tombstone that would otherwise carry
 	// uuid-2. It is the record the incarnation premise is left with, and a
 	// caught-up node has it. See seedMirroredObjectRef.
+	//
+	// So is the CORROBORATION, and for the same reason: a mapping row identifies
+	// an incarnation without saying it stopped existing, and what makes its
+	// absence from this read a fact about the cluster is the cluster confirming
+	// the read. A caught-up node's fan-out agrees. See vmRemovalProven.
+	withCorroboratedInventory(r)
 	seedMirroredObjectRef(t, r, netbox.Identity(fp, "uuid-2", ""), 12)
 	seedHydratedVM(t, r, "vm-1", "uuid-1", macH1)
 	seedHydratedVM(t, r, "vm-2", "uuid-2", macH2)

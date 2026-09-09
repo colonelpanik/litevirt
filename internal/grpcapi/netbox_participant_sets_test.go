@@ -326,6 +326,73 @@ func TestTheDigestPathCannotBePointedAtTheRuntimeProofSet(t *testing.T) {
 	}
 }
 
+// TestTheMirrorsRemovalProofIsTheBindsInventoryProof is the same discipline
+// applied to the SECOND consumer of the inventory corroboration.
+//
+// The inventory mirror will not conclude that an incarnation stopped existing
+// from its own mapping row — which identifies an incarnation and says nothing
+// about whether it is gone — until the read that absence is measured against is
+// corroborated as the cluster's. That is the property the bind already refuses
+// to hand out addresses without, reached from the other side: a bind that
+// adopted nothing because it could not see a holder, and a mirror that deleted a
+// holder's inventory object because it could not see the holder, are one
+// condition.
+//
+// So it must be ONE mechanism. Two notions of a whole read is how the sweeper's
+// proof and the bind's came to differ over a witness, three rounds running, and
+// a mirror comparing digests its own way would be the fourth. This pins the
+// mirror's corroboration to the bind's proof, to the bind's table set, and away
+// from the runtime-proof set that excuses a witness — whose rows are exactly the
+// ones a short local inventory is missing.
+func TestTheMirrorsRemovalProofIsTheBindsInventoryProof(t *testing.T) {
+	fset := token.NewFileSet()
+	adopt := parseFuncs(t, fset, adoptSourceFile)
+
+	fn, ok := adopt["corroborateMirrorInventory"]
+	if !ok {
+		t.Fatalf("corroborateMirrorInventory is gone from %s: the mirror's removal-evidence "+
+			"policy has one record it cannot conclude an absence from without the cluster, "+
+			"and this is where it asks", adoptSourceFile)
+	}
+	called := functionsCalled(fn)
+	for _, must := range []string{
+		"localTableDigests", "proveNoPeerHoldsInventoryRowsWeLack", "adoptionInventoryTables",
+	} {
+		if !slices.Contains(called, must) {
+			t.Fatalf("corroborateMirrorInventory no longer calls %s: it must ask the BIND's "+
+				"proof, over the bind's table set, rather than deciding for itself what a "+
+				"whole inventory read is", must)
+		}
+	}
+	for _, bad := range []string{
+		// A comparison of its own, which is the shape a second mechanism takes.
+		"TableDigestsAgree", "gatherTableDigests",
+		// …and the wrong participant set, which is the mistake that has already
+		// been made three times.
+		"closedRuntimeProofSet", "runtimeProofParticipants", "closedInventoryCorroborationPeers",
+	} {
+		if slices.Contains(called, bad) {
+			t.Fatalf("corroborateMirrorInventory calls %s: it must reach the peers and the "+
+				"comparison only through proveNoPeerHoldsInventoryRowsWeLack, so the mirror "+
+				"and the bind cannot come to disagree about what a whole read is", bad)
+		}
+	}
+
+	// …and the mirror is actually wired to it. Without this the function could
+	// be correct and unreached, which is a mirror deleting objects on
+	// identification alone — the finding, reintroduced by omission.
+	build, ok := parseFuncs(t, fset, "netbox_mirror.go")["netboxMirror"]
+	if !ok {
+		t.Fatal("netboxMirror is gone: it is the only place the mirror's options are built")
+	}
+	if !slices.Contains(selectorsRead(build), "corroborateMirrorInventory") {
+		t.Fatal("netboxMirror no longer threads corroborateMirrorInventory into the " +
+			"reconciler. netboxsync treats an unwired corroboration as 'not corroborated', " +
+			"so this does not fail open — it withholds every removal whose only record is a " +
+			"mapping row, permanently, which is a mirror that never converges")
+	}
+}
+
 // parseFuncs parses one file in this package and indexes its function
 // declarations by name.
 func parseFuncs(t *testing.T, fset *token.FileSet, path string) map[string]*ast.FuncDecl {

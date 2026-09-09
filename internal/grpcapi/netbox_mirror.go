@@ -42,10 +42,27 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// A closure, so both latches AND the cluster-name pin are re-read on
 		// EVERY pass. See netboxMirrorPassAuthorized.
 		Latched: s.netboxMirrorPassAuthorized,
+		// The cluster half of the mirror's removal-evidence policy. The mirror
+		// cannot own it: the answer is a fan-out over the closed participant
+		// universe, which lives here beside the prefix bind that already
+		// requires the identical property. See corroborateMirrorInventory.
+		InventoryCorroborated: s.corroborateMirrorInventory,
 		// The intra-node half of the exclusion the leader lease only covers
 		// across nodes. See netboxExclusivePass.
 		Exclusive: s.netboxExclusivePass,
 	})
+}
+
+// CorroborateMirrorInventoryOnce answers the mirror's inventory corroboration
+// once, and reports the reason a negative answer is negative.
+//
+// It exists so a scenario can assert what the PRODUCTION function answers on a
+// cluster whose nodes hold genuinely divergent databases — which is the state
+// the whole policy turns on, and the one thing a single-package test cannot
+// build: it needs two real daemons, two real local databases and the real peer
+// fan-out. The mirror's own passes call the wired closure, not this.
+func (s *Server) CorroborateMirrorInventoryOnce(ctx context.Context) (bool, string) {
+	return s.corroborateMirrorInventory(ctx)
 }
 
 // effectiveNetBoxSweepInterval is the cadence a mirror built with this argument

@@ -297,3 +297,145 @@ func TestKnowsAddressNeedsALeaseRecord(t *testing.T) {
 			"can never be evidence")
 	}
 }
+
+// ── the VM half: WHICH record, not whether there is one ─────────────────────
+
+// TestVMRemovalTellsTheFourRecordsApart is the classification the mirror's
+// removal policy rests on, and every state here decides a different answer.
+//
+// The predicate this replaced returned one boolean for all of them, which is
+// what let a MAPPING row — "this node's mirror created that object" — stand in
+// for "that incarnation stopped existing". Keeping the records apart is the
+// whole mechanism: the policy lives in netboxsync, and it can only be right if
+// what it is given distinguishes a tombstone from a live row from a mapping row.
+func TestVMRemovalTellsTheFourRecordsApart(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	// A live workload, a template, and a destroyed incarnation — three VMs so
+	// no single-row fixture can conflate two of the states.
+	for _, vm := range []struct{ name, uuid string }{
+		{"vm-live", "uuid-live"},
+		{"vm-template", "uuid-template"},
+		{"vm-gone", "uuid-gone"},
+	} {
+		if err := InsertVM(ctx, c, VMRecord{
+			Name: vm.name, HostName: "host-a", State: "running",
+			Spec: `{"uuid":"` + vm.uuid + `"}`,
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM(%s): %v", vm.name, err)
+		}
+	}
+	if err := SetVMTemplate(ctx, c, "vm-template", true); err != nil {
+		t.Fatalf("SetVMTemplate: %v", err)
+	}
+	if err := DeleteVM(ctx, c, "vm-gone"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	// The mirror's own mapping row for an incarnation NO `vms` row mentions:
+	// what a node holds when `netbox_objects` has replicated and `vms` has not,
+	// and what survives the same-name re-create purge.
+	if err := PutObjectRef(ctx, c, ObjectRef{
+		LitevirtKind: mirrorRefKindVM, LitevirtKey: "lv:fp:uuid-mirrored:",
+		NetBoxKind: "virtual_machine", NetBoxID: 12,
+	}); err != nil {
+		t.Fatalf("PutObjectRef: %v", err)
+	}
+
+	known, err := ReadMirrorEvidence(ctx, c)
+	if err != nil {
+		t.Fatalf("ReadMirrorEvidence: %v", err)
+	}
+
+	for _, tc := range []struct {
+		what     string
+		identity string
+		uuid     string
+		want     VMRemovalRecord
+		why      string
+	}{
+		{"a live workload's own incarnation", "lv:fp:uuid-live:", "uuid-live",
+			VMRemovalLive,
+			"a live row says the incarnation EXISTS, which is the one answer that must " +
+				"never authorize removing its object"},
+		{"an incarnation this cluster turned into a template", "lv:fp:uuid-template:",
+			"uuid-template", VMRemovalLiveTemplate,
+			"a template's row is live and the mirror does not represent it, so its object " +
+				"is one to retire — reported apart from a plain live row so a FUTURE reason " +
+				"for leaving the desired set cannot inherit this permission"},
+		{"a destroyed incarnation", "lv:fp:uuid-gone:", "uuid-gone", VMRemovalRetired,
+			"litevirt soft-deletes, so the tombstone is what a destroyed incarnation leaves " +
+				"and it justifies absence on its own"},
+		{"an incarnation only the mapping row names", "lv:fp:uuid-mirrored:", "uuid-mirrored",
+			VMRemovalMirroredOnly,
+			"the mapping row identifies the incarnation and says NOTHING about whether it " +
+				"stopped existing; it must be distinguishable so the caller can require " +
+				"corroboration before concluding an absence from it"},
+		{"an incarnation this node has never held", "lv:fp:uuid-unknown:", "uuid-unknown",
+			VMRemovalNoRecord,
+			"an unhydrated node holds no record, and that has always withheld"},
+		{"an empty identity", "", "uuid-live", VMRemovalNoRecord,
+			"an empty identity is never evidence"},
+		{"an empty uuid", "lv:fp::", "", VMRemovalNoRecord,
+			"an empty uuid is never evidence"},
+	} {
+		if got := known.VMRemoval(tc.identity, tc.uuid); got != tc.want {
+			t.Errorf("VMRemoval for %s = %d, want %d: %s", tc.what, got, tc.want, tc.why)
+		}
+	}
+}
+
+// TestALiveRowOutranksATombstoneCarryingTheSameUUID pins the precedence, which
+// only shows up when one uuid is on two rows — a spec copied onto a second name.
+//
+// The permissive branch must need EVERY live row to agree; "one of them is still
+// live" is the answer that withholds.
+func TestALiveRowOutranksATombstoneCarryingTheSameUUID(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	for _, name := range []string{"vm-a", "vm-b"} {
+		if err := InsertVM(ctx, c, VMRecord{
+			Name: name, HostName: "host-a", State: "running",
+			Spec: `{"uuid":"uuid-shared"}`,
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM(%s): %v", name, err)
+		}
+	}
+	// One destroyed, one still running, both carrying the same uuid.
+	if err := DeleteVM(ctx, c, "vm-a"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+
+	known, err := ReadMirrorEvidence(ctx, c)
+	if err != nil {
+		t.Fatalf("ReadMirrorEvidence: %v", err)
+	}
+	if got := known.VMRemoval("lv:fp:uuid-shared:", "uuid-shared"); got != VMRemovalLive {
+		t.Fatalf("VMRemoval = %d, want VMRemovalLive (%d): a tombstone beside a LIVE row "+
+			"carrying the same uuid must not read as an absence", got, VMRemovalLive)
+	}
+
+	// …and the same precedence for the template flag: a live non-template row
+	// beside a live template one is a workload, not a template.
+	if err := SetVMTemplate(ctx, c, "vm-a", true); err != nil {
+		t.Fatalf("SetVMTemplate: %v", err)
+	}
+	if err := InsertVM(ctx, c, VMRecord{
+		Name: "vm-a", HostName: "host-a", State: "running",
+		Spec: `{"uuid":"uuid-shared"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM(revive): %v", err)
+	}
+	if err := SetVMTemplate(ctx, c, "vm-a", true); err != nil {
+		t.Fatalf("SetVMTemplate(revive): %v", err)
+	}
+	known, err = ReadMirrorEvidence(ctx, c)
+	if err != nil {
+		t.Fatalf("ReadMirrorEvidence: %v", err)
+	}
+	if got := known.VMRemoval("lv:fp:uuid-shared:", "uuid-shared"); got != VMRemovalLive {
+		t.Fatalf("VMRemoval = %d, want VMRemovalLive (%d): one live row is a template and "+
+			"the other is a running workload, so the uuid is a workload's", got, VMRemovalLive)
+	}
+}

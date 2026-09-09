@@ -27,6 +27,13 @@ import (
 // IS the evidence: a record of any kind means the cluster has told this node
 // about the object, and no record at all means it has not.
 //
+// A RECORD IS NOT AUTOMATICALLY A PERMISSION, which is the distinction the VM
+// half of this type gets wrong if it unions its records: knowing an incarnation
+// exists is a record too, and so is having MIRRORED one. So the VM question
+// reports WHICH record it holds (VMRemovalRecord) and leaves the policy to its
+// caller, while the NIC and address questions — where every record the local
+// database can hold really does say the thing is gone — stay predicates.
+//
 // The reads are per SWEEP, not per candidate: the mirror diffs the whole fleet
 // on a 15-minute cadence, and a query per candidate would turn one pass into
 // thousands of round trips against the same five tables.
@@ -35,104 +42,128 @@ import (
 // should be deleted; the diff decides that. This only says whether the local
 // database is in a position to have an opinion.
 type MirrorEvidence struct {
-	vmNames map[string]bool
 	nicKeys map[string]bool
 	addrIDs map[int]bool
 
-	// The two INCARNATION-level records, keyed on the uuid and on the identity
-	// that carries it rather than on any name. See KnowsIncarnation, which is
-	// their only reader and states why a name cannot answer its question.
-	vmUUIDs     map[string]bool
-	mirroredVMs map[string]bool
+	// The INCARNATION-level records, keyed on the uuid and on the identity that
+	// carries it rather than on any name. See VMRemoval, which is their only
+	// reader and states why a name cannot answer its question — and why the
+	// live and the tombstoned `vms` row are kept APART rather than unioned.
+	liveVMUUIDs map[string]bool
+	// liveWorkloadVMUUIDs is the subset of liveVMUUIDs whose live row is NOT a
+	// template. Held as the non-template set rather than as the template one so
+	// that a uuid carried by two live rows — one template, one not — reads as
+	// LIVE and withholds: the permissive branch must need every live row to
+	// agree, not just one.
+	liveWorkloadVMUUIDs map[string]bool
+	retiredVMUUIDs      map[string]bool
+	mirroredVMs         map[string]bool
 }
 
-// KnowsVM reports whether the local database holds a `vms` row of ANY kind for
-// this name.
+// VMRemovalRecord is what the local database holds about ONE INCARNATION, in
+// the four states that decide whether the mirror may remove that incarnation's
+// NetBox object.
 //
-// IT ANSWERS FOR AN ORDINARY DELETE AND FOR NOTHING ELSE. A name is a slot, not
-// an identity, so this cannot say which INCARNATION the cluster accounted for —
-// and there is one removal where that difference decides the answer. See
-// KnowsIncarnation, which the mirror's vm/replace asks instead, and which exists
-// because the beneficiary of a replace is itself a row under the very name this
-// would be asked about.
+// FOUR STATES AND NOT A BOOLEAN, because the question a removal has to answer is
+// not "can this node name the thing?" but "can this node conclude the mirror
+// must no longer represent it?" — and those two came apart here once already. A
+// predicate that unioned every record it held answered the first question and
+// was read as the second: it accepted a MAPPING row, which proves an incarnation
+// was MIRRORED and says nothing whatever about whether it stopped existing.
+// Identifying the victim precisely is not permission to delete it.
 //
-// Keyed on the NAME rather than the spec's incarnation uuid, and for an ordinary
-// delete that is the stronger choice. The create path drops a VM's tombstones
-// when a VM of the SAME NAME is created again (the `full-state-delete-ok`
-// statements in InsertVMWithHardware), so a uuid-keyed lookup over `vms` ALONE
-// would lose its evidence on every re-create and leave the old incarnation's
-// NetBox object un-reapable forever. The name survives that: a name the local
-// database holds a row for is a name the cluster has accounted for, whichever
-// incarnation currently owns it — and the old incarnation's object is genuinely
-// obsolete either way. (KnowsIncarnation needs the incarnation regardless, and
-// pairs the uuid with the mirror's own identity map, which that purge does not
-// touch — see there.)
-//
-// WHAT ACTUALLY TAKES A ROW AWAY FROM A NAME is three paths, not one — the
-// create-path cleanup above, DiscardReplicatedStateForReseed's outright
-// truncation of `vms`/`vm_interfaces`/`vm_nics`, and RenameVM, which UPDATEs
-// `vms.name` (`vm_name` in the child tables, where the rename MOVES the evidence
-// to the new name rather than removing it) and so leaves nothing at the old name.
-// See HasVMRecords for why each is safe. The common property, and the only one
-// this type relies on, is that absent evidence means the caller WITHHOLDS its
-// removal: a path that takes evidence away can cost a withheld delete, never an
-// unproven one.
-//
-// An empty name is never evidence.
-func (e MirrorEvidence) KnowsVM(name string) bool {
-	return name != "" && e.vmNames[name]
-}
+// So the records are reported APART and the caller applies the policy. See
+// MirrorEvidence.VMRemoval for what each state is derived from, and
+// netboxsync's vmRemovalProven for the one policy both removals apply to them.
+type VMRemovalRecord int
 
-// KnowsIncarnation reports whether the local database holds a record — live or
-// tombstoned — of the ONE INCARNATION this identity names.
+const (
+	// VMRemovalNoRecord: this node holds NOTHING about this incarnation — no
+	// `vms` row of any kind, no mapping row. The unhydrated case, and the one
+	// state that has always withheld.
+	VMRemovalNoRecord VMRemovalRecord = iota
+	// VMRemovalRetired: a TOMBSTONED `vms` row carrying this uuid. litevirt
+	// soft-deletes, so this is the record a destroyed incarnation leaves, and it
+	// is a justified conclusion of absence on its own.
+	VMRemovalRetired
+	// VMRemovalLive: a LIVE `vms` row carrying this uuid. The incarnation
+	// EXISTS. Nothing may remove its object.
+	VMRemovalLive
+	// VMRemovalLiveTemplate: a LIVE `vms` row carrying this uuid whose
+	// `is_template` is set. The incarnation exists and the mirror deliberately
+	// does not represent it — a template is a disk image, never a running
+	// machine, and desiredState skips it — so its object is one the mirror must
+	// no longer hold. The one state where a live row still authorizes a removal,
+	// and it is reported separately rather than folded into VMRemovalLive so
+	// that a live row some FUTURE reason drops from the desired set fails closed
+	// instead of inheriting this one's permission.
+	VMRemovalLiveTemplate
+	// VMRemovalMirroredOnly: no `vms` row of any kind, but the mirror's own
+	// `netbox_objects` mapping row for this exact identity. INCARNATION-SPECIFIC
+	// IDENTIFICATION AND NOTHING MORE — it proves this node's mirror created that
+	// object for that incarnation, not that the incarnation is gone. Replication
+	// is per TABLE, so this is exactly what a node holds for an incarnation whose
+	// `vms` row has not arrived and whose VM may be alive on a peer. It
+	// authorizes nothing by itself; the caller has to corroborate its inventory
+	// read against the cluster first.
+	VMRemovalMirroredOnly
+)
+
+// VMRemoval reports which record — if any — the local database holds about the
+// ONE INCARNATION this identity names.
 //
-// WHY A NAME CANNOT ANSWER THIS. It is asked by the mirror's vm/replace, the
-// removal that frees a reused VM name for the create or the rename about to take
-// it. The identity of the object being removed is not the identity of the VM
-// taking the name — that is the entire point of the action — so a name-keyed
-// question is answered by the row of the VM the replace is being performed FOR.
-// The premise then proves itself: any VM under that name, related or not,
-// authorizes replacing an object whose incarnation this node has never held. A
-// name standing in for an identity, at the one place the mirror is irreversible.
+// WHY A NAME CANNOT ANSWER THIS, for either removal that asks. The mirror's
+// vm/replace frees a reused VM name for the create or the rename about to take
+// it, so the identity being removed is by construction NOT the identity of the
+// VM taking the name: a name-keyed question is answered by the row of the
+// BENEFICIARY, the premise proves itself, and any VM under that name authorizes
+// replacing an object whose incarnation this node has never held. The ordinary
+// vm/delete had the same defect from the other direction — a tombstone under the
+// name proved a removal for whichever incarnation NetBox happened to hold there,
+// so a re-created-then-deleted VM's tombstone authorized deleting the object of a
+// DIFFERENT incarnation that may be alive on a peer.
 //
-// TWO RECORDS, EITHER OF WHICH IS THE INCARNATION ITSELF:
+// THE RECORDS, and each is incarnation-keyed so that no row of a different VM
+// sharing the name can satisfy it:
 //
-//   - a `vms` row of ANY kind whose spec carries this uuid. Present here and
-//     absent from the desired set means the cluster told this node about the
-//     incarnation and it is no longer live — tombstoned, or turned into a
-//     template the mirror does not represent. RenameVM MOVES that row rather
-//     than removing it, and patches only the spec's `name`, so a
-//     rename-then-delete leaves the uuid exactly where this looks. That is what
-//     makes the freed-name rename provable without asking about the stale name
-//     NetBox still holds.
-//   - a `netbox_objects` mapping row of ANY kind under this exact identity. The
-//     mirror's own createVM/updateVM writes it, its delete tombstones it, and
-//     NOTHING prunes it — so it survives the one path that takes the `vms` uuid
-//     away: InsertVMWithHardware's same-name re-create purge, which drops the
-//     previous incarnation's tombstone. That purge is precisely the
-//     delete-then-recreate-under-the-same-name case the replace was built for, so
-//     without this second record the commonest proven replacement would be
-//     withheld forever and the original permanent collision stall would be back.
+//   - the `vms` row carrying this uuid, CLASSIFIED live or tombstoned rather
+//     than unioned. RenameVM MOVES that row rather than removing it, and patches
+//     only the spec's `name`, so a rename-then-delete leaves the uuid exactly
+//     where this looks — which is what makes the freed-name rename provable
+//     without asking about the stale name NetBox still holds.
+//   - the `netbox_objects` mapping row under this exact identity, reported ONLY
+//     when no `vms` row carries the uuid. The mirror's own createVM/updateVM
+//     writes it, its delete tombstones it, and NOTHING prunes it — so it
+//     survives the one path that takes the `vms` uuid away:
+//     InsertVMWithHardware's same-name re-create purge, which drops the previous
+//     incarnation's tombstone. That purge is precisely the
+//     delete-then-recreate-under-the-same-name case the replace exists for, so
+//     without this record the commonest proven replacement would be withheld
+//     forever and the original permanent collision stall would be back. What it
+//     is NOT is evidence of absence — see VMRemovalMirroredOnly.
 //
-// Both are INCARNATION-keyed, which is the property that matters: neither can be
-// satisfied by a different VM that happens to hold the same name.
-//
-// WHAT IT DOES NOT CLOSE, stated because the direction is what makes it safe
-// rather than completeness. Replication is per TABLE, so a node can hold the
-// mapping row for an incarnation whose `vms` row has not arrived; the premise is
-// then satisfiable for an object whose VM is alive elsewhere. That window is
-// bounded by ONE named incarnation this node's own mirror is recorded as having
-// created, where the name-keyed question was satisfied by any row at all — and it
-// fails the safe way whenever the node holds neither record: the replacement is
-// withheld, the create or rename collides, and the mirror stalls for that one VM
-// rather than removing an object it cannot account for.
+// A LIVE ROW WINS over a tombstone carrying the same uuid. Two rows can carry
+// one uuid (a spec copied onto a second name), and "one of them is still live"
+// is the answer that withholds.
 //
 // An empty identity or uuid is never evidence.
-func (e MirrorEvidence) KnowsIncarnation(identity, vmUUID string) bool {
+func (e MirrorEvidence) VMRemoval(identity, vmUUID string) VMRemovalRecord {
 	if identity == "" || vmUUID == "" {
-		return false
+		return VMRemovalNoRecord
 	}
-	return e.vmUUIDs[vmUUID] || e.mirroredVMs[identity]
+	switch {
+	case e.liveVMUUIDs[vmUUID]:
+		if e.liveWorkloadVMUUIDs[vmUUID] {
+			return VMRemovalLive
+		}
+		return VMRemovalLiveTemplate
+	case e.retiredVMUUIDs[vmUUID]:
+		return VMRemovalRetired
+	case e.mirroredVMs[identity]:
+		return VMRemovalMirroredOnly
+	default:
+		return VMRemovalNoRecord
+	}
 }
 
 // KnowsNIC reports whether the local database holds an interface row of ANY kind
@@ -272,37 +303,55 @@ func specVMUUID(spec string) string {
 // exactly the fail-open the caller must not have.
 func ReadMirrorEvidence(ctx context.Context, c *Client) (MirrorEvidence, error) {
 	out := MirrorEvidence{
-		vmNames:     map[string]bool{},
-		nicKeys:     map[string]bool{},
-		addrIDs:     map[int]bool{},
-		vmUUIDs:     map[string]bool{},
-		mirroredVMs: map[string]bool{},
+		nicKeys:             map[string]bool{},
+		addrIDs:             map[int]bool{},
+		liveVMUUIDs:         map[string]bool{},
+		liveWorkloadVMUUIDs: map[string]bool{},
+		retiredVMUUIDs:      map[string]bool{},
+		mirroredVMs:         map[string]bool{},
 	}
 
-	// The name AND the incarnation, from ONE scan. Two queries over the same
-	// table would be two chances for one of them to grow a `deleted_at`
-	// predicate the other does not have, and the absence of that predicate is
-	// the evidence.
-	rows, err := c.Query(ctx, `SELECT name, spec FROM vms`)
+	// EVERY incarnation record from ONE scan. Two queries over the same table
+	// would be two chances for one of them to grow a `deleted_at` predicate the
+	// other does not have, and the absence of that predicate is the evidence.
+	//
+	// `deleted_at` IS SELECTED and is still not a predicate. It is read to
+	// CLASSIFY the row — live, or the tombstone a destroyed incarnation leaves —
+	// which is the difference between "it exists" and "it stopped existing", and
+	// the whole reason two of the four states above are separate. Filtering on
+	// it would throw away exactly the rows that authorize a removal; unioning
+	// the two states, as this once did, throws away the only rows that forbid
+	// one.
+	rows, err := c.Query(ctx,
+		`SELECT spec, COALESCE(deleted_at, '') AS deleted_at,
+		        COALESCE(is_template, 0) AS is_template
+		   FROM vms`)
 	if err != nil {
 		return MirrorEvidence{}, fmt.Errorf("read local VM records: %w", err)
 	}
 	for _, r := range rows {
-		if name := r.String("name"); name != "" {
-			out.vmNames[name] = true
-		}
 		// A spec that will not parse, or one with no uuid, contributes NOTHING
 		// rather than an empty key: an unreadable record is not evidence about
 		// any incarnation, and a blank entry would be evidence about all of them.
-		if uuid := specVMUUID(r.String("spec")); uuid != "" {
-			out.vmUUIDs[uuid] = true
+		uuid := specVMUUID(r.String("spec"))
+		if uuid == "" {
+			continue
+		}
+		if r.String("deleted_at") != "" {
+			out.retiredVMUUIDs[uuid] = true
+			continue
+		}
+		out.liveVMUUIDs[uuid] = true
+		if r.Int("is_template") == 0 {
+			out.liveWorkloadVMUUIDs[uuid] = true
 		}
 	}
 
 	// The mirror's own identity map, TOMBSTONES INCLUDED and for the same reason
-	// every other read here omits the predicate — see KnowsIncarnation, which is
-	// the only reader and states why this second record is load-bearing rather
-	// than a duplicate of the `vms` uuid above.
+	// every other read here omits the predicate — see VMRemoval, which is the
+	// only reader and states why this record is load-bearing rather than a
+	// duplicate of the `vms` uuid above, and why on its own it is
+	// identification and not evidence of absence.
 	//
 	// Scoped to the VM kind. A VM identity is its NIC identity with an empty MAC
 	// component, so the two kinds share a key space and an unscoped read would

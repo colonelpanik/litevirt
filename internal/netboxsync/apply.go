@@ -155,6 +155,12 @@ type Reconciler struct {
 	// See Options.Latched.
 	latched func(context.Context) bool
 
+	// inventoryCorroborated reports whether this node's inventory read is the
+	// cluster's, for the one removal record that cannot say so by itself. Nil
+	// never corroborates. See Options.InventoryCorroborated and
+	// vmRemovalProven.
+	inventoryCorroborated func(context.Context) (bool, string)
+
 	// exclusive is the caller's INTRA-NODE critical section around one pass.
 	// Nil runs the pass directly. See Options.Exclusive.
 	exclusive func(context.Context, func(context.Context) error) error

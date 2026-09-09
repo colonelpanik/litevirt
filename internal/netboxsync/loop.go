@@ -99,6 +99,26 @@ type Options struct {
 	// wiring must be inert rather than an ungated writer.
 	Latched func(context.Context) bool
 
+	// InventoryCorroborated reports whether this node's own inventory read is
+	// CORROBORATED as the cluster's, and — when it is not — the operator-facing
+	// reason why not.
+	//
+	// It is the second half of the removal-evidence policy for the one record
+	// that cannot supply it: the mirror's own mapping row, which identifies an
+	// incarnation without saying anything about whether it stopped existing. See
+	// vmRemovalProven.
+	//
+	// THREADED IN rather than implemented here, exactly as the lease and the
+	// latch are, because the answer needs the cluster: it is a fan-out over the
+	// closed participant universe comparing every address-bearing table's digest
+	// with this node's, and that machinery lives beside the prefix bind that
+	// already depends on it. Reimplementing a second notion of a whole read in
+	// this package is how two proofs of one property came to differ before.
+	//
+	// Nil is "not corroborated", matching every other predicate here: an
+	// incomplete wiring withholds a removal rather than authorizing one.
+	InventoryCorroborated func(context.Context) (bool, string)
+
 	// Exclusive runs one pass inside the caller's INTRA-NODE critical section,
 	// and may decline to run it at all.
 	//
@@ -141,6 +161,8 @@ func New(o Options) *Reconciler {
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
 		exclusive:    o.Exclusive,
+
+		inventoryCorroborated: o.InventoryCorroborated,
 	}
 }
 
@@ -679,11 +701,17 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 		nameByID[v.ID] = v.Name
 	}
 
+	// The inventory corroboration, ASKED AT MOST ONCE for the whole pass and only
+	// if some removal's evidence actually needs it. It is a peer fan-out — see
+	// removalCorroboration — and a healthy pass whose every removal rests on a
+	// tombstone must not pay for one.
+	corr := r.removalCorroboration(ctx)
+
 	kept := make([]Action, 0, len(actions))
 	var unprovenVMs, unprovenNICs []string
 	var unprovenAddrs []int
 	for _, a := range actions {
-		if !destructive(a) || provenRemovable(a, actual, nameByID, known) {
+		if !destructive(a) || provenRemovable(a, actual, nameByID, known, corr) {
 			kept = append(kept, a)
 			continue
 		}
@@ -702,12 +730,15 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 		// each time instead of reshuffling it.
 		sort.Strings(unprovenVMs)
 		sort.Strings(unprovenNICs)
-		slog.Warn("netbox mirror: withholding deletes for NetBox objects this node holds no "+
-			"record of, tombstone included — the local database has not replicated them, or "+
-			"they belong to a workload it has never seen; the next sweep re-evaluates",
+		slog.Warn("netbox mirror: withholding deletes for NetBox objects whose removal this "+
+			"node cannot conclude from its own records — it holds no record of the incarnation, "+
+			"tombstone included; or it holds one that says the incarnation still EXISTS; or all "+
+			"it holds is its own mapping row, which proves the object was mirrored and not that "+
+			"the workload is gone, and the cluster could not confirm this node's inventory read "+
+			"is whole. The next sweep re-evaluates",
 			"vms", unprovenVMs, "interface_macs", unprovenNICs,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs),
-			"withheld_deletes", deletes)
+			"withheld_deletes", deletes, "inventory_corroboration", corr.reason())
 	}
 	if len(unprovenAddrs) > 0 {
 		sort.Ints(unprovenAddrs)
@@ -745,8 +776,14 @@ func destructive(a Action) bool {
 	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace
 }
 
-// provenRemovable reports whether the local database holds a record — live or
-// tombstoned — of the thing this destructive action would take away.
+// provenRemovable reports whether this node can CONCLUDE, from records it holds
+// itself, that the thing this destructive action would take away is one the
+// mirror must no longer hold.
+//
+// Not "holds a record of", which is what it used to say and what its VM half
+// used to implement. A record can just as easily say the thing is still there,
+// or say only that the mirror once created an object for it. Which record it is
+// decides the answer — see vmRemovalProven.
 //
 // A CLEAR asks about the ADDRESS, not the interface. The interface is in the
 // desired set by construction (Diff only computes a clear for a NIC it is
@@ -755,26 +792,20 @@ func destructive(a Action) bool {
 // names this address", and the lease row — live or tombstoned — is the evidence
 // for it.
 //
-// A REPLACE ASKS ABOUT THE INCARNATION, NOT THE NAME, and it is the one
-// destructive op here that cannot share the delete's question.
-//
-// The name a replace frees is, by construction, a name the local database holds
-// a row under: the VM taking it. So `KnowsVM(that name)` is answered by the
-// BENEFICIARY of the removal — the premise proves itself, and an unrelated VM's
-// row under the same name authorizes replacing an object whose incarnation this
-// node has never held. Its own NIC delete used to catch that by accident, being
-// keyed on (name, MAC); the cascade now owns those removals, correctly, so the
-// accident is gone and the parent premise has to carry the identity itself.
-// KnowsIncarnation is that question — the uuid inside the identity the action
-// targets, or the mirror's own mapping row for exactly that identity — and it
-// cannot be satisfied by a different VM sharing the name. See
-// corrosion.MirrorEvidence.KnowsIncarnation for both records and for the window
-// it does not close.
+// BOTH VM REMOVALS ASK ONE QUESTION, and it is vmRemovalProven's. The vm/delete
+// and the vm/replace differ in when they run and in what they unblock, never in
+// what would make removing a VM object justified, and the two rounds of findings
+// here were both a path answering it its own way: the replace on a NAME (proved
+// by the beneficiary of the removal), then the delete on a NAME (proved by
+// whichever incarnation last held it). So neither branch below has an evidence
+// question of its own — they share one, and a change to the policy cannot reach
+// one path and miss the other.
 //
 // An op or Kind it does not recognise is NOT proven. A third of either added
 // without a matching evidence question must fail closed rather than inherit a
 // permissive default.
-func provenRemovable(a Action, actual Actual, nameByID map[int]string, known corrosion.MirrorEvidence) bool {
+func provenRemovable(a Action, actual Actual, nameByID map[int]string,
+	known corrosion.MirrorEvidence, corr *removalCorroboration) bool {
 	if a.Op == "clear" {
 		return known.KnowsAddress(a.IPID)
 	}
@@ -785,20 +816,155 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string, known cor
 		if a.Kind != "vm" {
 			return false
 		}
-		return known.KnowsIncarnation(a.Key, netbox.IdentityVMUUID(a.Key))
+		return vmRemovalProven(a.Key, known, corr)
 	}
 	if a.Op != "delete" {
 		return false
 	}
 	switch a.Kind {
 	case "vm":
-		return known.KnowsVM(actual.VMs[a.Key].Name)
+		return vmRemovalProven(a.Key, known, corr)
 	case "nic":
 		n := actual.NICs[a.Key]
 		return known.KnowsNIC(nameByID[n.VMID], n.MAC)
 	default:
 		return false
 	}
+}
+
+// vmRemovalProven is THE removal-evidence policy for a VM object, and the only
+// one: both the ordinary vm/delete and the vm/replace reach it.
+//
+// TWO REQUIREMENTS, NOT ONE. That is the whole of it, and each was a separate
+// finding when it was missing:
+//
+//  1. INCARNATION-SPECIFIC EVIDENCE, never the name. `identity` carries the
+//     incarnation uuid, and every record corrosion classifies is keyed on it, so
+//     no row of a different VM sharing the name can answer for it. A name-keyed
+//     premise fails in both directions — the replace's name is held by the VM
+//     the replace is FOR, and the delete's name is held by whichever incarnation
+//     used it last.
+//  2. A JUSTIFIED CONCLUSION that the mirror must no longer represent this
+//     incarnation. Being able to NAME the incarnation is not that conclusion,
+//     which is exactly the step the previous round skipped: it asked for
+//     incarnation-specific evidence, got incarnation-specific IDENTIFICATION,
+//     and treated it as authorization.
+//
+// WHAT SATISFIES THE SECOND REQUIREMENT, per record:
+//
+//   - A TOMBSTONE for this exact incarnation justifies absence on its own.
+//     litevirt soft-deletes, so this is what a destroyed incarnation leaves, and
+//     no peer can be running a VM whose row this cluster has tombstoned.
+//   - A LIVE row that is a TEMPLATE justifies the removal WITHOUT justifying
+//     absence, and it is the one record of that shape. The incarnation exists,
+//     and the mirror deliberately does not represent it — desiredState skips a
+//     template because a template is a disk image, not a running machine — so
+//     this node can read the reason its object is unwanted straight off the row
+//     it holds. Every OTHER live row is the opposite answer.
+//   - A LIVE row that is not a template means THE INCARNATION EXISTS, so no
+//     removal. Reaching here on one means the desired read and the evidence read
+//     disagree about the same row, and the safe reading of a contradiction is to
+//     act on neither half of it.
+//   - A MAPPING ROW ALONE justifies NOTHING about absence. It proves this node's
+//     mirror created that object for that incarnation — replication is per
+//     TABLE, so it is precisely what a node holds for an incarnation whose `vms`
+//     row has not arrived and whose VM may be live on a peer. It becomes a
+//     justified absence only when the inventory read it is absent FROM is
+//     corroborated as the cluster's: every participant's address-bearing tables
+//     agreeing with this node's means no host holds a row for this uuid, and a
+//     VM nobody holds a row for is not running anywhere. See
+//     removalCorroboration, which reuses the bind path's proof rather than
+//     inventing a second notion of a whole read.
+//   - NO RECORD withholds, as it always has.
+//
+// The corroboration is asked ONLY on the mapping-only branch. It is a peer
+// fan-out, and every other branch is answered from a local row.
+func vmRemovalProven(identity string, known corrosion.MirrorEvidence, corr *removalCorroboration) bool {
+	switch known.VMRemoval(identity, netbox.IdentityVMUUID(identity)) {
+	case corrosion.VMRemovalRetired, corrosion.VMRemovalLiveTemplate:
+		return true
+	case corrosion.VMRemovalMirroredOnly:
+		return corr.corroborated()
+	default:
+		// VMRemovalLive — it exists — and VMRemovalNoRecord, which is the
+		// unhydrated node. A record class added to corrosion without a decision
+		// here lands on this branch and withholds.
+		return false
+	}
+}
+
+// removalCorroboration is this pass's answer to "is this node's inventory read
+// the CLUSTER's?", asked at most once and only if a removal actually needs it.
+//
+// WHY THE QUESTION EXISTS. One removal record — the mirror's own mapping row —
+// identifies an incarnation without saying whether it stopped existing, and the
+// gap between those two is where a deletion of a live peer's VM object fitted.
+// What closes it is not a stronger local read: replication is per TABLE, and
+// nothing in the schema records how much of a table this node has received, so
+// no local signal can tell "no row for this uuid" from "that row has not arrived
+// yet". The second signal has to be the cluster, asked.
+//
+// WHAT IT ASKS IS THE PREFIX BIND'S OWN PROOF, unchanged and not a second
+// notion of the same thing: every host in the closed participant universe —
+// offline, fenced, tombstoned and witness hosts included, because a host that
+// cannot be reached still HOLDS its rows — is asked for its digest of every
+// address-bearing table, and they must all AGREE with this node's. Two
+// mechanisms answering one question is how several findings on this path
+// survived, so there is one, wired in from where it already lives.
+//
+// ASKED LAZILY, AND ONCE. It dials peers, so a pass whose every removal rests on
+// a tombstone must not pay for it — and two candidates in one pass must not each
+// pay, nor be allowed to get different answers from two fan-outs a write could
+// land between.
+//
+// FAIL CLOSED, including the unwired case: no asker is not a corroborated
+// inventory, and the removal is withheld. The reason is kept for the log line,
+// because "not corroborated" with nothing attached is what an operator cannot
+// act on.
+type removalCorroboration struct {
+	ask  func() (bool, string)
+	done bool
+	ok   bool
+	why  string
+}
+
+// removalCorroboration binds this pass's corroboration to its context.
+//
+// The context is captured here rather than stored on the value: the fan-out
+// belongs to ONE pass, and a struct carrying a context is one refactor away from
+// being reused across two.
+func (r *Reconciler) removalCorroboration(ctx context.Context) *removalCorroboration {
+	return &removalCorroboration{ask: func() (bool, string) {
+		if r.inventoryCorroborated == nil {
+			return false, "this mirror is wired without an inventory corroboration, so no " +
+				"absence can be concluded from a mapping row alone"
+		}
+		return r.inventoryCorroborated(ctx)
+	}}
+}
+
+// corroborated answers the question, asking at most once per pass.
+func (c *removalCorroboration) corroborated() bool {
+	if !c.done {
+		c.done = true
+		c.ok, c.why = c.ask()
+	}
+	return c.ok
+}
+
+// reason is what to tell an operator about a corroboration that came back
+// negative, or "" when it was never needed or came back positive.
+//
+// "not asked" and "asked and agreed" are deliberately the same empty answer:
+// both mean the corroboration is not why anything was withheld.
+func (c *removalCorroboration) reason() string {
+	if !c.done || c.ok {
+		return ""
+	}
+	if c.why == "" {
+		return "this node's inventory read could not be corroborated as the cluster's"
+	}
+	return c.why
 }
 
 // hasRemovals reports whether the list holds any destructive action at all.

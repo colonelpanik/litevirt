@@ -751,6 +751,55 @@ func adoptionInventoryTables() []string {
 	return tables
 }
 
+// corroborateMirrorInventory is the SECOND caller of the proof above, and it is
+// deliberately the same proof rather than a second one.
+//
+// WHO ASKS AND WHY. The inventory mirror's removal-evidence policy has one
+// record that identifies an incarnation without saying whether it stopped
+// existing: its own `netbox_objects` mapping row, which is exactly what a node
+// holds for an incarnation whose `vms` row has not replicated here and whose VM
+// may be live on a peer. The mirror will not conclude an absence from it until
+// the read that absence is measured against is corroborated as the cluster's —
+// which is the identical property the prefix bind refuses to hand out addresses
+// without, reached from the other side. A bind that adopted nothing because it
+// could not see a holder, and a mirror that deleted a holder's inventory object
+// because it could not see the holder, are one condition.
+//
+// SO IT IS ONE MECHANISM, NOT TWO. Same table set (adoptionInventoryTables),
+// same predicate (corrosion.TableDigestsAgree over every one of them), same
+// closed participant universe with witnesses in and nobody excused. The mirror
+// reaches it through a function value threaded into netboxsync.Options, because
+// that package cannot import this one — see netboxsync.Options.
+//
+// FAIL CLOSED at every branch, with the reason returned rather than logged here:
+// the mirror puts it on its own withheld-removal warning, beside the objects it
+// withheld, which is the line an operator reads.
+//
+// WHAT IT COSTS. On a cluster with rows in flight the digests disagree until
+// replication settles, so a removal resting on a mapping row alone is DELAYED —
+// the mirror stalls for that one object, logs why, and does not stamp its
+// success gauge. That is the same direction every other decision here takes, and
+// the same limitation the bind documents: a PERMANENTLY lost host can never
+// produce a digest, so a removal that needs one keeps withholding and the object
+// is one to remove in NetBox by hand. See docs/networking.md.
+func (s *Server) corroborateMirrorInventory(ctx context.Context) (bool, string) {
+	local, err := s.localTableDigests(ctx, adoptionInventoryTables())
+	if err != nil {
+		return false, fmt.Sprintf(
+			"this node's own inventory digests could not be read (%v)", err)
+	}
+	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, local)
+	if perr != nil {
+		return false, fmt.Sprintf(
+			"whether any peer holds an inventory record this node has not received could "+
+				"not be established (%v)", perr)
+	}
+	if proven {
+		return true, ""
+	}
+	return false, why
+}
+
 // proveNoPeerHoldsInventoryRowsWeLack asks every host in the CLOSED participant
 // universe for its digest of each address-bearing table and reports whether they
 // ALL AGREE with this node's.

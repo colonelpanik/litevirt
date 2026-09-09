@@ -611,6 +611,13 @@ var partitionedMethods = map[string]bool{
 	"StreamSensitiveStateDump": true,
 	"ReserveProjectCapacity":   true,
 	"ReleaseProjectCapacity":   true,
+	// The lease-term barrier's quorum read is peer traffic over the same link,
+	// so a partition must drop it too. Without this a scenario that partitions
+	// an executor into a minority still collected every peer's answer and
+	// proved nothing about the unreachable-quorum path — it would pass against
+	// an implementation that fails OPEN on an unreachable quorum, which is the
+	// one outcome that would present as protection while providing none.
+	"GetLeaseTermHighWater": true,
 }
 
 // methodName returns the final segment of a gRPC full-method string

@@ -385,3 +385,72 @@ func TestInventoryProto_OwnershipTiesRoundTrip(t *testing.T) {
 		t.Errorf("UnresolvedTies = %d, want 5", out.UnresolvedTies)
 	}
 }
+
+// TestClaimCarriedProof_AnUnknownLeaseKeyIsRefused: service.proto and the
+// schema's v53 history block both assert, in the present tense, that "the
+// executor validates it against a CLOSED SET and refuses an unknown key:
+// reading a nonexistent ledger yields MAX(term) = 0, which would pass every
+// proof naming it." Nothing did that; ValidLeaseKey's only non-test caller was
+// the operator acknowledgement RPC.
+//
+// It has to be refused on RECEIPT, not at enforcement time, because the key is
+// bound: the seed path persists a peer-supplied key and replicates it, so a
+// forged value becomes that row's permanent authorization record fleet-wide.
+func TestClaimCarriedProof_AnUnknownLeaseKeyIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // host name "host-a"
+
+	// A trailing space: ValidLeaseKey matches exactly and deliberately neither
+	// trims nor case-folds, so this is a different key from "failover".
+	for _, key := range []string{"failover ", "not_a_lease", "FAILOVER"} {
+		_, err := s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+			Id: "p-key", Action: corrosion.ActionReschedule, TargetKind: "vm",
+			TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a",
+			LeaseTerm: 3, LeaseKey: key,
+		}, corrosion.ActionReschedule, "vm", "vm1")
+		if err == nil {
+			t.Fatalf("accepted a proof naming lease key %q; enforcement would read an empty "+
+				"ledger for it and pass every proof naming it", key)
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("key %q: code = %v, want InvalidArgument", key, status.Code(err))
+		}
+	}
+
+	// The empty key stays valid: it is the "minted without a lease" form the
+	// three lease-less producers emit, and refusing it would fail LB apply,
+	// container relocation and automated promotion closed.
+	if _, err := s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+		Id: "p-nokey", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a",
+	}, corrosion.ActionReschedule, "vm", "vm1"); err != nil {
+		t.Errorf("refused a proof carrying no lease key: %v; that is the legacy/lease-less "+
+			"form and must stay acceptable", err)
+	}
+}
+
+// TestProofPB_RoundTripsEveryBoundField is the test that makes a dropped
+// forward impossible to add.
+//
+// Four sites hand-copied corrosion.ActionProof into pb.RuntimeActionProof, and
+// one of them dropped a field each time the bound set grew — fence_epoch, then
+// lease_key — under a comment reading "Every field claimCarriedProof binds must
+// be forwarded." The executor compares a carried proof against the row it
+// persisted, so the symptom is FailedPrecondition blaming replication
+// divergence, on the recovery path.
+func TestProofPB_RoundTripsEveryBoundField(t *testing.T) {
+	full := corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionRelocate, TargetKind: "container",
+		TargetName: "ct1", DestHost: "host-b", Coordinator: "node-a",
+		LeaseHolder: "node-a", LeaseExpiresAt: "2026-09-08T12:00:00Z",
+		QuorumLive: 3, QuorumNeeded: 2, RelocationToken: "tok1",
+		FenceEpoch: "7", OwnerEpoch: "4", LeaseTerm: 9,
+		LeaseKey: corrosion.LeaseKeyFailover,
+	}
+	got := proofFromPB(proofToPB(full))
+	if !corrosion.ProofBindingEqual(got, full) {
+		t.Errorf("a proof does not survive proofToPB → proofFromPB:\n got %+v\nwant %+v\n"+
+			"a field missing from either direction is a dropped forward, which the executor "+
+			"reports as a divergent row", got, full)
+	}
+}

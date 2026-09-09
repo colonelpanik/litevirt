@@ -548,7 +548,7 @@ func TestProofBindingEqual_IgnoresTheEvidenceOnlyFields(t *testing.T) {
 	withEvidence.LeaseHolder = "node-a"
 	withEvidence.LeaseExpiresAt = "2026-09-08T12:00:30Z"
 	withEvidence.QuorumLive, withEvidence.QuorumNeeded = 3, 2
-	if !proofBindingEqual(base, withEvidence) {
+	if !ProofBindingEqual(base, withEvidence) {
 		t.Error("the evidence-only fields are bound; a proof whose LeaseHolder is empty (the " +
 			"documented behaviour on a read error) would be refused")
 	}
@@ -566,7 +566,7 @@ func TestProofBindingEqual_IgnoresTheEvidenceOnlyFields(t *testing.T) {
 	} {
 		other := base
 		mutate(&other)
-		if proofBindingEqual(base, other) {
+		if ProofBindingEqual(base, other) {
 			t.Errorf("%s is not part of the binding; a divergent same-id row could differ on it "+
 				"and still be claimed", name)
 		}
@@ -613,7 +613,7 @@ func TestProofBindingEqual_BindsTheLeaseKey(t *testing.T) {
 	}
 	other := base
 	other.LeaseKey = LeaseKeyRebalancer
-	if proofBindingEqual(base, other) {
+	if ProofBindingEqual(base, other) {
 		t.Error("two proofs differing only on lease_key compared equal; the same term number " +
 			"under two different ledgers would be interchangeable")
 	}
@@ -672,5 +672,46 @@ func TestWriteActionProofValidated_AnIdenticalKeyedProofIsAccepted(t *testing.T)
 	got, ok, _ := GetActionProof(ctx, c, "p1")
 	if !ok || got.LeaseKey != LeaseKeyFailover || got.LeaseTerm != 4 {
 		t.Errorf("proof after the retry = %+v, want term 4 under %q", got, LeaseKeyFailover)
+	}
+}
+
+// TestWriteActionProofValidated_ATombstonedRowStillBinds: a tombstone occupies
+// the primary key, so its facts must bind exactly as a live row's do.
+//
+// The guard used to filter `deleted_at IS NULL`, and ReapSpentProofs tombstones
+// every completed or failed proof and never hard-deletes — so every id ever
+// spent was a permanently open hole. The guard saw no row, returned true, and
+// the presented INSERT was relayed to every peer even though it no-ops locally
+// on the PK. A peer that never received the genuine row applies the forged one
+// at status 'prepared', and WriteActionProofValidated reports success with
+// nothing persisted locally.
+func TestWriteActionProofValidated_ATombstonedRowStillBinds(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	base := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "host-b", Coordinator: "node-a", LeaseTerm: 3, LeaseKey: LeaseKeyFailover,
+	}
+	if err := WriteActionProof(ctx, c, base); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Reaped, exactly as ReapSpentProofs leaves it.
+	if err := c.Execute(ctx,
+		`UPDATE runtime_action_proofs SET deleted_at = ? WHERE id = ?`, c.NowTS(), "p1"); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
+
+	before := mutationLogCount(t, c)
+	forged := base
+	forged.LeaseTerm = 9
+	err := WriteActionProofValidated(ctx, c, forged)
+	if !errors.Is(err, ErrProofDiverges) {
+		t.Fatalf("err = %v, want ErrProofDiverges: a reaped id must not be a hole through which "+
+			"a forged proof reaches every peer", err)
+	}
+	if after := mutationLogCount(t, c); after != before {
+		t.Errorf("the refused proof wrote %d mutation_log row(s); a refusal must write nothing "+
+			"AND log nothing, or peers apply the forged row", after-before)
 	}
 }

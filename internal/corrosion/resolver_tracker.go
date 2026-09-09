@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -67,14 +69,49 @@ func (c *Client) dropDeferredEffects(tx *sql.Tx) {
 	c.txEffectsMu.Unlock()
 }
 
-// contentPair returns a stable, order-independent fingerprint of the two rows'
+// contentPair returns a stable, order-independent encoding of the two rows'
 // content, so the same divergence (regardless of which side is "local") maps to
 // one key.
+//
+// This is RAW CONTENT, not a digest — encodeRowCells is a length-prefixed
+// concatenation of cell values. trackUnresolvedPair digests it on the way into
+// the register (pairFingerprint), which is where the invariant lives, so
+// nothing here or in trackIdentityFault has to remember to hash.
 func contentPair(local, incoming []interface{}) string {
 	a, b := encodeRowCells(local), encodeRowCells(incoming)
 	pair := []string{a, b}
 	sort.Strings(pair)
 	return strings.Join(pair, "\x01")
+}
+
+// pairFingerprint reduces a row-content pair to a fixed-size digest. Every pair
+// entering the register goes through it, which is the invariant: NO ROW CONTENT
+// IS EVER RETAINED, in memory, on disk, or in a log line.
+//
+// The two producers both hand over raw content today. contentPair joins two
+// encodeRowCells outputs and trackIdentityFault passes an encodeRowCellsV2 of
+// the whole local row; both encodings are length-prefixed concatenations of RAW
+// CELL VALUES, not hashes, despite the "content-hash pair" wording this file
+// and client.go have carried since before this branch. In memory that was
+// merely mislabelled. Once acknowledgements became durable it stopped being
+// cosmetic: acknowledged_ties.content_pair persisted the plaintext of both
+// conflicting row versions.
+//
+// Secret-bearing rows do reach the tracker. user_2fa and recovery_codes end
+// their resolver chains in ruleUnresolved("auth_factor") — whose own comment is
+// "a differing secret/epoch is fail-to-human" — and lb_token ends in
+// decideUnresolved("lb_token"). AcknowledgeUnresolvedTie is exported and takes
+// an arbitrary (table, pk), so acknowledging such a tie wrote TOTP secrets,
+// recovery material or a bearer token as cleartext into a local table that no
+// redaction covers, that has no GC path, that loadAcknowledgedTies re-reads
+// wholesale at every startup, and that rides along in any copy of the database
+// file or any support bundle.
+//
+// A digest costs nothing here because the pair is only ever compared for
+// equality — never parsed, displayed, or used to reconstruct a row.
+func pairFingerprint(pair string) string {
+	sum := sha256.Sum256([]byte(pair))
+	return hex.EncodeToString(sum[:])
 }
 
 // anyUnresolved is the lock-free fast path for the clear-on-write hooks.
@@ -150,6 +187,7 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 // of the positional (local,incoming) pair.
 func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath, category string) {
 	key := unresolvedKey(table, pk)
+	pair = pairFingerprint(pair)
 
 	c.tieMu.Lock()
 	if c.unresolvedTies == nil {
@@ -343,7 +381,8 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 		slog.Warn("a different divergence appeared on this row while the acknowledgement was "+
 			"being recorded; the acknowledgement stands for the pair the operator saw and the "+
 			"new conflict stays tracked",
-			"table", table, "pk", pk, "acknowledged_pair", t.pair, "tracked_pair", cur.pair)
+			"table", table, "pk", pk,
+			"acknowledged_fingerprint", t.pair, "tracked_fingerprint", cur.pair)
 		return true, nil
 	}
 	if still {

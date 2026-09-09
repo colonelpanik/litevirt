@@ -25,6 +25,32 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 	}
 }
 
+// proofToPB is proofFromPB's inverse, for a caller forwarding a proof it read
+// out of the database to the host that will execute it.
+//
+// It exists because every such site used to hand-copy the field list, and one
+// of them dropped a field every time the bound set grew: fence_epoch once, then
+// lease_key. The executor compares the carried proof against the row it has
+// PERSISTED, so a dropped field reads as a divergent row and refuses the action
+// with an error blaming replication divergence — on the recovery path, for a
+// field that was simply not copied. Forward a proof through this function and
+// the compiler carries new fields for you.
+//
+// The lifecycle fields (status, holder, timestamps) are deliberately absent:
+// they are the executor's to set, are not part of ProofBindingEqual, and a
+// carried value for them would be ignored at best.
+func proofToPB(p corrosion.ActionProof) *pb.RuntimeActionProof {
+	return &pb.RuntimeActionProof{
+		Id: p.ID, Action: p.Action, TargetKind: p.TargetKind,
+		TargetName: p.TargetName, DestHost: p.DestHost, Coordinator: p.Coordinator,
+		LeaseHolder: p.LeaseHolder, LeaseExpiresAt: p.LeaseExpiresAt,
+		QuorumLive: int32(p.QuorumLive), QuorumNeeded: int32(p.QuorumNeeded),
+		RelocationToken: p.RelocationToken, FenceEpoch: p.FenceEpoch,
+		OwnerEpoch: p.OwnerEpoch, LeaseTerm: p.LeaseTerm,
+		LeaseKey: p.LeaseKey,
+	}
+}
+
 // claimCarriedProof validates a coordinator-minted proof carried in a direct-RPC
 // request and claims it single-use on THIS host. It (1) validates the
 // coordinator's assertions — exact action/target and dest_host == this host — so
@@ -74,6 +100,28 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 				"(allocation starts at 1, and 0 means the proof was minted without one)",
 			p.GetId(), p.GetLeaseTerm())
 	}
+	// The lease KEY is validated against the closed set on RECEIPT, before it is
+	// persisted — which is what service.proto and the schema's v53 history block
+	// have claimed in the present tense since Task 2c, while nothing actually
+	// did it (ValidLeaseKey's only non-test caller was the operator ack RPC).
+	//
+	// It has to happen here rather than at enforcement time, because the key is
+	// BOUND: WriteActionProofValidated seeds a peer-supplied key and replicates
+	// it, so a forged value becomes that row's permanent authorization record on
+	// every peer. Enforcement would then read a nonexistent ledger for it,
+	// MAX(term) = 0, and pass every proof naming it. "failover " with a trailing
+	// space is enough — ValidLeaseKey matches exactly and neither trims nor
+	// folds, deliberately.
+	//
+	// "" stays valid: it is the documented "minted without a lease" form that
+	// the three lease-less producers emit, and refusing it here would fail
+	// closed on LB apply, container relocation and automated promotion.
+	if k := p.GetLeaseKey(); k != "" && !corrosion.ValidLeaseKey(k) {
+		return "", status.Errorf(codes.InvalidArgument,
+			"runtime-action proof %s names lease key %q, which is not a lease; refusing to "+
+				"persist it (an unknown key reads an empty ledger, so enforcement would pass "+
+				"every proof naming it)", p.GetId(), k)
+	}
 	// Seed the row from the carried proof AND check it against any row already
 	// present, in ONE guarded transaction.
 	//
@@ -85,7 +133,7 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 	// relays. A peer lacking the coordinator's genuine row would apply the
 	// forged one and then drop the real row on the primary key.
 	//
-	// The field set compared is proofBindingEqual's, shared with the writer, so
+	// The field set compared is ProofBindingEqual's, shared with the writer, so
 	// the two cannot disagree about which fields authorize an action. It covers
 	// action/target/dest/coordinator, relocation_token (a container relocation's
 	// binding key — claiming the token-A ledger row while stamping token B would

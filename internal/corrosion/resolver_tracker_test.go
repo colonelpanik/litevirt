@@ -393,13 +393,55 @@ func TestAcknowledgeUnresolvedTie_DoesNotClearAPairThatChangedMidWrite(t *testin
 	}
 
 	// And the durable row names what the operator actually saw, not what
-	// arrived afterwards.
+	// arrived afterwards — as a fingerprint, so this compares against the
+	// fingerprint of pair-a rather than the string.
 	rows, err := c.Query(ctx, `SELECT content_pair FROM acknowledged_ties`)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("acknowledged_ties rows = %d (err=%v), want 1", len(rows), err)
 	}
-	if got := rows[0].String("content_pair"); got != "pair-a" {
-		t.Errorf("content_pair = %q, want %q", got, "pair-a")
+	if got, want := rows[0].String("content_pair"), pairFingerprint("pair-a"); got != want {
+		t.Errorf("content_pair = %q, want the fingerprint of pair-a (%q)", got, want)
+	}
+}
+
+// TestAcknowledgedTies_StoresNoRowContent is a confidentiality property, and it
+// only became one when acknowledgements became durable.
+//
+// The pair is built by encodeRowCells / encodeRowCellsV2, which are
+// length-prefixed concatenations of RAW CELL VALUES — not hashes, whatever the
+// surrounding comments used to say. Secret-bearing rows reach this tracker:
+// user_2fa and recovery_codes end their resolver chains in
+// ruleUnresolved("auth_factor"), lb_token in decideUnresolved("lb_token"). And
+// AcknowledgeUnresolvedTie is exported and takes an arbitrary (table, pk). So
+// acknowledging one of those ties wrote the secret, in cleartext, into a local
+// table with no redaction, no GC path, a wholesale re-read at every startup,
+// and a place in every copy of the database file and every support bundle.
+func TestAcknowledgedTies_StoresNoRowContent(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	const secret = "JBSWY3DPEHPK3PXP" // shaped like a TOTP seed
+	c.trackUnresolvedPair("user_2fa", "tim", contentPair(
+		[]interface{}{"tim", secret, int64(1)},
+		[]interface{}{"tim", "ORSXG5BNMRQXIYI", int64(1)},
+	), pathAE, "auth_factor")
+	if _, err := c.AcknowledgeUnresolvedTie(ctx, "user_2fa", "tim", "tim"); err != nil {
+		t.Fatalf("acknowledge: %v", err)
+	}
+
+	rows, err := c.Query(ctx, `SELECT content_pair FROM acknowledged_ties`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("acknowledged_ties rows = %d (err=%v), want 1", len(rows), err)
+	}
+	stored := rows[0].String("content_pair")
+	if strings.Contains(stored, secret) {
+		t.Errorf("the acknowledgement persisted a row's cleartext content: %q contains the "+
+			"secret. Rows reaching this tracker can hold TOTP seeds, recovery material and "+
+			"bearer tokens", stored)
+	}
+	if len(stored) != 64 {
+		t.Errorf("content_pair = %q (%d chars), want a 64-char SHA-256 fingerprint",
+			stored, len(stored))
 	}
 }
 
@@ -485,5 +527,51 @@ func TestAcknowledgeUnresolvedTie_ADurableWriteFailureIsNotSuccess(t *testing.T)
 	if n := c.UnresolvedTieCount(); n != 1 {
 		t.Errorf("the tie was cleared from the register (%d left) despite the acknowledgement "+
 			"not being recorded; it must stay visible", n)
+	}
+}
+
+// TestAcknowledgeLeaseTermTie_WorksAtALargeTermNumber: the acknowledgement key
+// must be spelled the same way the merge spelled it, whatever Go type the term
+// arrived as.
+//
+// The merge sees a term decoded from a JSON state dump, so json.Unmarshal
+// (no UseNumber) hands it over as a float64; the RPC passes an int64. Both go
+// through coerceString, which was fmt.Sprintf("%v") — and %v on a float64
+// switches to exponent form at 1e6, so the merge registered
+// ["failover","1e+06"] while the operator's command looked up
+// ["failover","1000000"]. The lookup missed, the handler answered
+// Acknowledged:false with no error and no audit row — indistinguishable from
+// "no such tie" — and the contested term became permanently unacknowledgeable:
+// exactly the failure this feature exists to prevent. Every other test here
+// uses term 1 or 99, where the two encodings coincide.
+func TestAcknowledgeLeaseTermTie_WorksAtALargeTermNumber(t *testing.T) {
+	ctx := context.Background()
+	local, peer := testClient(t), testClient(t)
+
+	// A term past the point where %v on a float64 goes exponential. Reachable
+	// on a flapping lease: a term is minted per acquisition.
+	const term = int64(1000000)
+	seedTerm(t, local, LeaseKeyFailover, term, "host-a")
+	seedTerm(t, peer, LeaseKeyFailover, term, "host-b")
+
+	if err := local.MergeStateBytesLWW(peer.DumpStateBytes()); err != nil {
+		t.Fatalf("anti-entropy peer→local: %v", err)
+	}
+	if n := local.UnresolvedTieTables()["leader_lease_terms"]; n != 1 {
+		t.Fatalf("fixture produced %d contested-term ties, want 1 (tables=%v)",
+			n, local.UnresolvedTieTables())
+	}
+
+	ok, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, term, "tim")
+	if err != nil {
+		t.Fatalf("acknowledge: %v", err)
+	}
+	if !ok {
+		t.Fatal("acknowledging term 1000000 found nothing to acknowledge, though the merge just " +
+			"registered a tie for it: the register key is not type-stable across read paths, so " +
+			"a contested term above 1e6 can never be acknowledged")
+	}
+	if n := local.UnresolvedTieCount(); n != 0 {
+		t.Errorf("register still holds %d tie(s)", n)
 	}
 }

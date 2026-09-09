@@ -158,7 +158,7 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 // retrying.
 var ErrProofDiverges = errors.New("a persisted proof with this id disagrees with the presented one")
 
-// proofBindingEqual compares the fields that AUTHORIZE an action.
+// ProofBindingEqual compares the fields that AUTHORIZE an action.
 //
 // It is the ONE definition of that field set. claimCarriedProof compares the
 // carried proto against the persisted row through it, and
@@ -173,7 +173,7 @@ var ErrProofDiverges = errors.New("a persisted proof with this id disagrees with
 // coordinator persists and does not carry — leaseSnapshot returns "" on a read
 // error by design, because an honesty record must not fabricate a holder — so
 // binding them would refuse perfectly valid proofs.
-func proofBindingEqual(a, b ActionProof) bool {
+func ProofBindingEqual(a, b ActionProof) bool {
 	return a.Action == b.Action && a.TargetKind == b.TargetKind &&
 		a.TargetName == b.TargetName && a.DestHost == b.DestHost &&
 		a.Coordinator == b.Coordinator && a.RelocationToken == b.RelocationToken &&
@@ -205,6 +205,16 @@ func proofBindingEqual(a, b ActionProof) bool {
 //
 // A retried RPC and the coordinator's own replicated row both land in the third
 // case. Conflating it with the second would refuse every retry.
+//
+// The lookup deliberately does NOT filter deleted_at IS NULL. A tombstone still
+// occupies the primary key, and ReapSpentProofs tombstones every completed or
+// failed proof and never hard-deletes — so every id ever spent would otherwise
+// be a permanently open hole: the guard would see no row, return true, and
+// relay the presented INSERT to every peer even though it no-ops locally on the
+// PK. A peer that never received the genuine row would then apply the forged
+// one at status 'prepared'. Facts must match a tombstoned row exactly as they
+// must match a live one; whether a SPENT proof may be re-used is
+// ClaimActionProof's question, and it has its own deleted_at filter.
 func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) error {
 	now := c.NowTS()
 	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
@@ -212,7 +222,7 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 		err := tx.QueryRow(
 			`SELECT action, target_kind, target_name, dest_host, coordinator,
 			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
-			   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, p.ID).
+			   FROM runtime_action_proofs WHERE id = ?`, p.ID).
 			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
 				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
 				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
@@ -223,7 +233,7 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 		if err != nil {
 			return false, err
 		}
-		if !proofBindingEqual(existing, p) {
+		if !ProofBindingEqual(existing, p) {
 			return false, ErrProofDiverges
 		}
 		return false, nil

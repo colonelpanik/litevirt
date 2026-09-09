@@ -1639,7 +1639,7 @@ func jsonRoundTripCells(cells []interface{}) []interface{} {
 func pkKey(vals []interface{}) string {
 	parts := make([]string, len(vals))
 	for i, v := range vals {
-		parts[i] = coerceString(v)
+		parts[i] = coercePKString(v)
 	}
 	b, _ := json.Marshal(parts)
 	return string(b)
@@ -1658,6 +1658,37 @@ func pkKeyAt(row []interface{}, pkIdx []int) string {
 
 // coerceString normalizes a SQL/JSON scalar to a string. Replicated PKs are all
 // TEXT, so this is exact for them; other types use a stable fmt fallback.
+// coercePKString is coerceString for PRIMARY-KEY IDENTITY, where the string has
+// to be stable across read paths rather than merely readable.
+//
+// The same row reaches us with different Go types depending on the path: int64
+// from direct SQL and from a parsed WAL statement's params, float64 from a JSON
+// state dump (json.Unmarshal, no UseNumber). fmt.Sprintf("%v") is not
+// type-stable for integers — %v on a float64 switches to exponent form at 1e6,
+// so int64(1000000) renders "1000000" while float64(1000000) renders "1e+06",
+// and 1234567 renders "1.234567e+06". One row therefore had two identity
+// strings, and every keyed lookup across the two paths missed above that
+// threshold: the unresolved-tie register (a contested lease term became
+// permanently unacknowledgeable), the clear-on-write hooks, and the LWW
+// prefetch map that pairs an incoming dump row with its local updated_at.
+// scanner.go already documents this hazard class ("5000000000" vs "5e+09").
+//
+// Deliberately NOT applied to encodeRowCells. That feeds the v1 state digest,
+// so changing its encoding would change every table's hash on every node —
+// a fleet-wide compatibility event, from inside a lease-term change. Identity
+// strings are local (in memory, plus the local-only acknowledged_ties table),
+// so this is contained.
+//
+// Only integral float64 within exact-integer range is redirected: a genuinely
+// fractional value has no integer spelling to agree on, and beyond 2^53 the
+// float has already lost the digits that would make one meaningful.
+func coercePKString(v interface{}) string {
+	if f, ok := v.(float64); ok && f == math.Trunc(f) && math.Abs(f) < 1<<53 {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	return coerceString(v)
+}
+
 func coerceString(v interface{}) string {
 	switch x := v.(type) {
 	case nil:

@@ -357,12 +357,25 @@ func TestTheMirrorsRemovalProofIsTheBindsInventoryProof(t *testing.T) {
 	called := functionsCalled(fn)
 	for _, must := range []string{
 		"localTableDigests", "proveNoPeerHoldsInventoryRowsWeLack", "adoptionInventoryTables",
+		// …and the SHARED binding check. The mirror's conclusions are drawn from
+		// a read taken before the pass did anything; without this the proof can
+		// certify a later read and stamp the answer on that plan, which is how a
+		// live VM's object came to be deleted on a successful proof.
+		"inventoryMoved",
 	} {
 		if !slices.Contains(called, must) {
 			t.Fatalf("corroborateMirrorInventory no longer calls %s: it must ask the BIND's "+
-				"proof, over the bind's table set, rather than deciding for itself what a "+
-				"whole inventory read is", must)
+				"proof, over the bind's table set, with the bind's binding check, rather than "+
+				"deciding for itself what a whole inventory read is", must)
 		}
+	}
+	// The BOUND sample is what the peers are compared against, not a fresh read.
+	// Asserted on the argument, because passing `now` there compiles, reads
+	// almost identically, and is the entire defect.
+	if arg := soleDigestArgOf(t, fn, "proveNoPeerHoldsInventoryRowsWeLack"); arg != "bound" {
+		t.Fatalf("corroborateMirrorInventory proves %q against the peers, want the BOUND "+
+			"sample: proving a freshly sampled read whole says nothing about the plan that "+
+			"came out of the earlier one", arg)
 	}
 	for _, bad := range []string{
 		// A comparison of its own, which is the shape a second mechanism takes.
@@ -385,12 +398,62 @@ func TestTheMirrorsRemovalProofIsTheBindsInventoryProof(t *testing.T) {
 	if !ok {
 		t.Fatal("netboxMirror is gone: it is the only place the mirror's options are built")
 	}
-	if !slices.Contains(selectorsRead(build), "corroborateMirrorInventory") {
-		t.Fatal("netboxMirror no longer threads corroborateMirrorInventory into the " +
-			"reconciler. netboxsync treats an unwired corroboration as 'not corroborated', " +
-			"so this does not fail open — it withholds every removal whose only record is a " +
-			"mapping row, permanently, which is a mirror that never converges")
+	if !slices.Contains(selectorsRead(build), "netboxInventorySnapshot") {
+		t.Fatal("netboxMirror no longer threads netboxInventorySnapshot into the reconciler. " +
+			"netboxsync treats a missing inventory proof as 'not corroborated', so this does " +
+			"not fail open — it withholds every removal whose only record is a mapping row, " +
+			"permanently, which is a mirror that never converges")
 	}
+	// A SAMPLER, and the corroboration reached only through what it returns. A
+	// predicate wired straight in would answer about the inventory at the moment
+	// the question is asked, which is a different read from the one the pass's
+	// conclusions came out of.
+	mirror := parseFuncs(t, fset, "netbox_mirror.go")
+	sampler, ok := mirror["netboxInventorySnapshot"]
+	if !ok {
+		t.Fatal("netboxInventorySnapshot is gone: the mirror's proof has to be BOUND to a " +
+			"sample taken before the pass reads anything")
+	}
+	for _, must := range []string{"localTableDigests", "adoptionInventoryTables"} {
+		if !slices.Contains(functionsCalled(sampler), must) {
+			t.Fatalf("netboxInventorySnapshot no longer calls %s: the sample has to be the "+
+				"bind's own table set, read the bind's own way", must)
+		}
+	}
+	if slices.Contains(selectorsRead(sampler), "corroborateMirrorInventory") {
+		t.Fatal("netboxInventorySnapshot answers the corroboration itself: sampling and " +
+			"proving in one call is the defect — the pass has to read its state BETWEEN the " +
+			"two, which is the whole of what the binding certifies")
+	}
+}
+
+// soleDigestArgOf is the identifier `fn` passes to `callee` as its digest-map
+// argument, or "" when it passes something that is not a plain identifier.
+//
+// Structural because the distinction is invisible behaviourally at that line:
+// once the binding check has passed, the bound sample and a fresh read are
+// equal, so a test can only tell them apart by what the code says.
+func soleDigestArgOf(t *testing.T, fn *ast.FuncDecl, callee string) string {
+	t.Helper()
+	var got string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != callee || len(call.Args) < 2 {
+			return true
+		}
+		if id, ok := call.Args[len(call.Args)-1].(*ast.Ident); ok {
+			got = id.Name
+		}
+		return true
+	})
+	if got == "" {
+		t.Fatalf("could not read the digest argument %s passes to %s", fn.Name.Name, callee)
+	}
+	return got
 }
 
 // parseFuncs parses one file in this package and indexes its function

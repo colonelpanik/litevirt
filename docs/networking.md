@@ -410,11 +410,20 @@ repairs on. That costs one small request per peer. Fewer rows on a peer is not
 agreement: a peer holding one guest while this node holds two unrelated ones is
 not "behind", it is a peer holding a row this node has never seen.
 
+The agreement has to be about **the read the plan was built from**, not about
+whatever the tables hold a moment later. litevirt samples those four digests
+before it reads anything, builds the plan, and then proves that sample: every
+host agrees with it *and* this node's own rows still are it. A guest's row
+arriving while the plan is being assembled is therefore never adopted-by-luck —
+it is absent from the plan, so the plan is discarded and re-derived on the next
+pass rather than activated on a proof about a different read.
+
 If the inventory **cannot** be corroborated — a host that could not be reached, a
 host that reports different rows in any of those tables (more, fewer, or the same
-number of different ones), a host that says nothing about one of them, or a host
-that some peer knows about and this node has never heard of — the bind still
-succeeds, but the binding is created **suspended**:
+number of different ones), a host that says nothing about one of them, a host
+that some peer knows about and this node has never heard of, or this node's own
+inventory changing while the plan was being built — the bind still succeeds, but
+the binding is created **suspended**:
 
 ```
 $ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
@@ -809,8 +818,11 @@ period. So each removal is asked for its own proof:
   incarnation without saying anything about whether it stopped existing, so it
   authorizes a removal only once this node's inventory read is **corroborated as
   the cluster's** — the same digest agreement across the same closed participant
-  set that a prefix binding requires before it hands out an address. With none of
-  those, the removal is withheld.
+  set that a prefix binding requires before it hands out an address. It is *that*
+  read that has to be corroborated, the one the sweep drew the absence from: the
+  digests are sampled before the sweep reads anything, and a row arriving while
+  the sweep runs withholds the removal for one pass rather than certifying a read
+  the plan never saw. With none of those, the removal is withheld.
 - an **interface delete** needs a local row for the (VM, MAC) it retires — live
   or tombstoned, in either NIC table.
 - a **clear** needs a local lease row naming that NetBox address — again live or

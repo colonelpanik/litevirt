@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -46,23 +47,78 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// cannot own it: the answer is a fan-out over the closed participant
 		// universe, which lives here beside the prefix bind that already
 		// requires the identical property. See corroborateMirrorInventory.
-		InventoryCorroborated: s.corroborateMirrorInventory,
+		//
+		// A SAMPLER, not a predicate. The mirror takes this at the top of a pass
+		// and asks the value it returns later, so the proof answers for the read
+		// the pass was computed from rather than for whatever the tables hold by
+		// the time some removal turns out to need it. See
+		// netboxInventorySnapshot.
+		InventorySnapshot: s.netboxInventorySnapshot,
 		// The intra-node half of the exclusion the leader lease only covers
 		// across nodes. See netboxExclusivePass.
 		Exclusive: s.netboxExclusivePass,
 	})
 }
 
-// CorroborateMirrorInventoryOnce answers the mirror's inventory corroboration
-// once, and reports the reason a negative answer is negative.
+// netboxInventorySnapshot samples this node's inventory digests and returns the
+// mirror's corroboration BOUND to that sample.
 //
-// It exists so a scenario can assert what the PRODUCTION function answers on a
-// cluster whose nodes hold genuinely divergent databases — which is the state
-// the whole policy turns on, and the one thing a single-package test cannot
-// build: it needs two real daemons, two real local databases and the real peer
-// fan-out. The mirror's own passes call the wired closure, not this.
-func (s *Server) CorroborateMirrorInventoryOnce(ctx context.Context) (bool, string) {
-	return s.corroborateMirrorInventory(ctx)
+// The binding is the whole reason this is two steps. The mirror reads its
+// desired state and its removal evidence, diffs against NetBox, and only then
+// discovers that some removal rests on a mapping row alone; a predicate that
+// sampled its own digests at that moment would certify a different read from the
+// one the conclusion came out of. So the sample is taken here, before the pass
+// reads anything, and travels with the pass — see netboxsync.InventoryProof and
+// corroborateMirrorInventory, which requires the sample to still be this node's
+// own read before it compares it with a peer's.
+//
+// A sampling failure returns a proof that answers NO with the reason, rather
+// than a nil the caller has to remember to check: an unreadable digest is not a
+// corroborated inventory.
+func (s *Server) netboxInventorySnapshot(ctx context.Context) netboxsync.InventoryProof {
+	bound, err := s.localTableDigests(ctx, adoptionInventoryTables())
+	if err != nil {
+		return unreadableInventory{err: err}
+	}
+	return boundInventory{s: s, bound: bound}
+}
+
+// boundInventory is one sampled inventory, and the corroboration of THAT
+// inventory.
+type boundInventory struct {
+	s     *Server
+	bound map[string]corrosion.TableDigest
+}
+
+// Corroborated answers for the bound sample. See corroborateMirrorInventory.
+func (b boundInventory) Corroborated(ctx context.Context) (bool, string) {
+	return b.s.corroborateMirrorInventory(ctx, b.bound)
+}
+
+// unreadableInventory is the sample that could not be taken. It answers no,
+// always, and carries the read failure to the operator-facing line.
+type unreadableInventory struct{ err error }
+
+// Corroborated reports that nothing was sampled, so nothing can be corroborated.
+func (u unreadableInventory) Corroborated(context.Context) (bool, string) {
+	return false, fmt.Sprintf("this node's own inventory digests could not be sampled before "+
+		"the pass read its state (%v), so no absence can be concluded from a mapping row alone",
+		u.err)
+}
+
+// NetBoxInventorySnapshotOnce samples the mirror's inventory proof once, exactly
+// as a pass does.
+//
+// It exists so a scenario can drive the PRODUCTION sampler and the PRODUCTION
+// corroboration on a cluster whose nodes hold genuinely divergent databases —
+// which is the state the whole policy turns on, and the one thing a
+// single-package test cannot build: it needs two real daemons, two real local
+// databases and the real peer fan-out. It hands back the bound proof rather than
+// an answer, because the binding is the property under test: a scenario asks it
+// AFTER doing whatever the pass would have done in between. The mirror's own
+// passes call the wired sampler, not this.
+func (s *Server) NetBoxInventorySnapshotOnce(ctx context.Context) netboxsync.InventoryProof {
+	return s.netboxInventorySnapshot(ctx)
 }
 
 // effectiveNetBoxSweepInterval is the cadence a mirror built with this argument

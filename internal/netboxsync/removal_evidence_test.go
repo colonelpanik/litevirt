@@ -41,13 +41,37 @@ import (
 // to say so — a fixture-wide default would make the two mapping-row scenarios
 // below differ in nothing visible.
 func withCorroboratedInventory(r *Reconciler) {
-	r.inventoryCorroborated = func(context.Context) (bool, string) { return true, "" }
+	withInventoryProof(r, &fixedProof{ok: true})
 }
 
 // withUncorroboratedInventory is the other half: the cluster could NOT confirm
 // this node's read, which is what a node still replicating gets.
 func withUncorroboratedInventory(r *Reconciler, why string) {
-	r.inventoryCorroborated = func(context.Context) (bool, string) { return false, why }
+	withInventoryProof(r, &fixedProof{why: why})
+}
+
+// withInventoryProof makes one proof the answer this reconciler's passes get,
+// through the production sampler seam.
+//
+// A SAMPLER, matching production, so a scenario cannot accidentally pin a shape
+// the daemon does not have: the pass takes the proof before it reads anything
+// and asks it later, and the tests below that count how often it was asked are
+// counting what a pass actually does.
+func withInventoryProof(r *Reconciler, proof InventoryProof) {
+	r.inventorySnapshot = func(context.Context) InventoryProof { return proof }
+}
+
+// fixedProof is a corroboration with a predetermined answer, counting how many
+// times it was asked.
+type fixedProof struct {
+	ok    bool
+	why   string
+	asked int
+}
+
+func (f *fixedProof) Corroborated(context.Context) (bool, string) {
+	f.asked++
+	return f.ok, f.why
 }
 
 // TestAMappingRowAloneDoesNotProveTheIncarnationStoppedExisting is finding 1.
@@ -150,7 +174,7 @@ func TestAnUnwiredCorroborationWithholdsAMappingOnlyRemoval(t *testing.T) {
 	nb.enforceNames = true
 	nb.listVMs = nb.listVMs[:2]
 	nb.listIfaces = nb.listIfaces[:2]
-	if r.inventoryCorroborated != nil {
+	if r.inventorySnapshot != nil {
 		t.Fatal("this scenario is about the UNWIRED default; the fixture has supplied one")
 	}
 	seedMirroredObjectRef(t, r, netbox.Identity(fp, "uuid-2", ""), 12)
@@ -339,24 +363,20 @@ func TestVMRemovalProvenCoversEveryRecordAndAsksTheClusterForOne(t *testing.T) {
 		{"an identity carrying no uuid", "not-an-identity", true, false, false,
 			"an unparseable identity names no incarnation"},
 	} {
-		var asked int
-		r.inventoryCorroborated = func(context.Context) (bool, string) {
-			asked++
-			return tc.corroborated, "the cluster could not confirm this read"
-		}
-		corr := r.removalCorroboration(ctx)
+		proof := &fixedProof{ok: tc.corroborated, why: "the cluster could not confirm this read"}
+		corr := r.removalCorroboration(ctx, proof)
 
 		if got := vmRemovalProven(tc.identity, known, corr); got != tc.want {
 			t.Errorf("%s: proven = %v, want %v — %s", tc.what, got, tc.want, tc.why)
 		}
-		if (asked > 0) != tc.wantAsked {
+		if (proof.asked > 0) != tc.wantAsked {
 			t.Errorf("%s: the cluster was asked %d time(s), want asked=%v. The corroboration "+
 				"is a peer fan-out, so it must be reached only by the record that cannot "+
-				"answer without it", tc.what, asked, tc.wantAsked)
+				"answer without it", tc.what, proof.asked, tc.wantAsked)
 		}
-		if asked > 1 {
+		if proof.asked > 1 {
 			t.Errorf("%s: the cluster was asked %d times for ONE pass; two fan-outs can "+
-				"straddle a write and give two answers to one question", tc.what, asked)
+				"straddle a write and give two answers to one question", tc.what, proof.asked)
 		}
 	}
 }
@@ -382,18 +402,14 @@ func TestOnePassAsksTheClusterAtMostOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadMirrorEvidence: %v", err)
 	}
-	var asked int
-	r.inventoryCorroborated = func(context.Context) (bool, string) {
-		asked++
-		return true, ""
-	}
+	proof := &fixedProof{ok: true}
 
-	corr := r.removalCorroboration(ctx)
+	corr := r.removalCorroboration(ctx, proof)
 	if !vmRemovalProven(first, known, corr) || !vmRemovalProven(second, known, corr) {
 		t.Fatal("both mapping-only removals are corroborated and must be proven")
 	}
-	if asked != 1 {
-		t.Fatalf("the cluster was asked %d times for two candidates in one pass, want 1", asked)
+	if proof.asked != 1 {
+		t.Fatalf("the cluster was asked %d times for two candidates in one pass, want 1", proof.asked)
 	}
 }
 

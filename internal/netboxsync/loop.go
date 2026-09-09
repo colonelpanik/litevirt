@@ -59,6 +59,37 @@ const clusterTypeName = "litevirt"
 // fingerprint carried in the custom field.
 const fallbackClusterName = "litevirt"
 
+// InventoryProof is a corroboration BOUND to one sampled inventory: the answer
+// to "is the read these conclusions were computed from the CLUSTER's?", asked
+// about that read and not about whatever the tables hold by the time the
+// question is put.
+//
+// The binding is what makes the answer mean anything. The mirror reads its
+// desired state and its removal evidence, diffs them against NetBox, and only
+// then discovers that one removal rests on a mapping row alone — the record that
+// cannot justify an absence by itself. Everything before that sentence took
+// time, and replication does not stop while it passes. A proof sampled at the
+// end certifies the inventory as it is then; the plan came from the inventory as
+// it was, and the two are the same only by luck. A live VM's NetBox object was
+// deleted through precisely that gap: the target's `vms` row landed after the
+// plan was built, both peers agreed on the now-complete inventory, and the OLD
+// plan executed with a fresh proof stamped on it.
+//
+// So an implementation must answer for the SAMPLE, which entails both halves:
+// every participant agrees with the sampled digests, AND this node's own rows
+// still are those digests. The second half is not redundant — a peer that has
+// not yet received a row agrees with a sample this node has already moved past,
+// and the conclusion drawn from the sample is then contradicted by the local
+// database itself.
+type InventoryProof interface {
+	// Corroborated reports whether the bound sample is corroborated as the
+	// cluster's inventory and, when it is not, the operator-facing reason.
+	//
+	// Called at most once per pass (see removalCorroboration): it is a peer
+	// fan-out, and two answers to one question can straddle a write.
+	Corroborated(ctx context.Context) (bool, string)
+}
+
 // Options is everything the reconciler needs. The daemon fills it from config;
 // see internal/grpcapi's mirror wiring, which is the only production caller.
 type Options struct {
@@ -99,14 +130,23 @@ type Options struct {
 	// wiring must be inert rather than an ungated writer.
 	Latched func(context.Context) bool
 
-	// InventoryCorroborated reports whether this node's own inventory read is
-	// CORROBORATED as the cluster's, and — when it is not — the operator-facing
-	// reason why not.
+	// InventorySnapshot samples the inventory this pass reads its conclusions
+	// from, and returns the corroboration BOUND to that exact sample.
 	//
 	// It is the second half of the removal-evidence policy for the one record
 	// that cannot supply it: the mirror's own mapping row, which identifies an
 	// incarnation without saying anything about whether it stopped existing. See
 	// vmRemovalProven.
+	//
+	// TWO CALLS, NOT ONE PREDICATE, and the split is the whole point. A pass
+	// concludes an absence from rows it read at the START of the sweep and asks
+	// about it LATER, after a diff and several NetBox round trips. A predicate
+	// that sampled its own digests when asked would therefore certify a
+	// DIFFERENT state from the one that supplied the conclusion — peers agreeing
+	// about the inventory as it is now says nothing about the plan computed from
+	// the inventory as it was, and a live VM's object was deleted through exactly
+	// that gap. So the sample is taken BEFORE the reads and the proof is bound to
+	// it: see InventoryProof.
 	//
 	// THREADED IN rather than implemented here, exactly as the lease and the
 	// latch are, because the answer needs the cluster: it is a fan-out over the
@@ -116,8 +156,10 @@ type Options struct {
 	// this package is how two proofs of one property came to differ before.
 	//
 	// Nil is "not corroborated", matching every other predicate here: an
-	// incomplete wiring withholds a removal rather than authorizing one.
-	InventoryCorroborated func(context.Context) (bool, string)
+	// incomplete wiring withholds a removal rather than authorizing one. So is a
+	// nil InventoryProof, which is what a sampler that could not read its own
+	// digests returns.
+	InventorySnapshot func(context.Context) InventoryProof
 
 	// Exclusive runs one pass inside the caller's INTRA-NODE critical section,
 	// and may decline to run it at all.
@@ -162,7 +204,7 @@ func New(o Options) *Reconciler {
 		latched:      o.Latched,
 		exclusive:    o.Exclusive,
 
-		inventoryCorroborated: o.InventoryCorroborated,
+		inventorySnapshot: o.InventorySnapshot,
 	}
 }
 
@@ -386,6 +428,26 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 	}
 	r.clusterID = clusterID
 
+	// THE SNAPSHOT THIS PASS'S CONCLUSIONS ARE BOUND TO, sampled BEFORE the
+	// reads that produce them and not when the proof is finally needed.
+	//
+	// Everything below — the desired state, the diff, the removal evidence — is
+	// read from the local inventory tables, and the one conclusion that needs
+	// the cluster ("no host holds a row for this incarnation") is a statement
+	// about THIS read. Sampling the digests later would prove a different read
+	// whole and stamp the answer on this one: that is how a live VM's object
+	// came to be deleted, with the target's row already replicated and both
+	// peers agreeing about it. See InventoryProof.
+	//
+	// Unconditional, unlike the fan-out it feeds. The sample is local — a table
+	// digest, no peer dialled, the same computation anti-entropy already runs
+	// every tick — and it has to be taken before anything is read, which is
+	// exactly when a pass cannot yet know whether some removal will need it. So
+	// the leader pays one digest per sweep; the fan-out itself stays lazy (see
+	// removalCorroboration), and a pass whose every removal rests on a tombstone
+	// still asks no peer.
+	proof := r.bindInventory(ctx)
+
 	desired, skipped, err := r.desiredState(ctx)
 	if err != nil {
 		return false, fmt.Errorf("read desired state: %w", err)
@@ -445,7 +507,7 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"desired_vms", len(desired), "skipped_records", skipped,
 			"netbox_vms", len(actual.VMs), "netbox_interfaces", len(actual.NICs))
 		actions, converged, partialRead = kept, false, why
-	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual); unprovenDeletes+unprovenClears > 0 {
+	} else if kept, unprovenDeletes, unprovenClears := r.withoutUnprovenRemovals(ctx, actions, actual, proof); unprovenDeletes+unprovenClears > 0 {
 		// The whole-pass gate above answers "is this read whole?", which a
 		// PARTIALLY hydrated database passes: some of the cluster's rows are
 		// here, so the read is neither empty nor short of a record it tried to
@@ -673,7 +735,8 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 //
 // A partial pass is NOT an error. It reports unconverged — the caller withholds
 // the success stamp — and the next sweep re-derives everything from scratch.
-func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Action, actual Actual) ([]Action, int, int) {
+func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Action, actual Actual,
+	proof InventoryProof) ([]Action, int, int) {
 	if !hasRemovals(actions) {
 		// The evidence read costs five table scans, so a pass with nothing to
 		// prove does not pay for them.
@@ -705,7 +768,7 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 	// if some removal's evidence actually needs it. It is a peer fan-out — see
 	// removalCorroboration — and a healthy pass whose every removal rests on a
 	// tombstone must not pay for one.
-	corr := r.removalCorroboration(ctx)
+	corr := r.removalCorroboration(ctx, proof)
 
 	kept := make([]Action, 0, len(actions))
 	var unprovenVMs, unprovenNICs []string
@@ -869,12 +932,13 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string,
 //     mirror created that object for that incarnation — replication is per
 //     TABLE, so it is precisely what a node holds for an incarnation whose `vms`
 //     row has not arrived and whose VM may be live on a peer. It becomes a
-//     justified absence only when the inventory read it is absent FROM is
-//     corroborated as the cluster's: every participant's address-bearing tables
-//     agreeing with this node's means no host holds a row for this uuid, and a
-//     VM nobody holds a row for is not running anywhere. See
-//     removalCorroboration, which reuses the bind path's proof rather than
-//     inventing a second notion of a whole read.
+//     justified absence only when THE INVENTORY READ IT IS ABSENT FROM — that
+//     read, not a later one — is corroborated as the cluster's: every
+//     participant's address-bearing tables agreeing with the sample this pass
+//     was computed from means no host holds a row for this uuid, and a VM nobody
+//     holds a row for is not running anywhere. See removalCorroboration, which
+//     asks a proof BOUND to that sample and reuses the bind path's own machinery
+//     rather than inventing a second notion of a whole read.
 //   - NO RECORD withholds, as it always has.
 //
 // The corroboration is asked ONLY on the mapping-only branch. It is a peer
@@ -917,6 +981,15 @@ func vmRemovalProven(identity string, known corrosion.MirrorEvidence, corr *remo
 // pay, nor be allowed to get different answers from two fan-outs a write could
 // land between.
 //
+// ASKED LATE, ABOUT AN INVENTORY SAMPLED EARLY. Lazy is right for the fan-out
+// and wrong for the SAMPLE: by the time a mapping-only removal turns up, the
+// read that removal is measured against is already several reads and several
+// NetBox round trips old. So the pass hands in an InventoryProof bound to the
+// inventory it read, taken before it read anything, and this asks that proof.
+// Sampling here instead would answer about the inventory as it is now — a
+// different state from the one that produced the conclusion, which is how a live
+// VM's object was once deleted on a perfectly successful proof.
+//
 // FAIL CLOSED, including the unwired case: no asker is not a corroborated
 // inventory, and the removal is withheld. The reason is kept for the log line,
 // because "not corroborated" with nothing attached is what an operator cannot
@@ -928,18 +1001,38 @@ type removalCorroboration struct {
 	why  string
 }
 
-// removalCorroboration binds this pass's corroboration to its context.
+// bindInventory samples the inventory this pass will read its conclusions from,
+// and returns the proof bound to that sample.
+//
+// Nil in, nil out, and a sampler that could not read its own digests returns nil
+// too: every one of those is "not corroborated" at the point the question is
+// asked (see removalCorroboration), so an unwired or unreadable mirror withholds
+// a mapping-only removal rather than authorizing one.
+func (r *Reconciler) bindInventory(ctx context.Context) InventoryProof {
+	if r.inventorySnapshot == nil {
+		return nil
+	}
+	return r.inventorySnapshot(ctx)
+}
+
+// removalCorroboration binds this pass's corroboration to its context and to the
+// SNAPSHOT the pass's conclusions were read from.
+//
+// The proof is taken by the caller before any read (see sweep) and passed in
+// here, so nothing on this path can reach a corroboration of a different read:
+// there is no sampler to call late. That is the structural half of the fix — the
+// proof's own binding check is the other, and neither is enough alone.
 //
 // The context is captured here rather than stored on the value: the fan-out
 // belongs to ONE pass, and a struct carrying a context is one refactor away from
 // being reused across two.
-func (r *Reconciler) removalCorroboration(ctx context.Context) *removalCorroboration {
+func (r *Reconciler) removalCorroboration(ctx context.Context, proof InventoryProof) *removalCorroboration {
 	return &removalCorroboration{ask: func() (bool, string) {
-		if r.inventoryCorroborated == nil {
-			return false, "this mirror is wired without an inventory corroboration, so no " +
-				"absence can be concluded from a mapping row alone"
+		if proof == nil {
+			return false, "this mirror has no inventory proof for the read this pass was " +
+				"computed from, so no absence can be concluded from a mapping row alone"
 		}
-		return r.inventoryCorroborated(ctx)
+		return proof.Corroborated(ctx)
 	}}
 }
 

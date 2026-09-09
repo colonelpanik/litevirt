@@ -155,11 +155,11 @@ type Reconciler struct {
 	// See Options.Latched.
 	latched func(context.Context) bool
 
-	// inventoryCorroborated reports whether this node's inventory read is the
-	// cluster's, for the one removal record that cannot say so by itself. Nil
-	// never corroborates. See Options.InventoryCorroborated and
-	// vmRemovalProven.
-	inventoryCorroborated func(context.Context) (bool, string)
+	// inventorySnapshot samples the inventory a pass's conclusions are read
+	// from and hands back the corroboration BOUND to that exact sample, for the
+	// one removal record that cannot say so by itself. Nil never corroborates.
+	// See Options.InventorySnapshot and vmRemovalProven.
+	inventorySnapshot func(context.Context) InventoryProof
 
 	// exclusive is the caller's INTRA-NODE critical section around one pass.
 	// Nil runs the pass directly. See Options.Exclusive.

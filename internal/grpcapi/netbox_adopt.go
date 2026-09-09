@@ -77,6 +77,16 @@ import (
 // `lv netbox resume` finishes it — the same contract the CA re-key already
 // promises, through the same gate.
 
+// SetOnInventoryRead installs a hook that runs immediately AFTER planAdoption's
+// local VM enumeration and before the plan is corroborated.
+//
+// It exists so a scenario can replicate a row into the exact window the plan's
+// snapshot binding defends — a `vms` or NIC row arriving after the enumeration
+// the candidate list came from — which nothing above the server can otherwise
+// reach: the window is inside one function, between two local reads. nil in
+// production.
+func (s *Server) SetOnInventoryRead(fn func()) { s.onInventoryRead = fn }
+
 // adoptionCap bounds how many addresses ONE bind will adopt.
 //
 // The unit of cost is one PENDING adoption: a POST to NetBox, plus up to two
@@ -339,6 +349,14 @@ func (s *Server) adoptExistingAddresses(ctx context.Context, b corrosion.Binding
 // what a NIC actually IS is per-VM; a network-scoped read would have to
 // reimplement that resolution.
 //
+// The inventory SAMPLE at the top adds one more read of a different shape: a
+// whole-database table digest, the same computation anti-entropy runs on its own
+// tick. It is taken before the refusals rather than after, because a sample
+// taken after a read is a sample that cannot certify it — so a bind refused for
+// a container on the network now pays for one digest it does not use. That is a
+// few milliseconds against an operation that already scans every VM in the
+// cluster.
+//
 // IT IS DELIBERATELY NOT BOUNDED, and the cap is not what would bound it — the
 // cap counts adoption CANDIDATES, so it is evaluated after the scan and cannot
 // shorten it. The reason is that every caller is either interactive and rare or
@@ -362,6 +380,31 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 			b.Network, b.ObservedCIDR, perr)
 	}
 	ones, _ := prefix.Mask.Size()
+
+	// THE SNAPSHOT THIS PLAN IS BOUND TO, sampled BEFORE the first read that
+	// goes into it.
+	//
+	// The plan is a claim about the whole cluster — "these are all the addresses
+	// guests already hold inside this prefix" — assembled from the local reads
+	// below, and the corroboration at the bottom is what turns those reads into
+	// a statement about the cluster. It therefore has to certify THESE reads.
+	// Sampling the digests part-way through, which is where this check used to
+	// sit, certified a read the candidate list had already been enumerated from
+	// something older than: a `vms` row arriving between the enumeration and the
+	// sample was absent from the candidates and PRESENT in the digest every peer
+	// then agreed with, so the bind went live over an address it had not seen —
+	// the same defect the inventory mirror was found to have, reached from the
+	// other side.
+	//
+	// An unreadable digest is recorded as uncorroborated rather than returned as
+	// an error, matching corroborateAdoptionInventory's own read failure: the
+	// remedy for both is a later pass, not an operator.
+	bound, berr := s.localTableDigests(ctx, adoptionInventoryTables())
+	if berr != nil {
+		slog.Warn("netbox: could not sample this node's inventory digests before planning an "+
+			"adoption; the plan cannot be corroborated and the binding stays suspended",
+			"network", b.Network, "prefix", b.PrefixID, "error", berr)
+	}
 
 	// What litevirt has ALREADY accounted for on this network, plus the one
 	// class of lease that refuses the bind outright.
@@ -441,21 +484,14 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 	if err != nil {
 		return adoptionPlan{}, fmt.Errorf("list VMs to find existing addresses on network %q: %w", b.Network, err)
 	}
-	// The ONE read this function cannot fail closed on from the read itself.
-	// Recorded on the plan rather than acted on here, because what it costs is
-	// decided by the caller: a bind SUSPENDS, and an adoption that is meant to
-	// finish a suspension REFUSES. See corroborateAdoptionInventory.
-	//
-	// On EVERY bind, not only an empty read. An empty list is the loudest shape
-	// of an unreplicated inventory but not the only one, and it is not even the
-	// dangerous one: a node that has received SOME rows and not the target
-	// network's guests enumerates a plausible-looking list, adopts what is in it,
-	// binds live having adopted nothing that matters, and hands the incumbent's
-	// address to the next VM created there. Gating the check on `len(vms) == 0`
-	// let exactly that through — one unrelated VM was enough to skip it.
-	plan := adoptionPlan{}
-	plan.uncorroborated = !s.corroborateAdoptionInventory(ctx, b)
+	if s.onInventoryRead != nil {
+		// A TEST SEAM, and the window it opens is the one the snapshot binding
+		// above defends: a replicated row landing after the enumeration this
+		// plan is built from. nil in production. See SetOnInventoryRead.
+		s.onInventoryRead()
+	}
 
+	plan := adoptionPlan{}
 	var cands []adoptCandidate
 	seen := make(map[string]string) // bare address -> the VM already claiming it
 	for _, vm := range vms {
@@ -598,6 +634,30 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 		return bytes.Compare(net.ParseIP(cands[i].IP), net.ParseIP(cands[j].IP)) < 0
 	})
 	plan.candidates = cands
+
+	// THE ONE THING THIS FUNCTION CANNOT FAIL CLOSED ON FROM ITS OWN READS, and
+	// it is asked LAST, about the snapshot taken FIRST.
+	//
+	// Recorded on the plan rather than acted on here, because what it costs is
+	// decided by the caller: a bind SUSPENDS, and an adoption that is meant to
+	// finish a suspension REFUSES. See corroborateAdoptionInventory.
+	//
+	// On EVERY bind, not only an empty read. An empty list is the loudest shape
+	// of an unreplicated inventory but not the only one, and it is not even the
+	// dangerous one: a node that has received SOME rows and not the target
+	// network's guests enumerates a plausible-looking list, adopts what is in it,
+	// binds live having adopted nothing that matters, and hands the incumbent's
+	// address to the next VM created there. Gating the check on `len(vms) == 0`
+	// let exactly that through — one unrelated VM was enough to skip it.
+	//
+	// ASKED HERE, not part-way up, and that is the second finding on this line.
+	// Every read this plan rests on is now inside the window the proof covers:
+	// the leases, the container NICs, the VM enumeration and each VM's merged
+	// NICs. Asked before those reads finished, the proof certified an inventory
+	// the candidate list had not been built from — and a row that arrived in
+	// between was missing from the list while being present in the digest every
+	// peer agreed with, which is a live binding over an address nobody adopted.
+	plan.uncorroborated = !s.corroborateAdoptionInventory(ctx, b, bound)
 	return plan, nil
 }
 
@@ -672,11 +732,33 @@ func (s *Server) planAdoption(ctx context.Context, b corrosion.BindingRecord) (a
 // that costs is a suspension that lifts itself on the next pass; what fail-open
 // would cost is a live binding over addresses running guests hold.
 //
+// IT CERTIFIES THE SNAPSHOT THE PLAN WAS BUILT FROM, not the inventory as it
+// stands when the question is asked. planAdoption samples the digests before its
+// first read and hands them in here; this re-reads them and requires them
+// IDENTICAL (inventoryMoved) before comparing anything with a peer, and it is
+// the BOUND digests the peers are compared against. Both halves are load-bearing
+// and neither is enough alone: without the binding, a row arriving mid-plan is
+// absent from the candidate list and present in the digest every peer agrees
+// with — a live binding over an address nobody adopted; without the peer
+// agreement, an unhydrated node's short read is confirmed by nothing but itself.
+//
+// A CHANGE DISCARDS THE PLAN. The bind suspends under the self-lifting
+// unhydrated reason, and the revalidation pass re-derives the plan from a fresh
+// snapshot on its next pass — a re-plan with no retry loop, no second code path
+// and no NetBox requests spent on a premise that has already moved.
+//
 // WHAT IT STILL CANNOT SEE: an inventory that is identical on every host in the
 // closed participant set and wrong on all of them. Agreement across the cluster
 // is the strongest statement replicated rows can support; no proof can invent a
 // row nobody holds.
-func (s *Server) corroborateAdoptionInventory(ctx context.Context, b corrosion.BindingRecord) bool {
+func (s *Server) corroborateAdoptionInventory(ctx context.Context, b corrosion.BindingRecord,
+	bound map[string]corrosion.TableDigest) bool {
+	if len(bound) == 0 {
+		slog.Warn("netbox: no inventory sample was taken before this adoption plan was built, "+
+			"so there is nothing to corroborate it against; treating it as uncorroborated",
+			"network", b.Network, "prefix", b.PrefixID)
+		return false
+	}
 	local, err := s.localTableDigests(ctx, adoptionInventoryTables())
 	if err != nil {
 		slog.Warn("netbox: could not read this node's own inventory digests while binding a "+
@@ -684,7 +766,18 @@ func (s *Server) corroborateAdoptionInventory(ctx context.Context, b corrosion.B
 			"network", b.Network, "prefix", b.PrefixID, "error", err)
 		return false
 	}
-	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, local)
+	if moved := inventoryMoved(bound, local); moved != "" {
+		// THE PLAN'S OWN INPUTS MOVED WHILE IT WAS BEING BUILT. Discarded, not
+		// re-planned: the caller suspends the binding under the self-lifting
+		// unhydrated reason and the revalidation pass re-derives the whole plan
+		// from a fresh snapshot, which is a re-plan with none of the machinery.
+		slog.Warn("netbox: this node's inventory changed while an adoption plan was being "+
+			"built, so the plan does not describe the read the cluster can confirm; the "+
+			"binding stays suspended and a revalidation pass re-plans it",
+			"network", b.Network, "prefix", b.PrefixID, "reason", moved)
+		return false
+	}
+	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, bound)
 	if perr != nil {
 		slog.Warn("netbox: could not establish whether any peer holds an inventory record this "+
 			"node has not received while binding a prefix; treating it as uncorroborated",
@@ -771,6 +864,40 @@ func adoptionInventoryTables() []string {
 // reaches it through a function value threaded into netboxsync.Options, because
 // that package cannot import this one — see netboxsync.Options.
 //
+// IT ANSWERS FOR THE SNAPSHOT IT IS GIVEN, WHICH IS THE WHOLE OF THE SECOND
+// FINDING HERE. The mirror does not ask this until it has read its desired
+// state, diffed it against NetBox and classified its removal evidence — so by
+// the time the question arrives, the read the absence is measured against is
+// already several reads old. An earlier round reused the bind's predicate as it
+// stood, which samples its digests when called. That is right for the bind,
+// which proves and then acts on one read, and wrong here: it certified the
+// inventory as it was at the END of the pass and stamped the answer on a
+// conclusion drawn at the start. A live VM's object was deleted through that gap
+// — the target's `vms` row replicated mid-pass, both peers agreed about the
+// now-complete inventory, and the OLD plan executed with a successful proof
+// attached. A separately sampled boolean cannot establish a relationship to a
+// plan it never saw.
+//
+// So the caller samples FIRST (netboxsync.Options.InventorySnapshot) and this
+// answers about THAT sample, in two halves that are both required:
+//
+//  1. THE SAMPLE IS STILL THIS NODE'S OWN READ. Re-read the digests and require
+//     them identical (inventoryMoved). Without it a peer that has not yet
+//     received the row agrees with a sample this node has already moved past —
+//     the proof succeeds while the local database itself now contradicts the
+//     conclusion.
+//  2. EVERY PARTICIPANT AGREES WITH THE SAMPLE — the bind's own fan-out, handed
+//     the BOUND digests rather than freshly sampled ones, so what is proven
+//     whole is the read the plan came from.
+//
+// A CHANGE DISCARDS, it does not retry. The pass withholds the removals it
+// cannot prove, reports unconverged, stamps no success and re-derives everything
+// on the next tick; nothing about the withheld object is remembered. Recomputing
+// inside the pass would mean re-reading both sides — the desired state AND
+// NetBox — in a loop a busy cluster's write rate could keep alive, inside a
+// one-minute leader lease and while holding this node's NetBox critical section.
+// Withholding costs one interval of a leaked NetBox object; leak over collision.
+//
 // FAIL CLOSED at every branch, with the reason returned rather than logged here:
 // the mirror puts it on its own withheld-removal warning, beside the objects it
 // withheld, which is the line an operator reads.
@@ -778,17 +905,29 @@ func adoptionInventoryTables() []string {
 // WHAT IT COSTS. On a cluster with rows in flight the digests disagree until
 // replication settles, so a removal resting on a mapping row alone is DELAYED —
 // the mirror stalls for that one object, logs why, and does not stamp its
-// success gauge. That is the same direction every other decision here takes, and
-// the same limitation the bind documents: a PERMANENTLY lost host can never
-// produce a digest, so a removal that needs one keeps withholding and the object
-// is one to remove in NetBox by hand. See docs/networking.md.
-func (s *Server) corroborateMirrorInventory(ctx context.Context) (bool, string) {
-	local, err := s.localTableDigests(ctx, adoptionInventoryTables())
+// success gauge. The binding check widens that from "settled at this instant" to
+// "unchanged across the pass's own reads", which is the same direction and the
+// same self-clearing delay. And the same limitation the bind documents holds: a
+// PERMANENTLY lost host can never produce a digest, so a removal that needs one
+// keeps withholding and the object is one to remove in NetBox by hand. See
+// docs/networking.md.
+func (s *Server) corroborateMirrorInventory(ctx context.Context, bound map[string]corrosion.TableDigest) (bool, string) {
+	if len(bound) == 0 {
+		// No sample means no conclusion to certify: the sampler failed, or a
+		// caller passed nothing. Either way this cannot answer for a read it was
+		// never given, and answering about a fresh one is the defect.
+		return false, "this pass carries no inventory sample, so the read its conclusions " +
+			"were drawn from cannot be corroborated"
+	}
+	now, err := s.localTableDigests(ctx, adoptionInventoryTables())
 	if err != nil {
 		return false, fmt.Sprintf(
 			"this node's own inventory digests could not be read (%v)", err)
 	}
-	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, local)
+	if moved := inventoryMoved(bound, now); moved != "" {
+		return false, moved
+	}
+	proven, why, perr := s.proveNoPeerHoldsInventoryRowsWeLack(ctx, bound)
 	if perr != nil {
 		return false, fmt.Sprintf(
 			"whether any peer holds an inventory record this node has not received could "+
@@ -798,6 +937,70 @@ func (s *Server) corroborateMirrorInventory(ctx context.Context) (bool, string) 
 		return true, ""
 	}
 	return false, why
+}
+
+// inventoryMoved reports the table whose digest changed between the sample a
+// conclusion was computed from and the sample taken while proving it, or "" when
+// every table is identical.
+//
+// THE ONE COPY, shared by both consumers of the inventory proof, because both
+// have the same shape: read the inventory, conclude something from it, prove the
+// conclusion. Two spellings of "did our read move?" would be a second notion of
+// a whole read, which is the mistake this file has already made three times in
+// the peer-set direction.
+//
+// SCOPED TO THE INVENTORY TABLES, and deliberately no wider. These are the
+// tables whose rows decide the conclusions — whether a guest already holds an
+// address (the bind) and whether any host holds a row for an incarnation (the
+// mirror). `ip_allocations`, `netbox_objects` and every other replicated table
+// are excluded for the reason adoptionInventoryTables states: a row arriving
+// there cannot make an absent VM present or an unrecorded address held. Widening
+// this to the whole database would withhold on writes that cannot change the
+// answer — the mirror's own mapping-row write is one of them — and a busy
+// cluster would never prove a mapping-only removal again. That is a liveness
+// regression bought for nothing.
+//
+// STRICT EQUALITY, both hashes and the count. A count that matches under a
+// different hash is a row that was REPLACED, which moves the read as surely as
+// one that was added; and the v1/v2 hash pair is compared whole because a
+// digest_v2 flip mid-pass is itself a change in what the sample means. The
+// comparison is local-to-local — one node's own two reads — so there is no
+// pairwise negotiation to do and nothing corrosion.TableDigestsAgree would add:
+// that predicate answers the DIFFERENT question of whether two NODES agree, and
+// borrowing it here is how one question grows two answers.
+//
+// WHAT IT CANNOT SEE: a change that lands and is undone inside the window,
+// restoring an identical digest. Row PRESENCE is monotone across a window this
+// short — litevirt soft-deletes, so an arrival leaves a row that is still there
+// at the second sample and the count cannot come back down — so no ARRIVAL can
+// hide here, and an arrival is what every conclusion on this path turns on. A
+// row updated away and back would hide, and costs nothing: both conclusions rest
+// on a row existing, not on its contents.
+func inventoryMoved(bound, now map[string]corrosion.TableDigest) string {
+	// Walked in adoptionInventoryTables order so two runs over one change name
+	// the same table rather than whichever the map yielded first.
+	for _, table := range adoptionInventoryTables() {
+		was, ok := bound[table]
+		if !ok {
+			return fmt.Sprintf(
+				"the inventory sample this conclusion was drawn from carries no %s digest, "+
+					"so there is nothing to corroborate it against", table)
+		}
+		is, ok := now[table]
+		if !ok {
+			return fmt.Sprintf("this node no longer reports a %s digest, so the read this "+
+				"conclusion was drawn from cannot be confirmed as still its own", table)
+		}
+		if was != is {
+			return fmt.Sprintf(
+				"this node's %s rows changed while the proof was being taken (%d row(s) in "+
+					"the read this conclusion was drawn from, %d now), so what the cluster "+
+					"agrees about is no longer the read that produced it; the conclusion is "+
+					"discarded and the next pass re-derives it",
+				table, was.Count, is.Count)
+		}
+	}
+	return ""
 }
 
 // proveNoPeerHoldsInventoryRowsWeLack asks every host in the CLOSED participant

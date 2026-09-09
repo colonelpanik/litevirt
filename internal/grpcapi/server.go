@@ -133,6 +133,12 @@ type Server struct {
 	onProofCollected func()
 	onProofsGathered func(map[string]OrphanProof)
 
+	// onInventoryRead is an ADOPTION-PLAN TEST SEAM, run immediately after the
+	// local VM enumeration a plan is built from, so a scenario can land a
+	// replicated row inside the exact window the plan's snapshot binding
+	// defends. nil in production. See SetOnInventoryRead.
+	onInventoryRead func()
+
 	// onMaintenanceTick is a MAINTENANCE-LOOP TEST SEAM: it fires after each
 	// completed tick, so a test can observe the CADENCE the loop actually runs
 	// at without a database behind it. nil in production.

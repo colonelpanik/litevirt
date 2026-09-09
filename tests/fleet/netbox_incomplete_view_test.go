@@ -233,7 +233,11 @@ func TestFleetAPartiallyHydratedBindIsSuspendedUnderTheSelfLiftingReason(t *test
 // THIS NEEDS TWO REAL DATABASES. The policy's unit scenarios inject the
 // corroboration's answer, which is right for testing the policy and says nothing
 // about what the production function answers when a peer genuinely holds VM rows
-// this node has not received. That is what this asserts, over the real fan-out.
+// this node has not received. That is what this asserts, over the real fan-out —
+// sampling and asking back to back, which is the PEER half of the proof with its
+// snapshot binding trivially satisfied. The binding itself is covered by
+// TestIndependentCorroborationMustCoverTheDeletionSnapshot, which puts a write
+// between the two.
 //
 // THE CONTROL RUNS FIRST, on the very same two nodes: with both inventories
 // agreeing the corroboration passes, so the refusal afterwards is produced by
@@ -242,7 +246,7 @@ func TestFleetAMirrorOnAShortInventoryCannotCorroborateIt(t *testing.T) {
 	_, c, holder, short := unhydratedCluster(t)
 	ctx := context.Background()
 
-	if ok, why := short.Server.CorroborateMirrorInventoryOnce(ctx); !ok {
+	if ok, why := short.Server.NetBoxInventorySnapshotOnce(ctx).Corroborated(ctx); !ok {
 		t.Fatalf("with nothing diverging, the corroboration must pass — otherwise the "+
 			"assertion below is satisfied by a fan-out that never completes in this "+
 			"fixture: %s", why)
@@ -254,7 +258,7 @@ func TestFleetAMirrorOnAShortInventoryCannotCorroborateIt(t *testing.T) {
 	mustCreateUnboundNetwork(t, c, holder, adoptNetName, adoptSubnet)
 	mustCreateVMHoldingIP(t, c, holder, "incumbent", adoptNetName, adoptFirstIP)
 
-	ok, why := short.Server.CorroborateMirrorInventoryOnce(ctx)
+	ok, why := short.Server.NetBoxInventorySnapshotOnce(ctx).Corroborated(ctx)
 	if ok {
 		t.Fatal("a node whose inventory is short of a peer's VM rows corroborated its read " +
 			"as the cluster's; a mapping-row-only removal would then be taken as a proven " +

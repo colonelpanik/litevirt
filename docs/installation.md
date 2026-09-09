@@ -345,10 +345,24 @@ automatically:
 3. Restarts the main service.
 4. Logs the rollback to journal with `litevirt-rollback` tag.
 
-This works without any operator action. Verify with:
+It is conditional on **both** the `.upgrade-pending` sentinel and `litevirt.old`
+existing: with no sentinel the service deliberately declines and leaves the
+failed binary in place, and with no `.old` it logs that there is nothing to roll
+back to and exits non-zero. Either way the unit stays failed, so a daemon that
+will not start is not by itself evidence that a rollback was attempted.
+
+**This path has not been confirmed through a live systemd upgrade** — treat the
+behaviour above as expected rather than verified, and read the journals. Note
+also that restoring `.old` restores the previous binary's behaviour in full,
+including any limitations that build had.
+
+Verify with **both** journals — the rollback service's own log is the only place
+its decision is recorded:
 
 ```bash
-journalctl -t litevirt-rollback
+journalctl -t litevirt-rollback          # ran, declined, or found no .old
+journalctl -u litevirt-rollback.service  # the unit's start/exit status
+journalctl -u litevirt.service           # why the daemon failed in the first place
 systemctl status litevirt
 ```
 

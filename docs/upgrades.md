@@ -215,13 +215,51 @@ ExecStart=/bin/sh -c '\
   fi'
 ```
 
+### What the rollback is conditional on — and what has not been verified
+
+The rollback fires only when **both** conditions hold:
+
+1. **The `.upgrade-pending` sentinel exists.** Without it the rollback service
+   deliberately does nothing and leaves the failed binary in place, logging that
+   it declined. That is the intended behaviour, not a fault: a failed state with
+   no upgrade in progress must not silently downgrade a healthy binary.
+2. **`/usr/local/bin/litevirt.old` exists.** With the sentinel present but no
+   `.old`, the service logs that there is nothing to roll back to and exits
+   non-zero, leaving the unit failed.
+
+So a daemon that will not start is **not** evidence that a rollback was
+attempted. Read the journal before concluding anything.
+
+**This path has not been confirmed end to end through a live systemd upgrade.**
+The unit wiring, the sentinel gate and the shell logic are as documented and
+reviewed, but no rollout has yet driven a real panic-loop through it on a live
+host. Treat the behaviour above as **expected**, not verified, and check the
+journals rather than assuming it ran.
+
+**Restoring `.old` restores the previous binary's behaviour in full** — including
+any limitations that build had. A rollback is a return to a known state, not a
+repair: whatever the older binary refused, mis-handled or did not yet implement,
+it will refuse, mis-handle and not implement again. In particular a build carrying
+prerelease behaviour that a later build deliberately refuses to migrate is exactly
+the build the cluster returns to.
+
 ### Verifying a rollback fired
 
+Check **both** journals. They answer different questions, and the rollback
+service's own log is the only place its *decision* is recorded:
+
 ```bash
-journalctl -t litevirt-rollback         # rollback log entries
+journalctl -t litevirt-rollback          # did the rollback run, decline, or find no .old?
+journalctl -u litevirt-rollback.service  # the unit's own start/exit status
+journalctl -u litevirt.service           # why the daemon failed in the first place
 systemctl status litevirt                # should be active again, on the .old binary
 litevirt --version                       # confirms the rolled-back version
 ```
+
+A `litevirt.service` journal showing repeated startup failures with **nothing**
+in the `litevirt-rollback` journal means the rollback service never fired at all
+— check `OnFailure=` wiring and whether the unit actually reached `failed`
+state rather than being restarted indefinitely.
 
 The systemd rollback unit handles the **panic-loop** case: a binary that
 crashes/exits on startup. The **post-upgrade health watchdog** (below) covers

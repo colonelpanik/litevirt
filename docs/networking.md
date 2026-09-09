@@ -527,7 +527,22 @@ the prefix no longer satisfies what the bind checked, the binding is
 - running VMs are untouched, and keep the addresses they hold.
 
 An unreachable NetBox is *not* drift and never suspends a binding — silence is
-not a change.
+not a change. Note the asymmetry: the periodic pass tolerates a NetBox it cannot
+read, because it can only ever *suspend* and a suspension is sticky, so a
+maintenance window must not brick a network. Every path that makes a binding
+**live** again refuses that same unreadable answer — see
+[Resuming a suspended binding](#resuming-a-suspended-binding).
+
+**A prefix moved between two VRFs is drift even when both enforce uniqueness.**
+The binding pins the VRF it validated as its allocation scope, and a move takes
+the prefix out of it. litevirt compares the VRF **ID**, not merely whether the
+current VRF enforces uniqueness, so a move from one enforcing VRF to another
+suspends the binding rather than passing. The pinned VRF is **not** rewritten:
+re-pinning would move the allocation scope without establishing that the
+addresses this network's guests already hold are unique inside the new VRF, and
+those leases were proved against the old one. Move the prefix back in NetBox, or
+delete and recreate the litevirt network to bind it against the new VRF (which
+re-proves from scratch).
 
 Suspension is deliberately sticky: nothing lifts it automatically. Which command
 lifts it depends on what drifted — see the two sections below.
@@ -544,6 +559,14 @@ Resume rewrites no binding facts. It re-runs every bind-time check against the
 facts the binding pinned and clears the suspension only when all of them agree
 again; while the drift is still present the command is refused, naming the
 reason, and the binding stays suspended.
+
+**A resume that could not read NetBox is refused, not granted.** Resume does not
+take the repair on the operator's word — the re-check *is* its premise — so if
+the prefix or its VRF cannot be read, the command refuses (`FailedPrecondition`),
+writes nothing, and leaves the binding suspended under its existing reason. Run
+it again once NetBox answers. The same rule holds for the tail of
+`lv netbox rekey` and for the automatic completion the maintenance pass performs:
+a binding goes live only on preconditions something actually read.
 
 It also finishes any adoption the bind left owed — see
 [Binding a subnet that already has VMs on it](#binding-a-subnet-that-already-has-vms-on-it).
@@ -565,6 +588,7 @@ Repairable in place, by fixing NetBox and running `lv netbox resume`:
 |---|---|
 | the prefix's VRF stopped enforcing uniqueness | set `enforce_unique` on the VRF again |
 | the prefix was moved to the global table | move it back into a VRF with `enforce_unique` |
+| the prefix was moved into a different VRF | move it back into the VRF the binding pinned |
 | the prefix was re-CIDRed | revert the CIDR to the one the binding recorded |
 
 A suspension caused by a **moved cluster fingerprint** is not repaired in NetBox
@@ -804,6 +828,23 @@ the orphan sweeper and the re-key, and re-reads it before every batch of writes,
 so a handover mid-sweep stops the outgoing leader instead of letting two nodes
 write the same objects. It writes only on change: a sweep over inventory that
 already matches issues no writes at all.
+
+**A VM recreated under the same name converges.** Delete a VM and recreate it
+under the same name and the new incarnation has a new uuid, so a new identity,
+so the mirror has to create a new object — while the old object still holds the
+name NetBox allows only one of. The mirror resolves that by replacing the old
+object first, and only on proof taken from the identity: the object holding the
+name carries **this** cluster's fingerprint and a uuid that is **not** in the
+desired set, which makes it a superseded incarnation of that name. That one
+removal is the only one that runs ahead of the creates.
+
+Two things it will never touch, both refused twice over (once when the action is
+planned, once again before the delete is issued): an object whose identity **is**
+in the desired set — a live VM of this cluster, which freeing a name may never
+remove — and an object carrying a **different** cluster's fingerprint, which
+belongs to another installation. A sweep that cannot prove its own view of the
+cluster is complete withholds the replacement along with its deletes, so the
+create collides for that one VM and the next healthy sweep converges it.
 
 **Two litevirt clusters, one NetBox.** Give each one a NetBox cluster of its own
 with `netbox.cluster_name`. NetBox allows one VM name per cluster, so two

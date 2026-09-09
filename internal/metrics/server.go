@@ -425,7 +425,9 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"litevirt_leader_lease_term",
 			"Highest recorded lease incarnation (fencing term) per leader-lease key. "+
 				"Each new term is one acquisition, so the RATE is leadership churn — alert on "+
-				"it climbing faster than the expected failover rate. Nothing enforces on a term yet.",
+				"it climbing faster than the expected failover rate. Whether a term is "+
+				"ENFORCED depends on enforcement.lease_term plus the lease_term_v1 latch; "+
+				"this gauge is the audit record either way.",
 			[]string{"key"}, prometheus.Labels{"host": hostName},
 		),
 		fenceFailures: prometheus.NewDesc(

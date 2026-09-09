@@ -81,7 +81,7 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   set of changes is silently lost — and under clock skew the host with the faster
   clock wins, so NTP is required.
 
-### Leader-lease terms are recorded, not enforced
+### Leader-lease terms, and what enforcing on them does and does not buy
 
 Every acquisition of a leader lease — `failover`, the rebalancer, the dual-run
 detector — records a **term**: an incarnation number for that holder's tenure,
@@ -106,7 +106,7 @@ whenever the holder changes. These all mint:
 Nothing mints until the cluster has finished rolling. Minting waits for
 `lease_term_ledger_v1` to latch durably on the node doing it — a token with no
 config flag, advertised by every build that has the ledger, so nothing is
-required of you: it latches on its own once the last host is upgraded, and terms
+required of you: it latches on its own once every host is upgraded, and terms
 begin at the next tenure change. Before it latches, leases are taken exactly as
 they were before terms existed; you will see `leader_election` move with an
 empty `leader_lease_terms`.
@@ -116,49 +116,149 @@ table ever replicated, and a host still on the previous release cannot decode
 it: the write would not be ignored, it would stall that host's replication
 entirely. So the latch is the proof that no such host is listening any more.
 
-Two operational consequences. A cluster stuck mid-roll — one host held back —
-mints no terms at all, which is by design and is visible as an empty ledger
-rather than as an error. And `lease_term_v1` will not advertise ready on a host
-whose ledger token has not latched, because enforcing on terms while producing
-none would refuse every reschedule that host coordinates. The withheld-readiness
-reason names the token, so a host that looks stuck says which of the two is
-outstanding.
+**"Every host" means every host still receiving replication, not every host that
+votes.** A host in `maintenance` does not vote, but its daemon is up, it is in
+memberlist, and it is still a replication target — so it holds this latch off
+until it is upgraded or its daemon is stopped. That is the invariant rather than
+a quirk: while it is listening, we must not send it shapes it cannot decode. If
+a roll appears not to complete, look for a host parked in `maintenance` on an
+older build.
+
+Three operational consequences.
+
+A cluster stuck mid-roll — one host held back — mints no terms at all. This is
+by design: you see an empty `leader_lease_terms` rather than an error, and
+`litevirt_ha_degraded{reason="capability_rollout_pending"}` rather than
+`unsupported_member`. The two are deliberately distinct — a rollout in progress
+is not a fault, so it does not page, but a rollout that never finishes is worth
+a look. `unsupported_member` stays reserved for a capability you asked to
+enforce that the cluster cannot confirm, and for one that latched and later
+regressed.
+
+`lease_term_v1` will not advertise ready on a host whose ledger token has not
+latched, because enforcing on terms while producing none would refuse every
+reschedule that host coordinates. The withheld-readiness reason names the token,
+so a host that looks stuck says which of the two is outstanding.
+
+There is no way to stand the ledger token down, deliberately. It has no config
+flag, and deleting its marker file does not last — the monitor re-latches as
+soon as the fleet is uniform. If you need minting to stop, stop the fleet being
+uniform: roll a host back below this build, or leave one on the previous
+release. Terms are additive audit facts and nothing acts on them until
+`enforcement.lease_term` is enabled, and that IS a flag — so the thing you would
+actually want to stop in an incident is reachable the ordinary way.
 
 So an ordinary rolling restart of an N-host cluster mints roughly 3N terms —
 each of the three leases moves once per host — on **every** roll. Size a
 term-growth alert against that, not against the one-off upgrade backfill.
 
-**No term is compared against any other term.** This is not split-brain
-prevention and it is not a working fencing token yet: keeping two nodes from
-each believing they hold the lease requires consensus, which a CRDT row store
-does not provide, and everything in *CRDT is not linearizable* above still
-holds in full. Enforcement is a separate change and will latch behind a
-capability token the way other cluster-wide behaviour changes do. Until then a
-term is an audit fact — make no availability decision on the strength of one.
+#### Turning enforcement on
 
-One narrow exception, so the earlier absolute is not misread. Since schema v52
-a runtime-action proof carries the term of the tenure that minted it, and since
-v53 the key of the lease that term belongs to. Both are part of the field-match
-an executor runs between the proof it was handed and the proof row it has
-persisted, alongside the action, the target kind and name, the coordinator, the
-destination, the relocation token, the fence epoch and the owner epoch —
-`corrosion.ProofBindingEqual` is the one definition of that set. A mismatch
-refuses the action, ungated, exactly as a mismatched relocation token already
-did.
+Enforcement is **off by default** and needs two things: `enforcement.lease_term`
+in config, AND the `lease_term_v1` capability latch. Neither alone does
+anything. Before both hold, behaviour is exactly what it was before terms
+existed — a stale term refuses nothing.
 
-That is a check for a DIVERGENT PROOF ROW, not term enforcement. Nothing
-compares the term against the lease ledger, against a quorum-observed maximum,
-or against any other node's view; refusing a superseded term arrives behind
-`lease_term_v1`.
+`lease_term_v1` will not latch on a cluster with **fewer than three
+voting-eligible hosts**, whatever the flag says. The barrier needs
+`liveHosts/2+1` answers: on two hosts that is both of them, so a single host
+outage would refuse every protected action — and a host outage is precisely when
+failover has to work. On one host quorum is self-satisfied and the barrier is a
+no-op that protects nothing. Three is the smallest size where enforcing is both
+meaningful and survivable.
 
-It is not, however, inert. No proof-MINTING site sets a term yet, but a carried
-proof's term and key are seeded into `runtime_action_proofs` on receipt and
-replicate from there, so on any node that has received one the persisted side
-is caller-chosen rather than 0 and the field-match is live today. That is why
-the executor validates the key against the closed set before persisting it, and
-refuses a negative term outright: an unknown key would otherwise become a row's
-permanent authorization record, and enforcement reading a nonexistent ledger
-for it would find `MAX(term) = 0` and pass every proof naming it.
+**The latch is one-way.** A cluster that shrinks below three hosts after
+latching keeps enforcing, because a latch that re-opened when a peer became
+unreachable would fail open in exactly the partition it exists for. Setting
+`enforcement.lease_term: false` and restarting is the way out: the flag is
+authoritative for enforcement and for recovery, so it stops enforcement
+regardless of the latch marker. Do not delete marker files to achieve this.
+
+#### The two refusal reasons
+
+Both appear in `litevirt_runtime_action_refused_total{action,reason}` and in the
+refusal returned to the caller. They mean different things and are deliberately
+not merged:
+
+- **`stale_lease_term` — FENCED.** The proof's term is below the
+  quorum-observed high water for its lease, or it names a coordinator this node
+  did not record as holding that term. The mechanism worked and refused
+  something it should refuse. A burst of these around a failover is the feature
+  doing its job; a steady trickle in calm conditions means something is minting
+  proofs from a tenure it no longer holds.
+- **`lease_term_unconfirmed` — NOT fenced; could not establish whether it
+  was.** This node could not reach a quorum to ask. It is a degradation and
+  wants investigation: the action was refused for lack of evidence, not because
+  anything was found wrong. Look for a partition or unreachable peers, not for a
+  split-brain.
+
+An operator who cannot tell these apart will hunt a split-brain that never
+happened, which is why they are separate strings rather than one "refused".
+
+#### What it costs
+
+An **accepted** proof pays one bounded peer fan-out — a quorum read of every
+reachable peer's newest term for that lease key. The budget is 3s for the whole
+sweep, not per peer, so an unreachable fleet cannot multiply it. Concurrent
+callers share one sweep, which matters because the load arrives in bursts: a
+host loss with 40 workloads would otherwise run 40 fan-outs at the one moment
+the system is meant to be fast. A **refusal** can be served from a short-lived
+cache without any fan-out, because the observed high water only rises — so an
+old reading is a lower bound, and refusing on a lower bound is sound while
+accepting on one is not.
+
+#### What enforcement does NOT do
+
+Stated plainly, because the name invites more confidence than the mechanism
+earns:
+
+- **It does not stop two nodes believing they hold the lease.** That needs
+  consensus, which a CRDT row store does not provide. Everything in *CRDT is not
+  linearizable* above still holds in full.
+- **It is not consensus, and a contested term is not resolved cluster-wide.**
+  Two partitioned nodes can each mint the same term naming themselves, and
+  nothing here elects a winner or ever will — see *What this table will and will
+  not show you* below.
+- **One host will not act for two claimants of one tenure.** That is the real
+  guarantee, and it is narrower than it sounds: the claim binds an executor to
+  the first claimant it acted for at that `(key, term)`, so the second is
+  refused on that host.
+- **But two hosts may each act for a different claimant**, and nothing produces
+  agreement about which was legitimate. If that happens you have two
+  coordinators that each got one host to act, and the ledger's job is to make it
+  VISIBLE rather than to prevent it.
+
+So enforcement narrows the blast radius of a stale leader; it does not eliminate
+the split. Do not size a recovery plan as though it did.
+
+#### Which proofs carry a term, and which legitimately do not
+
+Not every proof is stamped, and an unstamped one is usually correct rather than
+broken. A producer can only stamp a term if it holds a lease to take one from.
+
+- The **failover coordinator** holds the failover lease, so it stamps the term
+  of its own recorded tenure onto the reschedule and relocate proofs it mints.
+  `reschedule` is the one action whose every producer holds a lease, so it is
+  the one action where an unstamped proof is refused outright.
+- **Container cold migration, LB apply and automated replica promotion** hold no
+  lease at all. They mint term 0 with an empty key, and that is their normal
+  output — refusing it would break container migration, load-balancer
+  reconfiguration and post-fence promotion the moment the token latched, which
+  is why the term requirement is scoped to `reschedule` rather than applied
+  everywhere.
+
+One consequence worth knowing: `relocate` has producers of both kinds, so an
+unstamped relocate proof is either a lease-less producer's ordinary output or a
+coordinator on an older build, and nothing can tell those apart. Narrowing that
+needs a decision about whether container cold migration may require the
+coordinator.
+
+A carried proof's term and key are persisted on receipt and replicate from
+there, so the executor validates the key against the closed set of lease names
+before storing it, and refuses a negative term outright. An unknown key would
+otherwise become that row's permanent authorization record — and enforcement
+reading a nonexistent ledger for it would find `MAX(term) = 0` and pass every
+proof naming it.
 
 To read the current terms:
 
@@ -185,6 +285,22 @@ and it needs no conflict to be useful.
 serious one: **two nodes recorded themselves as holding the same term.** That is
 the event the ledger exists to make visible, and it is a safety fault, not a
 transient. `litevirt_lww_tie_unresolved_total` counts them cumulatively.
+
+`litevirt_runtime_action_refused_total{reason="stale_lease_term"}` is
+enforcement firing. Expect a burst around a genuine failover; a steady trickle
+in calm conditions means a producer is minting proofs from a tenure it no longer
+holds, and that producer is worth finding.
+
+`litevirt_runtime_action_refused_total{reason="lease_term_unconfirmed"}` is
+enforcement UNABLE to fire. It says actions are being refused for lack of
+quorum evidence, so alert on it separately and treat it as an availability
+signal rather than a safety one — this is the reason that appears when a
+partition, not a stale leader, is the problem.
+
+`litevirt_ha_degraded{reason="capability_rollout_pending"}` says a mandatory
+token has not latched yet. During an upgrade that is expected and should not
+page; persisting long after one is the signal that a host is stuck — most often
+one parked in `maintenance` on an older build.
 
 #### What this table will and will not show you
 

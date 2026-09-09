@@ -217,6 +217,7 @@ const (
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
+	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
@@ -558,6 +559,12 @@ type LiteVirtClient interface {
 	// node-local, and a node must not acknowledge its own contest. An operator
 	// acknowledges on each host the ha.lww.unresolved condition names.
 	AcknowledgeLeaseTermTie(ctx context.Context, in *AcknowledgeLeaseTermTieRequest, opts ...grpc.CallOption) (*AcknowledgeLeaseTermTieResponse, error)
+	// GetLeaseTermHighWater reports this node's newest lease term for a key.
+	// Peer-callable, read-only, no side effects. It is the quorum read
+	// barrier's input: an executor fans this out before validating a proof, so
+	// its rejection threshold is quorum-observed rather than its own
+	// possibly-stale replica. It must never itself invoke the barrier.
+	GetLeaseTermHighWater(ctx context.Context, in *GetLeaseTermHighWaterRequest, opts ...grpc.CallOption) (*GetLeaseTermHighWaterResponse, error)
 	GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -2882,6 +2889,16 @@ func (c *liteVirtClient) AcknowledgeLeaseTermTie(ctx context.Context, in *Acknow
 	return out, nil
 }
 
+func (c *liteVirtClient) GetLeaseTermHighWater(ctx context.Context, in *GetLeaseTermHighWaterRequest, opts ...grpc.CallOption) (*GetLeaseTermHighWaterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLeaseTermHighWaterResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetLeaseTermHighWater_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDumpResponse)
@@ -3653,6 +3670,12 @@ type LiteVirtServer interface {
 	// node-local, and a node must not acknowledge its own contest. An operator
 	// acknowledges on each host the ha.lww.unresolved condition names.
 	AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error)
+	// GetLeaseTermHighWater reports this node's newest lease term for a key.
+	// Peer-callable, read-only, no side effects. It is the quorum read
+	// barrier's input: an executor fans this out before validating a proof, so
+	// its rejection threshold is quorum-observed rather than its own
+	// possibly-stale replica. It must never itself invoke the barrier.
+	GetLeaseTermHighWater(context.Context, *GetLeaseTermHighWaterRequest) (*GetLeaseTermHighWaterResponse, error)
 	GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -4387,6 +4410,9 @@ func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empt
 }
 func (UnimplementedLiteVirtServer) AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AcknowledgeLeaseTermTie not implemented")
+}
+func (UnimplementedLiteVirtServer) GetLeaseTermHighWater(context.Context, *GetLeaseTermHighWaterRequest) (*GetLeaseTermHighWaterResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLeaseTermHighWater not implemented")
 }
 func (UnimplementedLiteVirtServer) GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDump not implemented")
@@ -7837,6 +7863,24 @@ func _LiteVirt_AcknowledgeLeaseTermTie_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_GetLeaseTermHighWater_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLeaseTermHighWaterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetLeaseTermHighWater(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetLeaseTermHighWater_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetLeaseTermHighWater(ctx, req.(*GetLeaseTermHighWaterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDump_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -9275,6 +9319,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AcknowledgeLeaseTermTie",
 			Handler:    _LiteVirt_AcknowledgeLeaseTermTie_Handler,
+		},
+		{
+			MethodName: "GetLeaseTermHighWater",
+			Handler:    _LiteVirt_GetLeaseTermHighWater_Handler,
 		},
 		{
 			MethodName: "GetStateDump",

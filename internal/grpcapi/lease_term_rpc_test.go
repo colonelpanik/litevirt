@@ -199,3 +199,140 @@ func TestAcknowledgeLeaseTermTie_IsNotPeerCallable(t *testing.T) {
 		t.Errorf("code = %v, want Unauthenticated or PermissionDenied", c)
 	}
 }
+
+// twoTermLedger seeds a ledger whose newest live term is 2, held by node-b,
+// through the REAL allocator rather than by inserting rows.
+//
+// node-b's acquisition is dated past node-a's expiry, which is what makes it a
+// new tenure and mints term 2 — AcquireLeaseWithTerm treats a lapsed lease as a
+// new tenure even for its own prior holder, because the lapse is exactly the
+// window other nodes were entitled to act in. Hand-inserted rows would assert
+// against a shape that can drift from that.
+func twoTermLedger(t *testing.T, s *Server) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	ttl := 30 * time.Second
+
+	if held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, s.db, corrosion.LeaseKeyFailover, "node-a", ttl, now); err != nil || !held || term != 1 {
+		t.Fatalf("node-a acquire: held=%v term=%d err=%v", held, term, err)
+	}
+	if held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, s.db, corrosion.LeaseKeyFailover, "node-b", ttl, now.Add(2*ttl)); err != nil || !held || term != 2 {
+		t.Fatalf("node-b acquire: held=%v term=%d err=%v", held, term, err)
+	}
+}
+
+// TestGetLeaseTermHighWater_AnswersFromTheLocalLedger.
+func TestGetLeaseTermHighWater_AnswersFromTheLocalLedger(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	twoTermLedger(t, s)
+
+	resp, err := s.GetLeaseTermHighWater(peerCtxFor(t, s, "host-peer"),
+		&pb.GetLeaseTermHighWaterRequest{Key: corrosion.LeaseKeyFailover})
+	if err != nil {
+		t.Fatalf("rpc: %v", err)
+	}
+	if resp.GetKey() != corrosion.LeaseKeyFailover {
+		t.Errorf("key = %q, want %q — the caller matches on it to detect a peer answering "+
+			"about a different ledger", resp.GetKey(), corrosion.LeaseKeyFailover)
+	}
+	if resp.GetTerm() != 2 || resp.GetHolder() != "node-b" {
+		t.Errorf("= (%d, %q), want (2, node-b)", resp.GetTerm(), resp.GetHolder())
+	}
+}
+
+// TestGetLeaseTermHighWater_EmptyLedgerIsZeroNotAnError: a node that has never
+// recorded a term answers 0 with no holder. That is a legitimate answer and
+// counts toward quorum; an error would not, and would leave every fresh cluster
+// unable to establish a threshold at all.
+func TestGetLeaseTermHighWater_EmptyLedgerIsZeroNotAnError(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	resp, err := s.GetLeaseTermHighWater(peerCtxFor(t, s, "host-peer"),
+		&pb.GetLeaseTermHighWaterRequest{Key: corrosion.LeaseKeyFailover})
+	if err != nil {
+		t.Fatalf("rpc: %v", err)
+	}
+	if resp.GetTerm() != 0 || resp.GetHolder() != "" {
+		t.Errorf("= (%d, %q), want (0, \"\")", resp.GetTerm(), resp.GetHolder())
+	}
+}
+
+// TestGetLeaseTermHighWater_AnswersAboutEveryRealLease: the key selects which
+// ledger answers, and all three are real. A handler that knew only the failover
+// key would answer term 0 for a rebalancer proof, and 0 is the sentinel meaning
+// "no term recorded" — so the barrier would read a live rebalancer tenure as
+// absent.
+func TestGetLeaseTermHighWater_AnswersAboutEveryRealLease(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	// Once, outside the loop: peerCtxFor registers the peer host, and a second
+	// call collides on hosts.name.
+	peer := peerCtxFor(t, s, "host-peer")
+
+	for _, key := range []string{
+		corrosion.LeaseKeyFailover, corrosion.LeaseKeyRebalancer, corrosion.LeaseKeyDualRun,
+	} {
+		if held, term, err := corrosion.AcquireLeaseWithTerm(
+			ctx, s.db, key, "node-a", 30*time.Second, now); err != nil || !held || term != 1 {
+			t.Fatalf("%s acquire: held=%v term=%d err=%v", key, held, term, err)
+		}
+		resp, err := s.GetLeaseTermHighWater(peer, &pb.GetLeaseTermHighWaterRequest{Key: key})
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if resp.GetTerm() != 1 || resp.GetHolder() != "node-a" {
+			t.Errorf("%s = (%d, %q), want (1, node-a)", key, resp.GetTerm(), resp.GetHolder())
+		}
+	}
+}
+
+// TestGetLeaseTermHighWater_RejectsAnUnknownKey: accepting an arbitrary string
+// lets a caller choose which ledger a fencing decision consults, and the key
+// reaches a metric label, where unbounded peer-supplied input is what the
+// repo's bounded-label discipline exists to prevent.
+func TestGetLeaseTermHighWater_RejectsAnUnknownKey(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	peer := peerCtxFor(t, s, "host-peer")
+	for _, key := range []string{"../etc/passwd", "", "failover ", "FAILOVER"} {
+		_, err := s.GetLeaseTermHighWater(peer, &pb.GetLeaseTermHighWaterRequest{Key: key})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("key %q: code = %v, want InvalidArgument", key, status.Code(err))
+		}
+	}
+}
+
+// TestGetLeaseTermHighWater_RequiresAPeerOrOperator: it reads replicated
+// cluster state and is the input to a fencing decision.
+func TestGetLeaseTermHighWater_RequiresAPeerOrOperator(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	_, err := s.GetLeaseTermHighWater(context.Background(),
+		&pb.GetLeaseTermHighWaterRequest{Key: corrosion.LeaseKeyFailover})
+	if err == nil {
+		t.Fatal("answered an unauthenticated caller")
+	}
+	if c := status.Code(err); c != codes.Unauthenticated && c != codes.PermissionDenied {
+		t.Errorf("code = %v, want Unauthenticated or PermissionDenied", c)
+	}
+}
+
+// TestGetLeaseTermHighWater_AnUnreadableLedgerIsNotAgreementAtZero.
+//
+// The distinction is the whole point of the barrier. 0 means "no term
+// recorded", which is a real answer that counts toward quorum; a failed read
+// means this node does not know, and reporting it as 0 would let a stale
+// threshold be computed from nodes that never answered.
+func TestGetLeaseTermHighWater_AnUnreadableLedgerIsNotAgreementAtZero(t *testing.T) {
+	s, _ := cleanAdvertisingNode(t)
+	if err := s.db.Execute(context.Background(), `DROP TABLE leader_lease_terms`); err != nil {
+		t.Fatalf("drop ledger: %v", err)
+	}
+	_, err := s.GetLeaseTermHighWater(peerCtxFor(t, s, "host-peer"),
+		&pb.GetLeaseTermHighWaterRequest{Key: corrosion.LeaseKeyFailover})
+	if status.Code(err) != codes.Unavailable {
+		t.Errorf("code = %v, want Unavailable — a node that cannot read its ledger must not "+
+			"be counted as agreeing at term 0", status.Code(err))
+	}
+}

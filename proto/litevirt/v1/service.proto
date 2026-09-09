@@ -1665,6 +1665,26 @@ message AcknowledgeLeaseTermTieResponse {
     bool acknowledged = 1;
 }
 
+message GetLeaseTermHighWaterRequest {
+    // key names which leader lease to answer about. Only the keys litevirt
+    // itself mints are accepted; an unknown key is InvalidArgument, NOT term 0,
+    // because 0 is the sentinel for "no term recorded" and would read as a
+    // legitimate answer.
+    string key = 1;
+}
+message GetLeaseTermHighWaterResponse {
+    // key echoes the request so a caller can detect a peer answering about a
+    // different ledger. A mismatch counts as no answer.
+    string key = 1;
+    // term is this node's newest LIVE term for key; 0 = none recorded, which is
+    // a legitimate answer and counts toward quorum. A node that cannot READ its
+    // ledger returns Unavailable instead, so it is counted as silent rather
+    // than as agreeing at 0.
+    int64 term = 2;
+    // holder is the holder recorded at that term; "" when term == 0.
+    string holder = 3;
+}
+
 message PromoteReplicaRequest {
     string vm_name     = 1; // VM whose replica to promote
     string target_pool = 2; // optional — pool holding the replica; defaults to the VM's replication schedule
@@ -2438,6 +2458,13 @@ service LiteVirt {
     // node-local, and a node must not acknowledge its own contest. An operator
     // acknowledges on each host the ha.lww.unresolved condition names.
     rpc AcknowledgeLeaseTermTie(AcknowledgeLeaseTermTieRequest) returns (AcknowledgeLeaseTermTieResponse);
+
+    // GetLeaseTermHighWater reports this node's newest lease term for a key.
+    // Peer-callable, read-only, no side effects. It is the quorum read
+    // barrier's input: an executor fans this out before validating a proof, so
+    // its rejection threshold is quorum-observed rather than its own
+    // possibly-stale replica. It must never itself invoke the barrier.
+    rpc GetLeaseTermHighWater(GetLeaseTermHighWaterRequest) returns (GetLeaseTermHighWaterResponse);
     rpc GetStateDump(google.protobuf.Empty)         returns (StateDumpResponse);
     // StreamStateDump is the chunked replacement for GetStateDump: it streams
     // the gzipped dump in bounded slices so it survives at scale. GetStateDump

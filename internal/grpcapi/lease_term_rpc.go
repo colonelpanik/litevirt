@@ -13,6 +13,62 @@ import (
 
 // Lease-term RPCs.
 
+// GetLeaseTermHighWater reports this node's newest live lease term for key,
+// with the holder that claimed it.
+//
+// Read-only and side-effect free. It must NOT consult the barrier,
+// gate.Enforced or any peer: it IS the barrier's input, and fanning out from
+// here would turn one executor's barrier into a cluster-wide storm.
+//
+// Three answers, and the difference between the last two is the whole reason
+// the barrier exists:
+//
+//   - term > 0 with a holder — this node has seen that tenure.
+//   - term 0 — nothing recorded for this key. A REAL answer that counts toward
+//     quorum; a fresh cluster is all zeroes and must still be able to establish
+//     a threshold.
+//   - Unavailable — this node cannot read its ledger. It does not know, and
+//     reporting that as 0 would let a threshold be computed from nodes that
+//     never answered.
+//
+// The key is validated against the closed set that corrosion owns. Not a
+// package-local list here: the answer selects which ledger a fencing decision
+// consults, so a caller must not get to choose, and the key reaches a metric
+// label where unbounded peer-supplied input is what the repo's bounded-label
+// discipline exists to prevent. All three real leases are answerable — a
+// handler that knew only the failover key would answer 0 for a rebalancer
+// proof, and 0 means "no term recorded", so the barrier would read a live
+// tenure as absent.
+func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTermHighWaterRequest) (*pb.GetLeaseTermHighWaterResponse, error) {
+	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
+		return nil, err
+	}
+	key := req.GetKey()
+	if !corrosion.ValidLeaseKey(key) {
+		return nil, status.Errorf(codes.InvalidArgument, "unknown lease key %q", key)
+	}
+	term, err := corrosion.CurrentLeaseTerm(ctx, s.db, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read lease term for %q: %v", key, err)
+	}
+	var holder string
+	if term > 0 {
+		// found == false is not an error here: the term row could have been
+		// tombstoned between the two reads, and the caller's threshold only
+		// needs the term. err is read FIRST, per LeaseTermHolder's contract —
+		// its ("", false, err) is indistinguishable from a genuinely unseen
+		// term.
+		h, found, herr := corrosion.LeaseTermHolder(ctx, s.db, key, term)
+		if herr != nil {
+			return nil, status.Errorf(codes.Unavailable, "read lease term holder for %q: %v", key, herr)
+		}
+		if found {
+			holder = h
+		}
+	}
+	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: term, Holder: holder}, nil
+}
+
 // AcknowledgeLeaseTermTie clears a contested lease term from THIS node's
 // unresolved-tie register, on the operator's statement that they have seen it.
 //

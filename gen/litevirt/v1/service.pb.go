@@ -638,7 +638,11 @@ func (x PromoteReplicaProgress_Phase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PromoteReplicaProgress_Phase.Descriptor instead.
 func (PromoteReplicaProgress_Phase) EnumDescriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{272, 0}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{268, 0}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 // ── Hosts ──
@@ -18014,6 +18018,121 @@ func (x *AcknowledgeLeaseTermTieResponse) GetAcknowledged() bool {
 	return false
 }
 
+type GetLeaseTermHighWaterRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// key names which leader lease to answer about. Only the keys litevirt
+	// itself mints are accepted; an unknown key is InvalidArgument, NOT term 0,
+	// because 0 is the sentinel for "no term recorded" and would read as a
+	// legitimate answer.
+	Key           string `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaseTermHighWaterRequest) Reset() {
+	*x = GetLeaseTermHighWaterRequest{}
+	mi := &file_litevirt_v1_service_proto_msgTypes[265]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaseTermHighWaterRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaseTermHighWaterRequest) ProtoMessage() {}
+
+func (x *GetLeaseTermHighWaterRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_service_proto_msgTypes[265]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaseTermHighWaterRequest.ProtoReflect.Descriptor instead.
+func (*GetLeaseTermHighWaterRequest) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{265}
+}
+
+func (x *GetLeaseTermHighWaterRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+type GetLeaseTermHighWaterResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// key echoes the request so a caller can detect a peer answering about a
+	// different ledger. A mismatch counts as no answer.
+	Key string `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// term is this node's newest LIVE term for key; 0 = none recorded, which is
+	// a legitimate answer and counts toward quorum. A node that cannot READ its
+	// ledger returns Unavailable instead, so it is counted as silent rather
+	// than as agreeing at 0.
+	Term int64 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	// holder is the holder recorded at that term; "" when term == 0.
+	Holder        string `protobuf:"bytes,3,opt,name=holder,proto3" json:"holder,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaseTermHighWaterResponse) Reset() {
+	*x = GetLeaseTermHighWaterResponse{}
+	mi := &file_litevirt_v1_service_proto_msgTypes[266]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaseTermHighWaterResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaseTermHighWaterResponse) ProtoMessage() {}
+
+func (x *GetLeaseTermHighWaterResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_service_proto_msgTypes[266]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaseTermHighWaterResponse.ProtoReflect.Descriptor instead.
+func (*GetLeaseTermHighWaterResponse) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{266}
+}
+
+func (x *GetLeaseTermHighWaterResponse) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *GetLeaseTermHighWaterResponse) GetTerm() int64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *GetLeaseTermHighWaterResponse) GetHolder() string {
+	if x != nil {
+		return x.Holder
+	}
+	return ""
+}
+
 type PromoteReplicaRequest struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	VmName     string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`              // VM whose replica to promote
@@ -18034,7 +18153,11 @@ type PromoteReplicaRequest struct {
 
 func (x *PromoteReplicaRequest) Reset() {
 	*x = PromoteReplicaRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[267]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18046,7 +18169,11 @@ func (x *PromoteReplicaRequest) String() string {
 func (*PromoteReplicaRequest) ProtoMessage() {}
 
 func (x *PromoteReplicaRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[267]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18059,7 +18186,11 @@ func (x *PromoteReplicaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteReplicaRequest.ProtoReflect.Descriptor instead.
 func (*PromoteReplicaRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{271}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{267}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PromoteReplicaRequest) GetVmName() string {
@@ -18132,7 +18263,11 @@ type PromoteReplicaProgress struct {
 
 func (x *PromoteReplicaProgress) Reset() {
 	*x = PromoteReplicaProgress{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[268]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18144,7 +18279,11 @@ func (x *PromoteReplicaProgress) String() string {
 func (*PromoteReplicaProgress) ProtoMessage() {}
 
 func (x *PromoteReplicaProgress) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[268]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18157,7 +18296,11 @@ func (x *PromoteReplicaProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteReplicaProgress.ProtoReflect.Descriptor instead.
 func (*PromoteReplicaProgress) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{272}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{268}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PromoteReplicaProgress) GetPhase() PromoteReplicaProgress_Phase {
@@ -18211,7 +18354,11 @@ type PingRequest struct {
 
 func (x *PingRequest) Reset() {
 	*x = PingRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[269]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18223,7 +18370,11 @@ func (x *PingRequest) String() string {
 func (*PingRequest) ProtoMessage() {}
 
 func (x *PingRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[269]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18236,7 +18387,11 @@ func (x *PingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingRequest.ProtoReflect.Descriptor instead.
 func (*PingRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{273}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{269}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 type PingResponse struct {
@@ -18309,7 +18464,11 @@ type PingResponse struct {
 
 func (x *PingResponse) Reset() {
 	*x = PingResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[270]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18321,7 +18480,11 @@ func (x *PingResponse) String() string {
 func (*PingResponse) ProtoMessage() {}
 
 func (x *PingResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[270]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18334,7 +18497,11 @@ func (x *PingResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingResponse.ProtoReflect.Descriptor instead.
 func (*PingResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{274}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{270}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PingResponse) GetHostName() string {
@@ -18402,7 +18569,11 @@ type FetchBinaryRequest struct {
 
 func (x *FetchBinaryRequest) Reset() {
 	*x = FetchBinaryRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18414,7 +18585,11 @@ func (x *FetchBinaryRequest) String() string {
 func (*FetchBinaryRequest) ProtoMessage() {}
 
 func (x *FetchBinaryRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[271]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18427,7 +18602,11 @@ func (x *FetchBinaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchBinaryRequest.ProtoReflect.Descriptor instead.
 func (*FetchBinaryRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{275}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{271}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 type FetchBinaryChunk struct {
@@ -18442,7 +18621,11 @@ type FetchBinaryChunk struct {
 
 func (x *FetchBinaryChunk) Reset() {
 	*x = FetchBinaryChunk{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18454,7 +18637,11 @@ func (x *FetchBinaryChunk) String() string {
 func (*FetchBinaryChunk) ProtoMessage() {}
 
 func (x *FetchBinaryChunk) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[272]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18467,7 +18654,11 @@ func (x *FetchBinaryChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchBinaryChunk.ProtoReflect.Descriptor instead.
 func (*FetchBinaryChunk) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{276}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{272}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *FetchBinaryChunk) GetChunk() []byte {
@@ -18511,7 +18702,11 @@ type ProvisionNetworkRequest struct {
 
 func (x *ProvisionNetworkRequest) Reset() {
 	*x = ProvisionNetworkRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18523,7 +18718,11 @@ func (x *ProvisionNetworkRequest) String() string {
 func (*ProvisionNetworkRequest) ProtoMessage() {}
 
 func (x *ProvisionNetworkRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[273]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18536,7 +18735,11 @@ func (x *ProvisionNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProvisionNetworkRequest.ProtoReflect.Descriptor instead.
 func (*ProvisionNetworkRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{277}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{273}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ProvisionNetworkRequest) GetName() string {
@@ -18579,7 +18782,11 @@ type EnsureCloudInitRequest struct {
 
 func (x *EnsureCloudInitRequest) Reset() {
 	*x = EnsureCloudInitRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18591,7 +18798,11 @@ func (x *EnsureCloudInitRequest) String() string {
 func (*EnsureCloudInitRequest) ProtoMessage() {}
 
 func (x *EnsureCloudInitRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[274]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18604,7 +18815,11 @@ func (x *EnsureCloudInitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureCloudInitRequest.ProtoReflect.Descriptor instead.
 func (*EnsureCloudInitRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{278}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{274}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *EnsureCloudInitRequest) GetVmName() string {
@@ -18638,7 +18853,11 @@ type EnsureDisksRequest struct {
 
 func (x *EnsureDisksRequest) Reset() {
 	*x = EnsureDisksRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18650,7 +18869,11 @@ func (x *EnsureDisksRequest) String() string {
 func (*EnsureDisksRequest) ProtoMessage() {}
 
 func (x *EnsureDisksRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[275]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18663,7 +18886,11 @@ func (x *EnsureDisksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureDisksRequest.ProtoReflect.Descriptor instead.
 func (*EnsureDisksRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{279}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{275}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *EnsureDisksRequest) GetVmName() string {
@@ -18690,7 +18917,11 @@ type DiskStub struct {
 
 func (x *DiskStub) Reset() {
 	*x = DiskStub{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18702,7 +18933,11 @@ func (x *DiskStub) String() string {
 func (*DiskStub) ProtoMessage() {}
 
 func (x *DiskStub) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[276]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18715,7 +18950,11 @@ func (x *DiskStub) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiskStub.ProtoReflect.Descriptor instead.
 func (*DiskStub) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{280}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{276}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DiskStub) GetPath() string {
@@ -18748,7 +18987,11 @@ type EnsureFirmwareStateRequest struct {
 
 func (x *EnsureFirmwareStateRequest) Reset() {
 	*x = EnsureFirmwareStateRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18760,7 +19003,11 @@ func (x *EnsureFirmwareStateRequest) String() string {
 func (*EnsureFirmwareStateRequest) ProtoMessage() {}
 
 func (x *EnsureFirmwareStateRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[277]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18773,7 +19020,11 @@ func (x *EnsureFirmwareStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnsureFirmwareStateRequest.ProtoReflect.Descriptor instead.
 func (*EnsureFirmwareStateRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{281}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{277}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *EnsureFirmwareStateRequest) GetVmName() string {
@@ -18827,7 +19078,11 @@ type CleanupMigrationArtifactsRequest struct {
 
 func (x *CleanupMigrationArtifactsRequest) Reset() {
 	*x = CleanupMigrationArtifactsRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18839,7 +19094,11 @@ func (x *CleanupMigrationArtifactsRequest) String() string {
 func (*CleanupMigrationArtifactsRequest) ProtoMessage() {}
 
 func (x *CleanupMigrationArtifactsRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[278]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18852,7 +19111,11 @@ func (x *CleanupMigrationArtifactsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CleanupMigrationArtifactsRequest.ProtoReflect.Descriptor instead.
 func (*CleanupMigrationArtifactsRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{282}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{278}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *CleanupMigrationArtifactsRequest) GetVmName() string {
@@ -18901,7 +19164,11 @@ type SyncVTEPRequest struct {
 
 func (x *SyncVTEPRequest) Reset() {
 	*x = SyncVTEPRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18913,7 +19180,11 @@ func (x *SyncVTEPRequest) String() string {
 func (*SyncVTEPRequest) ProtoMessage() {}
 
 func (x *SyncVTEPRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[279]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18926,7 +19197,11 @@ func (x *SyncVTEPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncVTEPRequest.ProtoReflect.Descriptor instead.
 func (*SyncVTEPRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{283}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{279}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *SyncVTEPRequest) GetNetworkName() string {
@@ -18965,7 +19240,11 @@ type GetVMIPRequest struct {
 
 func (x *GetVMIPRequest) Reset() {
 	*x = GetVMIPRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -18977,7 +19256,11 @@ func (x *GetVMIPRequest) String() string {
 func (*GetVMIPRequest) ProtoMessage() {}
 
 func (x *GetVMIPRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[280]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -18990,7 +19273,11 @@ func (x *GetVMIPRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMIPRequest.ProtoReflect.Descriptor instead.
 func (*GetVMIPRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{284}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{280}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetVMIPRequest) GetMac() string {
@@ -19030,7 +19317,11 @@ type GetVMIPResponse struct {
 
 func (x *GetVMIPResponse) Reset() {
 	*x = GetVMIPResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19042,7 +19333,11 @@ func (x *GetVMIPResponse) String() string {
 func (*GetVMIPResponse) ProtoMessage() {}
 
 func (x *GetVMIPResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[281]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19055,7 +19350,11 @@ func (x *GetVMIPResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMIPResponse.ProtoReflect.Descriptor instead.
 func (*GetVMIPResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{285}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{281}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetVMIPResponse) GetIp() string {
@@ -19074,7 +19373,11 @@ type RefreshLBRequest struct {
 
 func (x *RefreshLBRequest) Reset() {
 	*x = RefreshLBRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19086,7 +19389,11 @@ func (x *RefreshLBRequest) String() string {
 func (*RefreshLBRequest) ProtoMessage() {}
 
 func (x *RefreshLBRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[282]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19099,7 +19406,11 @@ func (x *RefreshLBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshLBRequest.ProtoReflect.Descriptor instead.
 func (*RefreshLBRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{286}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{282}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RefreshLBRequest) GetStackName() string {
@@ -19121,7 +19432,11 @@ type UpdateFDBRequest struct {
 
 func (x *UpdateFDBRequest) Reset() {
 	*x = UpdateFDBRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19133,7 +19448,11 @@ func (x *UpdateFDBRequest) String() string {
 func (*UpdateFDBRequest) ProtoMessage() {}
 
 func (x *UpdateFDBRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[283]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19146,7 +19465,11 @@ func (x *UpdateFDBRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateFDBRequest.ProtoReflect.Descriptor instead.
 func (*UpdateFDBRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{287}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{283}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UpdateFDBRequest) GetVni() int32 {
@@ -19197,7 +19520,11 @@ type TableDigest struct {
 
 func (x *TableDigest) Reset() {
 	*x = TableDigest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19209,7 +19536,11 @@ func (x *TableDigest) String() string {
 func (*TableDigest) ProtoMessage() {}
 
 func (x *TableDigest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[284]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19222,7 +19553,11 @@ func (x *TableDigest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableDigest.ProtoReflect.Descriptor instead.
 func (*TableDigest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{288}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{284}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *TableDigest) GetName() string {
@@ -19270,7 +19605,11 @@ type StateDigestResponse struct {
 
 func (x *StateDigestResponse) Reset() {
 	*x = StateDigestResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19282,7 +19621,11 @@ func (x *StateDigestResponse) String() string {
 func (*StateDigestResponse) ProtoMessage() {}
 
 func (x *StateDigestResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[285]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19295,7 +19638,11 @@ func (x *StateDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDigestResponse.ProtoReflect.Descriptor instead.
 func (*StateDigestResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{289}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{285}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *StateDigestResponse) GetHostName() string {
@@ -19324,7 +19671,11 @@ type TriggerAntiEntropyRequest struct {
 
 func (x *TriggerAntiEntropyRequest) Reset() {
 	*x = TriggerAntiEntropyRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19336,7 +19687,11 @@ func (x *TriggerAntiEntropyRequest) String() string {
 func (*TriggerAntiEntropyRequest) ProtoMessage() {}
 
 func (x *TriggerAntiEntropyRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[286]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19349,7 +19704,11 @@ func (x *TriggerAntiEntropyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerAntiEntropyRequest.ProtoReflect.Descriptor instead.
 func (*TriggerAntiEntropyRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{290}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{286}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *TriggerAntiEntropyRequest) GetAll() bool {
@@ -19371,7 +19730,11 @@ type TriggerAntiEntropyResponse struct {
 
 func (x *TriggerAntiEntropyResponse) Reset() {
 	*x = TriggerAntiEntropyResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19383,7 +19746,11 @@ func (x *TriggerAntiEntropyResponse) String() string {
 func (*TriggerAntiEntropyResponse) ProtoMessage() {}
 
 func (x *TriggerAntiEntropyResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[287]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19396,7 +19763,11 @@ func (x *TriggerAntiEntropyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TriggerAntiEntropyResponse.ProtoReflect.Descriptor instead.
 func (*TriggerAntiEntropyResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{291}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{287}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *TriggerAntiEntropyResponse) GetTriggered() []string {
@@ -19441,7 +19812,11 @@ type ClusterStateDigestResponse struct {
 
 func (x *ClusterStateDigestResponse) Reset() {
 	*x = ClusterStateDigestResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19453,7 +19828,11 @@ func (x *ClusterStateDigestResponse) String() string {
 func (*ClusterStateDigestResponse) ProtoMessage() {}
 
 func (x *ClusterStateDigestResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[288]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19466,7 +19845,11 @@ func (x *ClusterStateDigestResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterStateDigestResponse.ProtoReflect.Descriptor instead.
 func (*ClusterStateDigestResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{292}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{288}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ClusterStateDigestResponse) GetHosts() []*StateDigestResponse {
@@ -19499,7 +19882,11 @@ type StateDumpResponse struct {
 
 func (x *StateDumpResponse) Reset() {
 	*x = StateDumpResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19511,7 +19898,11 @@ func (x *StateDumpResponse) String() string {
 func (*StateDumpResponse) ProtoMessage() {}
 
 func (x *StateDumpResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[289]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19524,7 +19915,11 @@ func (x *StateDumpResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDumpResponse.ProtoReflect.Descriptor instead.
 func (*StateDumpResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{293}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{289}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *StateDumpResponse) GetData() []byte {
@@ -19548,7 +19943,11 @@ type StateDumpChunk struct {
 
 func (x *StateDumpChunk) Reset() {
 	*x = StateDumpChunk{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19560,7 +19959,11 @@ func (x *StateDumpChunk) String() string {
 func (*StateDumpChunk) ProtoMessage() {}
 
 func (x *StateDumpChunk) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[290]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19573,7 +19976,11 @@ func (x *StateDumpChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateDumpChunk.ProtoReflect.Descriptor instead.
 func (*StateDumpChunk) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{294}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{290}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *StateDumpChunk) GetData() []byte {
@@ -19601,7 +20008,11 @@ type SensitiveStateRequest struct {
 
 func (x *SensitiveStateRequest) Reset() {
 	*x = SensitiveStateRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19613,7 +20024,11 @@ func (x *SensitiveStateRequest) String() string {
 func (*SensitiveStateRequest) ProtoMessage() {}
 
 func (x *SensitiveStateRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[291]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19626,7 +20041,11 @@ func (x *SensitiveStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SensitiveStateRequest.ProtoReflect.Descriptor instead.
 func (*SensitiveStateRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{295}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{291}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *SensitiveStateRequest) GetSender() string {
@@ -19653,7 +20072,11 @@ type DiagnoseDivergenceRequest struct {
 
 func (x *DiagnoseDivergenceRequest) Reset() {
 	*x = DiagnoseDivergenceRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19665,7 +20088,11 @@ func (x *DiagnoseDivergenceRequest) String() string {
 func (*DiagnoseDivergenceRequest) ProtoMessage() {}
 
 func (x *DiagnoseDivergenceRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[292]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19678,7 +20105,11 @@ func (x *DiagnoseDivergenceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiagnoseDivergenceRequest.ProtoReflect.Descriptor instead.
 func (*DiagnoseDivergenceRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{296}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{292}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DiagnoseDivergenceRequest) GetIncludeSensitive() bool {
@@ -19708,7 +20139,11 @@ type NodeRowMeta struct {
 
 func (x *NodeRowMeta) Reset() {
 	*x = NodeRowMeta{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19720,7 +20155,11 @@ func (x *NodeRowMeta) String() string {
 func (*NodeRowMeta) ProtoMessage() {}
 
 func (x *NodeRowMeta) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[293]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19733,7 +20172,11 @@ func (x *NodeRowMeta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeRowMeta.ProtoReflect.Descriptor instead.
 func (*NodeRowMeta) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{297}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{293}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *NodeRowMeta) GetHost() string {
@@ -19783,7 +20226,11 @@ type DivergenceRow struct {
 
 func (x *DivergenceRow) Reset() {
 	*x = DivergenceRow{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19795,7 +20242,11 @@ func (x *DivergenceRow) String() string {
 func (*DivergenceRow) ProtoMessage() {}
 
 func (x *DivergenceRow) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[294]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19808,7 +20259,11 @@ func (x *DivergenceRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DivergenceRow.ProtoReflect.Descriptor instead.
 func (*DivergenceRow) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{298}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{294}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DivergenceRow) GetTable() string {
@@ -19851,7 +20306,11 @@ type SemanticViolationPB struct {
 
 func (x *SemanticViolationPB) Reset() {
 	*x = SemanticViolationPB{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19863,7 +20322,11 @@ func (x *SemanticViolationPB) String() string {
 func (*SemanticViolationPB) ProtoMessage() {}
 
 func (x *SemanticViolationPB) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[295]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19876,7 +20339,11 @@ func (x *SemanticViolationPB) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SemanticViolationPB.ProtoReflect.Descriptor instead.
 func (*SemanticViolationPB) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{299}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{295}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *SemanticViolationPB) GetKind() string {
@@ -19929,7 +20396,11 @@ type DivergenceReport struct {
 
 func (x *DivergenceReport) Reset() {
 	*x = DivergenceReport{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -19941,7 +20412,11 @@ func (x *DivergenceReport) String() string {
 func (*DivergenceReport) ProtoMessage() {}
 
 func (x *DivergenceReport) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[296]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -19954,7 +20429,11 @@ func (x *DivergenceReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DivergenceReport.ProtoReflect.Descriptor instead.
 func (*DivergenceReport) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{300}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{296}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DivergenceReport) GetNodesScanned() []string {
@@ -20017,7 +20496,11 @@ type ScanSensitiveRequest struct {
 
 func (x *ScanSensitiveRequest) Reset() {
 	*x = ScanSensitiveRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20029,7 +20512,11 @@ func (x *ScanSensitiveRequest) String() string {
 func (*ScanSensitiveRequest) ProtoMessage() {}
 
 func (x *ScanSensitiveRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[297]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20042,7 +20529,11 @@ func (x *ScanSensitiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanSensitiveRequest.ProtoReflect.Descriptor instead.
 func (*ScanSensitiveRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{301}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{297}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ScanSensitiveRequest) GetSender() string {
@@ -20083,7 +20574,11 @@ type SensitiveRowMetaPB struct {
 
 func (x *SensitiveRowMetaPB) Reset() {
 	*x = SensitiveRowMetaPB{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20095,7 +20590,11 @@ func (x *SensitiveRowMetaPB) String() string {
 func (*SensitiveRowMetaPB) ProtoMessage() {}
 
 func (x *SensitiveRowMetaPB) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[298]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20108,7 +20607,11 @@ func (x *SensitiveRowMetaPB) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SensitiveRowMetaPB.ProtoReflect.Descriptor instead.
 func (*SensitiveRowMetaPB) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{302}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{298}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *SensitiveRowMetaPB) GetTable() string {
@@ -20163,7 +20666,11 @@ type ScanSensitiveResponse struct {
 
 func (x *ScanSensitiveResponse) Reset() {
 	*x = ScanSensitiveResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20175,7 +20682,11 @@ func (x *ScanSensitiveResponse) String() string {
 func (*ScanSensitiveResponse) ProtoMessage() {}
 
 func (x *ScanSensitiveResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[299]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20188,7 +20699,11 @@ func (x *ScanSensitiveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanSensitiveResponse.ProtoReflect.Descriptor instead.
 func (*ScanSensitiveResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{303}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{299}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ScanSensitiveResponse) GetHostName() string {
@@ -20217,7 +20732,11 @@ type MutationEntry struct {
 
 func (x *MutationEntry) Reset() {
 	*x = MutationEntry{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20229,7 +20748,11 @@ func (x *MutationEntry) String() string {
 func (*MutationEntry) ProtoMessage() {}
 
 func (x *MutationEntry) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[300]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20242,7 +20765,11 @@ func (x *MutationEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MutationEntry.ProtoReflect.Descriptor instead.
 func (*MutationEntry) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{304}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{300}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *MutationEntry) GetSeq() int64 {
@@ -20286,7 +20813,11 @@ type ReplicateRequest struct {
 
 func (x *ReplicateRequest) Reset() {
 	*x = ReplicateRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20298,7 +20829,11 @@ func (x *ReplicateRequest) String() string {
 func (*ReplicateRequest) ProtoMessage() {}
 
 func (x *ReplicateRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[301]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20311,7 +20846,11 @@ func (x *ReplicateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateRequest.ProtoReflect.Descriptor instead.
 func (*ReplicateRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{305}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{301}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReplicateRequest) GetSender() string {
@@ -20358,7 +20897,11 @@ type ReplicateResponse struct {
 
 func (x *ReplicateResponse) Reset() {
 	*x = ReplicateResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20370,7 +20913,11 @@ func (x *ReplicateResponse) String() string {
 func (*ReplicateResponse) ProtoMessage() {}
 
 func (x *ReplicateResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[302]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20383,7 +20930,11 @@ func (x *ReplicateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicateResponse.ProtoReflect.Descriptor instead.
 func (*ReplicateResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{306}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{302}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReplicateResponse) GetAppliedUpTo() int64 {
@@ -20403,7 +20954,11 @@ type AckRequest struct {
 
 func (x *AckRequest) Reset() {
 	*x = AckRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20415,7 +20970,11 @@ func (x *AckRequest) String() string {
 func (*AckRequest) ProtoMessage() {}
 
 func (x *AckRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[303]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20428,7 +20987,11 @@ func (x *AckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckRequest.ProtoReflect.Descriptor instead.
 func (*AckRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{307}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{303}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *AckRequest) GetSender() string {
@@ -20457,7 +21020,11 @@ type GetVMLogsRequest struct {
 
 func (x *GetVMLogsRequest) Reset() {
 	*x = GetVMLogsRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20469,7 +21036,11 @@ func (x *GetVMLogsRequest) String() string {
 func (*GetVMLogsRequest) ProtoMessage() {}
 
 func (x *GetVMLogsRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[304]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20482,7 +21053,11 @@ func (x *GetVMLogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVMLogsRequest.ProtoReflect.Descriptor instead.
 func (*GetVMLogsRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{308}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{304}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetVMLogsRequest) GetName() string {
@@ -20515,7 +21090,11 @@ type VMLogChunk struct {
 
 func (x *VMLogChunk) Reset() {
 	*x = VMLogChunk{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20527,7 +21106,11 @@ func (x *VMLogChunk) String() string {
 func (*VMLogChunk) ProtoMessage() {}
 
 func (x *VMLogChunk) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[305]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20540,7 +21123,11 @@ func (x *VMLogChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VMLogChunk.ProtoReflect.Descriptor instead.
 func (*VMLogChunk) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{309}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{305}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *VMLogChunk) GetData() []byte {
@@ -20563,7 +21150,11 @@ type UpgradeHostRequest struct {
 
 func (x *UpgradeHostRequest) Reset() {
 	*x = UpgradeHostRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20575,7 +21166,11 @@ func (x *UpgradeHostRequest) String() string {
 func (*UpgradeHostRequest) ProtoMessage() {}
 
 func (x *UpgradeHostRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[306]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20588,7 +21183,11 @@ func (x *UpgradeHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeHostRequest.ProtoReflect.Descriptor instead.
 func (*UpgradeHostRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{310}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{306}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UpgradeHostRequest) GetChunk() []byte {
@@ -20633,7 +21232,11 @@ type UpgradeHostResponse struct {
 
 func (x *UpgradeHostResponse) Reset() {
 	*x = UpgradeHostResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20645,7 +21248,11 @@ func (x *UpgradeHostResponse) String() string {
 func (*UpgradeHostResponse) ProtoMessage() {}
 
 func (x *UpgradeHostResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[307]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20658,7 +21265,11 @@ func (x *UpgradeHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpgradeHostResponse.ProtoReflect.Descriptor instead.
 func (*UpgradeHostResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{311}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{307}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UpgradeHostResponse) GetHostName() string {
@@ -20714,7 +21325,11 @@ type UninstallHostRequest struct {
 
 func (x *UninstallHostRequest) Reset() {
 	*x = UninstallHostRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20726,7 +21341,11 @@ func (x *UninstallHostRequest) String() string {
 func (*UninstallHostRequest) ProtoMessage() {}
 
 func (x *UninstallHostRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[308]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20739,7 +21358,11 @@ func (x *UninstallHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UninstallHostRequest.ProtoReflect.Descriptor instead.
 func (*UninstallHostRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{312}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{308}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UninstallHostRequest) GetKeepData() bool {
@@ -20766,7 +21389,11 @@ type UninstallHostResponse struct {
 
 func (x *UninstallHostResponse) Reset() {
 	*x = UninstallHostResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20778,7 +21405,11 @@ func (x *UninstallHostResponse) String() string {
 func (*UninstallHostResponse) ProtoMessage() {}
 
 func (x *UninstallHostResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[309]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20791,7 +21422,11 @@ func (x *UninstallHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UninstallHostResponse.ProtoReflect.Descriptor instead.
 func (*UninstallHostResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{313}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{309}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UninstallHostResponse) GetHostName() string {
@@ -20822,7 +21457,11 @@ type ExecuteCreateVMRequest struct {
 
 func (x *ExecuteCreateVMRequest) Reset() {
 	*x = ExecuteCreateVMRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20834,7 +21473,11 @@ func (x *ExecuteCreateVMRequest) String() string {
 func (*ExecuteCreateVMRequest) ProtoMessage() {}
 
 func (x *ExecuteCreateVMRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[310]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20847,7 +21490,11 @@ func (x *ExecuteCreateVMRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteCreateVMRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteCreateVMRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{314}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{310}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ExecuteCreateVMRequest) GetRequest() *CreateVMRequest {
@@ -20889,7 +21536,11 @@ type AdmitHostRequest struct {
 
 func (x *AdmitHostRequest) Reset() {
 	*x = AdmitHostRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20901,7 +21552,11 @@ func (x *AdmitHostRequest) String() string {
 func (*AdmitHostRequest) ProtoMessage() {}
 
 func (x *AdmitHostRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[311]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20914,7 +21569,11 @@ func (x *AdmitHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdmitHostRequest.ProtoReflect.Descriptor instead.
 func (*AdmitHostRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{315}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{311}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *AdmitHostRequest) GetName() string {
@@ -20965,7 +21624,11 @@ type HostNetwork struct {
 
 func (x *HostNetwork) Reset() {
 	*x = HostNetwork{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -20977,7 +21640,11 @@ func (x *HostNetwork) String() string {
 func (*HostNetwork) ProtoMessage() {}
 
 func (x *HostNetwork) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[312]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -20990,7 +21657,11 @@ func (x *HostNetwork) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostNetwork.ProtoReflect.Descriptor instead.
 func (*HostNetwork) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{316}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{312}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *HostNetwork) GetHostName() string {
@@ -21114,7 +21785,11 @@ type ListHostNetworksRequest struct {
 
 func (x *ListHostNetworksRequest) Reset() {
 	*x = ListHostNetworksRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21126,7 +21801,11 @@ func (x *ListHostNetworksRequest) String() string {
 func (*ListHostNetworksRequest) ProtoMessage() {}
 
 func (x *ListHostNetworksRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[313]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21139,7 +21818,11 @@ func (x *ListHostNetworksRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostNetworksRequest.ProtoReflect.Descriptor instead.
 func (*ListHostNetworksRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{317}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{313}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListHostNetworksRequest) GetHostName() string {
@@ -21158,7 +21841,11 @@ type ListHostNetworksResponse struct {
 
 func (x *ListHostNetworksResponse) Reset() {
 	*x = ListHostNetworksResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21170,7 +21857,11 @@ func (x *ListHostNetworksResponse) String() string {
 func (*ListHostNetworksResponse) ProtoMessage() {}
 
 func (x *ListHostNetworksResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[314]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21183,7 +21874,11 @@ func (x *ListHostNetworksResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListHostNetworksResponse.ProtoReflect.Descriptor instead.
 func (*ListHostNetworksResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{318}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{314}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListHostNetworksResponse) GetNetworks() []*HostNetwork {
@@ -21202,7 +21897,11 @@ type UpsertHostNetworkRequest struct {
 
 func (x *UpsertHostNetworkRequest) Reset() {
 	*x = UpsertHostNetworkRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21214,7 +21913,11 @@ func (x *UpsertHostNetworkRequest) String() string {
 func (*UpsertHostNetworkRequest) ProtoMessage() {}
 
 func (x *UpsertHostNetworkRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[315]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21227,7 +21930,11 @@ func (x *UpsertHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*UpsertHostNetworkRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{319}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{315}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UpsertHostNetworkRequest) GetNetwork() *HostNetwork {
@@ -21246,7 +21953,11 @@ type PlanHostNetworkRequest struct {
 
 func (x *PlanHostNetworkRequest) Reset() {
 	*x = PlanHostNetworkRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21258,7 +21969,11 @@ func (x *PlanHostNetworkRequest) String() string {
 func (*PlanHostNetworkRequest) ProtoMessage() {}
 
 func (x *PlanHostNetworkRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[316]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21271,7 +21986,11 @@ func (x *PlanHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*PlanHostNetworkRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{320}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{316}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PlanHostNetworkRequest) GetHostName() string {
@@ -21295,7 +22014,11 @@ type PlanHostNetworkResponse struct {
 
 func (x *PlanHostNetworkResponse) Reset() {
 	*x = PlanHostNetworkResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21307,7 +22030,11 @@ func (x *PlanHostNetworkResponse) String() string {
 func (*PlanHostNetworkResponse) ProtoMessage() {}
 
 func (x *PlanHostNetworkResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[317]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21320,7 +22047,11 @@ func (x *PlanHostNetworkResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanHostNetworkResponse.ProtoReflect.Descriptor instead.
 func (*PlanHostNetworkResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{321}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{317}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PlanHostNetworkResponse) GetRendered() string {
@@ -21377,7 +22108,11 @@ type ApplyHostNetworkRequest struct {
 
 func (x *ApplyHostNetworkRequest) Reset() {
 	*x = ApplyHostNetworkRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21389,7 +22124,11 @@ func (x *ApplyHostNetworkRequest) String() string {
 func (*ApplyHostNetworkRequest) ProtoMessage() {}
 
 func (x *ApplyHostNetworkRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[318]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21402,7 +22141,11 @@ func (x *ApplyHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*ApplyHostNetworkRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{322}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{318}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ApplyHostNetworkRequest) GetHostName() string {
@@ -21429,7 +22172,11 @@ type DeleteHostNetworkRequest struct {
 
 func (x *DeleteHostNetworkRequest) Reset() {
 	*x = DeleteHostNetworkRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21441,7 +22188,11 @@ func (x *DeleteHostNetworkRequest) String() string {
 func (*DeleteHostNetworkRequest) ProtoMessage() {}
 
 func (x *DeleteHostNetworkRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[319]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21454,7 +22205,11 @@ func (x *DeleteHostNetworkRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteHostNetworkRequest.ProtoReflect.Descriptor instead.
 func (*DeleteHostNetworkRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{323}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{319}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DeleteHostNetworkRequest) GetHostName() string {
@@ -21482,7 +22237,11 @@ type IsolateHostRequest struct {
 
 func (x *IsolateHostRequest) Reset() {
 	*x = IsolateHostRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21494,7 +22253,11 @@ func (x *IsolateHostRequest) String() string {
 func (*IsolateHostRequest) ProtoMessage() {}
 
 func (x *IsolateHostRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[320]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21507,7 +22270,11 @@ func (x *IsolateHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IsolateHostRequest.ProtoReflect.Descriptor instead.
 func (*IsolateHostRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{324}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{320}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *IsolateHostRequest) GetName() string {
@@ -21535,7 +22302,11 @@ type HostIsolationStatus struct {
 
 func (x *HostIsolationStatus) Reset() {
 	*x = HostIsolationStatus{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21547,7 +22318,11 @@ func (x *HostIsolationStatus) String() string {
 func (*HostIsolationStatus) ProtoMessage() {}
 
 func (x *HostIsolationStatus) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[321]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21560,7 +22335,11 @@ func (x *HostIsolationStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostIsolationStatus.ProtoReflect.Descriptor instead.
 func (*HostIsolationStatus) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{325}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{321}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *HostIsolationStatus) GetHostName() string {
@@ -21598,7 +22377,11 @@ type ReseedHostRequest struct {
 
 func (x *ReseedHostRequest) Reset() {
 	*x = ReseedHostRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21610,7 +22393,11 @@ func (x *ReseedHostRequest) String() string {
 func (*ReseedHostRequest) ProtoMessage() {}
 
 func (x *ReseedHostRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[322]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21623,7 +22410,11 @@ func (x *ReseedHostRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReseedHostRequest.ProtoReflect.Descriptor instead.
 func (*ReseedHostRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{326}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{322}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReseedHostRequest) GetName() string {
@@ -21659,7 +22450,11 @@ type ReseedHostResponse struct {
 
 func (x *ReseedHostResponse) Reset() {
 	*x = ReseedHostResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21671,7 +22466,11 @@ func (x *ReseedHostResponse) String() string {
 func (*ReseedHostResponse) ProtoMessage() {}
 
 func (x *ReseedHostResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[323]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21684,7 +22483,11 @@ func (x *ReseedHostResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReseedHostResponse.ProtoReflect.Descriptor instead.
 func (*ReseedHostResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{327}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{323}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReseedHostResponse) GetHostName() string {
@@ -21727,7 +22530,11 @@ type PreflightUpgradeRequest struct {
 
 func (x *PreflightUpgradeRequest) Reset() {
 	*x = PreflightUpgradeRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21739,7 +22546,11 @@ func (x *PreflightUpgradeRequest) String() string {
 func (*PreflightUpgradeRequest) ProtoMessage() {}
 
 func (x *PreflightUpgradeRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[324]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21752,7 +22563,11 @@ func (x *PreflightUpgradeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightUpgradeRequest.ProtoReflect.Descriptor instead.
 func (*PreflightUpgradeRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{328}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{324}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PreflightUpgradeRequest) GetTargetHost() string {
@@ -21773,7 +22588,11 @@ type PreflightUpgradeResponse struct {
 
 func (x *PreflightUpgradeResponse) Reset() {
 	*x = PreflightUpgradeResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21785,7 +22604,11 @@ func (x *PreflightUpgradeResponse) String() string {
 func (*PreflightUpgradeResponse) ProtoMessage() {}
 
 func (x *PreflightUpgradeResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[325]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21798,7 +22621,11 @@ func (x *PreflightUpgradeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightUpgradeResponse.ProtoReflect.Descriptor instead.
 func (*PreflightUpgradeResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{329}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{325}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PreflightUpgradeResponse) GetOk() bool {
@@ -21833,7 +22660,11 @@ type PreflightFinding struct {
 
 func (x *PreflightFinding) Reset() {
 	*x = PreflightFinding{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21845,7 +22676,11 @@ func (x *PreflightFinding) String() string {
 func (*PreflightFinding) ProtoMessage() {}
 
 func (x *PreflightFinding) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[326]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21858,7 +22693,11 @@ func (x *PreflightFinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreflightFinding.ProtoReflect.Descriptor instead.
 func (*PreflightFinding) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{330}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{326}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *PreflightFinding) GetSeverity() string {
@@ -21891,7 +22730,11 @@ type GetSpiceInfoRequest struct {
 
 func (x *GetSpiceInfoRequest) Reset() {
 	*x = GetSpiceInfoRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21903,7 +22746,11 @@ func (x *GetSpiceInfoRequest) String() string {
 func (*GetSpiceInfoRequest) ProtoMessage() {}
 
 func (x *GetSpiceInfoRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[327]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21916,7 +22763,11 @@ func (x *GetSpiceInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSpiceInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetSpiceInfoRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{331}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{327}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetSpiceInfoRequest) GetVmName() string {
@@ -21937,7 +22788,11 @@ type GetSpiceInfoResponse struct {
 
 func (x *GetSpiceInfoResponse) Reset() {
 	*x = GetSpiceInfoResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -21949,7 +22804,11 @@ func (x *GetSpiceInfoResponse) String() string {
 func (*GetSpiceInfoResponse) ProtoMessage() {}
 
 func (x *GetSpiceInfoResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[328]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -21962,7 +22821,11 @@ func (x *GetSpiceInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSpiceInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetSpiceInfoResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{332}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{328}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetSpiceInfoResponse) GetHost() string {
@@ -22005,7 +22868,11 @@ type RebalanceProposal struct {
 
 func (x *RebalanceProposal) Reset() {
 	*x = RebalanceProposal{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22017,7 +22884,11 @@ func (x *RebalanceProposal) String() string {
 func (*RebalanceProposal) ProtoMessage() {}
 
 func (x *RebalanceProposal) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[329]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22030,7 +22901,11 @@ func (x *RebalanceProposal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebalanceProposal.ProtoReflect.Descriptor instead.
 func (*RebalanceProposal) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{333}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{329}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RebalanceProposal) GetId() string {
@@ -22119,7 +22994,11 @@ type ListRebalanceProposalsRequest struct {
 
 func (x *ListRebalanceProposalsRequest) Reset() {
 	*x = ListRebalanceProposalsRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22131,7 +23010,11 @@ func (x *ListRebalanceProposalsRequest) String() string {
 func (*ListRebalanceProposalsRequest) ProtoMessage() {}
 
 func (x *ListRebalanceProposalsRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[330]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22144,7 +23027,11 @@ func (x *ListRebalanceProposalsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRebalanceProposalsRequest.ProtoReflect.Descriptor instead.
 func (*ListRebalanceProposalsRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{334}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{330}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListRebalanceProposalsRequest) GetStatusFilter() string {
@@ -22163,7 +23050,11 @@ type ListRebalanceProposalsResponse struct {
 
 func (x *ListRebalanceProposalsResponse) Reset() {
 	*x = ListRebalanceProposalsResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22175,7 +23066,11 @@ func (x *ListRebalanceProposalsResponse) String() string {
 func (*ListRebalanceProposalsResponse) ProtoMessage() {}
 
 func (x *ListRebalanceProposalsResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[331]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22188,7 +23083,11 @@ func (x *ListRebalanceProposalsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRebalanceProposalsResponse.ProtoReflect.Descriptor instead.
 func (*ListRebalanceProposalsResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{335}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{331}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListRebalanceProposalsResponse) GetProposals() []*RebalanceProposal {
@@ -22207,7 +23106,11 @@ type RunRebalanceRequest struct {
 
 func (x *RunRebalanceRequest) Reset() {
 	*x = RunRebalanceRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22219,7 +23122,11 @@ func (x *RunRebalanceRequest) String() string {
 func (*RunRebalanceRequest) ProtoMessage() {}
 
 func (x *RunRebalanceRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[332]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22232,7 +23139,11 @@ func (x *RunRebalanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRebalanceRequest.ProtoReflect.Descriptor instead.
 func (*RunRebalanceRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{336}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{332}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RunRebalanceRequest) GetDryRun() bool {
@@ -22251,7 +23162,11 @@ type RunRebalanceResponse struct {
 
 func (x *RunRebalanceResponse) Reset() {
 	*x = RunRebalanceResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22263,7 +23178,11 @@ func (x *RunRebalanceResponse) String() string {
 func (*RunRebalanceResponse) ProtoMessage() {}
 
 func (x *RunRebalanceResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[333]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22276,7 +23195,11 @@ func (x *RunRebalanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRebalanceResponse.ProtoReflect.Descriptor instead.
 func (*RunRebalanceResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{337}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{333}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RunRebalanceResponse) GetProposalsEmitted() int32 {
@@ -22295,7 +23218,11 @@ type ApproveRebalanceProposalRequest struct {
 
 func (x *ApproveRebalanceProposalRequest) Reset() {
 	*x = ApproveRebalanceProposalRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22307,7 +23234,11 @@ func (x *ApproveRebalanceProposalRequest) String() string {
 func (*ApproveRebalanceProposalRequest) ProtoMessage() {}
 
 func (x *ApproveRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[334]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22320,7 +23251,11 @@ func (x *ApproveRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApproveRebalanceProposalRequest.ProtoReflect.Descriptor instead.
 func (*ApproveRebalanceProposalRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{338}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{334}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ApproveRebalanceProposalRequest) GetId() string {
@@ -22340,7 +23275,11 @@ type RejectRebalanceProposalRequest struct {
 
 func (x *RejectRebalanceProposalRequest) Reset() {
 	*x = RejectRebalanceProposalRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22352,7 +23291,11 @@ func (x *RejectRebalanceProposalRequest) String() string {
 func (*RejectRebalanceProposalRequest) ProtoMessage() {}
 
 func (x *RejectRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[335]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22365,7 +23308,11 @@ func (x *RejectRebalanceProposalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RejectRebalanceProposalRequest.ProtoReflect.Descriptor instead.
 func (*RejectRebalanceProposalRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{339}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{335}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RejectRebalanceProposalRequest) GetId() string {
@@ -22390,7 +23337,11 @@ type ListRegionsRequest struct {
 
 func (x *ListRegionsRequest) Reset() {
 	*x = ListRegionsRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22402,7 +23353,11 @@ func (x *ListRegionsRequest) String() string {
 func (*ListRegionsRequest) ProtoMessage() {}
 
 func (x *ListRegionsRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[336]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22415,7 +23370,11 @@ func (x *ListRegionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegionsRequest.ProtoReflect.Descriptor instead.
 func (*ListRegionsRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{340}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{336}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 type ListRegionsResponse struct {
@@ -22427,7 +23386,11 @@ type ListRegionsResponse struct {
 
 func (x *ListRegionsResponse) Reset() {
 	*x = ListRegionsResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22439,7 +23402,11 @@ func (x *ListRegionsResponse) String() string {
 func (*ListRegionsResponse) ProtoMessage() {}
 
 func (x *ListRegionsResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[337]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22452,7 +23419,11 @@ func (x *ListRegionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRegionsResponse.ProtoReflect.Descriptor instead.
 func (*ListRegionsResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{341}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{337}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListRegionsResponse) GetRegions() []string {
@@ -22471,7 +23442,11 @@ type RegionStatusRequest struct {
 
 func (x *RegionStatusRequest) Reset() {
 	*x = RegionStatusRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22483,7 +23458,11 @@ func (x *RegionStatusRequest) String() string {
 func (*RegionStatusRequest) ProtoMessage() {}
 
 func (x *RegionStatusRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[338]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22496,7 +23475,11 @@ func (x *RegionStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatusRequest.ProtoReflect.Descriptor instead.
 func (*RegionStatusRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{342}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{338}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RegionStatusRequest) GetRegion() string {
@@ -22515,7 +23498,11 @@ type RegionStatusResponse struct {
 
 func (x *RegionStatusResponse) Reset() {
 	*x = RegionStatusResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22527,7 +23514,11 @@ func (x *RegionStatusResponse) String() string {
 func (*RegionStatusResponse) ProtoMessage() {}
 
 func (x *RegionStatusResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[339]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22540,7 +23531,11 @@ func (x *RegionStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatusResponse.ProtoReflect.Descriptor instead.
 func (*RegionStatusResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{343}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{339}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RegionStatusResponse) GetStatuses() []*RegionStatus {
@@ -22563,7 +23558,11 @@ type RegionStatus struct {
 
 func (x *RegionStatus) Reset() {
 	*x = RegionStatus{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22575,7 +23574,11 @@ func (x *RegionStatus) String() string {
 func (*RegionStatus) ProtoMessage() {}
 
 func (x *RegionStatus) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[340]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22588,7 +23591,11 @@ func (x *RegionStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegionStatus.ProtoReflect.Descriptor instead.
 func (*RegionStatus) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{340}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RegionStatus) GetName() string {
@@ -22649,7 +23656,11 @@ type CrossRegionMigrateRequest struct {
 
 func (x *CrossRegionMigrateRequest) Reset() {
 	*x = CrossRegionMigrateRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22661,7 +23672,11 @@ func (x *CrossRegionMigrateRequest) String() string {
 func (*CrossRegionMigrateRequest) ProtoMessage() {}
 
 func (x *CrossRegionMigrateRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[341]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22674,7 +23689,11 @@ func (x *CrossRegionMigrateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CrossRegionMigrateRequest.ProtoReflect.Descriptor instead.
 func (*CrossRegionMigrateRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{345}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{341}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *CrossRegionMigrateRequest) GetVmName() string {
@@ -22725,7 +23744,11 @@ type ServiceEndpoint struct {
 
 func (x *ServiceEndpoint) Reset() {
 	*x = ServiceEndpoint{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22737,7 +23760,11 @@ func (x *ServiceEndpoint) String() string {
 func (*ServiceEndpoint) ProtoMessage() {}
 
 func (x *ServiceEndpoint) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[342]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22750,7 +23777,11 @@ func (x *ServiceEndpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServiceEndpoint.ProtoReflect.Descriptor instead.
 func (*ServiceEndpoint) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{346}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{342}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ServiceEndpoint) GetServiceName() string {
@@ -22793,7 +23824,11 @@ type UpsertServiceEndpointRequest struct {
 
 func (x *UpsertServiceEndpointRequest) Reset() {
 	*x = UpsertServiceEndpointRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22805,7 +23840,11 @@ func (x *UpsertServiceEndpointRequest) String() string {
 func (*UpsertServiceEndpointRequest) ProtoMessage() {}
 
 func (x *UpsertServiceEndpointRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[343]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22818,7 +23857,11 @@ func (x *UpsertServiceEndpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertServiceEndpointRequest.ProtoReflect.Descriptor instead.
 func (*UpsertServiceEndpointRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{347}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{343}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *UpsertServiceEndpointRequest) GetServiceName() string {
@@ -22858,7 +23901,11 @@ type ListServiceEndpointsRequest struct {
 
 func (x *ListServiceEndpointsRequest) Reset() {
 	*x = ListServiceEndpointsRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22870,7 +23917,11 @@ func (x *ListServiceEndpointsRequest) String() string {
 func (*ListServiceEndpointsRequest) ProtoMessage() {}
 
 func (x *ListServiceEndpointsRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[344]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22883,7 +23934,11 @@ func (x *ListServiceEndpointsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListServiceEndpointsRequest.ProtoReflect.Descriptor instead.
 func (*ListServiceEndpointsRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{348}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{344}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListServiceEndpointsRequest) GetServiceName() string {
@@ -22902,7 +23957,11 @@ type ListServiceEndpointsResponse struct {
 
 func (x *ListServiceEndpointsResponse) Reset() {
 	*x = ListServiceEndpointsResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22914,7 +23973,11 @@ func (x *ListServiceEndpointsResponse) String() string {
 func (*ListServiceEndpointsResponse) ProtoMessage() {}
 
 func (x *ListServiceEndpointsResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[345]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22927,7 +23990,11 @@ func (x *ListServiceEndpointsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListServiceEndpointsResponse.ProtoReflect.Descriptor instead.
 func (*ListServiceEndpointsResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{349}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{345}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListServiceEndpointsResponse) GetEndpoints() []*ServiceEndpoint {
@@ -22947,7 +24014,11 @@ type DeleteServiceEndpointRequest struct {
 
 func (x *DeleteServiceEndpointRequest) Reset() {
 	*x = DeleteServiceEndpointRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -22959,7 +24030,11 @@ func (x *DeleteServiceEndpointRequest) String() string {
 func (*DeleteServiceEndpointRequest) ProtoMessage() {}
 
 func (x *DeleteServiceEndpointRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[346]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -22972,7 +24047,11 @@ func (x *DeleteServiceEndpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteServiceEndpointRequest.ProtoReflect.Descriptor instead.
 func (*DeleteServiceEndpointRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{350}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{346}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DeleteServiceEndpointRequest) GetServiceName() string {
@@ -23011,7 +24090,11 @@ type BackupSchedule struct {
 
 func (x *BackupSchedule) Reset() {
 	*x = BackupSchedule{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23023,7 +24106,11 @@ func (x *BackupSchedule) String() string {
 func (*BackupSchedule) ProtoMessage() {}
 
 func (x *BackupSchedule) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[347]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23036,7 +24123,11 @@ func (x *BackupSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupSchedule.ProtoReflect.Descriptor instead.
 func (*BackupSchedule) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{351}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{347}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *BackupSchedule) GetVmName() string {
@@ -23157,7 +24248,11 @@ type CreateBackupScheduleRequest struct {
 
 func (x *CreateBackupScheduleRequest) Reset() {
 	*x = CreateBackupScheduleRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23169,7 +24264,11 @@ func (x *CreateBackupScheduleRequest) String() string {
 func (*CreateBackupScheduleRequest) ProtoMessage() {}
 
 func (x *CreateBackupScheduleRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[348]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23182,7 +24281,11 @@ func (x *CreateBackupScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateBackupScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateBackupScheduleRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{352}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{348}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *CreateBackupScheduleRequest) GetVmName() string {
@@ -23277,7 +24380,11 @@ type ListBackupSchedulesRequest struct {
 
 func (x *ListBackupSchedulesRequest) Reset() {
 	*x = ListBackupSchedulesRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23289,7 +24396,11 @@ func (x *ListBackupSchedulesRequest) String() string {
 func (*ListBackupSchedulesRequest) ProtoMessage() {}
 
 func (x *ListBackupSchedulesRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[349]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23302,7 +24413,11 @@ func (x *ListBackupSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListBackupSchedulesRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{353}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{349}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 type ListBackupSchedulesResponse struct {
@@ -23314,7 +24429,11 @@ type ListBackupSchedulesResponse struct {
 
 func (x *ListBackupSchedulesResponse) Reset() {
 	*x = ListBackupSchedulesResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23326,7 +24445,11 @@ func (x *ListBackupSchedulesResponse) String() string {
 func (*ListBackupSchedulesResponse) ProtoMessage() {}
 
 func (x *ListBackupSchedulesResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[350]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23339,7 +24462,11 @@ func (x *ListBackupSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListBackupSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListBackupSchedulesResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{354}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{350}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListBackupSchedulesResponse) GetSchedules() []*BackupSchedule {
@@ -23362,7 +24489,11 @@ type DeleteBackupScheduleRequest struct {
 
 func (x *DeleteBackupScheduleRequest) Reset() {
 	*x = DeleteBackupScheduleRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23374,7 +24505,11 @@ func (x *DeleteBackupScheduleRequest) String() string {
 func (*DeleteBackupScheduleRequest) ProtoMessage() {}
 
 func (x *DeleteBackupScheduleRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[351]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23387,7 +24522,11 @@ func (x *DeleteBackupScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteBackupScheduleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteBackupScheduleRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{355}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{351}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DeleteBackupScheduleRequest) GetVmName() string {
@@ -23447,7 +24586,11 @@ type ReplicationSchedule struct {
 
 func (x *ReplicationSchedule) Reset() {
 	*x = ReplicationSchedule{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23459,7 +24602,11 @@ func (x *ReplicationSchedule) String() string {
 func (*ReplicationSchedule) ProtoMessage() {}
 
 func (x *ReplicationSchedule) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[352]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23472,7 +24619,11 @@ func (x *ReplicationSchedule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReplicationSchedule.ProtoReflect.Descriptor instead.
 func (*ReplicationSchedule) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{356}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{352}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReplicationSchedule) GetVmName() string {
@@ -23585,7 +24736,11 @@ type CreateReplicationScheduleRequest struct {
 
 func (x *CreateReplicationScheduleRequest) Reset() {
 	*x = CreateReplicationScheduleRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23597,7 +24752,11 @@ func (x *CreateReplicationScheduleRequest) String() string {
 func (*CreateReplicationScheduleRequest) ProtoMessage() {}
 
 func (x *CreateReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[353]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23610,7 +24769,11 @@ func (x *CreateReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateReplicationScheduleRequest.ProtoReflect.Descriptor instead.
 func (*CreateReplicationScheduleRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{357}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{353}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *CreateReplicationScheduleRequest) GetVmName() string {
@@ -23698,7 +24861,11 @@ type ListReplicationSchedulesRequest struct {
 
 func (x *ListReplicationSchedulesRequest) Reset() {
 	*x = ListReplicationSchedulesRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23710,7 +24877,11 @@ func (x *ListReplicationSchedulesRequest) String() string {
 func (*ListReplicationSchedulesRequest) ProtoMessage() {}
 
 func (x *ListReplicationSchedulesRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[354]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23723,7 +24894,11 @@ func (x *ListReplicationSchedulesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicationSchedulesRequest.ProtoReflect.Descriptor instead.
 func (*ListReplicationSchedulesRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{358}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{354}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 type ListReplicationSchedulesResponse struct {
@@ -23735,7 +24910,11 @@ type ListReplicationSchedulesResponse struct {
 
 func (x *ListReplicationSchedulesResponse) Reset() {
 	*x = ListReplicationSchedulesResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23747,7 +24926,11 @@ func (x *ListReplicationSchedulesResponse) String() string {
 func (*ListReplicationSchedulesResponse) ProtoMessage() {}
 
 func (x *ListReplicationSchedulesResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[355]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23760,7 +24943,11 @@ func (x *ListReplicationSchedulesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListReplicationSchedulesResponse.ProtoReflect.Descriptor instead.
 func (*ListReplicationSchedulesResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{359}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{355}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListReplicationSchedulesResponse) GetSchedules() []*ReplicationSchedule {
@@ -23783,7 +24970,11 @@ type DeleteReplicationScheduleRequest struct {
 
 func (x *DeleteReplicationScheduleRequest) Reset() {
 	*x = DeleteReplicationScheduleRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23795,7 +24986,11 @@ func (x *DeleteReplicationScheduleRequest) String() string {
 func (*DeleteReplicationScheduleRequest) ProtoMessage() {}
 
 func (x *DeleteReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[356]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23808,7 +25003,11 @@ func (x *DeleteReplicationScheduleRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteReplicationScheduleRequest.ProtoReflect.Descriptor instead.
 func (*DeleteReplicationScheduleRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{360}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{356}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DeleteReplicationScheduleRequest) GetVmName() string {
@@ -23925,7 +25124,11 @@ type VerifyAuditChainResponse struct {
 
 func (x *VerifyAuditChainResponse) Reset() {
 	*x = VerifyAuditChainResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -23937,7 +25140,11 @@ func (x *VerifyAuditChainResponse) String() string {
 func (*VerifyAuditChainResponse) ProtoMessage() {}
 
 func (x *VerifyAuditChainResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[357]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -23950,7 +25157,11 @@ func (x *VerifyAuditChainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyAuditChainResponse.ProtoReflect.Descriptor instead.
 func (*VerifyAuditChainResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{361}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{357}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *VerifyAuditChainResponse) GetRowsChecked() int32 {
@@ -24158,7 +25369,11 @@ type RetireAuditKeyRequest struct {
 
 func (x *RetireAuditKeyRequest) Reset() {
 	*x = RetireAuditKeyRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24170,7 +25385,11 @@ func (x *RetireAuditKeyRequest) String() string {
 func (*RetireAuditKeyRequest) ProtoMessage() {}
 
 func (x *RetireAuditKeyRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[358]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24183,7 +25402,11 @@ func (x *RetireAuditKeyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAuditKeyRequest.ProtoReflect.Descriptor instead.
 func (*RetireAuditKeyRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{362}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{358}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RetireAuditKeyRequest) GetHostName() string {
@@ -24255,7 +25478,11 @@ type RetireAuditKeyResponse struct {
 
 func (x *RetireAuditKeyResponse) Reset() {
 	*x = RetireAuditKeyResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24267,7 +25494,11 @@ func (x *RetireAuditKeyResponse) String() string {
 func (*RetireAuditKeyResponse) ProtoMessage() {}
 
 func (x *RetireAuditKeyResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[359]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24280,7 +25511,11 @@ func (x *RetireAuditKeyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAuditKeyResponse.ProtoReflect.Descriptor instead.
 func (*RetireAuditKeyResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{363}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{359}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *RetireAuditKeyResponse) GetRetiredKeyId() string {
@@ -24309,7 +25544,11 @@ type ExportAuditChainRequest struct {
 
 func (x *ExportAuditChainRequest) Reset() {
 	*x = ExportAuditChainRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24321,7 +25560,11 @@ func (x *ExportAuditChainRequest) String() string {
 func (*ExportAuditChainRequest) ProtoMessage() {}
 
 func (x *ExportAuditChainRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[360]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24334,7 +25577,11 @@ func (x *ExportAuditChainRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAuditChainRequest.ProtoReflect.Descriptor instead.
 func (*ExportAuditChainRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{364}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{360}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ExportAuditChainRequest) GetSince() string {
@@ -24364,7 +25611,11 @@ type ExportAuditChainResponse struct {
 
 func (x *ExportAuditChainResponse) Reset() {
 	*x = ExportAuditChainResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24376,7 +25627,11 @@ func (x *ExportAuditChainResponse) String() string {
 func (*ExportAuditChainResponse) ProtoMessage() {}
 
 func (x *ExportAuditChainResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[361]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24389,7 +25644,11 @@ func (x *ExportAuditChainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportAuditChainResponse.ProtoReflect.Descriptor instead.
 func (*ExportAuditChainResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{365}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{361}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ExportAuditChainResponse) GetJson() string {
@@ -24419,7 +25678,11 @@ type Project struct {
 
 func (x *Project) Reset() {
 	*x = Project{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24431,7 +25694,11 @@ func (x *Project) String() string {
 func (*Project) ProtoMessage() {}
 
 func (x *Project) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[362]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24444,7 +25711,11 @@ func (x *Project) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Project.ProtoReflect.Descriptor instead.
 func (*Project) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{366}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{362}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *Project) GetName() string {
@@ -24493,7 +25764,11 @@ type CreateProjectRequest struct {
 
 func (x *CreateProjectRequest) Reset() {
 	*x = CreateProjectRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24505,7 +25780,11 @@ func (x *CreateProjectRequest) String() string {
 func (*CreateProjectRequest) ProtoMessage() {}
 
 func (x *CreateProjectRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[363]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24518,7 +25797,11 @@ func (x *CreateProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateProjectRequest.ProtoReflect.Descriptor instead.
 func (*CreateProjectRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{367}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{363}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *CreateProjectRequest) GetName() string {
@@ -24551,7 +25834,11 @@ type ListProjectsResponse struct {
 
 func (x *ListProjectsResponse) Reset() {
 	*x = ListProjectsResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24563,7 +25850,11 @@ func (x *ListProjectsResponse) String() string {
 func (*ListProjectsResponse) ProtoMessage() {}
 
 func (x *ListProjectsResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[364]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24576,7 +25867,11 @@ func (x *ListProjectsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListProjectsResponse.ProtoReflect.Descriptor instead.
 func (*ListProjectsResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{368}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{364}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ListProjectsResponse) GetProjects() []*Project {
@@ -24595,7 +25890,11 @@ type GetProjectRequest struct {
 
 func (x *GetProjectRequest) Reset() {
 	*x = GetProjectRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24607,7 +25906,11 @@ func (x *GetProjectRequest) String() string {
 func (*GetProjectRequest) ProtoMessage() {}
 
 func (x *GetProjectRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[365]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24620,7 +25923,11 @@ func (x *GetProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{369}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{365}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetProjectRequest) GetName() string {
@@ -24639,7 +25946,11 @@ type DeleteProjectRequest struct {
 
 func (x *DeleteProjectRequest) Reset() {
 	*x = DeleteProjectRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24651,7 +25962,11 @@ func (x *DeleteProjectRequest) String() string {
 func (*DeleteProjectRequest) ProtoMessage() {}
 
 func (x *DeleteProjectRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[366]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24664,7 +25979,11 @@ func (x *DeleteProjectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteProjectRequest.ProtoReflect.Descriptor instead.
 func (*DeleteProjectRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{370}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{366}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *DeleteProjectRequest) GetName() string {
@@ -24689,7 +26008,11 @@ type ProjectQuota struct {
 
 func (x *ProjectQuota) Reset() {
 	*x = ProjectQuota{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24701,7 +26024,11 @@ func (x *ProjectQuota) String() string {
 func (*ProjectQuota) ProtoMessage() {}
 
 func (x *ProjectQuota) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[367]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24714,7 +26041,11 @@ func (x *ProjectQuota) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProjectQuota.ProtoReflect.Descriptor instead.
 func (*ProjectQuota) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{371}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{367}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ProjectQuota) GetProjectName() string {
@@ -24775,7 +26106,11 @@ type SetProjectQuotaRequest struct {
 
 func (x *SetProjectQuotaRequest) Reset() {
 	*x = SetProjectQuotaRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24787,7 +26122,11 @@ func (x *SetProjectQuotaRequest) String() string {
 func (*SetProjectQuotaRequest) ProtoMessage() {}
 
 func (x *SetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[368]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24800,7 +26139,11 @@ func (x *SetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetProjectQuotaRequest.ProtoReflect.Descriptor instead.
 func (*SetProjectQuotaRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{372}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{368}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *SetProjectQuotaRequest) GetQuota() *ProjectQuota {
@@ -24819,7 +26162,11 @@ type GetProjectQuotaRequest struct {
 
 func (x *GetProjectQuotaRequest) Reset() {
 	*x = GetProjectQuotaRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24831,7 +26178,11 @@ func (x *GetProjectQuotaRequest) String() string {
 func (*GetProjectQuotaRequest) ProtoMessage() {}
 
 func (x *GetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[369]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24844,7 +26195,11 @@ func (x *GetProjectQuotaRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectQuotaRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectQuotaRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{373}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{369}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetProjectQuotaRequest) GetProjectName() string {
@@ -24870,7 +26225,11 @@ type ProjectUsage struct {
 
 func (x *ProjectUsage) Reset() {
 	*x = ProjectUsage{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24882,7 +26241,11 @@ func (x *ProjectUsage) String() string {
 func (*ProjectUsage) ProtoMessage() {}
 
 func (x *ProjectUsage) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[370]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24895,7 +26258,11 @@ func (x *ProjectUsage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProjectUsage.ProtoReflect.Descriptor instead.
 func (*ProjectUsage) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{374}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{370}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ProjectUsage) GetProjectName() string {
@@ -24963,7 +26330,11 @@ type GetProjectUsageRequest struct {
 
 func (x *GetProjectUsageRequest) Reset() {
 	*x = GetProjectUsageRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -24975,7 +26346,11 @@ func (x *GetProjectUsageRequest) String() string {
 func (*GetProjectUsageRequest) ProtoMessage() {}
 
 func (x *GetProjectUsageRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[371]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -24988,7 +26363,11 @@ func (x *GetProjectUsageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetProjectUsageRequest.ProtoReflect.Descriptor instead.
 func (*GetProjectUsageRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{375}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{371}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *GetProjectUsageRequest) GetProjectName() string {
@@ -25040,7 +26419,11 @@ type ReserveProjectCapacityRequest struct {
 
 func (x *ReserveProjectCapacityRequest) Reset() {
 	*x = ReserveProjectCapacityRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25052,7 +26435,11 @@ func (x *ReserveProjectCapacityRequest) String() string {
 func (*ReserveProjectCapacityRequest) ProtoMessage() {}
 
 func (x *ReserveProjectCapacityRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[372]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25065,7 +26452,11 @@ func (x *ReserveProjectCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveProjectCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReserveProjectCapacityRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{376}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{372}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReserveProjectCapacityRequest) GetProject() string {
@@ -25176,7 +26567,11 @@ type ReserveProjectCapacityResponse struct {
 
 func (x *ReserveProjectCapacityResponse) Reset() {
 	*x = ReserveProjectCapacityResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25188,7 +26583,11 @@ func (x *ReserveProjectCapacityResponse) String() string {
 func (*ReserveProjectCapacityResponse) ProtoMessage() {}
 
 func (x *ReserveProjectCapacityResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[373]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25201,7 +26600,11 @@ func (x *ReserveProjectCapacityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveProjectCapacityResponse.ProtoReflect.Descriptor instead.
 func (*ReserveProjectCapacityResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{377}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{373}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReserveProjectCapacityResponse) GetLeaseId() string {
@@ -25228,7 +26631,11 @@ type ReleaseProjectCapacityRequest struct {
 
 func (x *ReleaseProjectCapacityRequest) Reset() {
 	*x = ReleaseProjectCapacityRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25240,7 +26647,11 @@ func (x *ReleaseProjectCapacityRequest) String() string {
 func (*ReleaseProjectCapacityRequest) ProtoMessage() {}
 
 func (x *ReleaseProjectCapacityRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[374]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25253,7 +26664,11 @@ func (x *ReleaseProjectCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseProjectCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseProjectCapacityRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{378}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{374}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReleaseProjectCapacityRequest) GetProject() string {
@@ -25290,7 +26705,11 @@ type ReserveHostCapacityRequest struct {
 
 func (x *ReserveHostCapacityRequest) Reset() {
 	*x = ReserveHostCapacityRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25302,7 +26721,11 @@ func (x *ReserveHostCapacityRequest) String() string {
 func (*ReserveHostCapacityRequest) ProtoMessage() {}
 
 func (x *ReserveHostCapacityRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[375]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25315,7 +26738,11 @@ func (x *ReserveHostCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveHostCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReserveHostCapacityRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{379}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{375}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReserveHostCapacityRequest) GetHost() string {
@@ -25392,7 +26819,11 @@ type ReserveHostCapacityResponse struct {
 
 func (x *ReserveHostCapacityResponse) Reset() {
 	*x = ReserveHostCapacityResponse{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[380]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25404,7 +26835,11 @@ func (x *ReserveHostCapacityResponse) String() string {
 func (*ReserveHostCapacityResponse) ProtoMessage() {}
 
 func (x *ReserveHostCapacityResponse) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[380]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[376]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25417,7 +26852,11 @@ func (x *ReserveHostCapacityResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveHostCapacityResponse.ProtoReflect.Descriptor instead.
 func (*ReserveHostCapacityResponse) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{380}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{376}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReserveHostCapacityResponse) GetLeaseId() string {
@@ -25436,7 +26875,11 @@ type ReleaseHostCapacityRequest struct {
 
 func (x *ReleaseHostCapacityRequest) Reset() {
 	*x = ReleaseHostCapacityRequest{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[381]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25448,7 +26891,11 @@ func (x *ReleaseHostCapacityRequest) String() string {
 func (*ReleaseHostCapacityRequest) ProtoMessage() {}
 
 func (x *ReleaseHostCapacityRequest) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[381]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[377]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25461,7 +26908,11 @@ func (x *ReleaseHostCapacityRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseHostCapacityRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseHostCapacityRequest) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{381}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{377}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *ReleaseHostCapacityRequest) GetLeaseId() string {
@@ -25496,7 +26947,11 @@ type FenceHostPosture struct {
 
 func (x *FenceHostPosture) Reset() {
 	*x = FenceHostPosture{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[382]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25508,7 +26963,11 @@ func (x *FenceHostPosture) String() string {
 func (*FenceHostPosture) ProtoMessage() {}
 
 func (x *FenceHostPosture) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[382]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[378]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25521,7 +26980,11 @@ func (x *FenceHostPosture) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceHostPosture.ProtoReflect.Descriptor instead.
 func (*FenceHostPosture) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{382}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{378}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *FenceHostPosture) GetHost() string {
@@ -25604,7 +27067,11 @@ type FenceReadiness struct {
 
 func (x *FenceReadiness) Reset() {
 	*x = FenceReadiness{}
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[383]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -25616,7 +27083,11 @@ func (x *FenceReadiness) String() string {
 func (*FenceReadiness) ProtoMessage() {}
 
 func (x *FenceReadiness) ProtoReflect() protoreflect.Message {
+<<<<<<< HEAD
 	mi := &file_litevirt_v1_service_proto_msgTypes[383]
+=======
+	mi := &file_litevirt_v1_service_proto_msgTypes[379]
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -25629,7 +27100,11 @@ func (x *FenceReadiness) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FenceReadiness.ProtoReflect.Descriptor instead.
 func (*FenceReadiness) Descriptor() ([]byte, []int) {
+<<<<<<< HEAD
 	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{383}
+=======
+	return file_litevirt_v1_service_proto_rawDescGZIP(), []int{379}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func (x *FenceReadiness) GetCapabilityLatched() bool {
@@ -27080,7 +28555,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x03R\x04term\"E\n" +
 	"\x1fAcknowledgeLeaseTermTieResponse\x12\"\n" +
-	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"\x95\x02\n" +
+	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"0\n" +
+	"\x1cGetLeaseTermHighWaterRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\"]\n" +
+	"\x1dGetLeaseTermHighWaterResponse\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x03R\x04term\x12\x16\n" +
+	"\x06holder\x18\x03 \x01(\tR\x06holder\"\x95\x02\n" +
 	"\x15PromoteReplicaRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1f\n" +
 	"\vtarget_pool\x18\x02 \x01(\tR\n" +
@@ -27688,7 +29169,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0eRelayVIPResult\x12\x15\n" +
 	"\x11RELAY_VIP_UNKNOWN\x10\x00\x12\x14\n" +
 	"\x10RELAY_VIP_CLAIMS\x10\x01\x12\x17\n" +
+<<<<<<< HEAD
 	"\x13RELAY_VIP_NO_CLAIMS\x10\x022Ɵ\x01\n" +
+=======
+	"\x13RELAY_VIP_NO_CLAIMS\x10\x022\xf5\x9d\x01\n" +
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	"\bLiteVirt\x12J\n" +
 	"\tListHosts\x12\x1d.litevirt.v1.ListHostsRequest\x1a\x1e.litevirt.v1.ListHostsResponse\x12A\n" +
 	"\vInspectHost\x12\x1f.litevirt.v1.InspectHostRequest\x1a\x11.litevirt.v1.Host\x12H\n" +
@@ -27904,7 +29389,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x13EnsureFirmwareState\x12'.litevirt.v1.EnsureFirmwareStateRequest\x1a\x16.google.protobuf.Empty\x12b\n" +
 	"\x19CleanupMigrationArtifacts\x12-.litevirt.v1.CleanupMigrationArtifactsRequest\x1a\x16.google.protobuf.Empty\x12J\n" +
 	"\x0eGetStateDigest\x12\x16.google.protobuf.Empty\x1a .litevirt.v1.StateDigestResponse\x12t\n" +
-	"\x17AcknowledgeLeaseTermTie\x12+.litevirt.v1.AcknowledgeLeaseTermTieRequest\x1a,.litevirt.v1.AcknowledgeLeaseTermTieResponse\x12F\n" +
+	"\x17AcknowledgeLeaseTermTie\x12+.litevirt.v1.AcknowledgeLeaseTermTieRequest\x1a,.litevirt.v1.AcknowledgeLeaseTermTieResponse\x12n\n" +
+	"\x15GetLeaseTermHighWater\x12).litevirt.v1.GetLeaseTermHighWaterRequest\x1a*.litevirt.v1.GetLeaseTermHighWaterResponse\x12F\n" +
 	"\fGetStateDump\x12\x16.google.protobuf.Empty\x1a\x1e.litevirt.v1.StateDumpResponse\x12H\n" +
 	"\x0fStreamStateDump\x12\x16.google.protobuf.Empty\x1a\x1b.litevirt.v1.StateDumpChunk0\x01\x12_\n" +
 	"\x17GetSensitiveStateDigest\x12\".litevirt.v1.SensitiveStateRequest\x1a .litevirt.v1.StateDigestResponse\x12]\n" +
@@ -27964,7 +29450,11 @@ func file_litevirt_v1_service_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_service_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
+<<<<<<< HEAD
 var file_litevirt_v1_service_proto_msgTypes = make([]protoimpl.MessageInfo, 393)
+=======
+var file_litevirt_v1_service_proto_msgTypes = make([]protoimpl.MessageInfo, 389)
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 var file_litevirt_v1_service_proto_goTypes = []any{
 	(RelayVIPResult)(0),                        // 0: litevirt.v1.RelayVIPResult
 	(MoveVolumeProgress_Phase)(0),              // 1: litevirt.v1.MoveVolumeProgress.Phase
@@ -28023,6 +29513,7 @@ var file_litevirt_v1_service_proto_goTypes = []any{
 	(*GetRuntimeInventoryRequest)(nil),         // 54: litevirt.v1.GetRuntimeInventoryRequest
 	(*RuntimeWorkload)(nil),                    // 55: litevirt.v1.RuntimeWorkload
 	(*RuntimeInventory)(nil),                   // 56: litevirt.v1.RuntimeInventory
+<<<<<<< HEAD
 	(*OrphanProofRequest)(nil),                 // 57: litevirt.v1.OrphanProofRequest
 	(*OrphanProofResponse)(nil),                // 58: litevirt.v1.OrphanProofResponse
 	(*MembershipHost)(nil),                     // 59: litevirt.v1.MembershipHost
@@ -28410,10 +29901,396 @@ var file_litevirt_v1_service_proto_depIdxs = []int32{
 	404, // 1: litevirt.v1.ListHostsResponse.hosts:type_name -> litevirt.v1.Host
 	405, // 2: litevirt.v1.DrainProgress.strategy:type_name -> litevirt.v1.MigrateStrategy
 	396, // 3: litevirt.v1.SetHostLabelsRequest.labels:type_name -> litevirt.v1.SetHostLabelsRequest.LabelsEntry
+=======
+	(*CloneVMRequest)(nil),                     // 57: litevirt.v1.CloneVMRequest
+	(*ConvertToTemplateRequest)(nil),           // 58: litevirt.v1.ConvertToTemplateRequest
+	(*ExecVMRequest)(nil),                      // 59: litevirt.v1.ExecVMRequest
+	(*ExecVMResponse)(nil),                     // 60: litevirt.v1.ExecVMResponse
+	(*ConsoleInput)(nil),                       // 61: litevirt.v1.ConsoleInput
+	(*ConsoleOutput)(nil),                      // 62: litevirt.v1.ConsoleOutput
+	(*SetVMIPRequest)(nil),                     // 63: litevirt.v1.SetVMIPRequest
+	(*SetBootOrderRequest)(nil),                // 64: litevirt.v1.SetBootOrderRequest
+	(*RebuildVMRequest)(nil),                   // 65: litevirt.v1.RebuildVMRequest
+	(*CutoverVMRequest)(nil),                   // 66: litevirt.v1.CutoverVMRequest
+	(*UpdateVMRequest)(nil),                    // 67: litevirt.v1.UpdateVMRequest
+	(*SetVMMemoryRequest)(nil),                 // 68: litevirt.v1.SetVMMemoryRequest
+	(*SetVMLabelsRequest)(nil),                 // 69: litevirt.v1.SetVMLabelsRequest
+	(*ResizeDiskRequest)(nil),                  // 70: litevirt.v1.ResizeDiskRequest
+	(*VNCData)(nil),                            // 71: litevirt.v1.VNCData
+	(*DeployStackRequest)(nil),                 // 72: litevirt.v1.DeployStackRequest
+	(*DeployProgress)(nil),                     // 73: litevirt.v1.DeployProgress
+	(*DeleteStackRequest)(nil),                 // 74: litevirt.v1.DeleteStackRequest
+	(*DeleteProgress)(nil),                     // 75: litevirt.v1.DeleteProgress
+	(*ListStacksResponse)(nil),                 // 76: litevirt.v1.ListStacksResponse
+	(*StackSummary)(nil),                       // 77: litevirt.v1.StackSummary
+	(*DiffStackRequest)(nil),                   // 78: litevirt.v1.DiffStackRequest
+	(*DiffStackResponse)(nil),                  // 79: litevirt.v1.DiffStackResponse
+	(*DiffEntry)(nil),                          // 80: litevirt.v1.DiffEntry
+	(*ExportStackRequest)(nil),                 // 81: litevirt.v1.ExportStackRequest
+	(*ExportStackResponse)(nil),                // 82: litevirt.v1.ExportStackResponse
+	(*MigrateVMRequest)(nil),                   // 83: litevirt.v1.MigrateVMRequest
+	(*MigrateProgress)(nil),                    // 84: litevirt.v1.MigrateProgress
+	(*MoveVolumeRequest)(nil),                  // 85: litevirt.v1.MoveVolumeRequest
+	(*MoveVolumeProgress)(nil),                 // 86: litevirt.v1.MoveVolumeProgress
+	(*ReplicateVolumeRequest)(nil),             // 87: litevirt.v1.ReplicateVolumeRequest
+	(*ReplicateVolumeProgress)(nil),            // 88: litevirt.v1.ReplicateVolumeProgress
+	(*MigrateStackVolumesRequest)(nil),         // 89: litevirt.v1.MigrateStackVolumesRequest
+	(*VolumePlacement)(nil),                    // 90: litevirt.v1.VolumePlacement
+	(*StackVolumeProgress)(nil),                // 91: litevirt.v1.StackVolumeProgress
+	(*PullImageRequest)(nil),                   // 92: litevirt.v1.PullImageRequest
+	(*PullProgress)(nil),                       // 93: litevirt.v1.PullProgress
+	(*ListImagesResponse)(nil),                 // 94: litevirt.v1.ListImagesResponse
+	(*DeleteImageRequest)(nil),                 // 95: litevirt.v1.DeleteImageRequest
+	(*ImportImageRequest)(nil),                 // 96: litevirt.v1.ImportImageRequest
+	(*ImportImageResponse)(nil),                // 97: litevirt.v1.ImportImageResponse
+	(*PushImageRequest)(nil),                   // 98: litevirt.v1.PushImageRequest
+	(*PushImageProgress)(nil),                  // 99: litevirt.v1.PushImageProgress
+	(*BuildImageRequest)(nil),                  // 100: litevirt.v1.BuildImageRequest
+	(*BuildImageResponse)(nil),                 // 101: litevirt.v1.BuildImageResponse
+	(*BackupVMRequest)(nil),                    // 102: litevirt.v1.BackupVMRequest
+	(*BackupChunk)(nil),                        // 103: litevirt.v1.BackupChunk
+	(*RestoreVMRequest)(nil),                   // 104: litevirt.v1.RestoreVMRequest
+	(*ImportVMRequest)(nil),                    // 105: litevirt.v1.ImportVMRequest
+	(*ImportVMProgress)(nil),                   // 106: litevirt.v1.ImportVMProgress
+	(*CreateSnapshotRequest)(nil),              // 107: litevirt.v1.CreateSnapshotRequest
+	(*ListSnapshotsRequest)(nil),               // 108: litevirt.v1.ListSnapshotsRequest
+	(*ListSnapshotsResponse)(nil),              // 109: litevirt.v1.ListSnapshotsResponse
+	(*RestoreSnapshotRequest)(nil),             // 110: litevirt.v1.RestoreSnapshotRequest
+	(*DeleteSnapshotRequest)(nil),              // 111: litevirt.v1.DeleteSnapshotRequest
+	(*CreateNetworkRequest)(nil),               // 112: litevirt.v1.CreateNetworkRequest
+	(*GetNetworkRequest)(nil),                  // 113: litevirt.v1.GetNetworkRequest
+	(*DeleteNetworkRequest)(nil),               // 114: litevirt.v1.DeleteNetworkRequest
+	(*ListNetworksResponse)(nil),               // 115: litevirt.v1.ListNetworksResponse
+	(*NetworkInfo)(nil),                        // 116: litevirt.v1.NetworkInfo
+	(*ListLBResponse)(nil),                     // 117: litevirt.v1.ListLBResponse
+	(*InspectLBRequest)(nil),                   // 118: litevirt.v1.InspectLBRequest
+	(*DisableBackendRequest)(nil),              // 119: litevirt.v1.DisableBackendRequest
+	(*EnableBackendRequest)(nil),               // 120: litevirt.v1.EnableBackendRequest
+	(*ApplyLBRequest)(nil),                     // 121: litevirt.v1.ApplyLBRequest
+	(*RemoveLBRequest)(nil),                    // 122: litevirt.v1.RemoveLBRequest
+	(*CreateLBRequest)(nil),                    // 123: litevirt.v1.CreateLBRequest
+	(*UpdateLBRequest)(nil),                    // 124: litevirt.v1.UpdateLBRequest
+	(*DeleteLBRequest)(nil),                    // 125: litevirt.v1.DeleteLBRequest
+	(*LBStatsRequest)(nil),                     // 126: litevirt.v1.LBStatsRequest
+	(*DrainBackendRequest)(nil),                // 127: litevirt.v1.DrainBackendRequest
+	(*DrainBackendResponse)(nil),               // 128: litevirt.v1.DrainBackendResponse
+	(*LoginRequest)(nil),                       // 129: litevirt.v1.LoginRequest
+	(*LoginResponse)(nil),                      // 130: litevirt.v1.LoginResponse
+	(*ListRealmsResponse)(nil),                 // 131: litevirt.v1.ListRealmsResponse
+	(*CreateUserRequest)(nil),                  // 132: litevirt.v1.CreateUserRequest
+	(*ListUsersResponse)(nil),                  // 133: litevirt.v1.ListUsersResponse
+	(*DeleteUserRequest)(nil),                  // 134: litevirt.v1.DeleteUserRequest
+	(*WhoamiResponse)(nil),                     // 135: litevirt.v1.WhoamiResponse
+	(*ChangePasswordRequest)(nil),              // 136: litevirt.v1.ChangePasswordRequest
+	(*CreateTokenRequest)(nil),                 // 137: litevirt.v1.CreateTokenRequest
+	(*RevokeTokenRequest)(nil),                 // 138: litevirt.v1.RevokeTokenRequest
+	(*BackupSnapshotRequest)(nil),              // 139: litevirt.v1.BackupSnapshotRequest
+	(*BackupSnapshotProgress)(nil),             // 140: litevirt.v1.BackupSnapshotProgress
+	(*RepoTarget)(nil),                         // 141: litevirt.v1.RepoTarget
+	(*HasChunksRequest)(nil),                   // 142: litevirt.v1.HasChunksRequest
+	(*HasChunksResponse)(nil),                  // 143: litevirt.v1.HasChunksResponse
+	(*PushBackupFrame)(nil),                    // 144: litevirt.v1.PushBackupFrame
+	(*PushBackupHeader)(nil),                   // 145: litevirt.v1.PushBackupHeader
+	(*PushChunkFrame)(nil),                     // 146: litevirt.v1.PushChunkFrame
+	(*PushManifestFrame)(nil),                  // 147: litevirt.v1.PushManifestFrame
+	(*PushBackupResponse)(nil),                 // 148: litevirt.v1.PushBackupResponse
+	(*RestoreFromBackupRequest)(nil),           // 149: litevirt.v1.RestoreFromBackupRequest
+	(*RestoreFromBackupProgress)(nil),          // 150: litevirt.v1.RestoreFromBackupProgress
+	(*Container)(nil),                          // 151: litevirt.v1.Container
+	(*ContainerNetwork)(nil),                   // 152: litevirt.v1.ContainerNetwork
+	(*CreateContainerRequest)(nil),             // 153: litevirt.v1.CreateContainerRequest
+	(*StartContainerRequest)(nil),              // 154: litevirt.v1.StartContainerRequest
+	(*StopContainerRequest)(nil),               // 155: litevirt.v1.StopContainerRequest
+	(*DeleteContainerRequest)(nil),             // 156: litevirt.v1.DeleteContainerRequest
+	(*ExecContainerRequest)(nil),               // 157: litevirt.v1.ExecContainerRequest
+	(*ExecContainerResponse)(nil),              // 158: litevirt.v1.ExecContainerResponse
+	(*ListContainersRequest)(nil),              // 159: litevirt.v1.ListContainersRequest
+	(*ListContainersResponse)(nil),             // 160: litevirt.v1.ListContainersResponse
+	(*PullOCIImageRequest)(nil),                // 161: litevirt.v1.PullOCIImageRequest
+	(*BackupContainerRequest)(nil),             // 162: litevirt.v1.BackupContainerRequest
+	(*BackupContainerProgress)(nil),            // 163: litevirt.v1.BackupContainerProgress
+	(*RestoreContainerRequest)(nil),            // 164: litevirt.v1.RestoreContainerRequest
+	(*RestoreContainerProgress)(nil),           // 165: litevirt.v1.RestoreContainerProgress
+	(*MigrateContainerRequest)(nil),            // 166: litevirt.v1.MigrateContainerRequest
+	(*MigrateContainerProgress)(nil),           // 167: litevirt.v1.MigrateContainerProgress
+	(*ContainerSnapshot)(nil),                  // 168: litevirt.v1.ContainerSnapshot
+	(*SnapshotContainerRequest)(nil),           // 169: litevirt.v1.SnapshotContainerRequest
+	(*ListContainerSnapshotsRequest)(nil),      // 170: litevirt.v1.ListContainerSnapshotsRequest
+	(*ListContainerSnapshotsResponse)(nil),     // 171: litevirt.v1.ListContainerSnapshotsResponse
+	(*RevertContainerSnapshotRequest)(nil),     // 172: litevirt.v1.RevertContainerSnapshotRequest
+	(*DeleteContainerSnapshotRequest)(nil),     // 173: litevirt.v1.DeleteContainerSnapshotRequest
+	(*ConvertContainerToTemplateRequest)(nil),  // 174: litevirt.v1.ConvertContainerToTemplateRequest
+	(*CloneContainerRequest)(nil),              // 175: litevirt.v1.CloneContainerRequest
+	(*FirewallStatus)(nil),                     // 176: litevirt.v1.FirewallStatus
+	(*BindSecurityGroupsRequest)(nil),          // 177: litevirt.v1.BindSecurityGroupsRequest
+	(*Session)(nil),                            // 178: litevirt.v1.Session
+	(*ListSessionsRequest)(nil),                // 179: litevirt.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),               // 180: litevirt.v1.ListSessionsResponse
+	(*RevokeSessionRequest)(nil),               // 181: litevirt.v1.RevokeSessionRequest
+	(*TwoFactor)(nil),                          // 182: litevirt.v1.TwoFactor
+	(*ListTwoFactorsRequest)(nil),              // 183: litevirt.v1.ListTwoFactorsRequest
+	(*ListTwoFactorsResponse)(nil),             // 184: litevirt.v1.ListTwoFactorsResponse
+	(*EnrollTOTPRequest)(nil),                  // 185: litevirt.v1.EnrollTOTPRequest
+	(*EnrollTOTPResponse)(nil),                 // 186: litevirt.v1.EnrollTOTPResponse
+	(*DisableTwoFactorRequest)(nil),            // 187: litevirt.v1.DisableTwoFactorRequest
+	(*RoleBinding)(nil),                        // 188: litevirt.v1.RoleBinding
+	(*GrantRoleRequest)(nil),                   // 189: litevirt.v1.GrantRoleRequest
+	(*GrantRoleResponse)(nil),                  // 190: litevirt.v1.GrantRoleResponse
+	(*RevokeRoleRequest)(nil),                  // 191: litevirt.v1.RevokeRoleRequest
+	(*RevokeRoleResponse)(nil),                 // 192: litevirt.v1.RevokeRoleResponse
+	(*ListRoleBindingsRequest)(nil),            // 193: litevirt.v1.ListRoleBindingsRequest
+	(*ListRoleBindingsResponse)(nil),           // 194: litevirt.v1.ListRoleBindingsResponse
+	(*NormalizeRoleBindingsRequest)(nil),       // 195: litevirt.v1.NormalizeRoleBindingsRequest
+	(*NormalizeRoleBindingsResponse)(nil),      // 196: litevirt.v1.NormalizeRoleBindingsResponse
+	(*GetVMOperationRequest)(nil),              // 197: litevirt.v1.GetVMOperationRequest
+	(*OperationStepInfo)(nil),                  // 198: litevirt.v1.OperationStepInfo
+	(*GetVMOperationResponse)(nil),             // 199: litevirt.v1.GetVMOperationResponse
+	(*AbortVMOperationRequest)(nil),            // 200: litevirt.v1.AbortVMOperationRequest
+	(*AbortVMOperationResponse)(nil),           // 201: litevirt.v1.AbortVMOperationResponse
+	(*RestoreLiveRequest)(nil),                 // 202: litevirt.v1.RestoreLiveRequest
+	(*RestoreLiveProgress)(nil),                // 203: litevirt.v1.RestoreLiveProgress
+	(*BeginWebAuthnRegistrationRequest)(nil),   // 204: litevirt.v1.BeginWebAuthnRegistrationRequest
+	(*BeginWebAuthnRegistrationResponse)(nil),  // 205: litevirt.v1.BeginWebAuthnRegistrationResponse
+	(*FinishWebAuthnRegistrationRequest)(nil),  // 206: litevirt.v1.FinishWebAuthnRegistrationRequest
+	(*FinishWebAuthnRegistrationResponse)(nil), // 207: litevirt.v1.FinishWebAuthnRegistrationResponse
+	(*BeginWebAuthnLoginRequest)(nil),          // 208: litevirt.v1.BeginWebAuthnLoginRequest
+	(*BeginWebAuthnLoginResponse)(nil),         // 209: litevirt.v1.BeginWebAuthnLoginResponse
+	(*FinishWebAuthnLoginRequest)(nil),         // 210: litevirt.v1.FinishWebAuthnLoginRequest
+	(*FinishWebAuthnLoginResponse)(nil),        // 211: litevirt.v1.FinishWebAuthnLoginResponse
+	(*GetVMStatsRequest)(nil),                  // 212: litevirt.v1.GetVMStatsRequest
+	(*GetHostStatsRequest)(nil),                // 213: litevirt.v1.GetHostStatsRequest
+	(*ClusterStatus)(nil),                      // 214: litevirt.v1.ClusterStatus
+	(*StreamEventsRequest)(nil),                // 215: litevirt.v1.StreamEventsRequest
+	(*ListAuditLogRequest)(nil),                // 216: litevirt.v1.ListAuditLogRequest
+	(*AuditEntry)(nil),                         // 217: litevirt.v1.AuditEntry
+	(*ListAuditLogResponse)(nil),               // 218: litevirt.v1.ListAuditLogResponse
+	(*ListVMEventsRequest)(nil),                // 219: litevirt.v1.ListVMEventsRequest
+	(*VMEvent)(nil),                            // 220: litevirt.v1.VMEvent
+	(*ListVMEventsResponse)(nil),               // 221: litevirt.v1.ListVMEventsResponse
+	(*CreateResourceMappingRequest)(nil),       // 222: litevirt.v1.CreateResourceMappingRequest
+	(*ListResourceMappingsRequest)(nil),        // 223: litevirt.v1.ListResourceMappingsRequest
+	(*ListResourceMappingsResponse)(nil),       // 224: litevirt.v1.ListResourceMappingsResponse
+	(*DeleteResourceMappingRequest)(nil),       // 225: litevirt.v1.DeleteResourceMappingRequest
+	(*AddMappingDeviceRequest)(nil),            // 226: litevirt.v1.AddMappingDeviceRequest
+	(*RemoveMappingDeviceRequest)(nil),         // 227: litevirt.v1.RemoveMappingDeviceRequest
+	(*CreateNotificationTargetRequest)(nil),    // 228: litevirt.v1.CreateNotificationTargetRequest
+	(*ListNotificationTargetsRequest)(nil),     // 229: litevirt.v1.ListNotificationTargetsRequest
+	(*ListNotificationTargetsResponse)(nil),    // 230: litevirt.v1.ListNotificationTargetsResponse
+	(*DeleteNotificationTargetRequest)(nil),    // 231: litevirt.v1.DeleteNotificationTargetRequest
+	(*TestNotificationTargetRequest)(nil),      // 232: litevirt.v1.TestNotificationTargetRequest
+	(*CreateNotificationRouteRequest)(nil),     // 233: litevirt.v1.CreateNotificationRouteRequest
+	(*ListNotificationRoutesRequest)(nil),      // 234: litevirt.v1.ListNotificationRoutesRequest
+	(*ListNotificationRoutesResponse)(nil),     // 235: litevirt.v1.ListNotificationRoutesResponse
+	(*DeleteNotificationRouteRequest)(nil),     // 236: litevirt.v1.DeleteNotificationRouteRequest
+	(*RegistryCredential)(nil),                 // 237: litevirt.v1.RegistryCredential
+	(*SetRegistryCredentialRequest)(nil),       // 238: litevirt.v1.SetRegistryCredentialRequest
+	(*ListRegistryCredentialsRequest)(nil),     // 239: litevirt.v1.ListRegistryCredentialsRequest
+	(*ListRegistryCredentialsResponse)(nil),    // 240: litevirt.v1.ListRegistryCredentialsResponse
+	(*DeleteRegistryCredentialRequest)(nil),    // 241: litevirt.v1.DeleteRegistryCredentialRequest
+	(*CreateClusterFirewallRuleRequest)(nil),   // 242: litevirt.v1.CreateClusterFirewallRuleRequest
+	(*ListClusterFirewallRulesRequest)(nil),    // 243: litevirt.v1.ListClusterFirewallRulesRequest
+	(*ListClusterFirewallRulesResponse)(nil),   // 244: litevirt.v1.ListClusterFirewallRulesResponse
+	(*DeleteClusterFirewallRuleRequest)(nil),   // 245: litevirt.v1.DeleteClusterFirewallRuleRequest
+	(*CreateHostFirewallRuleRequest)(nil),      // 246: litevirt.v1.CreateHostFirewallRuleRequest
+	(*ListHostFirewallRulesRequest)(nil),       // 247: litevirt.v1.ListHostFirewallRulesRequest
+	(*ListHostFirewallRulesResponse)(nil),      // 248: litevirt.v1.ListHostFirewallRulesResponse
+	(*DeleteHostFirewallRuleRequest)(nil),      // 249: litevirt.v1.DeleteHostFirewallRuleRequest
+	(*CreateIpSetRequest)(nil),                 // 250: litevirt.v1.CreateIpSetRequest
+	(*ListIpSetsRequest)(nil),                  // 251: litevirt.v1.ListIpSetsRequest
+	(*ListIpSetsResponse)(nil),                 // 252: litevirt.v1.ListIpSetsResponse
+	(*DeleteIpSetRequest)(nil),                 // 253: litevirt.v1.DeleteIpSetRequest
+	(*SetFirewallDefaultRequest)(nil),          // 254: litevirt.v1.SetFirewallDefaultRequest
+	(*ListFirewallDefaultsRequest)(nil),        // 255: litevirt.v1.ListFirewallDefaultsRequest
+	(*ListFirewallDefaultsResponse)(nil),       // 256: litevirt.v1.ListFirewallDefaultsResponse
+	(*ListStoragePoolsRequest)(nil),            // 257: litevirt.v1.ListStoragePoolsRequest
+	(*ListStoragePoolsResponse)(nil),           // 258: litevirt.v1.ListStoragePoolsResponse
+	(*CreateStoragePoolRequest)(nil),           // 259: litevirt.v1.CreateStoragePoolRequest
+	(*CreateStoragePoolResponse)(nil),          // 260: litevirt.v1.CreateStoragePoolResponse
+	(*DeleteStoragePoolRequest)(nil),           // 261: litevirt.v1.DeleteStoragePoolRequest
+	(*DeleteStoragePoolResponse)(nil),          // 262: litevirt.v1.DeleteStoragePoolResponse
+	(*GetStoragePoolRequest)(nil),              // 263: litevirt.v1.GetStoragePoolRequest
+	(*GetStoragePoolResponse)(nil),             // 264: litevirt.v1.GetStoragePoolResponse
+	(*StoragePoolContent)(nil),                 // 265: litevirt.v1.StoragePoolContent
+	(*ListStoragePoolContentsRequest)(nil),     // 266: litevirt.v1.ListStoragePoolContentsRequest
+	(*ListStoragePoolContentsResponse)(nil),    // 267: litevirt.v1.ListStoragePoolContentsResponse
+	(*UploadStoragePoolContentRequest)(nil),    // 268: litevirt.v1.UploadStoragePoolContentRequest
+	(*UploadStoragePoolContentResponse)(nil),   // 269: litevirt.v1.UploadStoragePoolContentResponse
+	(*DeleteStoragePoolContentRequest)(nil),    // 270: litevirt.v1.DeleteStoragePoolContentRequest
+	(*PushReplicaIncrementRequest)(nil),        // 271: litevirt.v1.PushReplicaIncrementRequest
+	(*PushReplicaIncrementResponse)(nil),       // 272: litevirt.v1.PushReplicaIncrementResponse
+	(*RuntimeActionProof)(nil),                 // 273: litevirt.v1.RuntimeActionProof
+	(*AcknowledgeLeaseTermTieRequest)(nil),     // 274: litevirt.v1.AcknowledgeLeaseTermTieRequest
+	(*AcknowledgeLeaseTermTieResponse)(nil),    // 275: litevirt.v1.AcknowledgeLeaseTermTieResponse
+	(*GetLeaseTermHighWaterRequest)(nil),       // 276: litevirt.v1.GetLeaseTermHighWaterRequest
+	(*GetLeaseTermHighWaterResponse)(nil),      // 277: litevirt.v1.GetLeaseTermHighWaterResponse
+	(*PromoteReplicaRequest)(nil),              // 278: litevirt.v1.PromoteReplicaRequest
+	(*PromoteReplicaProgress)(nil),             // 279: litevirt.v1.PromoteReplicaProgress
+	(*PingRequest)(nil),                        // 280: litevirt.v1.PingRequest
+	(*PingResponse)(nil),                       // 281: litevirt.v1.PingResponse
+	(*FetchBinaryRequest)(nil),                 // 282: litevirt.v1.FetchBinaryRequest
+	(*FetchBinaryChunk)(nil),                   // 283: litevirt.v1.FetchBinaryChunk
+	(*ProvisionNetworkRequest)(nil),            // 284: litevirt.v1.ProvisionNetworkRequest
+	(*EnsureCloudInitRequest)(nil),             // 285: litevirt.v1.EnsureCloudInitRequest
+	(*EnsureDisksRequest)(nil),                 // 286: litevirt.v1.EnsureDisksRequest
+	(*DiskStub)(nil),                           // 287: litevirt.v1.DiskStub
+	(*EnsureFirmwareStateRequest)(nil),         // 288: litevirt.v1.EnsureFirmwareStateRequest
+	(*CleanupMigrationArtifactsRequest)(nil),   // 289: litevirt.v1.CleanupMigrationArtifactsRequest
+	(*SyncVTEPRequest)(nil),                    // 290: litevirt.v1.SyncVTEPRequest
+	(*GetVMIPRequest)(nil),                     // 291: litevirt.v1.GetVMIPRequest
+	(*GetVMIPResponse)(nil),                    // 292: litevirt.v1.GetVMIPResponse
+	(*RefreshLBRequest)(nil),                   // 293: litevirt.v1.RefreshLBRequest
+	(*UpdateFDBRequest)(nil),                   // 294: litevirt.v1.UpdateFDBRequest
+	(*TableDigest)(nil),                        // 295: litevirt.v1.TableDigest
+	(*StateDigestResponse)(nil),                // 296: litevirt.v1.StateDigestResponse
+	(*TriggerAntiEntropyRequest)(nil),          // 297: litevirt.v1.TriggerAntiEntropyRequest
+	(*TriggerAntiEntropyResponse)(nil),         // 298: litevirt.v1.TriggerAntiEntropyResponse
+	(*ClusterStateDigestResponse)(nil),         // 299: litevirt.v1.ClusterStateDigestResponse
+	(*StateDumpResponse)(nil),                  // 300: litevirt.v1.StateDumpResponse
+	(*StateDumpChunk)(nil),                     // 301: litevirt.v1.StateDumpChunk
+	(*SensitiveStateRequest)(nil),              // 302: litevirt.v1.SensitiveStateRequest
+	(*DiagnoseDivergenceRequest)(nil),          // 303: litevirt.v1.DiagnoseDivergenceRequest
+	(*NodeRowMeta)(nil),                        // 304: litevirt.v1.NodeRowMeta
+	(*DivergenceRow)(nil),                      // 305: litevirt.v1.DivergenceRow
+	(*SemanticViolationPB)(nil),                // 306: litevirt.v1.SemanticViolationPB
+	(*DivergenceReport)(nil),                   // 307: litevirt.v1.DivergenceReport
+	(*ScanSensitiveRequest)(nil),               // 308: litevirt.v1.ScanSensitiveRequest
+	(*SensitiveRowMetaPB)(nil),                 // 309: litevirt.v1.SensitiveRowMetaPB
+	(*ScanSensitiveResponse)(nil),              // 310: litevirt.v1.ScanSensitiveResponse
+	(*MutationEntry)(nil),                      // 311: litevirt.v1.MutationEntry
+	(*ReplicateRequest)(nil),                   // 312: litevirt.v1.ReplicateRequest
+	(*ReplicateResponse)(nil),                  // 313: litevirt.v1.ReplicateResponse
+	(*AckRequest)(nil),                         // 314: litevirt.v1.AckRequest
+	(*GetVMLogsRequest)(nil),                   // 315: litevirt.v1.GetVMLogsRequest
+	(*VMLogChunk)(nil),                         // 316: litevirt.v1.VMLogChunk
+	(*UpgradeHostRequest)(nil),                 // 317: litevirt.v1.UpgradeHostRequest
+	(*UpgradeHostResponse)(nil),                // 318: litevirt.v1.UpgradeHostResponse
+	(*UninstallHostRequest)(nil),               // 319: litevirt.v1.UninstallHostRequest
+	(*UninstallHostResponse)(nil),              // 320: litevirt.v1.UninstallHostResponse
+	(*ExecuteCreateVMRequest)(nil),             // 321: litevirt.v1.ExecuteCreateVMRequest
+	(*AdmitHostRequest)(nil),                   // 322: litevirt.v1.AdmitHostRequest
+	(*HostNetwork)(nil),                        // 323: litevirt.v1.HostNetwork
+	(*ListHostNetworksRequest)(nil),            // 324: litevirt.v1.ListHostNetworksRequest
+	(*ListHostNetworksResponse)(nil),           // 325: litevirt.v1.ListHostNetworksResponse
+	(*UpsertHostNetworkRequest)(nil),           // 326: litevirt.v1.UpsertHostNetworkRequest
+	(*PlanHostNetworkRequest)(nil),             // 327: litevirt.v1.PlanHostNetworkRequest
+	(*PlanHostNetworkResponse)(nil),            // 328: litevirt.v1.PlanHostNetworkResponse
+	(*ApplyHostNetworkRequest)(nil),            // 329: litevirt.v1.ApplyHostNetworkRequest
+	(*DeleteHostNetworkRequest)(nil),           // 330: litevirt.v1.DeleteHostNetworkRequest
+	(*IsolateHostRequest)(nil),                 // 331: litevirt.v1.IsolateHostRequest
+	(*HostIsolationStatus)(nil),                // 332: litevirt.v1.HostIsolationStatus
+	(*ReseedHostRequest)(nil),                  // 333: litevirt.v1.ReseedHostRequest
+	(*ReseedHostResponse)(nil),                 // 334: litevirt.v1.ReseedHostResponse
+	(*PreflightUpgradeRequest)(nil),            // 335: litevirt.v1.PreflightUpgradeRequest
+	(*PreflightUpgradeResponse)(nil),           // 336: litevirt.v1.PreflightUpgradeResponse
+	(*PreflightFinding)(nil),                   // 337: litevirt.v1.PreflightFinding
+	(*GetSpiceInfoRequest)(nil),                // 338: litevirt.v1.GetSpiceInfoRequest
+	(*GetSpiceInfoResponse)(nil),               // 339: litevirt.v1.GetSpiceInfoResponse
+	(*RebalanceProposal)(nil),                  // 340: litevirt.v1.RebalanceProposal
+	(*ListRebalanceProposalsRequest)(nil),      // 341: litevirt.v1.ListRebalanceProposalsRequest
+	(*ListRebalanceProposalsResponse)(nil),     // 342: litevirt.v1.ListRebalanceProposalsResponse
+	(*RunRebalanceRequest)(nil),                // 343: litevirt.v1.RunRebalanceRequest
+	(*RunRebalanceResponse)(nil),               // 344: litevirt.v1.RunRebalanceResponse
+	(*ApproveRebalanceProposalRequest)(nil),    // 345: litevirt.v1.ApproveRebalanceProposalRequest
+	(*RejectRebalanceProposalRequest)(nil),     // 346: litevirt.v1.RejectRebalanceProposalRequest
+	(*ListRegionsRequest)(nil),                 // 347: litevirt.v1.ListRegionsRequest
+	(*ListRegionsResponse)(nil),                // 348: litevirt.v1.ListRegionsResponse
+	(*RegionStatusRequest)(nil),                // 349: litevirt.v1.RegionStatusRequest
+	(*RegionStatusResponse)(nil),               // 350: litevirt.v1.RegionStatusResponse
+	(*RegionStatus)(nil),                       // 351: litevirt.v1.RegionStatus
+	(*CrossRegionMigrateRequest)(nil),          // 352: litevirt.v1.CrossRegionMigrateRequest
+	(*ServiceEndpoint)(nil),                    // 353: litevirt.v1.ServiceEndpoint
+	(*UpsertServiceEndpointRequest)(nil),       // 354: litevirt.v1.UpsertServiceEndpointRequest
+	(*ListServiceEndpointsRequest)(nil),        // 355: litevirt.v1.ListServiceEndpointsRequest
+	(*ListServiceEndpointsResponse)(nil),       // 356: litevirt.v1.ListServiceEndpointsResponse
+	(*DeleteServiceEndpointRequest)(nil),       // 357: litevirt.v1.DeleteServiceEndpointRequest
+	(*BackupSchedule)(nil),                     // 358: litevirt.v1.BackupSchedule
+	(*CreateBackupScheduleRequest)(nil),        // 359: litevirt.v1.CreateBackupScheduleRequest
+	(*ListBackupSchedulesRequest)(nil),         // 360: litevirt.v1.ListBackupSchedulesRequest
+	(*ListBackupSchedulesResponse)(nil),        // 361: litevirt.v1.ListBackupSchedulesResponse
+	(*DeleteBackupScheduleRequest)(nil),        // 362: litevirt.v1.DeleteBackupScheduleRequest
+	(*ReplicationSchedule)(nil),                // 363: litevirt.v1.ReplicationSchedule
+	(*CreateReplicationScheduleRequest)(nil),   // 364: litevirt.v1.CreateReplicationScheduleRequest
+	(*ListReplicationSchedulesRequest)(nil),    // 365: litevirt.v1.ListReplicationSchedulesRequest
+	(*ListReplicationSchedulesResponse)(nil),   // 366: litevirt.v1.ListReplicationSchedulesResponse
+	(*DeleteReplicationScheduleRequest)(nil),   // 367: litevirt.v1.DeleteReplicationScheduleRequest
+	(*VerifyAuditChainResponse)(nil),           // 368: litevirt.v1.VerifyAuditChainResponse
+	(*RetireAuditKeyRequest)(nil),              // 369: litevirt.v1.RetireAuditKeyRequest
+	(*RetireAuditKeyResponse)(nil),             // 370: litevirt.v1.RetireAuditKeyResponse
+	(*ExportAuditChainRequest)(nil),            // 371: litevirt.v1.ExportAuditChainRequest
+	(*ExportAuditChainResponse)(nil),           // 372: litevirt.v1.ExportAuditChainResponse
+	(*Project)(nil),                            // 373: litevirt.v1.Project
+	(*CreateProjectRequest)(nil),               // 374: litevirt.v1.CreateProjectRequest
+	(*ListProjectsResponse)(nil),               // 375: litevirt.v1.ListProjectsResponse
+	(*GetProjectRequest)(nil),                  // 376: litevirt.v1.GetProjectRequest
+	(*DeleteProjectRequest)(nil),               // 377: litevirt.v1.DeleteProjectRequest
+	(*ProjectQuota)(nil),                       // 378: litevirt.v1.ProjectQuota
+	(*SetProjectQuotaRequest)(nil),             // 379: litevirt.v1.SetProjectQuotaRequest
+	(*GetProjectQuotaRequest)(nil),             // 380: litevirt.v1.GetProjectQuotaRequest
+	(*ProjectUsage)(nil),                       // 381: litevirt.v1.ProjectUsage
+	(*GetProjectUsageRequest)(nil),             // 382: litevirt.v1.GetProjectUsageRequest
+	(*ReserveProjectCapacityRequest)(nil),      // 383: litevirt.v1.ReserveProjectCapacityRequest
+	(*ReserveProjectCapacityResponse)(nil),     // 384: litevirt.v1.ReserveProjectCapacityResponse
+	(*ReleaseProjectCapacityRequest)(nil),      // 385: litevirt.v1.ReleaseProjectCapacityRequest
+	(*ReserveHostCapacityRequest)(nil),         // 386: litevirt.v1.ReserveHostCapacityRequest
+	(*ReserveHostCapacityResponse)(nil),        // 387: litevirt.v1.ReserveHostCapacityResponse
+	(*ReleaseHostCapacityRequest)(nil),         // 388: litevirt.v1.ReleaseHostCapacityRequest
+	(*FenceHostPosture)(nil),                   // 389: litevirt.v1.FenceHostPosture
+	(*FenceReadiness)(nil),                     // 390: litevirt.v1.FenceReadiness
+	nil,                                        // 391: litevirt.v1.ListHostsRequest.LabelFilterEntry
+	nil,                                        // 392: litevirt.v1.SetHostLabelsRequest.LabelsEntry
+	nil,                                        // 393: litevirt.v1.ListVMsRequest.LabelFilterEntry
+	nil,                                        // 394: litevirt.v1.SetVMLabelsRequest.LabelsEntry
+	nil,                                        // 395: litevirt.v1.ImportVMRequest.NetMapEntry
+	nil,                                        // 396: litevirt.v1.ImportVMRequest.DiskMapEntry
+	nil,                                        // 397: litevirt.v1.CreateContainerRequest.LabelsEntry
+	nil,                                        // 398: litevirt.v1.CreateStoragePoolRequest.OptionsEntry
+	nil,                                        // 399: litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
+	(*Host)(nil),                               // 400: litevirt.v1.Host
+	(MigrateStrategy)(0),                       // 401: litevirt.v1.MigrateStrategy
+	(*PCIDevice)(nil),                          // 402: litevirt.v1.PCIDevice
+	(*VMSpec)(nil),                             // 403: litevirt.v1.VMSpec
+	(*VM)(nil),                                 // 404: litevirt.v1.VM
+	(*HardwareDevice)(nil),                     // 405: litevirt.v1.HardwareDevice
+	(*RestartPolicy)(nil),                      // 406: litevirt.v1.RestartPolicy
+	(*timestamppb.Timestamp)(nil),              // 407: google.protobuf.Timestamp
+	(DiffOp)(0),                                // 408: litevirt.v1.DiffOp
+	(MigratePhase)(0),                          // 409: litevirt.v1.MigratePhase
+	(*Image)(nil),                              // 410: litevirt.v1.Image
+	(*Snapshot)(nil),                           // 411: litevirt.v1.Snapshot
+	(*LoadBalancer)(nil),                       // 412: litevirt.v1.LoadBalancer
+	(*LBBackend)(nil),                          // 413: litevirt.v1.LBBackend
+	(*LBPort)(nil),                             // 414: litevirt.v1.LBPort
+	(*LBBackendAddress)(nil),                   // 415: litevirt.v1.LBBackendAddress
+	(*User)(nil),                               // 416: litevirt.v1.User
+	(*ClusterEvent)(nil),                       // 417: litevirt.v1.ClusterEvent
+	(*ResourceMapping)(nil),                    // 418: litevirt.v1.ResourceMapping
+	(*NotificationTarget)(nil),                 // 419: litevirt.v1.NotificationTarget
+	(*NotificationRoute)(nil),                  // 420: litevirt.v1.NotificationRoute
+	(*FirewallRule)(nil),                       // 421: litevirt.v1.FirewallRule
+	(*IpSet)(nil),                              // 422: litevirt.v1.IpSet
+	(*FirewallDefault)(nil),                    // 423: litevirt.v1.FirewallDefault
+	(*StoragePool)(nil),                        // 424: litevirt.v1.StoragePool
+	(*emptypb.Empty)(nil),                      // 425: google.protobuf.Empty
+	(*AttachDeviceRequest)(nil),                // 426: litevirt.v1.AttachDeviceRequest
+	(*DetachDeviceRequest)(nil),                // 427: litevirt.v1.DetachDeviceRequest
+	(*LBKeepalivedRequest)(nil),                // 428: litevirt.v1.LBKeepalivedRequest
+	(*LBStatsResponse)(nil),                    // 429: litevirt.v1.LBStatsResponse
+	(*LBKeepalivedResponse)(nil),               // 430: litevirt.v1.LBKeepalivedResponse
+	(*Token)(nil),                              // 431: litevirt.v1.Token
+	(*VMStats)(nil),                            // 432: litevirt.v1.VMStats
+	(*HostResourceStats)(nil),                  // 433: litevirt.v1.HostResourceStats
+}
+var file_litevirt_v1_service_proto_depIdxs = []int32{
+	391, // 0: litevirt.v1.ListHostsRequest.label_filter:type_name -> litevirt.v1.ListHostsRequest.LabelFilterEntry
+	400, // 1: litevirt.v1.ListHostsResponse.hosts:type_name -> litevirt.v1.Host
+	401, // 2: litevirt.v1.DrainProgress.strategy:type_name -> litevirt.v1.MigrateStrategy
+	392, // 3: litevirt.v1.SetHostLabelsRequest.labels:type_name -> litevirt.v1.SetHostLabelsRequest.LabelsEntry
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	26,  // 4: litevirt.v1.ClusterHealth.conditions:type_name -> litevirt.v1.HealthCondition
 	27,  // 5: litevirt.v1.ClusterHealth.evaluators:type_name -> litevirt.v1.HealthEvaluatorStatus
 	28,  // 6: litevirt.v1.ClusterHealth.connectivity:type_name -> litevirt.v1.ConnectivityEdge
 	29,  // 7: litevirt.v1.ClusterHealth.capacity:type_name -> litevirt.v1.HostCapacityAssessment
+<<<<<<< HEAD
 	406, // 8: litevirt.v1.RescanHostResponse.devices:type_name -> litevirt.v1.PCIDevice
 	406, // 9: litevirt.v1.ListHostDevicesResponse.devices:type_name -> litevirt.v1.PCIDevice
 	407, // 10: litevirt.v1.CreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
@@ -29002,6 +30879,589 @@ var file_litevirt_v1_service_proto_depIdxs = []int32{
 	109, // [109:109] is the sub-list for extension type_name
 	109, // [109:109] is the sub-list for extension extendee
 	0,   // [0:109] is the sub-list for field type_name
+=======
+	402, // 8: litevirt.v1.RescanHostResponse.devices:type_name -> litevirt.v1.PCIDevice
+	402, // 9: litevirt.v1.ListHostDevicesResponse.devices:type_name -> litevirt.v1.PCIDevice
+	403, // 10: litevirt.v1.CreateVMRequest.spec:type_name -> litevirt.v1.VMSpec
+	393, // 11: litevirt.v1.ListVMsRequest.label_filter:type_name -> litevirt.v1.ListVMsRequest.LabelFilterEntry
+	404, // 12: litevirt.v1.ListVMsResponse.vms:type_name -> litevirt.v1.VM
+	405, // 13: litevirt.v1.ListVMHardwareResponse.devices:type_name -> litevirt.v1.HardwareDevice
+	0,   // 14: litevirt.v1.RelayCheckVIPParticipantResponse.result:type_name -> litevirt.v1.RelayVIPResult
+	55,  // 15: litevirt.v1.RuntimeInventory.workloads:type_name -> litevirt.v1.RuntimeWorkload
+	406, // 16: litevirt.v1.UpdateVMRequest.restart:type_name -> litevirt.v1.RestartPolicy
+	394, // 17: litevirt.v1.SetVMLabelsRequest.labels:type_name -> litevirt.v1.SetVMLabelsRequest.LabelsEntry
+	77,  // 18: litevirt.v1.ListStacksResponse.stacks:type_name -> litevirt.v1.StackSummary
+	407, // 19: litevirt.v1.StackSummary.created_at:type_name -> google.protobuf.Timestamp
+	80,  // 20: litevirt.v1.DiffStackResponse.entries:type_name -> litevirt.v1.DiffEntry
+	408, // 21: litevirt.v1.DiffEntry.operation:type_name -> litevirt.v1.DiffOp
+	401, // 22: litevirt.v1.MigrateVMRequest.strategy:type_name -> litevirt.v1.MigrateStrategy
+	409, // 23: litevirt.v1.MigrateProgress.phase:type_name -> litevirt.v1.MigratePhase
+	1,   // 24: litevirt.v1.MoveVolumeProgress.phase:type_name -> litevirt.v1.MoveVolumeProgress.Phase
+	2,   // 25: litevirt.v1.ReplicateVolumeProgress.phase:type_name -> litevirt.v1.ReplicateVolumeProgress.Phase
+	90,  // 26: litevirt.v1.MigrateStackVolumesRequest.placements:type_name -> litevirt.v1.VolumePlacement
+	3,   // 27: litevirt.v1.StackVolumeProgress.stage:type_name -> litevirt.v1.StackVolumeProgress.Stage
+	410, // 28: litevirt.v1.ListImagesResponse.images:type_name -> litevirt.v1.Image
+	395, // 29: litevirt.v1.ImportVMRequest.net_map:type_name -> litevirt.v1.ImportVMRequest.NetMapEntry
+	396, // 30: litevirt.v1.ImportVMRequest.disk_map:type_name -> litevirt.v1.ImportVMRequest.DiskMapEntry
+	411, // 31: litevirt.v1.ListSnapshotsResponse.snapshots:type_name -> litevirt.v1.Snapshot
+	116, // 32: litevirt.v1.ListNetworksResponse.networks:type_name -> litevirt.v1.NetworkInfo
+	412, // 33: litevirt.v1.ListLBResponse.lbs:type_name -> litevirt.v1.LoadBalancer
+	413, // 34: litevirt.v1.ApplyLBRequest.backends:type_name -> litevirt.v1.LBBackend
+	414, // 35: litevirt.v1.ApplyLBRequest.ports:type_name -> litevirt.v1.LBPort
+	273, // 36: litevirt.v1.ApplyLBRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	414, // 37: litevirt.v1.CreateLBRequest.ports:type_name -> litevirt.v1.LBPort
+	415, // 38: litevirt.v1.CreateLBRequest.backends:type_name -> litevirt.v1.LBBackendAddress
+	414, // 39: litevirt.v1.UpdateLBRequest.ports:type_name -> litevirt.v1.LBPort
+	415, // 40: litevirt.v1.UpdateLBRequest.add_backends:type_name -> litevirt.v1.LBBackendAddress
+	416, // 41: litevirt.v1.ListUsersResponse.users:type_name -> litevirt.v1.User
+	4,   // 42: litevirt.v1.BackupSnapshotProgress.phase:type_name -> litevirt.v1.BackupSnapshotProgress.Phase
+	141, // 43: litevirt.v1.HasChunksRequest.target:type_name -> litevirt.v1.RepoTarget
+	145, // 44: litevirt.v1.PushBackupFrame.header:type_name -> litevirt.v1.PushBackupHeader
+	146, // 45: litevirt.v1.PushBackupFrame.chunk:type_name -> litevirt.v1.PushChunkFrame
+	147, // 46: litevirt.v1.PushBackupFrame.manifest:type_name -> litevirt.v1.PushManifestFrame
+	141, // 47: litevirt.v1.PushBackupHeader.target:type_name -> litevirt.v1.RepoTarget
+	5,   // 48: litevirt.v1.RestoreFromBackupProgress.phase:type_name -> litevirt.v1.RestoreFromBackupProgress.Phase
+	406, // 49: litevirt.v1.Container.restart:type_name -> litevirt.v1.RestartPolicy
+	152, // 50: litevirt.v1.CreateContainerRequest.networks:type_name -> litevirt.v1.ContainerNetwork
+	397, // 51: litevirt.v1.CreateContainerRequest.labels:type_name -> litevirt.v1.CreateContainerRequest.LabelsEntry
+	406, // 52: litevirt.v1.CreateContainerRequest.restart:type_name -> litevirt.v1.RestartPolicy
+	151, // 53: litevirt.v1.ListContainersResponse.containers:type_name -> litevirt.v1.Container
+	6,   // 54: litevirt.v1.BackupContainerProgress.phase:type_name -> litevirt.v1.BackupContainerProgress.Phase
+	273, // 55: litevirt.v1.RestoreContainerRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	7,   // 56: litevirt.v1.RestoreContainerProgress.phase:type_name -> litevirt.v1.RestoreContainerProgress.Phase
+	8,   // 57: litevirt.v1.MigrateContainerProgress.phase:type_name -> litevirt.v1.MigrateContainerProgress.Phase
+	168, // 58: litevirt.v1.ListContainerSnapshotsResponse.snapshots:type_name -> litevirt.v1.ContainerSnapshot
+	178, // 59: litevirt.v1.ListSessionsResponse.sessions:type_name -> litevirt.v1.Session
+	182, // 60: litevirt.v1.ListTwoFactorsResponse.factors:type_name -> litevirt.v1.TwoFactor
+	188, // 61: litevirt.v1.GrantRoleResponse.binding:type_name -> litevirt.v1.RoleBinding
+	188, // 62: litevirt.v1.ListRoleBindingsResponse.bindings:type_name -> litevirt.v1.RoleBinding
+	198, // 63: litevirt.v1.GetVMOperationResponse.steps:type_name -> litevirt.v1.OperationStepInfo
+	403, // 64: litevirt.v1.RestoreLiveRequest.spec:type_name -> litevirt.v1.VMSpec
+	9,   // 65: litevirt.v1.RestoreLiveProgress.phase:type_name -> litevirt.v1.RestoreLiveProgress.Phase
+	400, // 66: litevirt.v1.ClusterStatus.hosts:type_name -> litevirt.v1.Host
+	417, // 67: litevirt.v1.ClusterStatus.recent_events:type_name -> litevirt.v1.ClusterEvent
+	217, // 68: litevirt.v1.ListAuditLogResponse.entries:type_name -> litevirt.v1.AuditEntry
+	220, // 69: litevirt.v1.ListVMEventsResponse.events:type_name -> litevirt.v1.VMEvent
+	418, // 70: litevirt.v1.ListResourceMappingsResponse.mappings:type_name -> litevirt.v1.ResourceMapping
+	419, // 71: litevirt.v1.ListNotificationTargetsResponse.targets:type_name -> litevirt.v1.NotificationTarget
+	420, // 72: litevirt.v1.ListNotificationRoutesResponse.routes:type_name -> litevirt.v1.NotificationRoute
+	237, // 73: litevirt.v1.ListRegistryCredentialsResponse.credentials:type_name -> litevirt.v1.RegistryCredential
+	421, // 74: litevirt.v1.CreateClusterFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
+	421, // 75: litevirt.v1.ListClusterFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
+	421, // 76: litevirt.v1.CreateHostFirewallRuleRequest.rule:type_name -> litevirt.v1.FirewallRule
+	421, // 77: litevirt.v1.ListHostFirewallRulesResponse.rules:type_name -> litevirt.v1.FirewallRule
+	422, // 78: litevirt.v1.ListIpSetsResponse.ipsets:type_name -> litevirt.v1.IpSet
+	423, // 79: litevirt.v1.ListFirewallDefaultsResponse.defaults:type_name -> litevirt.v1.FirewallDefault
+	424, // 80: litevirt.v1.ListStoragePoolsResponse.pools:type_name -> litevirt.v1.StoragePool
+	398, // 81: litevirt.v1.CreateStoragePoolRequest.options:type_name -> litevirt.v1.CreateStoragePoolRequest.OptionsEntry
+	424, // 82: litevirt.v1.CreateStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
+	424, // 83: litevirt.v1.GetStoragePoolResponse.pool:type_name -> litevirt.v1.StoragePool
+	265, // 84: litevirt.v1.ListStoragePoolContentsResponse.contents:type_name -> litevirt.v1.StoragePoolContent
+	273, // 85: litevirt.v1.PromoteReplicaRequest.proof:type_name -> litevirt.v1.RuntimeActionProof
+	10,  // 86: litevirt.v1.PromoteReplicaProgress.phase:type_name -> litevirt.v1.PromoteReplicaProgress.Phase
+	287, // 87: litevirt.v1.EnsureDisksRequest.disks:type_name -> litevirt.v1.DiskStub
+	295, // 88: litevirt.v1.StateDigestResponse.tables:type_name -> litevirt.v1.TableDigest
+	296, // 89: litevirt.v1.ClusterStateDigestResponse.hosts:type_name -> litevirt.v1.StateDigestResponse
+	304, // 90: litevirt.v1.DivergenceRow.per_node:type_name -> litevirt.v1.NodeRowMeta
+	305, // 91: litevirt.v1.DivergenceReport.rows:type_name -> litevirt.v1.DivergenceRow
+	306, // 92: litevirt.v1.DivergenceReport.violations:type_name -> litevirt.v1.SemanticViolationPB
+	309, // 93: litevirt.v1.ScanSensitiveResponse.rows:type_name -> litevirt.v1.SensitiveRowMetaPB
+	311, // 94: litevirt.v1.ReplicateRequest.entries:type_name -> litevirt.v1.MutationEntry
+	36,  // 95: litevirt.v1.ExecuteCreateVMRequest.request:type_name -> litevirt.v1.CreateVMRequest
+	323, // 96: litevirt.v1.ListHostNetworksResponse.networks:type_name -> litevirt.v1.HostNetwork
+	323, // 97: litevirt.v1.UpsertHostNetworkRequest.network:type_name -> litevirt.v1.HostNetwork
+	399, // 98: litevirt.v1.PlanHostNetworkResponse.conflicts:type_name -> litevirt.v1.PlanHostNetworkResponse.ConflictsEntry
+	337, // 99: litevirt.v1.PreflightUpgradeResponse.findings:type_name -> litevirt.v1.PreflightFinding
+	340, // 100: litevirt.v1.ListRebalanceProposalsResponse.proposals:type_name -> litevirt.v1.RebalanceProposal
+	351, // 101: litevirt.v1.RegionStatusResponse.statuses:type_name -> litevirt.v1.RegionStatus
+	353, // 102: litevirt.v1.ListServiceEndpointsResponse.endpoints:type_name -> litevirt.v1.ServiceEndpoint
+	358, // 103: litevirt.v1.ListBackupSchedulesResponse.schedules:type_name -> litevirt.v1.BackupSchedule
+	363, // 104: litevirt.v1.ListReplicationSchedulesResponse.schedules:type_name -> litevirt.v1.ReplicationSchedule
+	373, // 105: litevirt.v1.ListProjectsResponse.projects:type_name -> litevirt.v1.Project
+	378, // 106: litevirt.v1.SetProjectQuotaRequest.quota:type_name -> litevirt.v1.ProjectQuota
+	389, // 107: litevirt.v1.FenceReadiness.hosts:type_name -> litevirt.v1.FenceHostPosture
+	11,  // 108: litevirt.v1.LiteVirt.ListHosts:input_type -> litevirt.v1.ListHostsRequest
+	13,  // 109: litevirt.v1.LiteVirt.InspectHost:input_type -> litevirt.v1.InspectHostRequest
+	14,  // 110: litevirt.v1.LiteVirt.DrainHost:input_type -> litevirt.v1.DrainHostRequest
+	17,  // 111: litevirt.v1.LiteVirt.ShutdownHostWorkloads:input_type -> litevirt.v1.ShutdownHostWorkloadsRequest
+	16,  // 112: litevirt.v1.LiteVirt.UndrainHost:input_type -> litevirt.v1.UndrainHostRequest
+	19,  // 113: litevirt.v1.LiteVirt.SetHostLabels:input_type -> litevirt.v1.SetHostLabelsRequest
+	20,  // 114: litevirt.v1.LiteVirt.FenceHost:input_type -> litevirt.v1.FenceHostRequest
+	25,  // 115: litevirt.v1.LiteVirt.GetClusterHealth:input_type -> litevirt.v1.GetClusterHealthRequest
+	425, // 116: litevirt.v1.LiteVirt.GetFenceReadiness:input_type -> google.protobuf.Empty
+	21,  // 117: litevirt.v1.LiteVirt.RemoveHost:input_type -> litevirt.v1.RemoveHostRequest
+	322, // 118: litevirt.v1.LiteVirt.AdmitHost:input_type -> litevirt.v1.AdmitHostRequest
+	324, // 119: litevirt.v1.LiteVirt.ListHostNetworks:input_type -> litevirt.v1.ListHostNetworksRequest
+	326, // 120: litevirt.v1.LiteVirt.UpsertHostNetwork:input_type -> litevirt.v1.UpsertHostNetworkRequest
+	327, // 121: litevirt.v1.LiteVirt.PlanHostNetwork:input_type -> litevirt.v1.PlanHostNetworkRequest
+	329, // 122: litevirt.v1.LiteVirt.ApplyHostNetwork:input_type -> litevirt.v1.ApplyHostNetworkRequest
+	330, // 123: litevirt.v1.LiteVirt.DeleteHostNetwork:input_type -> litevirt.v1.DeleteHostNetworkRequest
+	331, // 124: litevirt.v1.LiteVirt.IsolateHost:input_type -> litevirt.v1.IsolateHostRequest
+	333, // 125: litevirt.v1.LiteVirt.ReseedHost:input_type -> litevirt.v1.ReseedHostRequest
+	22,  // 126: litevirt.v1.LiteVirt.PublishCRL:input_type -> litevirt.v1.PublishCRLRequest
+	31,  // 127: litevirt.v1.LiteVirt.RescanHost:input_type -> litevirt.v1.RescanHostRequest
+	33,  // 128: litevirt.v1.LiteVirt.ListHostDevices:input_type -> litevirt.v1.ListHostDevicesRequest
+	317, // 129: litevirt.v1.LiteVirt.UpgradeHost:input_type -> litevirt.v1.UpgradeHostRequest
+	317, // 130: litevirt.v1.LiteVirt.PreStageUpgrade:input_type -> litevirt.v1.UpgradeHostRequest
+	282, // 131: litevirt.v1.LiteVirt.FetchBinary:input_type -> litevirt.v1.FetchBinaryRequest
+	319, // 132: litevirt.v1.LiteVirt.UninstallHost:input_type -> litevirt.v1.UninstallHostRequest
+	35,  // 133: litevirt.v1.LiteVirt.ConfigureHost:input_type -> litevirt.v1.ConfigureHostRequest
+	36,  // 134: litevirt.v1.LiteVirt.CreateVM:input_type -> litevirt.v1.CreateVMRequest
+	37,  // 135: litevirt.v1.LiteVirt.ListVMs:input_type -> litevirt.v1.ListVMsRequest
+	39,  // 136: litevirt.v1.LiteVirt.InspectVM:input_type -> litevirt.v1.InspectVMRequest
+	40,  // 137: litevirt.v1.LiteVirt.ListVMHardware:input_type -> litevirt.v1.ListVMHardwareRequest
+	42,  // 138: litevirt.v1.LiteVirt.StartVM:input_type -> litevirt.v1.StartVMRequest
+	43,  // 139: litevirt.v1.LiteVirt.StopVM:input_type -> litevirt.v1.StopVMRequest
+	44,  // 140: litevirt.v1.LiteVirt.RestartVM:input_type -> litevirt.v1.RestartVMRequest
+	45,  // 141: litevirt.v1.LiteVirt.DeleteVM:input_type -> litevirt.v1.DeleteVMRequest
+	46,  // 142: litevirt.v1.LiteVirt.RepairVMOwner:input_type -> litevirt.v1.RepairVMOwnerRequest
+	54,  // 143: litevirt.v1.LiteVirt.GetRuntimeInventory:input_type -> litevirt.v1.GetRuntimeInventoryRequest
+	48,  // 144: litevirt.v1.LiteVirt.CheckVIPParticipant:input_type -> litevirt.v1.CheckVIPParticipantRequest
+	50,  // 145: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:input_type -> litevirt.v1.RelayCheckVIPParticipantRequest
+	52,  // 146: litevirt.v1.LiteVirt.CheckLBPresent:input_type -> litevirt.v1.CheckLBPresentRequest
+	57,  // 147: litevirt.v1.LiteVirt.CloneVM:input_type -> litevirt.v1.CloneVMRequest
+	58,  // 148: litevirt.v1.LiteVirt.ConvertToTemplate:input_type -> litevirt.v1.ConvertToTemplateRequest
+	59,  // 149: litevirt.v1.LiteVirt.ExecVM:input_type -> litevirt.v1.ExecVMRequest
+	61,  // 150: litevirt.v1.LiteVirt.ConsoleVM:input_type -> litevirt.v1.ConsoleInput
+	63,  // 151: litevirt.v1.LiteVirt.SetVMIP:input_type -> litevirt.v1.SetVMIPRequest
+	64,  // 152: litevirt.v1.LiteVirt.SetBootOrder:input_type -> litevirt.v1.SetBootOrderRequest
+	65,  // 153: litevirt.v1.LiteVirt.RebuildVM:input_type -> litevirt.v1.RebuildVMRequest
+	66,  // 154: litevirt.v1.LiteVirt.CutoverVM:input_type -> litevirt.v1.CutoverVMRequest
+	67,  // 155: litevirt.v1.LiteVirt.UpdateVM:input_type -> litevirt.v1.UpdateVMRequest
+	68,  // 156: litevirt.v1.LiteVirt.SetVMMemory:input_type -> litevirt.v1.SetVMMemoryRequest
+	69,  // 157: litevirt.v1.LiteVirt.SetVMLabels:input_type -> litevirt.v1.SetVMLabelsRequest
+	426, // 158: litevirt.v1.LiteVirt.AttachDevice:input_type -> litevirt.v1.AttachDeviceRequest
+	427, // 159: litevirt.v1.LiteVirt.DetachDevice:input_type -> litevirt.v1.DetachDeviceRequest
+	70,  // 160: litevirt.v1.LiteVirt.ResizeDisk:input_type -> litevirt.v1.ResizeDiskRequest
+	71,  // 161: litevirt.v1.LiteVirt.ProxyVNC:input_type -> litevirt.v1.VNCData
+	315, // 162: litevirt.v1.LiteVirt.GetVMLogs:input_type -> litevirt.v1.GetVMLogsRequest
+	72,  // 163: litevirt.v1.LiteVirt.DeployStack:input_type -> litevirt.v1.DeployStackRequest
+	74,  // 164: litevirt.v1.LiteVirt.DeleteStack:input_type -> litevirt.v1.DeleteStackRequest
+	425, // 165: litevirt.v1.LiteVirt.ListStacks:input_type -> google.protobuf.Empty
+	78,  // 166: litevirt.v1.LiteVirt.DiffStack:input_type -> litevirt.v1.DiffStackRequest
+	81,  // 167: litevirt.v1.LiteVirt.ExportStack:input_type -> litevirt.v1.ExportStackRequest
+	83,  // 168: litevirt.v1.LiteVirt.MigrateVM:input_type -> litevirt.v1.MigrateVMRequest
+	85,  // 169: litevirt.v1.LiteVirt.MoveVolume:input_type -> litevirt.v1.MoveVolumeRequest
+	87,  // 170: litevirt.v1.LiteVirt.ReplicateVolume:input_type -> litevirt.v1.ReplicateVolumeRequest
+	89,  // 171: litevirt.v1.LiteVirt.MigrateStackVolumes:input_type -> litevirt.v1.MigrateStackVolumesRequest
+	92,  // 172: litevirt.v1.LiteVirt.PullImage:input_type -> litevirt.v1.PullImageRequest
+	425, // 173: litevirt.v1.LiteVirt.ListImages:input_type -> google.protobuf.Empty
+	95,  // 174: litevirt.v1.LiteVirt.DeleteImage:input_type -> litevirt.v1.DeleteImageRequest
+	96,  // 175: litevirt.v1.LiteVirt.ImportImage:input_type -> litevirt.v1.ImportImageRequest
+	98,  // 176: litevirt.v1.LiteVirt.PushImage:input_type -> litevirt.v1.PushImageRequest
+	100, // 177: litevirt.v1.LiteVirt.BuildImage:input_type -> litevirt.v1.BuildImageRequest
+	102, // 178: litevirt.v1.LiteVirt.BackupVM:input_type -> litevirt.v1.BackupVMRequest
+	104, // 179: litevirt.v1.LiteVirt.RestoreVM:input_type -> litevirt.v1.RestoreVMRequest
+	105, // 180: litevirt.v1.LiteVirt.ImportVM:input_type -> litevirt.v1.ImportVMRequest
+	107, // 181: litevirt.v1.LiteVirt.CreateSnapshot:input_type -> litevirt.v1.CreateSnapshotRequest
+	108, // 182: litevirt.v1.LiteVirt.ListSnapshots:input_type -> litevirt.v1.ListSnapshotsRequest
+	110, // 183: litevirt.v1.LiteVirt.RestoreSnapshot:input_type -> litevirt.v1.RestoreSnapshotRequest
+	111, // 184: litevirt.v1.LiteVirt.DeleteSnapshot:input_type -> litevirt.v1.DeleteSnapshotRequest
+	112, // 185: litevirt.v1.LiteVirt.CreateNetwork:input_type -> litevirt.v1.CreateNetworkRequest
+	113, // 186: litevirt.v1.LiteVirt.GetNetwork:input_type -> litevirt.v1.GetNetworkRequest
+	114, // 187: litevirt.v1.LiteVirt.DeleteNetwork:input_type -> litevirt.v1.DeleteNetworkRequest
+	425, // 188: litevirt.v1.LiteVirt.ListNetworks:input_type -> google.protobuf.Empty
+	425, // 189: litevirt.v1.LiteVirt.ListLoadBalancers:input_type -> google.protobuf.Empty
+	118, // 190: litevirt.v1.LiteVirt.InspectLoadBalancer:input_type -> litevirt.v1.InspectLBRequest
+	123, // 191: litevirt.v1.LiteVirt.CreateLoadBalancer:input_type -> litevirt.v1.CreateLBRequest
+	124, // 192: litevirt.v1.LiteVirt.UpdateLoadBalancer:input_type -> litevirt.v1.UpdateLBRequest
+	125, // 193: litevirt.v1.LiteVirt.DeleteLoadBalancer:input_type -> litevirt.v1.DeleteLBRequest
+	126, // 194: litevirt.v1.LiteVirt.LBStats:input_type -> litevirt.v1.LBStatsRequest
+	127, // 195: litevirt.v1.LiteVirt.DrainBackend:input_type -> litevirt.v1.DrainBackendRequest
+	119, // 196: litevirt.v1.LiteVirt.DisableBackend:input_type -> litevirt.v1.DisableBackendRequest
+	120, // 197: litevirt.v1.LiteVirt.EnableBackend:input_type -> litevirt.v1.EnableBackendRequest
+	121, // 198: litevirt.v1.LiteVirt.ApplyLB:input_type -> litevirt.v1.ApplyLBRequest
+	122, // 199: litevirt.v1.LiteVirt.RemoveLB:input_type -> litevirt.v1.RemoveLBRequest
+	428, // 200: litevirt.v1.LiteVirt.LBKeepalivedRunning:input_type -> litevirt.v1.LBKeepalivedRequest
+	129, // 201: litevirt.v1.LiteVirt.Login:input_type -> litevirt.v1.LoginRequest
+	425, // 202: litevirt.v1.LiteVirt.ListRealms:input_type -> google.protobuf.Empty
+	425, // 203: litevirt.v1.LiteVirt.Logout:input_type -> google.protobuf.Empty
+	179, // 204: litevirt.v1.LiteVirt.ListSessions:input_type -> litevirt.v1.ListSessionsRequest
+	181, // 205: litevirt.v1.LiteVirt.RevokeSession:input_type -> litevirt.v1.RevokeSessionRequest
+	132, // 206: litevirt.v1.LiteVirt.CreateUser:input_type -> litevirt.v1.CreateUserRequest
+	425, // 207: litevirt.v1.LiteVirt.ListUsers:input_type -> google.protobuf.Empty
+	134, // 208: litevirt.v1.LiteVirt.DeleteUser:input_type -> litevirt.v1.DeleteUserRequest
+	137, // 209: litevirt.v1.LiteVirt.CreateToken:input_type -> litevirt.v1.CreateTokenRequest
+	138, // 210: litevirt.v1.LiteVirt.RevokeToken:input_type -> litevirt.v1.RevokeTokenRequest
+	425, // 211: litevirt.v1.LiteVirt.Whoami:input_type -> google.protobuf.Empty
+	136, // 212: litevirt.v1.LiteVirt.ChangePassword:input_type -> litevirt.v1.ChangePasswordRequest
+	183, // 213: litevirt.v1.LiteVirt.ListTwoFactors:input_type -> litevirt.v1.ListTwoFactorsRequest
+	185, // 214: litevirt.v1.LiteVirt.EnrollTOTP:input_type -> litevirt.v1.EnrollTOTPRequest
+	187, // 215: litevirt.v1.LiteVirt.DisableTwoFactor:input_type -> litevirt.v1.DisableTwoFactorRequest
+	189, // 216: litevirt.v1.LiteVirt.GrantRole:input_type -> litevirt.v1.GrantRoleRequest
+	191, // 217: litevirt.v1.LiteVirt.RevokeRole:input_type -> litevirt.v1.RevokeRoleRequest
+	193, // 218: litevirt.v1.LiteVirt.ListRoleBindings:input_type -> litevirt.v1.ListRoleBindingsRequest
+	195, // 219: litevirt.v1.LiteVirt.NormalizeRoleBindings:input_type -> litevirt.v1.NormalizeRoleBindingsRequest
+	197, // 220: litevirt.v1.LiteVirt.GetVMOperation:input_type -> litevirt.v1.GetVMOperationRequest
+	200, // 221: litevirt.v1.LiteVirt.AbortVMOperation:input_type -> litevirt.v1.AbortVMOperationRequest
+	204, // 222: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:input_type -> litevirt.v1.BeginWebAuthnRegistrationRequest
+	206, // 223: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:input_type -> litevirt.v1.FinishWebAuthnRegistrationRequest
+	208, // 224: litevirt.v1.LiteVirt.BeginWebAuthnLogin:input_type -> litevirt.v1.BeginWebAuthnLoginRequest
+	210, // 225: litevirt.v1.LiteVirt.FinishWebAuthnLogin:input_type -> litevirt.v1.FinishWebAuthnLoginRequest
+	202, // 226: litevirt.v1.LiteVirt.RestoreLive:input_type -> litevirt.v1.RestoreLiveRequest
+	177, // 227: litevirt.v1.LiteVirt.BindSecurityGroups:input_type -> litevirt.v1.BindSecurityGroupsRequest
+	425, // 228: litevirt.v1.LiteVirt.ReloadFirewall:input_type -> google.protobuf.Empty
+	139, // 229: litevirt.v1.LiteVirt.BackupSnapshot:input_type -> litevirt.v1.BackupSnapshotRequest
+	149, // 230: litevirt.v1.LiteVirt.RestoreFromBackup:input_type -> litevirt.v1.RestoreFromBackupRequest
+	142, // 231: litevirt.v1.LiteVirt.HasChunks:input_type -> litevirt.v1.HasChunksRequest
+	144, // 232: litevirt.v1.LiteVirt.PushBackup:input_type -> litevirt.v1.PushBackupFrame
+	153, // 233: litevirt.v1.LiteVirt.CreateContainer:input_type -> litevirt.v1.CreateContainerRequest
+	154, // 234: litevirt.v1.LiteVirt.StartContainer:input_type -> litevirt.v1.StartContainerRequest
+	155, // 235: litevirt.v1.LiteVirt.StopContainer:input_type -> litevirt.v1.StopContainerRequest
+	156, // 236: litevirt.v1.LiteVirt.DeleteContainer:input_type -> litevirt.v1.DeleteContainerRequest
+	157, // 237: litevirt.v1.LiteVirt.ExecContainer:input_type -> litevirt.v1.ExecContainerRequest
+	159, // 238: litevirt.v1.LiteVirt.ListContainers:input_type -> litevirt.v1.ListContainersRequest
+	161, // 239: litevirt.v1.LiteVirt.PullOCIImage:input_type -> litevirt.v1.PullOCIImageRequest
+	162, // 240: litevirt.v1.LiteVirt.BackupContainer:input_type -> litevirt.v1.BackupContainerRequest
+	164, // 241: litevirt.v1.LiteVirt.RestoreContainer:input_type -> litevirt.v1.RestoreContainerRequest
+	166, // 242: litevirt.v1.LiteVirt.MigrateContainer:input_type -> litevirt.v1.MigrateContainerRequest
+	169, // 243: litevirt.v1.LiteVirt.SnapshotContainer:input_type -> litevirt.v1.SnapshotContainerRequest
+	170, // 244: litevirt.v1.LiteVirt.ListContainerSnapshots:input_type -> litevirt.v1.ListContainerSnapshotsRequest
+	172, // 245: litevirt.v1.LiteVirt.RevertContainerSnapshot:input_type -> litevirt.v1.RevertContainerSnapshotRequest
+	173, // 246: litevirt.v1.LiteVirt.DeleteContainerSnapshot:input_type -> litevirt.v1.DeleteContainerSnapshotRequest
+	174, // 247: litevirt.v1.LiteVirt.ConvertContainerToTemplate:input_type -> litevirt.v1.ConvertContainerToTemplateRequest
+	175, // 248: litevirt.v1.LiteVirt.CloneContainer:input_type -> litevirt.v1.CloneContainerRequest
+	212, // 249: litevirt.v1.LiteVirt.GetVMStats:input_type -> litevirt.v1.GetVMStatsRequest
+	213, // 250: litevirt.v1.LiteVirt.GetHostStats:input_type -> litevirt.v1.GetHostStatsRequest
+	425, // 251: litevirt.v1.LiteVirt.GetClusterStatus:input_type -> google.protobuf.Empty
+	215, // 252: litevirt.v1.LiteVirt.StreamEvents:input_type -> litevirt.v1.StreamEventsRequest
+	216, // 253: litevirt.v1.LiteVirt.ListAuditLog:input_type -> litevirt.v1.ListAuditLogRequest
+	219, // 254: litevirt.v1.LiteVirt.ListVMEvents:input_type -> litevirt.v1.ListVMEventsRequest
+	257, // 255: litevirt.v1.LiteVirt.ListStoragePools:input_type -> litevirt.v1.ListStoragePoolsRequest
+	259, // 256: litevirt.v1.LiteVirt.CreateStoragePool:input_type -> litevirt.v1.CreateStoragePoolRequest
+	261, // 257: litevirt.v1.LiteVirt.DeleteStoragePool:input_type -> litevirt.v1.DeleteStoragePoolRequest
+	263, // 258: litevirt.v1.LiteVirt.GetStoragePool:input_type -> litevirt.v1.GetStoragePoolRequest
+	266, // 259: litevirt.v1.LiteVirt.ListStoragePoolContents:input_type -> litevirt.v1.ListStoragePoolContentsRequest
+	268, // 260: litevirt.v1.LiteVirt.UploadStoragePoolContent:input_type -> litevirt.v1.UploadStoragePoolContentRequest
+	222, // 261: litevirt.v1.LiteVirt.CreateResourceMapping:input_type -> litevirt.v1.CreateResourceMappingRequest
+	223, // 262: litevirt.v1.LiteVirt.ListResourceMappings:input_type -> litevirt.v1.ListResourceMappingsRequest
+	225, // 263: litevirt.v1.LiteVirt.DeleteResourceMapping:input_type -> litevirt.v1.DeleteResourceMappingRequest
+	226, // 264: litevirt.v1.LiteVirt.AddMappingDevice:input_type -> litevirt.v1.AddMappingDeviceRequest
+	227, // 265: litevirt.v1.LiteVirt.RemoveMappingDevice:input_type -> litevirt.v1.RemoveMappingDeviceRequest
+	228, // 266: litevirt.v1.LiteVirt.CreateNotificationTarget:input_type -> litevirt.v1.CreateNotificationTargetRequest
+	229, // 267: litevirt.v1.LiteVirt.ListNotificationTargets:input_type -> litevirt.v1.ListNotificationTargetsRequest
+	231, // 268: litevirt.v1.LiteVirt.DeleteNotificationTarget:input_type -> litevirt.v1.DeleteNotificationTargetRequest
+	232, // 269: litevirt.v1.LiteVirt.TestNotificationTarget:input_type -> litevirt.v1.TestNotificationTargetRequest
+	233, // 270: litevirt.v1.LiteVirt.CreateNotificationRoute:input_type -> litevirt.v1.CreateNotificationRouteRequest
+	234, // 271: litevirt.v1.LiteVirt.ListNotificationRoutes:input_type -> litevirt.v1.ListNotificationRoutesRequest
+	236, // 272: litevirt.v1.LiteVirt.DeleteNotificationRoute:input_type -> litevirt.v1.DeleteNotificationRouteRequest
+	238, // 273: litevirt.v1.LiteVirt.SetRegistryCredential:input_type -> litevirt.v1.SetRegistryCredentialRequest
+	239, // 274: litevirt.v1.LiteVirt.ListRegistryCredentials:input_type -> litevirt.v1.ListRegistryCredentialsRequest
+	241, // 275: litevirt.v1.LiteVirt.DeleteRegistryCredential:input_type -> litevirt.v1.DeleteRegistryCredentialRequest
+	242, // 276: litevirt.v1.LiteVirt.CreateClusterFirewallRule:input_type -> litevirt.v1.CreateClusterFirewallRuleRequest
+	243, // 277: litevirt.v1.LiteVirt.ListClusterFirewallRules:input_type -> litevirt.v1.ListClusterFirewallRulesRequest
+	245, // 278: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:input_type -> litevirt.v1.DeleteClusterFirewallRuleRequest
+	246, // 279: litevirt.v1.LiteVirt.CreateHostFirewallRule:input_type -> litevirt.v1.CreateHostFirewallRuleRequest
+	247, // 280: litevirt.v1.LiteVirt.ListHostFirewallRules:input_type -> litevirt.v1.ListHostFirewallRulesRequest
+	249, // 281: litevirt.v1.LiteVirt.DeleteHostFirewallRule:input_type -> litevirt.v1.DeleteHostFirewallRuleRequest
+	250, // 282: litevirt.v1.LiteVirt.CreateIpSet:input_type -> litevirt.v1.CreateIpSetRequest
+	251, // 283: litevirt.v1.LiteVirt.ListIpSets:input_type -> litevirt.v1.ListIpSetsRequest
+	253, // 284: litevirt.v1.LiteVirt.DeleteIpSet:input_type -> litevirt.v1.DeleteIpSetRequest
+	254, // 285: litevirt.v1.LiteVirt.SetFirewallDefault:input_type -> litevirt.v1.SetFirewallDefaultRequest
+	255, // 286: litevirt.v1.LiteVirt.ListFirewallDefaults:input_type -> litevirt.v1.ListFirewallDefaultsRequest
+	270, // 287: litevirt.v1.LiteVirt.DeleteStoragePoolContent:input_type -> litevirt.v1.DeleteStoragePoolContentRequest
+	271, // 288: litevirt.v1.LiteVirt.PushReplicaIncrement:input_type -> litevirt.v1.PushReplicaIncrementRequest
+	280, // 289: litevirt.v1.LiteVirt.Ping:input_type -> litevirt.v1.PingRequest
+	284, // 290: litevirt.v1.LiteVirt.ProvisionNetwork:input_type -> litevirt.v1.ProvisionNetworkRequest
+	290, // 291: litevirt.v1.LiteVirt.SyncVTEP:input_type -> litevirt.v1.SyncVTEPRequest
+	291, // 292: litevirt.v1.LiteVirt.GetVMIPRemote:input_type -> litevirt.v1.GetVMIPRequest
+	293, // 293: litevirt.v1.LiteVirt.RefreshLB:input_type -> litevirt.v1.RefreshLBRequest
+	294, // 294: litevirt.v1.LiteVirt.UpdateFDB:input_type -> litevirt.v1.UpdateFDBRequest
+	285, // 295: litevirt.v1.LiteVirt.EnsureCloudInit:input_type -> litevirt.v1.EnsureCloudInitRequest
+	286, // 296: litevirt.v1.LiteVirt.EnsureDisks:input_type -> litevirt.v1.EnsureDisksRequest
+	288, // 297: litevirt.v1.LiteVirt.EnsureFirmwareState:input_type -> litevirt.v1.EnsureFirmwareStateRequest
+	289, // 298: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:input_type -> litevirt.v1.CleanupMigrationArtifactsRequest
+	425, // 299: litevirt.v1.LiteVirt.GetStateDigest:input_type -> google.protobuf.Empty
+	274, // 300: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:input_type -> litevirt.v1.AcknowledgeLeaseTermTieRequest
+	276, // 301: litevirt.v1.LiteVirt.GetLeaseTermHighWater:input_type -> litevirt.v1.GetLeaseTermHighWaterRequest
+	425, // 302: litevirt.v1.LiteVirt.GetStateDump:input_type -> google.protobuf.Empty
+	425, // 303: litevirt.v1.LiteVirt.StreamStateDump:input_type -> google.protobuf.Empty
+	302, // 304: litevirt.v1.LiteVirt.GetSensitiveStateDigest:input_type -> litevirt.v1.SensitiveStateRequest
+	302, // 305: litevirt.v1.LiteVirt.StreamSensitiveStateDump:input_type -> litevirt.v1.SensitiveStateRequest
+	297, // 306: litevirt.v1.LiteVirt.TriggerAntiEntropy:input_type -> litevirt.v1.TriggerAntiEntropyRequest
+	425, // 307: litevirt.v1.LiteVirt.GetClusterStateDigest:input_type -> google.protobuf.Empty
+	303, // 308: litevirt.v1.LiteVirt.DiagnoseDivergence:input_type -> litevirt.v1.DiagnoseDivergenceRequest
+	308, // 309: litevirt.v1.LiteVirt.ScanSensitiveDivergence:input_type -> litevirt.v1.ScanSensitiveRequest
+	312, // 310: litevirt.v1.LiteVirt.PushMutations:input_type -> litevirt.v1.ReplicateRequest
+	314, // 311: litevirt.v1.LiteVirt.AckMutations:input_type -> litevirt.v1.AckRequest
+	341, // 312: litevirt.v1.LiteVirt.ListRebalanceProposals:input_type -> litevirt.v1.ListRebalanceProposalsRequest
+	343, // 313: litevirt.v1.LiteVirt.RunRebalance:input_type -> litevirt.v1.RunRebalanceRequest
+	345, // 314: litevirt.v1.LiteVirt.ApproveRebalanceProposal:input_type -> litevirt.v1.ApproveRebalanceProposalRequest
+	346, // 315: litevirt.v1.LiteVirt.RejectRebalanceProposal:input_type -> litevirt.v1.RejectRebalanceProposalRequest
+	338, // 316: litevirt.v1.LiteVirt.GetSpiceInfo:input_type -> litevirt.v1.GetSpiceInfoRequest
+	335, // 317: litevirt.v1.LiteVirt.PreflightUpgrade:input_type -> litevirt.v1.PreflightUpgradeRequest
+	347, // 318: litevirt.v1.LiteVirt.ListRegions:input_type -> litevirt.v1.ListRegionsRequest
+	349, // 319: litevirt.v1.LiteVirt.RegionStatus:input_type -> litevirt.v1.RegionStatusRequest
+	352, // 320: litevirt.v1.LiteVirt.CrossRegionMigrate:input_type -> litevirt.v1.CrossRegionMigrateRequest
+	354, // 321: litevirt.v1.LiteVirt.UpsertServiceEndpoint:input_type -> litevirt.v1.UpsertServiceEndpointRequest
+	355, // 322: litevirt.v1.LiteVirt.ListServiceEndpoints:input_type -> litevirt.v1.ListServiceEndpointsRequest
+	357, // 323: litevirt.v1.LiteVirt.DeleteServiceEndpoint:input_type -> litevirt.v1.DeleteServiceEndpointRequest
+	359, // 324: litevirt.v1.LiteVirt.CreateBackupSchedule:input_type -> litevirt.v1.CreateBackupScheduleRequest
+	360, // 325: litevirt.v1.LiteVirt.ListBackupSchedules:input_type -> litevirt.v1.ListBackupSchedulesRequest
+	362, // 326: litevirt.v1.LiteVirt.DeleteBackupSchedule:input_type -> litevirt.v1.DeleteBackupScheduleRequest
+	364, // 327: litevirt.v1.LiteVirt.CreateReplicationSchedule:input_type -> litevirt.v1.CreateReplicationScheduleRequest
+	365, // 328: litevirt.v1.LiteVirt.ListReplicationSchedules:input_type -> litevirt.v1.ListReplicationSchedulesRequest
+	367, // 329: litevirt.v1.LiteVirt.DeleteReplicationSchedule:input_type -> litevirt.v1.DeleteReplicationScheduleRequest
+	278, // 330: litevirt.v1.LiteVirt.PromoteReplica:input_type -> litevirt.v1.PromoteReplicaRequest
+	425, // 331: litevirt.v1.LiteVirt.VerifyAuditChain:input_type -> google.protobuf.Empty
+	371, // 332: litevirt.v1.LiteVirt.ExportAuditChain:input_type -> litevirt.v1.ExportAuditChainRequest
+	369, // 333: litevirt.v1.LiteVirt.RetireAuditKey:input_type -> litevirt.v1.RetireAuditKeyRequest
+	374, // 334: litevirt.v1.LiteVirt.CreateProject:input_type -> litevirt.v1.CreateProjectRequest
+	425, // 335: litevirt.v1.LiteVirt.ListProjects:input_type -> google.protobuf.Empty
+	376, // 336: litevirt.v1.LiteVirt.GetProject:input_type -> litevirt.v1.GetProjectRequest
+	377, // 337: litevirt.v1.LiteVirt.DeleteProject:input_type -> litevirt.v1.DeleteProjectRequest
+	379, // 338: litevirt.v1.LiteVirt.SetProjectQuota:input_type -> litevirt.v1.SetProjectQuotaRequest
+	380, // 339: litevirt.v1.LiteVirt.GetProjectQuota:input_type -> litevirt.v1.GetProjectQuotaRequest
+	382, // 340: litevirt.v1.LiteVirt.GetProjectUsage:input_type -> litevirt.v1.GetProjectUsageRequest
+	321, // 341: litevirt.v1.LiteVirt.ExecuteCreateVM:input_type -> litevirt.v1.ExecuteCreateVMRequest
+	383, // 342: litevirt.v1.LiteVirt.ReserveProjectCapacity:input_type -> litevirt.v1.ReserveProjectCapacityRequest
+	385, // 343: litevirt.v1.LiteVirt.ReleaseProjectCapacity:input_type -> litevirt.v1.ReleaseProjectCapacityRequest
+	386, // 344: litevirt.v1.LiteVirt.ReserveHostCapacity:input_type -> litevirt.v1.ReserveHostCapacityRequest
+	388, // 345: litevirt.v1.LiteVirt.ReleaseHostCapacity:input_type -> litevirt.v1.ReleaseHostCapacityRequest
+	12,  // 346: litevirt.v1.LiteVirt.ListHosts:output_type -> litevirt.v1.ListHostsResponse
+	400, // 347: litevirt.v1.LiteVirt.InspectHost:output_type -> litevirt.v1.Host
+	15,  // 348: litevirt.v1.LiteVirt.DrainHost:output_type -> litevirt.v1.DrainProgress
+	18,  // 349: litevirt.v1.LiteVirt.ShutdownHostWorkloads:output_type -> litevirt.v1.ShutdownProgress
+	400, // 350: litevirt.v1.LiteVirt.UndrainHost:output_type -> litevirt.v1.Host
+	400, // 351: litevirt.v1.LiteVirt.SetHostLabels:output_type -> litevirt.v1.Host
+	24,  // 352: litevirt.v1.LiteVirt.FenceHost:output_type -> litevirt.v1.FenceResult
+	30,  // 353: litevirt.v1.LiteVirt.GetClusterHealth:output_type -> litevirt.v1.ClusterHealth
+	390, // 354: litevirt.v1.LiteVirt.GetFenceReadiness:output_type -> litevirt.v1.FenceReadiness
+	425, // 355: litevirt.v1.LiteVirt.RemoveHost:output_type -> google.protobuf.Empty
+	425, // 356: litevirt.v1.LiteVirt.AdmitHost:output_type -> google.protobuf.Empty
+	325, // 357: litevirt.v1.LiteVirt.ListHostNetworks:output_type -> litevirt.v1.ListHostNetworksResponse
+	323, // 358: litevirt.v1.LiteVirt.UpsertHostNetwork:output_type -> litevirt.v1.HostNetwork
+	328, // 359: litevirt.v1.LiteVirt.PlanHostNetwork:output_type -> litevirt.v1.PlanHostNetworkResponse
+	425, // 360: litevirt.v1.LiteVirt.ApplyHostNetwork:output_type -> google.protobuf.Empty
+	425, // 361: litevirt.v1.LiteVirt.DeleteHostNetwork:output_type -> google.protobuf.Empty
+	332, // 362: litevirt.v1.LiteVirt.IsolateHost:output_type -> litevirt.v1.HostIsolationStatus
+	334, // 363: litevirt.v1.LiteVirt.ReseedHost:output_type -> litevirt.v1.ReseedHostResponse
+	23,  // 364: litevirt.v1.LiteVirt.PublishCRL:output_type -> litevirt.v1.PublishCRLResponse
+	32,  // 365: litevirt.v1.LiteVirt.RescanHost:output_type -> litevirt.v1.RescanHostResponse
+	34,  // 366: litevirt.v1.LiteVirt.ListHostDevices:output_type -> litevirt.v1.ListHostDevicesResponse
+	318, // 367: litevirt.v1.LiteVirt.UpgradeHost:output_type -> litevirt.v1.UpgradeHostResponse
+	318, // 368: litevirt.v1.LiteVirt.PreStageUpgrade:output_type -> litevirt.v1.UpgradeHostResponse
+	283, // 369: litevirt.v1.LiteVirt.FetchBinary:output_type -> litevirt.v1.FetchBinaryChunk
+	320, // 370: litevirt.v1.LiteVirt.UninstallHost:output_type -> litevirt.v1.UninstallHostResponse
+	400, // 371: litevirt.v1.LiteVirt.ConfigureHost:output_type -> litevirt.v1.Host
+	404, // 372: litevirt.v1.LiteVirt.CreateVM:output_type -> litevirt.v1.VM
+	38,  // 373: litevirt.v1.LiteVirt.ListVMs:output_type -> litevirt.v1.ListVMsResponse
+	404, // 374: litevirt.v1.LiteVirt.InspectVM:output_type -> litevirt.v1.VM
+	41,  // 375: litevirt.v1.LiteVirt.ListVMHardware:output_type -> litevirt.v1.ListVMHardwareResponse
+	404, // 376: litevirt.v1.LiteVirt.StartVM:output_type -> litevirt.v1.VM
+	404, // 377: litevirt.v1.LiteVirt.StopVM:output_type -> litevirt.v1.VM
+	404, // 378: litevirt.v1.LiteVirt.RestartVM:output_type -> litevirt.v1.VM
+	425, // 379: litevirt.v1.LiteVirt.DeleteVM:output_type -> google.protobuf.Empty
+	47,  // 380: litevirt.v1.LiteVirt.RepairVMOwner:output_type -> litevirt.v1.RepairVMOwnerResponse
+	56,  // 381: litevirt.v1.LiteVirt.GetRuntimeInventory:output_type -> litevirt.v1.RuntimeInventory
+	49,  // 382: litevirt.v1.LiteVirt.CheckVIPParticipant:output_type -> litevirt.v1.CheckVIPParticipantResponse
+	51,  // 383: litevirt.v1.LiteVirt.RelayCheckVIPParticipant:output_type -> litevirt.v1.RelayCheckVIPParticipantResponse
+	53,  // 384: litevirt.v1.LiteVirt.CheckLBPresent:output_type -> litevirt.v1.CheckLBPresentResponse
+	404, // 385: litevirt.v1.LiteVirt.CloneVM:output_type -> litevirt.v1.VM
+	404, // 386: litevirt.v1.LiteVirt.ConvertToTemplate:output_type -> litevirt.v1.VM
+	60,  // 387: litevirt.v1.LiteVirt.ExecVM:output_type -> litevirt.v1.ExecVMResponse
+	62,  // 388: litevirt.v1.LiteVirt.ConsoleVM:output_type -> litevirt.v1.ConsoleOutput
+	404, // 389: litevirt.v1.LiteVirt.SetVMIP:output_type -> litevirt.v1.VM
+	404, // 390: litevirt.v1.LiteVirt.SetBootOrder:output_type -> litevirt.v1.VM
+	404, // 391: litevirt.v1.LiteVirt.RebuildVM:output_type -> litevirt.v1.VM
+	404, // 392: litevirt.v1.LiteVirt.CutoverVM:output_type -> litevirt.v1.VM
+	404, // 393: litevirt.v1.LiteVirt.UpdateVM:output_type -> litevirt.v1.VM
+	404, // 394: litevirt.v1.LiteVirt.SetVMMemory:output_type -> litevirt.v1.VM
+	404, // 395: litevirt.v1.LiteVirt.SetVMLabels:output_type -> litevirt.v1.VM
+	404, // 396: litevirt.v1.LiteVirt.AttachDevice:output_type -> litevirt.v1.VM
+	404, // 397: litevirt.v1.LiteVirt.DetachDevice:output_type -> litevirt.v1.VM
+	404, // 398: litevirt.v1.LiteVirt.ResizeDisk:output_type -> litevirt.v1.VM
+	71,  // 399: litevirt.v1.LiteVirt.ProxyVNC:output_type -> litevirt.v1.VNCData
+	316, // 400: litevirt.v1.LiteVirt.GetVMLogs:output_type -> litevirt.v1.VMLogChunk
+	73,  // 401: litevirt.v1.LiteVirt.DeployStack:output_type -> litevirt.v1.DeployProgress
+	75,  // 402: litevirt.v1.LiteVirt.DeleteStack:output_type -> litevirt.v1.DeleteProgress
+	76,  // 403: litevirt.v1.LiteVirt.ListStacks:output_type -> litevirt.v1.ListStacksResponse
+	79,  // 404: litevirt.v1.LiteVirt.DiffStack:output_type -> litevirt.v1.DiffStackResponse
+	82,  // 405: litevirt.v1.LiteVirt.ExportStack:output_type -> litevirt.v1.ExportStackResponse
+	84,  // 406: litevirt.v1.LiteVirt.MigrateVM:output_type -> litevirt.v1.MigrateProgress
+	86,  // 407: litevirt.v1.LiteVirt.MoveVolume:output_type -> litevirt.v1.MoveVolumeProgress
+	88,  // 408: litevirt.v1.LiteVirt.ReplicateVolume:output_type -> litevirt.v1.ReplicateVolumeProgress
+	91,  // 409: litevirt.v1.LiteVirt.MigrateStackVolumes:output_type -> litevirt.v1.StackVolumeProgress
+	93,  // 410: litevirt.v1.LiteVirt.PullImage:output_type -> litevirt.v1.PullProgress
+	94,  // 411: litevirt.v1.LiteVirt.ListImages:output_type -> litevirt.v1.ListImagesResponse
+	425, // 412: litevirt.v1.LiteVirt.DeleteImage:output_type -> google.protobuf.Empty
+	97,  // 413: litevirt.v1.LiteVirt.ImportImage:output_type -> litevirt.v1.ImportImageResponse
+	99,  // 414: litevirt.v1.LiteVirt.PushImage:output_type -> litevirt.v1.PushImageProgress
+	101, // 415: litevirt.v1.LiteVirt.BuildImage:output_type -> litevirt.v1.BuildImageResponse
+	103, // 416: litevirt.v1.LiteVirt.BackupVM:output_type -> litevirt.v1.BackupChunk
+	404, // 417: litevirt.v1.LiteVirt.RestoreVM:output_type -> litevirt.v1.VM
+	106, // 418: litevirt.v1.LiteVirt.ImportVM:output_type -> litevirt.v1.ImportVMProgress
+	411, // 419: litevirt.v1.LiteVirt.CreateSnapshot:output_type -> litevirt.v1.Snapshot
+	109, // 420: litevirt.v1.LiteVirt.ListSnapshots:output_type -> litevirt.v1.ListSnapshotsResponse
+	404, // 421: litevirt.v1.LiteVirt.RestoreSnapshot:output_type -> litevirt.v1.VM
+	425, // 422: litevirt.v1.LiteVirt.DeleteSnapshot:output_type -> google.protobuf.Empty
+	116, // 423: litevirt.v1.LiteVirt.CreateNetwork:output_type -> litevirt.v1.NetworkInfo
+	116, // 424: litevirt.v1.LiteVirt.GetNetwork:output_type -> litevirt.v1.NetworkInfo
+	425, // 425: litevirt.v1.LiteVirt.DeleteNetwork:output_type -> google.protobuf.Empty
+	115, // 426: litevirt.v1.LiteVirt.ListNetworks:output_type -> litevirt.v1.ListNetworksResponse
+	117, // 427: litevirt.v1.LiteVirt.ListLoadBalancers:output_type -> litevirt.v1.ListLBResponse
+	412, // 428: litevirt.v1.LiteVirt.InspectLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	412, // 429: litevirt.v1.LiteVirt.CreateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	412, // 430: litevirt.v1.LiteVirt.UpdateLoadBalancer:output_type -> litevirt.v1.LoadBalancer
+	425, // 431: litevirt.v1.LiteVirt.DeleteLoadBalancer:output_type -> google.protobuf.Empty
+	429, // 432: litevirt.v1.LiteVirt.LBStats:output_type -> litevirt.v1.LBStatsResponse
+	128, // 433: litevirt.v1.LiteVirt.DrainBackend:output_type -> litevirt.v1.DrainBackendResponse
+	412, // 434: litevirt.v1.LiteVirt.DisableBackend:output_type -> litevirt.v1.LoadBalancer
+	412, // 435: litevirt.v1.LiteVirt.EnableBackend:output_type -> litevirt.v1.LoadBalancer
+	425, // 436: litevirt.v1.LiteVirt.ApplyLB:output_type -> google.protobuf.Empty
+	425, // 437: litevirt.v1.LiteVirt.RemoveLB:output_type -> google.protobuf.Empty
+	430, // 438: litevirt.v1.LiteVirt.LBKeepalivedRunning:output_type -> litevirt.v1.LBKeepalivedResponse
+	130, // 439: litevirt.v1.LiteVirt.Login:output_type -> litevirt.v1.LoginResponse
+	131, // 440: litevirt.v1.LiteVirt.ListRealms:output_type -> litevirt.v1.ListRealmsResponse
+	425, // 441: litevirt.v1.LiteVirt.Logout:output_type -> google.protobuf.Empty
+	180, // 442: litevirt.v1.LiteVirt.ListSessions:output_type -> litevirt.v1.ListSessionsResponse
+	425, // 443: litevirt.v1.LiteVirt.RevokeSession:output_type -> google.protobuf.Empty
+	416, // 444: litevirt.v1.LiteVirt.CreateUser:output_type -> litevirt.v1.User
+	133, // 445: litevirt.v1.LiteVirt.ListUsers:output_type -> litevirt.v1.ListUsersResponse
+	425, // 446: litevirt.v1.LiteVirt.DeleteUser:output_type -> google.protobuf.Empty
+	431, // 447: litevirt.v1.LiteVirt.CreateToken:output_type -> litevirt.v1.Token
+	425, // 448: litevirt.v1.LiteVirt.RevokeToken:output_type -> google.protobuf.Empty
+	135, // 449: litevirt.v1.LiteVirt.Whoami:output_type -> litevirt.v1.WhoamiResponse
+	425, // 450: litevirt.v1.LiteVirt.ChangePassword:output_type -> google.protobuf.Empty
+	184, // 451: litevirt.v1.LiteVirt.ListTwoFactors:output_type -> litevirt.v1.ListTwoFactorsResponse
+	186, // 452: litevirt.v1.LiteVirt.EnrollTOTP:output_type -> litevirt.v1.EnrollTOTPResponse
+	425, // 453: litevirt.v1.LiteVirt.DisableTwoFactor:output_type -> google.protobuf.Empty
+	190, // 454: litevirt.v1.LiteVirt.GrantRole:output_type -> litevirt.v1.GrantRoleResponse
+	192, // 455: litevirt.v1.LiteVirt.RevokeRole:output_type -> litevirt.v1.RevokeRoleResponse
+	194, // 456: litevirt.v1.LiteVirt.ListRoleBindings:output_type -> litevirt.v1.ListRoleBindingsResponse
+	196, // 457: litevirt.v1.LiteVirt.NormalizeRoleBindings:output_type -> litevirt.v1.NormalizeRoleBindingsResponse
+	199, // 458: litevirt.v1.LiteVirt.GetVMOperation:output_type -> litevirt.v1.GetVMOperationResponse
+	201, // 459: litevirt.v1.LiteVirt.AbortVMOperation:output_type -> litevirt.v1.AbortVMOperationResponse
+	205, // 460: litevirt.v1.LiteVirt.BeginWebAuthnRegistration:output_type -> litevirt.v1.BeginWebAuthnRegistrationResponse
+	207, // 461: litevirt.v1.LiteVirt.FinishWebAuthnRegistration:output_type -> litevirt.v1.FinishWebAuthnRegistrationResponse
+	209, // 462: litevirt.v1.LiteVirt.BeginWebAuthnLogin:output_type -> litevirt.v1.BeginWebAuthnLoginResponse
+	211, // 463: litevirt.v1.LiteVirt.FinishWebAuthnLogin:output_type -> litevirt.v1.FinishWebAuthnLoginResponse
+	203, // 464: litevirt.v1.LiteVirt.RestoreLive:output_type -> litevirt.v1.RestoreLiveProgress
+	425, // 465: litevirt.v1.LiteVirt.BindSecurityGroups:output_type -> google.protobuf.Empty
+	176, // 466: litevirt.v1.LiteVirt.ReloadFirewall:output_type -> litevirt.v1.FirewallStatus
+	140, // 467: litevirt.v1.LiteVirt.BackupSnapshot:output_type -> litevirt.v1.BackupSnapshotProgress
+	150, // 468: litevirt.v1.LiteVirt.RestoreFromBackup:output_type -> litevirt.v1.RestoreFromBackupProgress
+	143, // 469: litevirt.v1.LiteVirt.HasChunks:output_type -> litevirt.v1.HasChunksResponse
+	148, // 470: litevirt.v1.LiteVirt.PushBackup:output_type -> litevirt.v1.PushBackupResponse
+	151, // 471: litevirt.v1.LiteVirt.CreateContainer:output_type -> litevirt.v1.Container
+	425, // 472: litevirt.v1.LiteVirt.StartContainer:output_type -> google.protobuf.Empty
+	425, // 473: litevirt.v1.LiteVirt.StopContainer:output_type -> google.protobuf.Empty
+	425, // 474: litevirt.v1.LiteVirt.DeleteContainer:output_type -> google.protobuf.Empty
+	158, // 475: litevirt.v1.LiteVirt.ExecContainer:output_type -> litevirt.v1.ExecContainerResponse
+	160, // 476: litevirt.v1.LiteVirt.ListContainers:output_type -> litevirt.v1.ListContainersResponse
+	425, // 477: litevirt.v1.LiteVirt.PullOCIImage:output_type -> google.protobuf.Empty
+	163, // 478: litevirt.v1.LiteVirt.BackupContainer:output_type -> litevirt.v1.BackupContainerProgress
+	165, // 479: litevirt.v1.LiteVirt.RestoreContainer:output_type -> litevirt.v1.RestoreContainerProgress
+	167, // 480: litevirt.v1.LiteVirt.MigrateContainer:output_type -> litevirt.v1.MigrateContainerProgress
+	168, // 481: litevirt.v1.LiteVirt.SnapshotContainer:output_type -> litevirt.v1.ContainerSnapshot
+	171, // 482: litevirt.v1.LiteVirt.ListContainerSnapshots:output_type -> litevirt.v1.ListContainerSnapshotsResponse
+	425, // 483: litevirt.v1.LiteVirt.RevertContainerSnapshot:output_type -> google.protobuf.Empty
+	425, // 484: litevirt.v1.LiteVirt.DeleteContainerSnapshot:output_type -> google.protobuf.Empty
+	151, // 485: litevirt.v1.LiteVirt.ConvertContainerToTemplate:output_type -> litevirt.v1.Container
+	151, // 486: litevirt.v1.LiteVirt.CloneContainer:output_type -> litevirt.v1.Container
+	432, // 487: litevirt.v1.LiteVirt.GetVMStats:output_type -> litevirt.v1.VMStats
+	433, // 488: litevirt.v1.LiteVirt.GetHostStats:output_type -> litevirt.v1.HostResourceStats
+	214, // 489: litevirt.v1.LiteVirt.GetClusterStatus:output_type -> litevirt.v1.ClusterStatus
+	417, // 490: litevirt.v1.LiteVirt.StreamEvents:output_type -> litevirt.v1.ClusterEvent
+	218, // 491: litevirt.v1.LiteVirt.ListAuditLog:output_type -> litevirt.v1.ListAuditLogResponse
+	221, // 492: litevirt.v1.LiteVirt.ListVMEvents:output_type -> litevirt.v1.ListVMEventsResponse
+	258, // 493: litevirt.v1.LiteVirt.ListStoragePools:output_type -> litevirt.v1.ListStoragePoolsResponse
+	260, // 494: litevirt.v1.LiteVirt.CreateStoragePool:output_type -> litevirt.v1.CreateStoragePoolResponse
+	262, // 495: litevirt.v1.LiteVirt.DeleteStoragePool:output_type -> litevirt.v1.DeleteStoragePoolResponse
+	264, // 496: litevirt.v1.LiteVirt.GetStoragePool:output_type -> litevirt.v1.GetStoragePoolResponse
+	267, // 497: litevirt.v1.LiteVirt.ListStoragePoolContents:output_type -> litevirt.v1.ListStoragePoolContentsResponse
+	269, // 498: litevirt.v1.LiteVirt.UploadStoragePoolContent:output_type -> litevirt.v1.UploadStoragePoolContentResponse
+	418, // 499: litevirt.v1.LiteVirt.CreateResourceMapping:output_type -> litevirt.v1.ResourceMapping
+	224, // 500: litevirt.v1.LiteVirt.ListResourceMappings:output_type -> litevirt.v1.ListResourceMappingsResponse
+	425, // 501: litevirt.v1.LiteVirt.DeleteResourceMapping:output_type -> google.protobuf.Empty
+	418, // 502: litevirt.v1.LiteVirt.AddMappingDevice:output_type -> litevirt.v1.ResourceMapping
+	418, // 503: litevirt.v1.LiteVirt.RemoveMappingDevice:output_type -> litevirt.v1.ResourceMapping
+	419, // 504: litevirt.v1.LiteVirt.CreateNotificationTarget:output_type -> litevirt.v1.NotificationTarget
+	230, // 505: litevirt.v1.LiteVirt.ListNotificationTargets:output_type -> litevirt.v1.ListNotificationTargetsResponse
+	425, // 506: litevirt.v1.LiteVirt.DeleteNotificationTarget:output_type -> google.protobuf.Empty
+	425, // 507: litevirt.v1.LiteVirt.TestNotificationTarget:output_type -> google.protobuf.Empty
+	420, // 508: litevirt.v1.LiteVirt.CreateNotificationRoute:output_type -> litevirt.v1.NotificationRoute
+	235, // 509: litevirt.v1.LiteVirt.ListNotificationRoutes:output_type -> litevirt.v1.ListNotificationRoutesResponse
+	425, // 510: litevirt.v1.LiteVirt.DeleteNotificationRoute:output_type -> google.protobuf.Empty
+	237, // 511: litevirt.v1.LiteVirt.SetRegistryCredential:output_type -> litevirt.v1.RegistryCredential
+	240, // 512: litevirt.v1.LiteVirt.ListRegistryCredentials:output_type -> litevirt.v1.ListRegistryCredentialsResponse
+	425, // 513: litevirt.v1.LiteVirt.DeleteRegistryCredential:output_type -> google.protobuf.Empty
+	421, // 514: litevirt.v1.LiteVirt.CreateClusterFirewallRule:output_type -> litevirt.v1.FirewallRule
+	244, // 515: litevirt.v1.LiteVirt.ListClusterFirewallRules:output_type -> litevirt.v1.ListClusterFirewallRulesResponse
+	425, // 516: litevirt.v1.LiteVirt.DeleteClusterFirewallRule:output_type -> google.protobuf.Empty
+	421, // 517: litevirt.v1.LiteVirt.CreateHostFirewallRule:output_type -> litevirt.v1.FirewallRule
+	248, // 518: litevirt.v1.LiteVirt.ListHostFirewallRules:output_type -> litevirt.v1.ListHostFirewallRulesResponse
+	425, // 519: litevirt.v1.LiteVirt.DeleteHostFirewallRule:output_type -> google.protobuf.Empty
+	422, // 520: litevirt.v1.LiteVirt.CreateIpSet:output_type -> litevirt.v1.IpSet
+	252, // 521: litevirt.v1.LiteVirt.ListIpSets:output_type -> litevirt.v1.ListIpSetsResponse
+	425, // 522: litevirt.v1.LiteVirt.DeleteIpSet:output_type -> google.protobuf.Empty
+	425, // 523: litevirt.v1.LiteVirt.SetFirewallDefault:output_type -> google.protobuf.Empty
+	256, // 524: litevirt.v1.LiteVirt.ListFirewallDefaults:output_type -> litevirt.v1.ListFirewallDefaultsResponse
+	425, // 525: litevirt.v1.LiteVirt.DeleteStoragePoolContent:output_type -> google.protobuf.Empty
+	272, // 526: litevirt.v1.LiteVirt.PushReplicaIncrement:output_type -> litevirt.v1.PushReplicaIncrementResponse
+	281, // 527: litevirt.v1.LiteVirt.Ping:output_type -> litevirt.v1.PingResponse
+	425, // 528: litevirt.v1.LiteVirt.ProvisionNetwork:output_type -> google.protobuf.Empty
+	425, // 529: litevirt.v1.LiteVirt.SyncVTEP:output_type -> google.protobuf.Empty
+	292, // 530: litevirt.v1.LiteVirt.GetVMIPRemote:output_type -> litevirt.v1.GetVMIPResponse
+	425, // 531: litevirt.v1.LiteVirt.RefreshLB:output_type -> google.protobuf.Empty
+	425, // 532: litevirt.v1.LiteVirt.UpdateFDB:output_type -> google.protobuf.Empty
+	425, // 533: litevirt.v1.LiteVirt.EnsureCloudInit:output_type -> google.protobuf.Empty
+	425, // 534: litevirt.v1.LiteVirt.EnsureDisks:output_type -> google.protobuf.Empty
+	425, // 535: litevirt.v1.LiteVirt.EnsureFirmwareState:output_type -> google.protobuf.Empty
+	425, // 536: litevirt.v1.LiteVirt.CleanupMigrationArtifacts:output_type -> google.protobuf.Empty
+	296, // 537: litevirt.v1.LiteVirt.GetStateDigest:output_type -> litevirt.v1.StateDigestResponse
+	275, // 538: litevirt.v1.LiteVirt.AcknowledgeLeaseTermTie:output_type -> litevirt.v1.AcknowledgeLeaseTermTieResponse
+	277, // 539: litevirt.v1.LiteVirt.GetLeaseTermHighWater:output_type -> litevirt.v1.GetLeaseTermHighWaterResponse
+	300, // 540: litevirt.v1.LiteVirt.GetStateDump:output_type -> litevirt.v1.StateDumpResponse
+	301, // 541: litevirt.v1.LiteVirt.StreamStateDump:output_type -> litevirt.v1.StateDumpChunk
+	296, // 542: litevirt.v1.LiteVirt.GetSensitiveStateDigest:output_type -> litevirt.v1.StateDigestResponse
+	301, // 543: litevirt.v1.LiteVirt.StreamSensitiveStateDump:output_type -> litevirt.v1.StateDumpChunk
+	298, // 544: litevirt.v1.LiteVirt.TriggerAntiEntropy:output_type -> litevirt.v1.TriggerAntiEntropyResponse
+	299, // 545: litevirt.v1.LiteVirt.GetClusterStateDigest:output_type -> litevirt.v1.ClusterStateDigestResponse
+	307, // 546: litevirt.v1.LiteVirt.DiagnoseDivergence:output_type -> litevirt.v1.DivergenceReport
+	310, // 547: litevirt.v1.LiteVirt.ScanSensitiveDivergence:output_type -> litevirt.v1.ScanSensitiveResponse
+	313, // 548: litevirt.v1.LiteVirt.PushMutations:output_type -> litevirt.v1.ReplicateResponse
+	425, // 549: litevirt.v1.LiteVirt.AckMutations:output_type -> google.protobuf.Empty
+	342, // 550: litevirt.v1.LiteVirt.ListRebalanceProposals:output_type -> litevirt.v1.ListRebalanceProposalsResponse
+	344, // 551: litevirt.v1.LiteVirt.RunRebalance:output_type -> litevirt.v1.RunRebalanceResponse
+	340, // 552: litevirt.v1.LiteVirt.ApproveRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
+	340, // 553: litevirt.v1.LiteVirt.RejectRebalanceProposal:output_type -> litevirt.v1.RebalanceProposal
+	339, // 554: litevirt.v1.LiteVirt.GetSpiceInfo:output_type -> litevirt.v1.GetSpiceInfoResponse
+	336, // 555: litevirt.v1.LiteVirt.PreflightUpgrade:output_type -> litevirt.v1.PreflightUpgradeResponse
+	348, // 556: litevirt.v1.LiteVirt.ListRegions:output_type -> litevirt.v1.ListRegionsResponse
+	350, // 557: litevirt.v1.LiteVirt.RegionStatus:output_type -> litevirt.v1.RegionStatusResponse
+	84,  // 558: litevirt.v1.LiteVirt.CrossRegionMigrate:output_type -> litevirt.v1.MigrateProgress
+	353, // 559: litevirt.v1.LiteVirt.UpsertServiceEndpoint:output_type -> litevirt.v1.ServiceEndpoint
+	356, // 560: litevirt.v1.LiteVirt.ListServiceEndpoints:output_type -> litevirt.v1.ListServiceEndpointsResponse
+	425, // 561: litevirt.v1.LiteVirt.DeleteServiceEndpoint:output_type -> google.protobuf.Empty
+	358, // 562: litevirt.v1.LiteVirt.CreateBackupSchedule:output_type -> litevirt.v1.BackupSchedule
+	361, // 563: litevirt.v1.LiteVirt.ListBackupSchedules:output_type -> litevirt.v1.ListBackupSchedulesResponse
+	425, // 564: litevirt.v1.LiteVirt.DeleteBackupSchedule:output_type -> google.protobuf.Empty
+	363, // 565: litevirt.v1.LiteVirt.CreateReplicationSchedule:output_type -> litevirt.v1.ReplicationSchedule
+	366, // 566: litevirt.v1.LiteVirt.ListReplicationSchedules:output_type -> litevirt.v1.ListReplicationSchedulesResponse
+	425, // 567: litevirt.v1.LiteVirt.DeleteReplicationSchedule:output_type -> google.protobuf.Empty
+	279, // 568: litevirt.v1.LiteVirt.PromoteReplica:output_type -> litevirt.v1.PromoteReplicaProgress
+	368, // 569: litevirt.v1.LiteVirt.VerifyAuditChain:output_type -> litevirt.v1.VerifyAuditChainResponse
+	372, // 570: litevirt.v1.LiteVirt.ExportAuditChain:output_type -> litevirt.v1.ExportAuditChainResponse
+	370, // 571: litevirt.v1.LiteVirt.RetireAuditKey:output_type -> litevirt.v1.RetireAuditKeyResponse
+	373, // 572: litevirt.v1.LiteVirt.CreateProject:output_type -> litevirt.v1.Project
+	375, // 573: litevirt.v1.LiteVirt.ListProjects:output_type -> litevirt.v1.ListProjectsResponse
+	373, // 574: litevirt.v1.LiteVirt.GetProject:output_type -> litevirt.v1.Project
+	425, // 575: litevirt.v1.LiteVirt.DeleteProject:output_type -> google.protobuf.Empty
+	378, // 576: litevirt.v1.LiteVirt.SetProjectQuota:output_type -> litevirt.v1.ProjectQuota
+	378, // 577: litevirt.v1.LiteVirt.GetProjectQuota:output_type -> litevirt.v1.ProjectQuota
+	381, // 578: litevirt.v1.LiteVirt.GetProjectUsage:output_type -> litevirt.v1.ProjectUsage
+	404, // 579: litevirt.v1.LiteVirt.ExecuteCreateVM:output_type -> litevirt.v1.VM
+	384, // 580: litevirt.v1.LiteVirt.ReserveProjectCapacity:output_type -> litevirt.v1.ReserveProjectCapacityResponse
+	425, // 581: litevirt.v1.LiteVirt.ReleaseProjectCapacity:output_type -> google.protobuf.Empty
+	387, // 582: litevirt.v1.LiteVirt.ReserveHostCapacity:output_type -> litevirt.v1.ReserveHostCapacityResponse
+	425, // 583: litevirt.v1.LiteVirt.ReleaseHostCapacity:output_type -> google.protobuf.Empty
+	346, // [346:584] is the sub-list for method output_type
+	108, // [108:346] is the sub-list for method input_type
+	108, // [108:108] is the sub-list for extension type_name
+	108, // [108:108] is the sub-list for extension extendee
+	0,   // [0:108] is the sub-list for field type_name
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 }
 
 func init() { file_litevirt_v1_service_proto_init() }
@@ -29017,14 +31477,22 @@ func file_litevirt_v1_service_proto_init() {
 		(*PushBackupFrame_Chunk)(nil),
 		(*PushBackupFrame_Manifest)(nil),
 	}
+<<<<<<< HEAD
 	file_litevirt_v1_service_proto_msgTypes[362].OneofWrappers = []any{}
+=======
+	file_litevirt_v1_service_proto_msgTypes[358].OneofWrappers = []any{}
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_service_proto_rawDesc), len(file_litevirt_v1_service_proto_rawDesc)),
 			NumEnums:      11,
+<<<<<<< HEAD
 			NumMessages:   393,
+=======
+			NumMessages:   389,
+>>>>>>> b318261 (feat(grpcapi): a peer read for the lease-term high-water mark)
 			NumExtensions: 0,
 			NumServices:   1,
 		},

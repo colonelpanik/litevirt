@@ -166,11 +166,22 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 	// first still is changes nothing an operator can observe — the gauge is
 	// already 1 and no event fires. The set changing IS the news.
 	var prevUnsupported []degradedCapability
-	// Whose turn the single peer op is. See spendOnePeerOp: an unlatchable token
-	// must not be able to hold the freshness check off forever.
-	freshnessTurn := false
 	eval := func() {
-		freshnessTurn = s.spendOnePeerOp(ctx, freshnessTurn)
+		// One peer op per cycle, split between the two axes so neither starves the
+		// other: mostly spent latching an unlatched token (round-robin, so one
+		// that cannot confirm does not absorb every cycle), with a reserved share
+		// spent on the round-robin FRESHNESS check so a post-latch regression (a
+		// peer that rolled back / stopped advertising) still surfaces — the
+		// durable latch alone never flips back.
+		//
+		// This supersedes spendOnePeerOp's strict alternation, which solved the
+		// same starvation problem from the other direction. Two differences
+		// decided it: retryLatchedMarkers runs EVERY cycle here (alternation
+		// skipped marker-persistence retries on the check's turn), and the
+		// reserve is 1-in-4 rather than 1-in-2, so a pending activation is not
+		// halved. spendOnePeerOp is left in place because a test still drives it
+		// directly; retiring it belongs with whichever of these lands second.
+		s.spendCapabilityPeerOp(ctx)
 		// §A: act on a peer's SELF-REPORTED quarantine by recording its
 		// isolation. One peer per cycle, so this adds no fan-out.
 		s.recordSelfReportedIsolation(ctx)
@@ -272,29 +283,109 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 	// enforcing). Bound the cost: an unlatched token pays a fresh-Ping sweep, so drive
 	// at most ONE unlatched token per cycle (already-latched Enforced() is a cheap
 	// map read); the rest latch over subsequent cycles.
-	drove := false
+	s.retryLatchedMarkers(ctx)
+	return s.activateOneUnlatched(ctx)
+}
+
+// retryLatchedMarkers re-drives every ALREADY-latched token. This costs no peer
+// op — Enforced's already-path is a map read — so it is unconditional and runs
+// on every cycle, including the ones reserved for the freshness check.
+//
+// A latched token is driven regardless of its config flag: the already-path
+// RETRIES a marker write that hasn't yet persisted, and that retry must not stop
+// just because the operator disabled the flag after the token latched.
+// Otherwise a token latched in memory but not on disk would never become
+// DurablyLatched, and a durable-gated contract (canonical registry acceptance,
+// the lease-term mint) would fail closed forever.
+func (s *Server) retryLatchedMarkers(ctx context.Context) {
 	for _, tok := range capabilities.Supported() {
-		// An ALREADY-latched token is driven regardless of its config flag: Enforced's cheap
-		// already-path RETRIES a marker write that hasn't yet persisted, and that retry must not
-		// stop just because the operator disabled the flag after the token latched. Otherwise a
-		// token latched in memory but not on disk would never become DurablyLatched, and a
-		// durable-gated contract (canonical registry acceptance) would fail closed forever.
 		if s.gate.Latched(tok) {
-			s.gate.Enforced(ctx, tok) // cheap already-path; keeps retrying marker persistence
-			continue
+			s.gate.Enforced(ctx, tok)
 		}
-		// UNLATCHED activation depends on the config flag: advertised ≠ enforcing, so a config-off
-		// token is not driven and never latches.
-		if !s.tokenEnabled(tok) {
-			continue
-		}
-		if drove {
-			continue
-		}
-		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
-		drove = true
 	}
-	return drove
+}
+
+// activateOneUnlatched spends this cycle's ONE peer op driving a single
+// unlatched, config-enabled token's latch, and reports whether it spent it.
+//
+// An unlatched token pays a fresh-Ping sweep, which is why only one is driven
+// per cycle. The starting point ROTATES, and that is the load-bearing part: the
+// drive used to restart at index 0 every cycle and take the first unlatched
+// enabled token it found, so a token that cannot currently latch absorbed every
+// cycle forever and no token after it in Supported() was ever driven. The
+// blocking token needs no fault to do this — a config-uniformity flag switched
+// on here but not yet on one peer is enough, which is the ordinary state during
+// any staged config rollout. Everything later then sat inert with nothing in the
+// logs, including the tokens whose latch is the precondition for a durable-gated
+// write.
+//
+// UNLATCHED activation still depends on the config flag: advertised ≠ enforcing,
+// so a config-off token is not driven and never latches.
+func (s *Server) activateOneUnlatched(ctx context.Context) bool {
+	toks := capabilities.Supported()
+	if len(toks) == 0 {
+		return false
+	}
+
+	s.capHealthMu.Lock()
+	start := s.capDriveCursor % len(toks)
+	s.capHealthMu.Unlock()
+
+	for i := 0; i < len(toks); i++ {
+		idx := (start + i) % len(toks)
+		tok := toks[idx]
+		if s.gate.Latched(tok) || !s.tokenEnabled(tok) {
+			continue
+		}
+		// Resume AFTER this token next cycle, so one that never confirms is
+		// retried once per rotation instead of on every cycle.
+		s.capHealthMu.Lock()
+		s.capDriveCursor = (idx + 1) % len(toks)
+		s.capHealthMu.Unlock()
+
+		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
+		return true
+	}
+	return false
+}
+
+// capFreshnessReserveEvery is how often the HA monitor spends its cycle on the
+// freshness axis even though activation is still incomplete.
+//
+// checkOneCapabilityHealth used to run ONLY when activation had nothing to
+// drive, on the reasoning that a cycle spends at most one peer op. That held
+// only while every flag-less token could latch on a homogeneous fleet. A
+// mandatory token that cannot latch until the last host is upgraded makes the
+// drive claim every cycle for the whole roll — and permanently on a cluster
+// deliberately held with one host back — so the only post-latch regression
+// detector never ran, capHealthLast stayed empty, and evaluateHADegraded's
+// `latched && (!checked || lastOK)` quietly degenerated to `latched`.
+//
+// One cycle in four keeps the one-peer-op-per-cycle bound and still re-checks
+// every configured token within a bounded number of cycles.
+const capFreshnessReserveEvery = 4
+
+// spendCapabilityPeerOp spends this cycle's single capability peer op, splitting
+// it between driving activation and re-checking freshness so neither axis can
+// starve the other.
+func (s *Server) spendCapabilityPeerOp(ctx context.Context) {
+	if s.gate == nil {
+		return
+	}
+	s.retryLatchedMarkers(ctx)
+
+	s.capHealthMu.Lock()
+	s.capPeerOpCycle++
+	reserved := s.capPeerOpCycle%capFreshnessReserveEvery == 0
+	s.capHealthMu.Unlock()
+
+	if reserved {
+		s.checkOneCapabilityHealth(ctx)
+		return
+	}
+	if !s.activateOneUnlatched(ctx) {
+		s.checkOneCapabilityHealth(ctx)
+	}
 }
 
 // checkOneCapabilityHealth does ONE bounded freshness check per cycle: it round-robins

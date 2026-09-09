@@ -113,6 +113,91 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 	}
 }
 
+// stubbornGate is recordingGate where the named tokens never confirm: Enforced
+// records the attempt and returns false, leaving them unlatched forever. That is
+// not a fault — a config-uniformity token switched on here but not yet on one
+// peer behaves exactly this way for the whole of a staged rollout.
+type stubbornGate struct {
+	recordingGate
+	stuck map[string]bool
+}
+
+func (g *stubbornGate) Enforced(ctx context.Context, token string) bool {
+	if g.stuck[token] {
+		g.mu.Lock()
+		g.enforced = append(g.enforced, token)
+		g.mu.Unlock()
+		return false
+	}
+	return g.recordingGate.Enforced(ctx, token)
+}
+
+// TestActivateOneUnlatched_AStuckTokenDoesNotStarveTheOnesAfterIt: the drive
+// must rotate.
+//
+// It used to restart at index 0 every cycle and take the first unlatched
+// enabled token it found, so a token that cannot currently confirm absorbed
+// every cycle and nothing after it in Supported() was ever driven. The only
+// caller of Enforced for lease_term_ledger_v1 is this drive — the mint gate and
+// readiness both read DurablyLatched, which never latches anything — so a
+// starved token means no term is ever minted, on a cluster that looks healthy
+// and logs nothing about it. split_brain_gate_v1 was immune only by being first
+// in the slice.
+func TestActivateOneUnlatched_AStuckTokenDoesNotStarveTheOnesAfterIt(t *testing.T) {
+	g := &stubbornGate{stuck: map[string]bool{capabilities.SplitBrainGateV1: true}}
+	s := &Server{gate: g}
+
+	// Generously more cycles than Supported() is long, so a rotating drive
+	// reaches everything and a restarting one still reaches only the first.
+	for i := 0; i < 4*len(capabilities.Supported()); i++ {
+		s.activateOneUnlatched(context.Background())
+	}
+
+	if !g.Latched(capabilities.LeaseTermLedgerV1) {
+		t.Errorf("lease_term_ledger_v1 never latched across %d cycles while %q sat unconfirmable. "+
+			"It is 21st in Supported() behind ten flag-gated tokens, and this drive is its "+
+			"only activation path — starved, the ledger stays unwritable forever with "+
+			"nothing in the logs", 4*len(capabilities.Supported()), capabilities.SplitBrainGateV1)
+	}
+	if g.Latched(capabilities.SplitBrainGateV1) {
+		t.Error("the stuck token latched; the fixture is not reproducing an unconfirmable token")
+	}
+}
+
+// TestSpendCapabilityPeerOp_FreshnessRunsWhileActivationIsStuck: the freshness
+// axis must not be starved by the activation axis.
+//
+// checkOneCapabilityHealth used to run only when activation had nothing to
+// drive. That held while the only flag-less token was split_brain_gate_v1,
+// which latches on any homogeneous fleet, so the drive reached a fixed point.
+// A mandatory token that cannot latch until the last host is upgraded makes the
+// drive claim every cycle for the whole roll — and permanently on a cluster
+// deliberately held with one host back, which the operating model blesses as
+// by-design. checkOneCapabilityHealth is the ONLY post-latch regression
+// detector, so a peer that rolls back or stops advertising an already-latched
+// token went undetected, and capHealthLast stayed empty long enough that
+// evaluateHADegraded's `latched && (!checked || lastOK)` degenerated to
+// `latched`.
+func TestSpendCapabilityPeerOp_FreshnessRunsWhileActivationIsStuck(t *testing.T) {
+	g := &stubbornGate{stuck: map[string]bool{capabilities.SplitBrainGateV1: true}}
+	s := &Server{gate: g}
+
+	for i := 0; i < 2*capFreshnessReserveEvery; i++ {
+		s.spendCapabilityPeerOp(context.Background())
+	}
+
+	s.capHealthMu.Lock()
+	checked := len(s.capHealthLast)
+	s.capHealthMu.Unlock()
+
+	if checked == 0 {
+		t.Errorf("no capability freshness check ran in %d cycles while activation was stuck; "+
+			"post-latch regression detection is off for the whole roll, and "+
+			"evaluateHADegraded then treats `latched` alone as healthy",
+			2*capFreshnessReserveEvery)
+	}
+}
+
 // TestDriveCapabilityActivation_LatchedRetriesDespiteFlagOff proves the reorder that makes canonical
 // registry acceptance become DURABLE: an ALREADY-latched token is driven (Enforced → retry marker
 // persistence) even when its config flag is now OFF, so a marker that hasn't persisted yet still

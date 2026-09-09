@@ -322,6 +322,17 @@ type Server struct {
 	// down and no capability problem at all. Guarded by capHealthMu.
 	capHealthCause  map[string]string
 	capHealthCursor int
+	// capDriveCursor round-robins the ACTIVATION drive over Supported(). Without
+	// it the drive restarted at index 0 every cycle and spent its one peer op on
+	// the first unlatched enabled token, so a token that cannot currently latch —
+	// a config-uniformity flag switched on here but not yet on a peer — consumed
+	// every cycle and starved every token after it indefinitely. Guarded by
+	// capHealthMu.
+	capDriveCursor int
+	// capPeerOpCycle counts HA-monitor cycles so a share of them can be reserved
+	// for the freshness axis even while activation is incomplete. Guarded by
+	// capHealthMu.
+	capPeerOpCycle int
 	// isolationCursor round-robins the §A self-reported-quarantine check
 	// (one peer per HA cycle). Guarded by capHealthMu.
 	isolationCursor int

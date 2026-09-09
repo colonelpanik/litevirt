@@ -278,8 +278,33 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	//     would clear nothing.
 	prev, existed := c.unresolvedTies[key]
 	isNew := !existed || prev.pair != pair
-	if isNew || prev.acknowledged != acknowledged {
+
+	// An ACKNOWLEDGED observation must never displace a tracked UNACKNOWLEDGED
+	// one for the same row. The register holds a single entry per (table, PK),
+	// so a plain overwrite let a routine re-merge of an already-answered pair
+	// erase a live conflict: with three versions in play, an operator
+	// acknowledges A–B, a merge from C registers the unacknowledged A–C, and the
+	// next ordinary merge from B puts {A–B, acknowledged} back in its place. The
+	// unacknowledged divergence then vanished from liveTieCountLocked, from
+	// UnresolvedTieCategories, and so from the owner-epoch latch and
+	// ha.lww.unresolved — with no repair and no operator ever answering for it.
+	//
+	// This is the case the comment above says cannot happen ("a stale
+	// acknowledgement is inert — it cannot mask the live divergence"). Exact-pair
+	// suppression does make it inert on the SUPPRESSION path; masking came in
+	// through the overwrite instead.
+	//
+	// Keeping prev does not strand the remedy. Acknowledgement is single-slot
+	// per row, so acknowledging A–C moves the slot there, and the next
+	// observation of A–C finds acknowledged=true and marks the entry — while
+	// A–B, no longer covered by any acknowledgement, is correctly free to
+	// register as live again.
+	supersededByAck := existed && acknowledged && !prev.acknowledged && prev.pair != pair
+
+	livenessMoved := !existed
+	if !supersededByAck && (isNew || prev.acknowledged != acknowledged) {
 		c.unresolvedTies[key] = unresolvedTie{pair: pair, category: category, acknowledged: acknowledged}
+		livenessMoved = livenessMoved || (existed && prev.acknowledged != acknowledged)
 	}
 	if !existed {
 		// unresolvedLen mirrors EVERY entry, acknowledged included: it is the
@@ -287,10 +312,20 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 		// entry must still be cleared when its row converges — otherwise the
 		// digest keeps attributing a tie to a table that is now clean.
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
-		// Export the gauge WHILE holding tieMu so concurrent track/clear exports
-		// serialize in mutation order — the gauge can never settle on a stale
-		// (backwards) value due to callback reordering. The prometheus Set is a
-		// cheap atomic store and never re-enters our locks.
+	}
+	// Re-export whenever the LIVE count can have moved, which is on a new entry
+	// AND on an existing entry whose acknowledged state flipped. Gating this on
+	// !existed alone left the gauge stale in the direction that matters: after an
+	// acknowledgement drops it to zero, a fresh unacknowledged pair on that same
+	// row makes the register live again while the gauge kept reading zero until
+	// some unrelated operation happened to refresh it — so metric-based alerting
+	// missed the new contest entirely.
+	//
+	// Exported WHILE holding tieMu so concurrent track/clear exports serialize in
+	// mutation order — the gauge can never settle on a stale (backwards) value
+	// due to callback reordering. The prometheus Set is a cheap atomic store and
+	// never re-enters our locks.
+	if livenessMoved {
 		c.observeUnresolvedTieCurrent(c.liveTieCountLocked())
 	}
 	c.tieMu.Unlock()

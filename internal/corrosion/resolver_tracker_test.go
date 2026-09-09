@@ -676,6 +676,99 @@ func TestAcknowledgedTie_StaysVisibleToTheStateDigest(t *testing.T) {
 	}
 }
 
+// TestTrackUnresolvedPair_AnAckedPairDoesNotEraseALiveOne: re-observing an
+// already-answered divergence must not remove a different, unanswered one.
+//
+// The register holds one entry per (table, PK), and a plain overwrite meant an
+// ordinary merge could erase a live conflict. Three versions of a row are
+// enough: the operator acknowledges A–B, a merge from C registers the
+// unacknowledged A–C, and the next routine merge from B puts the acknowledged
+// A–B back in its place. The unanswered divergence then disappears from
+// UnresolvedTieCount, from UnresolvedTieCategories, and so from the owner-epoch
+// latch and ha.lww.unresolved — with no repair and nobody having answered for
+// it.
+//
+// trackUnresolvedPair's own comment asserts this cannot happen: "a stale
+// acknowledgement is inert — it cannot mask the live divergence". It is inert on
+// the SUPPRESSION path, which demands an exact pair match. Masking arrived
+// through the overwrite instead.
+func TestTrackUnresolvedPair_AnAckedPairDoesNotEraseALiveOne(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	// A–B is observed and the operator answers for it.
+	c.trackUnresolvedPair("vms", "vm1", "pair-ab", pathAE, TieCategoryRuntimeOwned)
+	if ok, err := c.AcknowledgeUnresolvedTie(ctx, "vms", "vm1", "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+	if n := c.UnresolvedTieCount(); n != 0 {
+		t.Fatalf("live count = %d right after the acknowledgement, want 0", n)
+	}
+
+	// A third node's version arrives: a DIFFERENT divergence, unanswered.
+	c.trackUnresolvedPair("vms", "vm1", "pair-ac", pathAE, TieCategoryRuntimeOwned)
+	if n := c.UnresolvedTieCount(); n != 1 {
+		t.Fatalf("live count = %d after a new unacknowledged pair, want 1; the rest of this "+
+			"test is vacuous", n)
+	}
+
+	// An ordinary re-merge from B re-observes the pair that WAS acknowledged.
+	c.trackUnresolvedPair("vms", "vm1", "pair-ab", pathAE, TieCategoryRuntimeOwned)
+
+	if n := c.UnresolvedTieCount(); n != 1 {
+		t.Errorf("live count = %d after re-observing the acknowledged pair, want 1. The "+
+			"unanswered A–C conflict was overwritten by an answered one, so the "+
+			"owner-epoch latch and ha.lww.unresolved both go clean on a row that is "+
+			"still divergent and still unreviewed", n)
+	}
+	if n := c.UnresolvedTieCategories()[TieCategoryRuntimeOwned]; n != 1 {
+		t.Errorf("category count = %d, want 1 — this map is what readiness and the "+
+			"owner-epoch latch consult", n)
+	}
+}
+
+// TestTrackUnresolvedPair_TheGaugeFollowsAReturnToUnresolved: the exported
+// gauge must move when an entry's live state changes, not only when a key first
+// appears.
+//
+// The re-export was gated on !existed, which left the gauge stale in exactly
+// the direction that matters. An acknowledgement drops it to zero; a fresh
+// unacknowledged pair on that same row makes the register live again, but the
+// gauge kept reading zero until some unrelated operation happened to refresh
+// it. Metric-based alerting therefore missed the new contest entirely, which is
+// the whole purpose of the gauge.
+func TestTrackUnresolvedPair_TheGaugeFollowsAReturnToUnresolved(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	m := &fakeSyncMetrics{}
+	c.SetSyncMetrics(m)
+
+	c.trackUnresolvedPair("vms", "vm1", "pair-ab", pathAE, TieCategoryRuntimeOwned)
+	if ok, err := c.AcknowledgeUnresolvedTie(ctx, "vms", "vm1", "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+
+	m.mu.Lock()
+	afterAck := m.unresolvedCurrent
+	m.mu.Unlock()
+	if afterAck != 0 {
+		t.Fatalf("gauge = %d after acknowledgement, want 0; the rest of this test is vacuous", afterAck)
+	}
+
+	// The operator's answer is then superseded by a genuinely new divergence.
+	c.trackUnresolvedPair("vms", "vm1", "pair-ac", pathAE, TieCategoryRuntimeOwned)
+
+	m.mu.Lock()
+	afterNew := m.unresolvedCurrent
+	m.mu.Unlock()
+	if afterNew != 1 {
+		t.Errorf("gauge = %d after a new unacknowledged pair on an acknowledged row, want 1. "+
+			"The register knows it is live again (UnresolvedTieCount = %d) but the "+
+			"exported value stayed put, so nothing alerts on the new contest",
+			afterNew, c.UnresolvedTieCount())
+	}
+}
+
 // TestAcknowledgedTie_StopsBeingAttributedOnceTheRowConverges is the other half:
 // a stale acknowledgement must not keep attributing a tie to a table that is
 // now clean, or the digest annotation starts masking real drift.

@@ -70,6 +70,9 @@ type Reconciler struct {
 	// and validates/claims the linked runtime_action_proofs row before starting.
 	// nil disables gating (tests that don't exercise it). See SetGate.
 	gate runtimeGate
+
+	// leaseTermGate judges a pending proof's lease term. See SetLeaseTermGate.
+	leaseTermGate LeaseTermGate
 	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
 	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
 	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
@@ -120,6 +123,11 @@ func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord)
 }
 
 // runtimeGate is the subset of *Checker the reconciler needs (injectable for tests).
+// LeaseTermGate judges a proof read off the replicated row and returns the
+// fence its claim must carry (nil = unfenced), or a countable refusal reason
+// and an error. Implemented by grpcapi.
+type LeaseTermGate func(ctx context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error)
+
 type runtimeGate interface {
 	ExecutionGate(ctx context.Context) GateResult
 	CapabilityActive(ctx context.Context, token string) (bool, string)
@@ -141,6 +149,16 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetLeaseTermGate injects the executor-side lease-term judgment for a pending
+// proof (grpcapi's LeaseTermGateForPendingProof).
+//
+// Injected rather than implemented here because internal/grpcapi imports this
+// package: the barrier, the closed key set and the two-arm check all live
+// there, and a second copy of a quorum comparison would diverge as a wrong
+// verdict rather than a compile error. nil leaves the path exactly as it was
+// before Phase 2.
+func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
 
 // SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
 // (enforcement.owner_epoch; the daemon wires it).
@@ -846,7 +864,51 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			return
 		}
 		proofFenceEpoch = pr.FenceEpoch
-		if err := corrosion.ClaimActionProof(ctx, r.db, proofID, r.hostName); err != nil {
+
+		// Lease-term enforcement (Phase 2), EXECUTE side. This is the SECOND
+		// executor trust boundary and it is easy to miss: a reschedule proof
+		// never travels over an RPC, so grpcapi's claimCarriedProof — where the
+		// rest of this regime lives — is never reached on the failover path.
+		// The coordinator writes the row with the pending marker and this
+		// reconciler claims it straight off replication. Without the check
+		// here, a superseded coordinator's reschedules execute exactly as they
+		// did before the feature existed, while every other proof path is
+		// gated.
+		//
+		// The judgment is INJECTED (see SetLeaseTermGate) rather than
+		// reimplemented: it lives in internal/grpcapi, which imports this
+		// package, so this package cannot import it back. A second copy of a
+		// quorum comparison is the class of bug this phase has already paid for
+		// twice.
+		//
+		// Unwired = inert, which is deliberate. A nil gate here is the
+		// pre-Phase-2 daemon, not a refusal: the enforcement decision is inside
+		// the injected function, which answers "no fence, no refusal" whenever
+		// the token is unlatched or the flag is off.
+		var termFence *corrosion.TermFence
+		if r.leaseTermGate != nil {
+			fence, reason, terr := r.leaseTermGate(ctx, pr)
+			if terr != nil {
+				slog.Warn("reconciler: pending proof refused by the lease-term gate",
+					"vm", vm.Name, "proof", proofID, "reason", reason, "error", terr)
+				r.noteGateRefused(corrosion.ActionReschedule, reason)
+				return
+			}
+			termFence = fence
+		}
+
+		if err := corrosion.ClaimActionProofFenced(ctx, r.db, proofID, r.hostName, termFence); err != nil {
+			if errors.Is(err, corrosion.ErrTermClaimantConflict) {
+				// This host already acted at this (key, term) for a different
+				// coordinator. Distinct from a spent proof: the proof is fine,
+				// the CLAIMANT is the problem.
+				slog.Warn("reconciler: this host has already acted at this lease term for another "+
+					"coordinator — refusing start",
+					"vm", vm.Name, "proof", proofID, "term", pr.LeaseTerm,
+					"key", pr.LeaseKey, "coordinator", pr.Coordinator)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleLeaseTerm)
+				return
+			}
 			if errors.Is(err, corrosion.ErrProofSpent) {
 				slog.Warn("reconciler: pending proof terminal/missing, refusing start",
 					"vm", vm.Name, "proof", proofID)

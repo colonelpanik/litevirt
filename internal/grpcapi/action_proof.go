@@ -253,6 +253,22 @@ func (s *Server) leaseTermFenceFor(ctx context.Context, p *pb.RuntimeActionProof
 // fenced. Collapsing them loses the only signal that separates the mechanism
 // working from the mechanism degraded.
 func (s *Server) checkProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionProof, action, targetName string) error {
+	reason, err := s.judgeProofLeaseTerm(ctx, p, action, targetName)
+	if err != nil {
+		s.noteGateRefused(action, reason)
+	}
+	return err
+}
+
+// judgeProofLeaseTerm is checkProofLeaseTerm's policy without the metric, and
+// returns the countable reason alongside the error.
+//
+// Split out so a caller in ANOTHER package can count the refusal on its own
+// observer. internal/health's reconciler is that caller: a VM reschedule proof
+// never travels over an RPC, so it claims one off the replicated row and needs
+// this exact judgment — but noting it here as well would count one refusal on
+// two metrics.
+func (s *Server) judgeProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionProof, action, targetName string) (string, error) {
 	term, key := p.GetLeaseTerm(), p.GetLeaseKey()
 
 	// An UNSTAMPED proof: term 0 with no key. Refused only for the actions whose
@@ -261,21 +277,19 @@ func (s *Server) checkProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionPro
 	// already had.
 	if term == 0 && key == "" {
 		if leaseTermRequiredActions[action] {
-			s.noteGateRefused(action, health.ReasonStaleLeaseTerm)
-			return status.Errorf(codes.FailedPrecondition,
+			return health.ReasonStaleLeaseTerm, status.Errorf(codes.FailedPrecondition,
 				"runtime-action proof %s carries no lease term; refusing %s of %s "+
 					"(lease_term_v1 is enforced and every producer of this action holds a lease)",
 				p.GetId(), action, targetName)
 		}
-		return nil
+		return "", nil
 	}
 
 	// A HALF-stamped proof is malformed however it got that way: a term without
 	// a key cannot be judged against any ledger, and a key without a term names
 	// a ledger with nothing to compare. Neither is something a producer emits.
 	if term <= 0 || !corrosion.ValidLeaseKey(key) {
-		s.noteGateRefused(action, health.ReasonStaleLeaseTerm)
-		return status.Errorf(codes.FailedPrecondition,
+		return health.ReasonStaleLeaseTerm, status.Errorf(codes.FailedPrecondition,
 			"runtime-action proof %s carries lease term %d for key %q, which is not a judgeable "+
 				"pair; refusing %s of %s", p.GetId(), term, key, action, targetName)
 	}
@@ -283,13 +297,11 @@ func (s *Server) checkProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionPro
 	verdict, threshold := s.leaseTermBarrier(ctx, key, term)
 	switch verdict {
 	case leaseTermUnconfirmed:
-		s.noteGateRefused(action, health.ReasonLeaseTermUnconfirmed)
-		return status.Errorf(codes.Unavailable,
+		return health.ReasonLeaseTermUnconfirmed, status.Errorf(codes.Unavailable,
 			"cannot establish the quorum-observed lease term for %q; refusing %s of %s rather than "+
 				"acting on this node's own possibly-stale replica", key, action, targetName)
 	case leaseTermStale:
-		s.noteGateRefused(action, health.ReasonStaleLeaseTerm)
-		return status.Errorf(codes.FailedPrecondition,
+		return health.ReasonStaleLeaseTerm, status.Errorf(codes.FailedPrecondition,
 			"runtime-action proof %s is at lease term %d, below the quorum-observed %d; refusing %s of %s",
 			p.GetId(), term, threshold, action, targetName)
 	}
@@ -304,19 +316,47 @@ func (s *Server) checkProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionPro
 	// covers the case this arm cannot see.
 	holder, found, err := corrosion.LeaseTermHolder(ctx, s.db, key, term)
 	if err != nil {
-		s.noteGateRefused(action, health.ReasonLeaseTermUnconfirmed)
-		return status.Errorf(codes.Unavailable,
+		return health.ReasonLeaseTermUnconfirmed, status.Errorf(codes.Unavailable,
 			"read the holder of lease term %d for %q: %v", term, key, err)
 	}
 	if found && holder != p.GetCoordinator() {
 		// Compared against Coordinator, not LeaseHolder: leaseSnapshot returns ""
 		// on a read error by design ("an honesty record must not FABRICATE a
 		// holder"), so LeaseHolder can be empty on a perfectly valid proof.
-		s.noteGateRefused(action, health.ReasonStaleLeaseTerm)
-		return status.Errorf(codes.FailedPrecondition,
+		return health.ReasonStaleLeaseTerm, status.Errorf(codes.FailedPrecondition,
 			"runtime-action proof %s claims lease term %d of %q as %q, but this node recorded that "+
 				"term to %q; refusing %s of %s",
 			p.GetId(), term, key, p.GetCoordinator(), holder, action, targetName)
 	}
-	return nil
+	return "", nil
+}
+
+// LeaseTermGateForPendingProof is the executor-side lease-term gate for a proof
+// read off the REPLICATED ROW rather than received over an RPC.
+//
+// It exists because claimCarriedProof is not the only executor trust boundary,
+// which the plan for this phase assumed it was. A VM reschedule proof — the
+// action this whole regime exists for — never travels over an RPC: the
+// coordinator writes the row with a pending marker and the DESTINATION's
+// internal/health reconciler picks it up from replication, validates it inline
+// and claims it itself. A check added only to claimCarriedProof therefore runs
+// on every proof path EXCEPT failover.
+//
+// The judgment is not duplicated for that caller. internal/grpcapi imports
+// internal/health, so health cannot import back; the daemon injects this method
+// into the reconciler instead. Everything policy-shaped stays here, in the one
+// place it is already tested.
+//
+// Returns the fence to claim with (nil = unfenced), and on refusal a countable
+// reason plus the error. The reason is returned rather than counted here so the
+// reconciler counts it on its own observer — one refusal, one metric.
+func (s *Server) LeaseTermGateForPendingProof(ctx context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error) {
+	if !s.leaseTermEnforced(ctx) {
+		return nil, "", nil
+	}
+	p := proofToPB(pr.ActionProof)
+	if reason, err := s.judgeProofLeaseTerm(ctx, p, pr.Action, pr.TargetName); err != nil {
+		return nil, reason, err
+	}
+	return s.leaseTermFenceFor(ctx, p), "", nil
 }

@@ -8,6 +8,17 @@ import (
 
 var leaseTestNow = time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 
+// mutationRows counts replicated mutations, for tests asserting that a path
+// writes nothing to a peer's replication stream.
+func mutationRows(t *testing.T, c *Client) int {
+	t.Helper()
+	var n int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM mutation_log`).Scan(&n); err != nil {
+		t.Fatalf("count mutation_log: %v", err)
+	}
+	return n
+}
+
 // seedTerm writes one term row directly, for tests that need a specific ledger
 // state without going through acquisition.
 func seedTerm(t *testing.T, c *Client, key string, term int64, holder string) {
@@ -384,6 +395,163 @@ func TestAcquireLeaseWithTerm_UnwiredGateFailsClosed(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("%d term row(s) written with no gate wired", len(rows))
+	}
+}
+
+// TestAcquireLeaseWithTerm_GateClosedKeepsRenewingOverAForeignTerm: a node that
+// cannot mint must keep renewing a lease it holds even when the ledger's newest
+// term belongs to somebody else.
+//
+// This is the state a gate-closed takeover LANDS IN, so it is not an edge case:
+// the previous holder minted a term while the gate was open for it, its lease
+// then lapsed, and this node — a fresh host, a wiped dataDir, a failed marker
+// write, or simply a node whose per-node latch has not formed yet — took the
+// lease over without a term.
+//
+// The classification arm for "a peer's term is newer than ours" fails closed,
+// which is correct when we can mint: minting there would promote the loser of
+// the term race above its winner and invert fencing. But a node that mints
+// nothing has no escalation to prevent, and refusing there reported held=false
+// while our own leader_election row still named us — so the lease was neither
+// renewed nor transferable, and the guarded upsert locked every peer out until
+// it expired. All three consumers stood down for most of every TTL, on the one
+// path whose stated contract is that availability is unaffected.
+func TestAcquireLeaseWithTerm_GateClosedKeepsRenewingOverAForeignTerm(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetLeaseTermLedgerGate(func() bool { return false })
+
+	// node-b held this lease, minted term 1, and let it lapse.
+	seedTerm(t, c, LeaseKeyFailover, 1, "node-b")
+	seedLease(t, c, LeaseKeyFailover, "node-b", leaseTestNow.Add(-time.Minute))
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "node-a", time.Minute, leaseTestNow)
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	if !held || term != 0 {
+		t.Fatalf("takeover gave held=%v term=%d, want held=true term=0", held, term)
+	}
+
+	// The renewals are the actual regression: the takeover always worked.
+	for i, at := range []time.Time{
+		leaseTestNow.Add(time.Second),
+		leaseTestNow.Add(2 * time.Second),
+		leaseTestNow.Add(3 * time.Second),
+	} {
+		held, term, err = AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "node-a", time.Minute, at)
+		if err != nil {
+			t.Fatalf("renewal %d: %v", i+1, err)
+		}
+		if !held {
+			t.Fatalf("renewal %d reported the lease lost while node-a still holds the row; "+
+				"nothing can take it either (the upsert needs it expired or its own), so "+
+				"failover, rebalancing and dual-run detection all stop until it lapses", i+1)
+		}
+		if term != 0 {
+			t.Errorf("renewal %d gave term %d, want 0 — node-b's term is not ours to report", i+1, term)
+		}
+	}
+
+	// node-b's ledger row is untouched: we never had permission to write here.
+	newest, err := newestLeaseTerm(ctx, c, LeaseKeyFailover)
+	if err != nil {
+		t.Fatalf("newestLeaseTerm: %v", err)
+	}
+	if newest.Term != 1 || newest.Holder != "node-b" {
+		t.Errorf("ledger newest = %+v, want term 1 held by node-b", newest)
+	}
+}
+
+// TestAcquireLeaseWithTerm_GateClosedReportsNoTermAcrossALapse: once the gate
+// closes, this node's OWN surviving ledger row stops being a description of its
+// current tenure, and must not be reported as one.
+//
+// A term is a claim about one unbroken tenure. With the gate open that
+// correspondence is maintained by the mint: a lease that fully lapsed and was
+// re-taken by its own prior holder classifies as a NEW tenure and gets a fresh
+// term, because the lapse is exactly the window in which other nodes were
+// entitled to act. A node that cannot mint cannot re-establish it — so after a
+// lapse its row says only "this node held some earlier tenure", and handing back
+// that number stamps work done after the lapse with the term from before it.
+func TestAcquireLeaseWithTerm_GateClosedReportsNoTermAcrossALapse(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	open := true
+	c.SetLeaseTermLedgerGate(func() bool { return open })
+
+	if _, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyRebalancer, "node-a", time.Minute, leaseTestNow); err != nil || term != 1 {
+		t.Fatalf("gate-open acquire: term=%d err=%v, want term 1", term, err)
+	}
+
+	// The latch is gone — a restart before it re-forms, or a failed marker
+	// write — and the lease lapses while it is down.
+	open = false
+	lapsed := leaseTestNow.Add(2 * time.Minute)
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyRebalancer, "node-a", time.Minute, lapsed)
+	if err != nil {
+		t.Fatalf("re-take after lapse: %v", err)
+	}
+	if !held {
+		t.Fatal("could not re-take our own expired lease with the gate closed")
+	}
+	if term != 0 {
+		t.Errorf("re-take after lapse gave term %d, want 0", term)
+	}
+
+	// The poll after the re-take is where the stale number surfaced: the row is
+	// live and names us again, and the ledger still holds our pre-lapse term.
+	held, term, err = AcquireLeaseWithTerm(ctx, c, LeaseKeyRebalancer, "node-a", time.Minute, lapsed.Add(time.Second))
+	if err != nil {
+		t.Fatalf("poll after re-take: %v", err)
+	}
+	if !held {
+		t.Fatal("lost the lease on the poll after re-taking it")
+	}
+	if term != 0 {
+		t.Errorf("poll after re-take gave term %d — that is the PRE-LAPSE term, reported for a "+
+			"tenure this node could not record; every proof it stamps claims a fencing "+
+			"position it no longer holds", term)
+	}
+}
+
+// TestAcquireLeaseWithTerm_GateClosedNonHolderWritesNothing: a losing poll must
+// not write.
+//
+// The upsert is a zero-row no-op when another node holds a live lease — its
+// ON CONFLICT ... WHERE takes the row only when the lease is expired or already
+// ours — but both write paths log the statements they were GIVEN rather than the
+// ones that changed anything, so a no-op still appends to mutation_log and wakes
+// the replicator. Before the gate existed the non-holder never reached the
+// statement at all: its guard declined inside the transaction and nothing was
+// written. Routing that case through the bare upsert turned every non-holder into
+// a steady source of replicated no-ops — (N-1) nodes x 3 lease keys x every poll
+// tick — onto the exact stream the gate exists to keep quiet, for as long as the
+// gate stays closed.
+func TestAcquireLeaseWithTerm_GateClosedNonHolderWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.SetLeaseTermLedgerGate(func() bool { return false })
+
+	seedLease(t, c, LeaseKeyDualRun, "node-b", leaseTestNow.Add(time.Minute))
+
+	before := mutationRows(t, c)
+	for i := 0; i < 3; i++ {
+		held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyDualRun, "node-a",
+			time.Minute, leaseTestNow.Add(time.Duration(i)*time.Second))
+		if err != nil {
+			t.Fatalf("losing poll %d: %v", i+1, err)
+		}
+		if held || term != 0 {
+			t.Fatalf("losing poll %d gave held=%v term=%d against node-b's live lease", i+1, held, term)
+		}
+	}
+	if after := mutationRows(t, c); after != before {
+		t.Errorf("%d replicated mutation(s) written by %d losing polls, want 0; a no-op upsert "+
+			"still logs and notifies, so every non-holder feeds the stream the gate is "+
+			"meant to keep quiet", after-before, 3)
 	}
 }
 

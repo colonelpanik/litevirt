@@ -70,6 +70,28 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		if err != nil {
 			return false, 0, err
 		}
+
+		// The ledger is not writable yet: hold the lease the pre-ledger way and
+		// report no term. This is the mid-rolling-upgrade state — a peer on the
+		// previous release cannot resolve the mint's statement shape, and an
+		// unregistered shape back-pressures its entire replication stream — so the
+		// mint waits for DurablyLatched(lease_term_ledger_v1). See
+		// SetLeaseTermLedgerGate.
+		//
+		// This runs BEFORE any ledger classification, and that ordering is the
+		// whole point. The classification below fails closed on a term belonging
+		// to another holder, which is right when we can mint — it stops this node
+		// promoting itself above the term race's winner — but a node that mints
+		// NOTHING has no escalation to prevent, and refusing there returned
+		// held=false while our own leader_election row still named us and still
+		// blocked every peer's guarded upsert. The lease stopped being renewed and
+		// could not transfer, so failover, rebalancing and dual-run detection all
+		// stood down for most of every TTL, indefinitely, on a path whose contract
+		// is that availability is unaffected.
+		if !c.MayMintLeaseTerm() {
+			return holdLeaseWithoutTerm(ctx, c, key, holder, expires, nowRFC, curHolder, curExpires)
+		}
+
 		newest, err := newestLeaseTerm(ctx, c, key)
 		if err != nil {
 			return false, 0, err
@@ -121,25 +143,6 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
-		// The ledger is not writable yet: take the lease the pre-ledger way and
-		// report no term. This is the mid-rolling-upgrade state — a peer on the
-		// previous release cannot resolve the mint's statement shape, and an
-		// unregistered shape back-pressures its entire replication stream — so the
-		// mint waits for DurablyLatched(lease_term_ledger_v1), which cannot form
-		// while such a peer is still listening. See SetLeaseTermLedgerGate.
-		//
-		// Availability is deliberately unaffected: the lease itself still
-		// transfers, so failover, rebalancing and dual-run detection keep working
-		// exactly as they did before terms existed. Only enforcement is withheld,
-		// and it refuses on term 0 by design.
-		if !c.MayMintLeaseTerm() {
-			held, err := renewLease(ctx, c, key, holder, expires, nowRFC)
-			if err != nil {
-				return false, 0, err
-			}
-			return held, 0, nil
-		}
-
 		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, now)
 		if err != nil {
 			return false, 0, err
@@ -154,6 +157,39 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 	}
 	// Contention never settled. Reported as "not held", never as an error.
 	return false, 0, nil
+}
+
+// holdLeaseWithoutTerm is the entire lease path while the term ledger is not
+// writable — the pre-ledger behaviour, reproduced exactly.
+//
+// The term is ALWAYS 0 here, including when this key's ledger already holds a
+// row naming us. A term is a claim about one unbroken tenure, and only the mint
+// re-establishes that correspondence: with the gate open, a lease that lapsed
+// and was re-taken by its own prior holder classifies as a new tenure and mints
+// a fresh term, so the ledger row and the tenure stay in step. A node that
+// cannot mint cannot do that, so a surviving row says only "this node held some
+// earlier tenure" — reporting its term would hand out the PRE-LAPSE number for
+// work done after the lapse, which is the staleness AcquireLeaseWithTerm's
+// expiry check exists to prevent. Withholding it costs nothing that is not
+// already withheld: enforcement refuses on term 0 by design, and
+// LeaseTermReadiness withholds lease_term_v1 for exactly this reason.
+//
+// A peer's live lease short-circuits before the upsert. The statement would be
+// a zero-row no-op — its ON CONFLICT ... WHERE takes the row only when the
+// lease is expired or already ours — but a no-op still writes a mutation_log
+// row and wakes the replicator, because both write paths log the statements they
+// were GIVEN rather than the ones that changed anything. Every non-holder
+// polling three lease keys would then emit sustained replicated no-ops onto the
+// stream this gate exists to keep quiet, for as long as the gate stays closed.
+func holdLeaseWithoutTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC, curHolder, curExpires string) (bool, int64, error) {
+	if curHolder != "" && curHolder != holder && curExpires >= nowRFC {
+		return false, 0, nil
+	}
+	held, err := renewLease(ctx, c, key, holder, expires, nowRFC)
+	if err != nil {
+		return false, 0, err
+	}
+	return held, 0, nil
 }
 
 // leaseContended is the sentinel takeLeaseAndMintTerm returns alongside

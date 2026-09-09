@@ -336,6 +336,19 @@ func startCheckers(t *testing.T, c *Cluster, gates map[string]*health.Checker) {
 			return state == health.QuorumYes
 		})
 	}
+	// Stop probing the moment quorum is established. The scenarios need the
+	// RESULT, not an ongoing loop: QuorumProof reads the peer state the probe
+	// cycle already recorded, and CapabilityActive drives the pinger directly
+	// rather than through this loop, so latching still works with it stopped.
+	//
+	// Left running, these are the first background goroutines this package has
+	// ever had, and they probe every peer every 2s over real mTLS for the rest
+	// of the test binary's run. Neighbouring timing-sensitive scenarios — the
+	// hardware_v2 latch tests lean on `eventually` against a 3s negative-cache
+	// TTL — were observed tipping over under that added load while passing in
+	// isolation. A test suite that makes its neighbours flaky has a cost even
+	// when its own assertions are sound.
+	cancel()
 }
 
 // latchLeaseTerm brings the whole fleet to a latched lease_term_v1.

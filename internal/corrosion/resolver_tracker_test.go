@@ -635,3 +635,69 @@ func TestAcknowledgeLeaseTermTie_WorksAtALargeTermNumber(t *testing.T) {
 		t.Errorf("register still holds %d tie(s)", n)
 	}
 }
+
+// TestAcknowledgedTie_StaysVisibleToTheStateDigest: an acknowledgement clears
+// DECISIONS, not the record that this row is divergent.
+//
+// Acknowledging does not converge anything — both claims stay in the ledger by
+// design — so this node's state digest still mismatches every peer afterwards.
+// UnresolvedTieTables is what a divergence report uses to attribute that
+// mismatch to a deliberate, operator-reviewed safety fault rather than to real
+// drift (grpcapi/sync.go feeds it into every digest response). Deleting the
+// entry on acknowledgement made the mismatch unattributable, which is a worse
+// answer than the permanently-dirty condition the acknowledgement exists to
+// clear.
+func TestAcknowledgedTie_StaysVisibleToTheStateDigest(t *testing.T) {
+	ctx := context.Background()
+	local, _ := contestedTermFixture(t)
+
+	if ok, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+
+	// The decision-driving views are clear...
+	if n := local.UnresolvedTieCount(); n != 0 {
+		t.Errorf("UnresolvedTieCount = %d after acknowledgement, want 0: this count drives "+
+			"ha.lww.unresolved and the owner-epoch latch, which is what the operator cleared", n)
+	}
+	if n := local.UnresolvedTieCategories()[TieCategoryImmutableLedger]; n != 0 {
+		t.Errorf("the ledger category still counts %d tie(s); readiness would keep withholding", n)
+	}
+
+	// ...and the attribution view is not.
+	if n := local.UnresolvedTieTables()["leader_lease_terms"]; n != 1 {
+		t.Errorf("UnresolvedTieTables reports %d tie(s) on leader_lease_terms, want 1. The two "+
+			"rows still disagree, so this node's digest still mismatches its peers — and this "+
+			"map is the only thing that says the mismatch is a reviewed safety fault rather "+
+			"than drift", n)
+	}
+	if n := local.TrackedTieCount(); n != 1 {
+		t.Errorf("TrackedTieCount = %d, want 1", n)
+	}
+}
+
+// TestAcknowledgedTie_StopsBeingAttributedOnceTheRowConverges is the other half:
+// a stale acknowledgement must not keep attributing a tie to a table that is
+// now clean, or the digest annotation starts masking real drift.
+func TestAcknowledgedTie_StopsBeingAttributedOnceTheRowConverges(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.trackUnresolvedPair("vms", "vm1", "pair-a", pathAE, TieCategoryRuntimeOwned)
+	if ok, err := c.AcknowledgeUnresolvedTie(ctx, "vms", "vm1", "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+	if n := c.UnresolvedTieTables()["vms"]; n != 1 {
+		t.Fatalf("attribution lost the acknowledged tie (%d); the rest of this test is vacuous", n)
+	}
+
+	// A remediating write lands and the row converges.
+	c.clearUnresolved("vms", "vm1")
+
+	if n := c.UnresolvedTieTables()["vms"]; n != 0 {
+		t.Errorf("UnresolvedTieTables still attributes %d tie(s) to vms after the row converged; "+
+			"a stale attribution masks real drift", n)
+	}
+	if n := c.TrackedTieCount(); n != 0 {
+		t.Errorf("TrackedTieCount = %d after the repair, want 0", n)
+	}
+}

@@ -116,16 +116,28 @@ capability token the way other cluster-wide behaviour changes do. Until then a
 term is an audit fact — make no availability decision on the strength of one.
 
 One narrow exception, so the earlier absolute is not misread. Since schema v52
-a runtime-action proof carries the term of the tenure that minted it, and that
-term is part of the field-match an executor runs between the proof it was
-handed and the proof row it has persisted — alongside the coordinator, the
-destination, the relocation token and the owner epoch. A mismatch there refuses
-the action, ungated, exactly as a mismatched relocation token already did. That
-is a check for a DIVERGENT PROOF ROW, not term enforcement: nothing compares the
-term against the lease ledger, against a quorum-observed maximum, or against
-any other node's view, and no proof-minting site sets a term yet, so both sides
-are 0 and the comparison is inert in practice. Real enforcement — refusing a
-superseded term — still arrives behind `lease_term_v1`.
+a runtime-action proof carries the term of the tenure that minted it, and since
+v53 the key of the lease that term belongs to. Both are part of the field-match
+an executor runs between the proof it was handed and the proof row it has
+persisted, alongside the action, the target kind and name, the coordinator, the
+destination, the relocation token, the fence epoch and the owner epoch —
+`corrosion.ProofBindingEqual` is the one definition of that set. A mismatch
+refuses the action, ungated, exactly as a mismatched relocation token already
+did.
+
+That is a check for a DIVERGENT PROOF ROW, not term enforcement. Nothing
+compares the term against the lease ledger, against a quorum-observed maximum,
+or against any other node's view; refusing a superseded term arrives behind
+`lease_term_v1`.
+
+It is not, however, inert. No proof-MINTING site sets a term yet, but a carried
+proof's term and key are seeded into `runtime_action_proofs` on receipt and
+replicate from there, so on any node that has received one the persisted side
+is caller-chosen rather than 0 and the field-match is live today. That is why
+the executor validates the key against the closed set before persisting it, and
+refuses a negative term outright: an unknown key would otherwise become a row's
+permanent authorization record, and enforcement reading a nonexistent ledger
+for it would find `MAX(term) = 0` and pass every proof naming it.
 
 To read the current terms:
 

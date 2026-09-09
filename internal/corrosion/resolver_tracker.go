@@ -122,6 +122,11 @@ func (c *Client) anyUnresolved() bool { return c.unresolvedLen.Load() > 0 }
 type unresolvedTie struct {
 	pair     string
 	category string
+	// acknowledged: an operator has stated they have seen THIS pair. The entry
+	// stays tracked so the state digest can still attribute a hash mismatch to
+	// it (the rows still disagree), but it stops driving decisions — the
+	// owner-epoch latch, the tie counts and the gauge all skip it.
+	acknowledged bool
 }
 
 // Tie categories: what a tie is ABOUT. A consumer decides which of these
@@ -251,30 +256,66 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	// stale acknowledgement is inert — it cannot mask the live divergence. And
 	// if the acknowledged pair is ever observed again, the operator did
 	// acknowledge precisely that, so staying quiet is the answer they gave.
-	if ack, ok := c.acknowledgedTies[key]; ok && ack == pair {
-		c.tieMu.Unlock()
-		return
-	}
+	ack, hasAck := c.acknowledgedTies[key]
+	acknowledged := hasAck && ack == pair
+
+	// An acknowledged tie is still TRACKED, marked. It is not deleted and not
+	// skipped, because "is this row currently divergent" and "should this
+	// divergence drive a decision" are different questions and one register
+	// answers both:
+	//
+	//   - UnresolvedTieTables feeds the cluster state digest, whose documented
+	//     job is to let a divergence report attribute a cross-host hash
+	//     mismatch to a deliberate safety-fault tie rather than real drift. The
+	//     two rows still disagree after an acknowledgement — that is the point,
+	//     the evidence stays — so this node's digest still mismatches every
+	//     peer. Dropping the entry left that mismatch looking like unattributed
+	//     drift, which is a worse answer than the permanently-dirty condition
+	//     the acknowledgement exists to clear.
+	//   - UnresolvedTieCategories feeds the owner-epoch latch and the tie
+	//     counts behind ha.lww.unresolved, which are DECISIONS. Those skip
+	//     acknowledged entries, and so does the gauge, or the operator's remedy
+	//     would clear nothing.
 	prev, existed := c.unresolvedTies[key]
 	isNew := !existed || prev.pair != pair
-	if isNew {
-		c.unresolvedTies[key] = unresolvedTie{pair: pair, category: category}
+	if isNew || prev.acknowledged != acknowledged {
+		c.unresolvedTies[key] = unresolvedTie{pair: pair, category: category, acknowledged: acknowledged}
 	}
 	if !existed {
+		// unresolvedLen mirrors EVERY entry, acknowledged included: it is the
+		// lock-free fast path for the clear-on-write hooks, and an acknowledged
+		// entry must still be cleared when its row converges — otherwise the
+		// digest keeps attributing a tie to a table that is now clean.
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
 		// Export the gauge WHILE holding tieMu so concurrent track/clear exports
 		// serialize in mutation order — the gauge can never settle on a stale
 		// (backwards) value due to callback reordering. The prometheus Set is a
 		// cheap atomic store and never re-enters our locks.
-		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
+		c.observeUnresolvedTieCurrent(c.liveTieCountLocked())
 	}
 	c.tieMu.Unlock()
 
-	if isNew {
+	// Neither alerted nor counted as a new tie when the operator has already
+	// answered for this exact divergence: a restart re-observes every
+	// acknowledged tie, and re-alerting on each one is the noise the durable
+	// acknowledgement exists to stop.
+	if isNew && !acknowledged {
 		c.observeTieUnresolved(table, string(path), category)
 		slog.Warn("lww: unresolved equal-timestamp tie (kept local, needs repair)",
 			"table", table, "pk", pk, "category", category, "path", string(path))
 	}
+}
+
+// liveTieCountLocked counts the tracked ties that still drive a decision — the
+// unacknowledged ones. Caller holds tieMu.
+func (c *Client) liveTieCountLocked() int {
+	n := 0
+	for _, t := range c.unresolvedTies {
+		if !t.acknowledged {
+			n++
+		}
+	}
+	return n
 }
 
 // clearUnresolved drops the tracked entry for (table,PK) — called when the row
@@ -285,7 +326,7 @@ func (c *Client) clearUnresolved(table, pk string) {
 		delete(c.unresolvedTies, unresolvedKey(table, pk))
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
 		// Export under the lock (see trackUnresolved) so the gauge can't regress.
-		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
+		c.observeUnresolvedTieCurrent(c.liveTieCountLocked())
 	}
 	c.tieMu.Unlock()
 }
@@ -330,6 +371,15 @@ func (c *Client) clearUnresolvedFromLocalStmt(s Statement) {
 func (c *Client) UnresolvedTieCount() int {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
+	return c.liveTieCountLocked()
+}
+
+// TrackedTieCount counts every tracked tie, acknowledged ones included — the
+// "is this row currently divergent" question, as against
+// UnresolvedTieCount's "is there something to act on".
+func (c *Client) TrackedTieCount() int {
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
 	return len(c.unresolvedTies)
 }
 
@@ -370,6 +420,19 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 	t, ok := c.unresolvedTies[key]
 	c.tieMu.Unlock()
 	if !ok {
+		return false, nil
+	}
+	if t.acknowledged {
+		// Already acknowledged. The entry is RETAINED rather than deleted (see
+		// unresolvedTie.acknowledged), so unlike the earlier delete-on-clear
+		// version a retry finds it right here — and must not re-record it,
+		// which would overwrite the original acknowledged_at and acknowledged_by
+		// with a later operator's. Nothing to write and nothing to clear.
+		//
+		// The answer is the same false a never-tracked tie gets, because in
+		// both cases this call changed nothing; TieAcknowledged is how a caller
+		// tells them apart, which is what lets the RPC re-emit a lost audit
+		// record on retry.
 		return false, nil
 	}
 
@@ -421,9 +484,12 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 		return true, nil
 	}
 	if still {
-		delete(c.unresolvedTies, key)
-		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
-		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
+		// MARKED, not deleted. The row is still divergent, so the digest's
+		// attribution must keep seeing it; what the acknowledgement stops is
+		// its effect on decisions. See unresolvedTie.acknowledged.
+		cur.acknowledged = true
+		c.unresolvedTies[key] = cur
+		c.observeUnresolvedTieCurrent(c.liveTieCountLocked())
 	}
 	return true, nil
 }
@@ -493,6 +559,13 @@ func (c *Client) UnresolvedTieCategories() map[string]int {
 	defer c.tieMu.Unlock()
 	out := make(map[string]int, len(c.unresolvedTies))
 	for _, t := range c.unresolvedTies {
+		// Acknowledged ties are excluded: this map drives the owner-epoch latch
+		// and the counts behind ha.lww.unresolved, and an acknowledgement is
+		// exactly the statement that those must stop firing. The digest's
+		// attribution still sees them, via UnresolvedTieTables.
+		if t.acknowledged {
+			continue
+		}
 		out[t.category]++
 	}
 	return out
@@ -501,6 +574,12 @@ func (c *Client) UnresolvedTieCategories() map[string]int {
 // UnresolvedTieTables returns the count of currently-tracked unresolved ties per table
 // (keys are the `table\x00pk` unresolvedKey form — split on the NUL). Lets a divergence
 // report attribute a cross-host hash mismatch to a deliberate safety-fault tie vs real drift.
+//
+// ACKNOWLEDGED ties are INCLUDED, unlike in UnresolvedTieCategories. An
+// acknowledgement does not converge the rows — both claims stay in the table by
+// design — so this node's digest still mismatches its peers afterwards, and
+// this map is the only thing that explains why. Excluding them turned a
+// deliberate, operator-reviewed safety fault into unattributed drift.
 func (c *Client) UnresolvedTieTables() map[string]int {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()

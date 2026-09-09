@@ -108,7 +108,9 @@ const evaluatorScanTTL = 5 * time.Minute
 //	           operator should be looking before the confirm lands);
 //	DEGRADED — active warning conditions, an evaluator without complete
 //	           coverage, a STALE evaluator (last scan past evaluatorScanTTL),
-//	           or an incomplete capacity observation;
+//	           or an incomplete capacity observation. Active INFO conditions do
+//	           NOT degrade: they are advisories, not faults (see the severity
+//	           branch below);
 //	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
 //	           last scan is stale (nothing is watching NOW, which is not the
 //	           same as nothing being wrong);
@@ -133,6 +135,31 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		}
 		if h.Severity == corrosion.SeverityCritical {
 			return HealthCritical
+		}
+		if h.Severity == corrosion.SeverityInfo {
+			// AN INFO CONDITION IS AN ADVISORY, NOT A FAULT, and the severity
+			// column is the only place that distinction can live. The three
+			// severities are a contract with the evaluators: critical means a
+			// workload is in danger now, warning means something is wrong and
+			// wants attention, and info means a state worth SEEING for as long
+			// as it lasts. An advisory can legitimately stand for months — it
+			// often describes something an operator chose — so degrading the
+			// roll-up for its whole life would make `lv health` exit non-zero
+			// indefinitely and train an operator to ignore the exit code, which
+			// costs the warnings and criticals their only channel.
+			//
+			// This is a POLICY, deliberately independent of who writes info
+			// rows: today nothing does, and the branch still has to be right, so
+			// that an evaluator can raise a standing advisory without silently
+			// making every cluster that has one look broken.
+			//
+			// It does NOT resolve anything. A stale row that nothing owns any
+			// more keeps standing at whatever severity it was written with, and a
+			// WARNING or CRITICAL one keeps degrading the roll-up — correctly, it
+			// is unresolved state. This branch changes the reading of severity,
+			// not the lifecycle: conditions that mean something is wrong are
+			// warning or critical, and both still degrade below.
+			continue
 		}
 		degraded = true
 	}

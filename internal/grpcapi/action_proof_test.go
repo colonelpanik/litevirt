@@ -2,11 +2,15 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -452,5 +456,338 @@ func TestProofPB_RoundTripsEveryBoundField(t *testing.T) {
 		t.Errorf("a proof does not survive proofToPB → proofFromPB:\n got %+v\nwant %+v\n"+
 			"a field missing from either direction is a dropped forward, which the executor "+
 			"reports as a divergent row", got, full)
+	}
+}
+
+// enforcingServer is a node with lease-term enforcement fully ON: the config
+// flag set, lease_term_v1 latched, quorum held, and a peer set answering the
+// given high-water terms.
+func enforcingServer(t *testing.T, peerTerms map[string]int64) *Server {
+	t.Helper()
+	s := apServer(t) // host name "host-a"
+	s.SetLeaseTermEnforce(true)
+	peers := make([]string, 0, len(peerTerms))
+	for p := range peerTerms {
+		peers = append(peers, p)
+	}
+	s.SetGate(fakeServerGate{
+		enforcedTok: map[string]bool{capabilities.LeaseTermV1: true},
+		quorum:      health.QuorumYes,
+		needed:      2,
+		healthy:     peers,
+	})
+	s.peerClientOverride = fakePeers(peerTerms)
+	return s
+}
+
+// enforcingServerWithoutQuorum enforces but cannot establish quorum.
+func enforcingServerWithoutQuorum(t *testing.T) *Server {
+	t.Helper()
+	s := apServer(t)
+	s.SetLeaseTermEnforce(true)
+	s.SetGate(fakeServerGate{
+		enforcedTok: map[string]bool{capabilities.LeaseTermV1: true},
+		quorum:      health.QuorumUnknown,
+	})
+	return s
+}
+
+// carriedProof builds a reschedule proof for vm `target`, destined for this
+// host, minted by `coordinator` at `term` of the failover lease.
+func carriedProof(id, coordinator, target string, term int64) *pb.RuntimeActionProof {
+	p := &pb.RuntimeActionProof{
+		Id: id, Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: target, DestHost: "host-a", Coordinator: coordinator,
+		LeaseTerm: term,
+	}
+	if term > 0 {
+		p.LeaseKey = corrosion.LeaseKeyFailover
+	}
+	return p
+}
+
+// refusalRecorder captures the (action, reason) pairs noteGateRefused emits, so
+// a test can assert a COUNTABLE refusal reason rather than a log line.
+func refusalRecorder(s *Server) func() string {
+	var last string
+	s.SetGateRefusedObserver(func(_, reason string) { last = reason })
+	return func() string { return last }
+}
+
+// seedFailoverTerm walks the local ledger to `term` with successive lapsed
+// tenures held by `holder`, using the real allocator.
+func seedFailoverTerm(t *testing.T, s *Server, term int64, holder string) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	for i := int64(1); i <= term; i++ {
+		if held, got, err := corrosion.AcquireLeaseWithTerm(ctx, s.db,
+			corrosion.LeaseKeyFailover, holder, 30*time.Second, now); err != nil || !held || got != i {
+			t.Fatalf("seed term %d: held=%v got=%d err=%v", i, held, got, err)
+		}
+		now = now.Add(2 * time.Minute)
+	}
+}
+
+// TestClaimCarriedProof_PreLatchEnforcementIsInert. Pre-latch behaviour must be
+// EXACTLY today's, or the rollout is not safe: a term-0 proof, and a proof whose
+// term is far below the ledger's maximum, both still claim.
+func TestClaimCarriedProof_PreLatchEnforcementIsInert(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // flag off, gate unlatched
+	seedFailoverTerm(t, s, 9, "node-a")
+
+	for i, term := range []int64{0, 1} {
+		p := carriedProof(fmt.Sprintf("p%d", i), "node-b", fmt.Sprintf("vm%d", i), term)
+		if _, err := s.claimCarriedProof(ctx, p, corrosion.ActionReschedule, "vm", fmt.Sprintf("vm%d", i)); err != nil {
+			t.Errorf("term %d refused pre-latch: %v — the pre-flip path must be today's exactly", term, err)
+		}
+	}
+}
+
+// TestClaimCarriedProof_StaleTermIsRefusedNotLogged. The refusal must be an
+// error the call site sees. A dropped-and-logged stale write is
+// indistinguishable from success to the caller.
+func TestClaimCarriedProof_StaleTermIsRefusedNotLogged(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 9})
+	lastReason := refusalRecorder(s)
+	seedFailoverTerm(t, s, 9, "node-a")
+
+	_, err := s.claimCarriedProof(ctx,
+		carriedProof("p1", "node-a", "vm1", 5),
+		corrosion.ActionReschedule, "vm", "vm1")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v (err %v), want FailedPrecondition", status.Code(err), err)
+	}
+	if got := lastReason(); got != health.ReasonStaleLeaseTerm {
+		t.Errorf("refusal reason = %q, want %q — a countable reason, not a log line",
+			got, health.ReasonStaleLeaseTerm)
+	}
+}
+
+// TestClaimCarriedProof_ZeroTermIsRefusedForARequiredAction: once the cluster
+// enforces, a reschedule proof carrying no term is a pre-v52 proof and cannot
+// be validated. 0 must never read as a valid term.
+//
+// Scoped to actions whose producers all hold a lease — see
+// leaseTermRequiredActions. reschedule is the only one.
+func TestClaimCarriedProof_ZeroTermIsRefusedForARequiredAction(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 3})
+	seedFailoverTerm(t, s, 3, "node-a")
+
+	_, err := s.claimCarriedProof(ctx,
+		carriedProof("p1", "node-a", "vm1", 0),
+		corrosion.ActionReschedule, "vm", "vm1")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition for a term-0 reschedule proof under enforcement",
+			status.Code(err))
+	}
+}
+
+// TestClaimCarriedProof_AnUnstampedLeaselessProducerStillWorks is the other
+// half of that scoping, and the one an unconditional refusal broke.
+//
+// mintLBProof, mintRelocationProof and AutoPromoteReplica hold no lease and
+// mint lease_term 0 with an empty key. Refusing those under enforcement fails
+// LB apply, container cold migration and restore, and automated post-fence
+// replica promotion CLOSED — the DR path broken by the feature meant to
+// protect it, and blamed on a stale tenure rather than an unstamped producer.
+func TestClaimCarriedProof_AnUnstampedLeaselessProducerStillWorks(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 9})
+	seedFailoverTerm(t, s, 9, "node-a")
+
+	for _, tc := range []struct{ action, kind, target string }{
+		{corrosion.ActionLBApply, "lb", "lb1"},
+		{corrosion.ActionPromote, "vm", "vm1"},
+		{corrosion.ActionRelocate, "container", "ct1"},
+	} {
+		p := &pb.RuntimeActionProof{
+			Id: "p-" + tc.action, Action: tc.action, TargetKind: tc.kind,
+			TargetName: tc.target, DestHost: "host-a", Coordinator: "host-a",
+		}
+		if _, err := s.claimCarriedProof(ctx, p, tc.action, tc.kind, tc.target); err != nil {
+			t.Errorf("%s refused under enforcement: %v — its producer holds no lease and has no "+
+				"term to stamp, so refusing it breaks the action rather than fencing anything",
+				tc.action, err)
+		}
+	}
+}
+
+// TestClaimCarriedProof_EqualTermChecksTheRecordedHolder — BOTH directions, or
+// the arm passes vacuously.
+//
+// Under Phase 1's keep-local merge each node retains whichever claim to a
+// contested term it recorded first, so this check refuses a competing claimant
+// ONCE THAT NODE HAS THE TERM ROW. It is not the whole per-executor guarantee:
+// when no row has replicated it passes vacuously, and the claim's TermFence is
+// what closes that case (OneExecutorWillNotActForTwoClaimants). It does not
+// make the cluster agree on a winner, and no assertion here may imply that it
+// does.
+func TestClaimCarriedProof_EqualTermChecksTheRecordedHolder(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name        string
+		coordinator string
+		wantErr     bool
+	}{
+		{"the recorded holder claims its own term", "node-a", false},
+		{"a competing claimant at the same term", "node-z", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := enforcingServer(t, map[string]int64{"node-c": 5})
+			seedFailoverTerm(t, s, 5, "node-a")
+
+			_, err := s.claimCarriedProof(ctx,
+				carriedProof("p1", tc.coordinator, "vm1", 5),
+				corrosion.ActionReschedule, "vm", "vm1")
+			if tc.wantErr && err == nil {
+				t.Error("accepted a term-5 proof from a coordinator that is not the recorded holder")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("refused the recorded holder's own term: %v", err)
+			}
+		})
+	}
+}
+
+// TestClaimCarriedProof_AnUnseenTermIsAcceptedAboveTheThreshold — the delicate
+// case, and both halves are needed.
+//
+// leader_lease_terms replicates independently of the direct RPC carrying a
+// proof, so a fresh valid proof routinely arrives before its own term row.
+// Refusing on "I have not seen that term" would break the ordinary path.
+// Accepting is safe only because the threshold arm already ran: a term at or
+// above the quorum-observed maximum is not stale by any definition this phase
+// can enforce. A test of only the accept half passes with the threshold arm
+// deleted.
+func TestClaimCarriedProof_AnUnseenTermIsAcceptedAboveTheThreshold(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unseen and at the threshold: accepted", func(t *testing.T) {
+		s := enforcingServer(t, map[string]int64{"node-c": 7})
+		// Local ledger has nothing at term 7 — the peer's answer set the threshold.
+		if _, err := s.claimCarriedProof(ctx,
+			carriedProof("p1", "node-a", "vm1", 7),
+			corrosion.ActionReschedule, "vm", "vm1"); err != nil {
+			t.Errorf("refused a term this node has not seen but which is AT the quorum "+
+				"threshold: %v — that is the ordinary replication-lag path", err)
+		}
+	})
+
+	t.Run("unseen and below the threshold: refused", func(t *testing.T) {
+		s := enforcingServer(t, map[string]int64{"node-c": 7})
+		if _, err := s.claimCarriedProof(ctx,
+			carriedProof("p2", "node-a", "vm2", 6),
+			corrosion.ActionReschedule, "vm", "vm2"); err == nil {
+			t.Error("accepted an unseen term BELOW the quorum threshold; 'not found' must not " +
+				"become a pass on its own")
+		}
+	})
+}
+
+// TestClaimCarriedProof_UnconfirmedQuorumRefusesWithItsOwnReason. An operator
+// needs to tell "I was fenced" from "I could not establish whether I was
+// fenced"; the first is the mechanism working, the second is degradation.
+func TestClaimCarriedProof_UnconfirmedQuorumRefusesWithItsOwnReason(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServerWithoutQuorum(t)
+	lastReason := refusalRecorder(s)
+	seedFailoverTerm(t, s, 3, "node-a")
+
+	_, err := s.claimCarriedProof(ctx,
+		carriedProof("p1", "node-a", "vm1", 3),
+		corrosion.ActionReschedule, "vm", "vm1")
+	if err == nil {
+		t.Fatal("claimed a proof without establishing quorum; failing OPEN here presents as " +
+			"protection while providing none")
+	}
+	if got := lastReason(); got != health.ReasonLeaseTermUnconfirmed {
+		t.Errorf("refusal reason = %q, want %q", got, health.ReasonLeaseTermUnconfirmed)
+	}
+}
+
+// TestClaimCarriedProof_OneExecutorWillNotActForTwoClaimants is the arm that
+// makes the per-executor guarantee true rather than nearly true.
+//
+// The equal-term holder check cannot cover this: it fires only when the term
+// row has ARRIVED, and during a partition NEITHER claimant's row has
+// propagated, so a holder lookup answers "not found" for both. Both proofs then
+// clear the quorum threshold (each is AT the observed maximum) and both clear
+// the holder arm vacuously. Nothing in the ledger distinguishes them.
+//
+// Note what the fixture does NOT do: it seeds no term row at all. That is the
+// whole point — seeding one would make the holder arm do the work and this test
+// would pass with the fence deleted.
+func TestClaimCarriedProof_OneExecutorWillNotActForTwoClaimants(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 7})
+	lastReason := refusalRecorder(s)
+
+	// node-a's proof at term 7 arrives first and is claimed.
+	if _, err := s.claimCarriedProof(ctx,
+		carriedProof("p-a", "node-a", "vm1", 7),
+		corrosion.ActionReschedule, "vm", "vm1"); err != nil {
+		t.Fatalf("first claimant at an unseen term refused: %v — that is the ordinary "+
+			"replication-lag path and must still work", err)
+	}
+
+	// node-z computed the SAME term 7 on the other side of the partition.
+	_, err := s.claimCarriedProof(ctx,
+		carriedProof("p-z", "node-z", "vm2", 7),
+		corrosion.ActionReschedule, "vm", "vm2")
+	if err == nil {
+		t.Fatal("one executor acted for BOTH claimants of term 7; the quorum threshold cannot " +
+			"separate them (both are at the maximum) and no term row had replicated, so the " +
+			"claim itself must carry the binding")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", status.Code(err))
+	}
+	if got := lastReason(); got != health.ReasonStaleLeaseTerm {
+		t.Errorf("refusal reason = %q, want %q", got, health.ReasonStaleLeaseTerm)
+	}
+}
+
+// TestClaimCarriedProof_TheSameClaimantMayActRepeatedly is the other half. The
+// fence binds an executor to one CLAIMANT, not to one action: a coordinator
+// failing over forty VMs mints forty proofs at one term and every one must
+// claim. A fence that compared only the term would fail closed on VM two.
+func TestClaimCarriedProof_TheSameClaimantMayActRepeatedly(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 7})
+
+	for i, vm := range []string{"vm1", "vm2", "vm3"} {
+		if _, err := s.claimCarriedProof(ctx,
+			carriedProof(fmt.Sprintf("p%d", i), "node-a", vm, 7),
+			corrosion.ActionReschedule, "vm", vm); err != nil {
+			t.Fatalf("%s refused for the SAME coordinator at term 7: %v — the fence binds a "+
+				"claimant, not a single action", vm, err)
+		}
+	}
+}
+
+// TestClaimCarriedProof_TheFenceIsScopedToItsLeaseKey: the three leases
+// allocate terms independently, so their numbers collide by design. A
+// rebalancer proof at term 7 must not be fenced by a failover proof at term 7
+// already claimed on this host — that would refuse a legitimate action and
+// report a split-brain conflict that never happened.
+func TestClaimCarriedProof_TheFenceIsScopedToItsLeaseKey(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 7})
+
+	failover := carriedProof("p-failover", "node-a", "vm1", 7)
+	if _, err := s.claimCarriedProof(ctx, failover, corrosion.ActionReschedule, "vm", "vm1"); err != nil {
+		t.Fatalf("failover term 7: %v", err)
+	}
+
+	// A DIFFERENT lease, same term number, different coordinator.
+	rebalancer := carriedProof("p-rebalancer", "node-z", "vm2", 7)
+	rebalancer.LeaseKey = corrosion.LeaseKeyRebalancer
+	if _, err := s.claimCarriedProof(ctx, rebalancer, corrosion.ActionReschedule, "vm", "vm2"); err != nil {
+		t.Errorf("a rebalancer proof at term 7 was fenced by an unrelated failover claim at "+
+			"term 7: %v — term numbers collide across the three leases by design", err)
 	}
 }

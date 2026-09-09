@@ -347,28 +347,126 @@ func GetActionProofByToken(ctx context.Context, c *Client, token string) (ProofR
 // proof returns ErrProofSpent so the caller refuses rather than re-running the
 // side effect. Guarded so a completed/failed proof can never regress.
 func ClaimActionProof(ctx context.Context, c *Client, id, executor string) error {
+	return ClaimActionProofFenced(ctx, c, id, executor, nil)
+}
+
+// ErrTermClaimantConflict means this executor has already claimed a proof at
+// this lease term, for this lease key, on behalf of a DIFFERENT coordinator. It
+// is a FENCING refusal, not a lifecycle one: kept distinct from ErrProofSpent so
+// the caller can report "you are a competing claimant" rather than "this proof
+// is used up", which are different operator problems.
+var ErrTermClaimantConflict = errors.New("lease term already claimed on this host by another coordinator")
+
+// TermFence binds a claim to ONE claimant of one lease term, on this executor.
+//
+// It exists because the replicated ledger cannot carry this weight. During a
+// partition neither claimant's leader_lease_terms row has propagated, so a
+// holder lookup answers "not found" for both, and an executor reachable from
+// both coordinators while they cannot see each other would act for both. The
+// claim is the one place this host writes something durable about what it
+// agreed to act on, so the claim is where the binding belongs.
+type TermFence struct {
+	// Key is the lease whose term this is. Part of the binding because term
+	// numbers COLLIDE across keys by design — the three leases allocate
+	// independently, and TestLeaseTermHolder_IsScopedToItsKey pins failover
+	// term 4 and rebalancer term 4 coexisting. Fencing on the term alone would
+	// refuse a legitimate rebalancer proof because an unrelated failover proof
+	// at the same number had been claimed here, and report it as a split-brain
+	// conflict that never happened.
+	Key string
+	// Term is the lease incarnation the proof was minted under.
+	Term int64
+	// Coordinator is the claimant this executor binds itself to for (Key, Term).
+	Coordinator string
+}
+
+// ClaimActionProofFenced is ClaimActionProof plus, when fence is non-nil, a
+// first-writer-wins binding of (this executor, fence.Key, fence.Term) →
+// fence.Coordinator.
+//
+// The binding is a NOT EXISTS inside the claim's own UPDATE, deliberately, so it
+// is decided in the same atomic statement that takes the claim. A read followed
+// by a claim would let two proofs at one term from two coordinators both pass
+// the read before either wrote — which is exactly the race the fence exists to
+// stop, reintroduced one layer up. TestClaimActionProofFenced_ConcurrentClaimantsRace
+// is the test that tells those two implementations apart; -race cannot, because
+// there is no data race, only a lost update.
+//
+// A nil fence is today's unfenced claim, so the pre-latch path is byte-identical
+// and there is only one copy of the claim guard.
+func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string, fence *TermFence) error {
 	now := c.NowTS()
-	// The claim is single-holder: a fresh (prepared, executor_host='') proof may be
-	// taken by anyone, but an in_progress proof may only be re-claimed by the SAME
-	// executor (idempotent resume). A different executor gets zero rows → ErrProofSpent,
-	// so a claim can't be stolen mid-flight.
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE runtime_action_proofs
-		    SET status = 'in_progress',
-		        executor_host = ?,
-		        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
-		        updated_at = ?
-		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
-		    AND (executor_host = '' OR executor_host = ?)`,
-		executor, now, now, id, executor)
+	if fence == nil {
+		n, err := c.ExecuteRows(ctx, claimProofSQL, executor, now, now, id, executor)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrProofSpent // terminal, missing, or held by another executor
+		}
+		return nil
+	}
+	n, err := c.ExecuteRows(ctx, claimProofFencedSQL,
+		executor, now, now, id, executor,
+		fence.Term, fence.Key, executor, fence.Coordinator, id)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return ErrProofSpent // terminal, missing, or held by another executor
+	if n > 0 {
+		return nil
 	}
-	return nil
+	// Zero rows is ambiguous — spent, missing, held elsewhere, OR fenced — and
+	// the two outcomes need different operator-facing reasons. Classify with a
+	// follow-up read. The SAFETY decision was already made atomically above;
+	// this read only chooses the error, so its raciness cannot admit an action.
+	rows, rerr := c.Query(ctx,
+		`SELECT coordinator FROM runtime_action_proofs
+		  WHERE lease_term = ? AND lease_key = ? AND executor_host = ?
+		    AND coordinator <> ? AND id <> ? AND deleted_at IS NULL LIMIT 1`,
+		fence.Term, fence.Key, executor, fence.Coordinator, id)
+	if rerr == nil && len(rows) > 0 {
+		return ErrTermClaimantConflict
+	}
+	return ErrProofSpent
 }
+
+// The claim is single-holder: a fresh (prepared, executor_host=”) proof may be
+// taken by anyone, but an in_progress proof may only be re-claimed by the SAME
+// executor (idempotent resume). A different executor gets zero rows →
+// ErrProofSpent, so a claim can't be stolen mid-flight.
+const claimProofSQL = `UPDATE runtime_action_proofs
+	    SET status = 'in_progress',
+	        executor_host = ?,
+	        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+	        updated_at = ?
+	  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+	    AND (executor_host = '' OR executor_host = ?)`
+
+// claimProofFencedSQL is claimProofSQL with the term binding as one more
+// predicate, so the fence is decided by the same UPDATE that takes the claim.
+//
+// SCOPED BY (lease_term, lease_key), and the key half is not optional. The three
+// leases allocate terms independently, so their numbers collide by design; an
+// earlier draft of this predicate matched on the term alone and would have
+// fenced a rebalancer proof at term 7 because a failover proof at term 7 had
+// been claimed on the same executor — refusing a legitimate action and
+// reporting a split-brain conflict that never happened.
+//
+// o.executor_host = ? keeps the binding LOCAL. Another executor's claim at this
+// term says nothing about what this one may do; the guarantee is per-executor,
+// and matching any host's claim would make one node's action fence the whole
+// fleet.
+const claimProofFencedSQL = `UPDATE runtime_action_proofs
+	    SET status = 'in_progress',
+	        executor_host = ?,
+	        started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+	        updated_at = ?
+	  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+	    AND (executor_host = '' OR executor_host = ?)
+	    AND NOT EXISTS (
+	          SELECT 1 FROM runtime_action_proofs o
+	           WHERE o.lease_term = ? AND o.lease_key = ? AND o.executor_host = ?
+	             AND o.coordinator <> ? AND o.id <> ? AND o.deleted_at IS NULL)`
 
 // CompleteVMStartProof marks a VM-start proof completed (terminal) AND clears the
 // VM's pending_action_id in the SAME mutation that moves it to 'running', so a

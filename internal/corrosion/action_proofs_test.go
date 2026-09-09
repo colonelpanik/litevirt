@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -713,5 +714,116 @@ func TestWriteActionProofValidated_ATombstonedRowStillBinds(t *testing.T) {
 	if after := mutationLogCount(t, c); after != before {
 		t.Errorf("the refused proof wrote %d mutation_log row(s); a refusal must write nothing "+
 			"AND log nothing, or peers apply the forged row", after-before)
+	}
+}
+
+// TestClaimActionProofFenced_ConcurrentClaimantsRace runs the two claimants
+// concurrently. Exactly one must win.
+//
+// A read-then-claim implementation passes every sequential test and fails this
+// one: both goroutines read "no conflicting claim" before either writes.
+// -race does not catch it either — there is no data race, just a lost update.
+// The NOT EXISTS lives inside the claim's own UPDATE for this reason.
+func TestClaimActionProofFenced_ConcurrentClaimantsRace(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	claimants := []struct{ id, coordinator string }{
+		{"p-a", "node-a"}, {"p-z", "node-z"},
+	}
+	for _, tc := range claimants {
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: tc.id, Action: ActionReschedule, TargetKind: "vm", TargetName: tc.id,
+			DestHost: "node-b", Coordinator: tc.coordinator,
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", tc.id, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(claimants))
+	start := make(chan struct{})
+	for i, tc := range claimants {
+		wg.Add(1)
+		go func(i int, id, coordinator string) {
+			defer wg.Done()
+			<-start
+			errs[i] = ClaimActionProofFenced(ctx, c, id, "node-b",
+				&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: coordinator})
+		}(i, tc.id, tc.coordinator)
+	}
+	close(start)
+	wg.Wait()
+
+	var won int
+	for _, err := range errs {
+		if err == nil {
+			won++
+		}
+	}
+	// Deliberately NOT `won <= 1`, which passes when the fence refuses everyone
+	// — the failure mode that would silently break every failover.
+	if won != 1 {
+		t.Fatalf("%d of 2 competing claimants at term 7 won the claim, want exactly 1 "+
+			"(errs: %v) — a read before the claim lets both through", won, errs)
+	}
+}
+
+// TestClaimActionProofFenced_AnotherExecutorsClaimDoesNotFenceThisOne: the
+// guarantee is PER-EXECUTOR. Another host having acted at this term says
+// nothing about what this host may do, and matching any host's claim would let
+// one node's action fence the whole fleet.
+func TestClaimActionProofFenced_AnotherExecutorsClaimDoesNotFenceThisOne(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	for _, tc := range []struct{ id, coordinator string }{
+		{"p-elsewhere", "node-a"}, {"p-here", "node-z"},
+	} {
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: tc.id, Action: ActionReschedule, TargetKind: "vm", TargetName: tc.id,
+			DestHost: "node-b", Coordinator: tc.coordinator,
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", tc.id, err)
+		}
+	}
+
+	// A DIFFERENT executor claims node-a's proof at term 7.
+	if err := ClaimActionProofFenced(ctx, c, "p-elsewhere", "node-OTHER",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-a"}); err != nil {
+		t.Fatalf("the other executor's claim: %v", err)
+	}
+
+	// This executor has bound nothing yet, so node-z's proof must claim.
+	if err := ClaimActionProofFenced(ctx, c, "p-here", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-z"}); err != nil {
+		t.Errorf("this executor was fenced by ANOTHER host's claim at term 7: %v — the "+
+			"binding is per-executor, and a fleet-wide one would refuse every second "+
+			"coordinator's work", err)
+	}
+}
+
+// TestClaimActionProofFenced_ANilFenceIsTodaysClaim: the pre-latch path must be
+// byte-identical, and ClaimActionProof delegates here with nil.
+func TestClaimActionProofFenced_ANilFenceIsTodaysClaim(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	for _, id := range []string{"p-a", "p-z"} {
+		coordinator := "node-" + id[2:]
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: id, Action: ActionReschedule, TargetKind: "vm", TargetName: id,
+			DestHost: "node-b", Coordinator: coordinator,
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	// Two competing claimants at one term BOTH claim when unfenced — that is
+	// today's behaviour, and the rollout depends on it being unchanged.
+	if err := ClaimActionProof(ctx, c, "p-a", "node-b"); err != nil {
+		t.Fatalf("p-a: %v", err)
+	}
+	if err := ClaimActionProof(ctx, c, "p-z", "node-b"); err != nil {
+		t.Errorf("p-z refused with no fence: %v — the unfenced claim must be exactly today's", err)
 	}
 }

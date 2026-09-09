@@ -803,6 +803,64 @@ func TestClaimActionProofFenced_AnotherExecutorsClaimDoesNotFenceThisOne(t *test
 	}
 }
 
+// TestClaimActionProofFenced_ReapedClaimStillFences: garbage collection must not
+// erase the fence.
+//
+// ReapSpentProofs tombstones terminal proofs on AGE alone — default 24h — and
+// says nothing about whether their lease term is still current. A leader that
+// holds its lease longer than the retention window is ordinary on a stable
+// cluster, so the binding this executor formed at a still-live term aged out
+// from under it. With the conflict subquery filtering deleted_at, the reap then
+// let a SECOND coordinator at that same live term claim on a host that had
+// already executed for the first — one host acting for two claimants of one
+// tenure, which is the split the fence is the last line against.
+//
+// The proof is a consumable and the tombstone rightly makes it inert as one.
+// The claim it records is EVIDENCE, and spending the proof is what creates the
+// evidence, so a fence that ignores spent rows ignores nearly all of it.
+func TestClaimActionProofFenced_ReapedClaimStillFences(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	for _, tc := range []struct{ id, coordinator string }{
+		{"p-first", "node-a"}, {"p-second", "node-z"},
+	} {
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: tc.id, Action: ActionReschedule, TargetKind: "vm", TargetName: tc.id,
+			DestHost: "node-b", Coordinator: tc.coordinator,
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", tc.id, err)
+		}
+	}
+
+	// node-b executes for node-a at term 7 and the action finishes.
+	if err := ClaimActionProofFenced(ctx, c, "p-first", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-a"}); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if _, err := c.db.Exec(
+		`UPDATE runtime_action_proofs SET status = 'completed' WHERE id = ?`, "p-first"); err != nil {
+		t.Fatalf("terminalise p-first: %v", err)
+	}
+
+	// Retention elapses. The lease has NOT moved: term 7 is still current.
+	n, err := ReapSpentProofs(ctx, c, 0)
+	if err != nil {
+		t.Fatalf("ReapSpentProofs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reaped %d proofs, want 1 — the test needs the tombstone to exist", n)
+	}
+
+	err = ClaimActionProofFenced(ctx, c, "p-second", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-z"})
+	if !errors.Is(err, ErrTermClaimantConflict) {
+		t.Errorf("second claimant at the same live term got %v, want ErrTermClaimantConflict; "+
+			"node-b already executed for node-a at (failover, 7), and reaping that proof "+
+			"does not un-execute it", err)
+	}
+}
+
 // TestClaimActionProofFenced_ANilFenceIsTodaysClaim: the pre-latch path must be
 // byte-identical, and ClaimActionProof delegates here with nil.
 func TestClaimActionProofFenced_ANilFenceIsTodaysClaim(t *testing.T) {

@@ -419,10 +419,15 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 	// the two outcomes need different operator-facing reasons. Classify with a
 	// follow-up read. The SAFETY decision was already made atomically above;
 	// this read only chooses the error, so its raciness cannot admit an action.
+	// Tombstones are included here for the same reason the UPDATE's subquery
+	// includes them: the conflicting claim is evidence, not a consumable, and
+	// spending it is what created the evidence. Filtering them here too would
+	// report ErrProofSpent for a refusal that was actually a claimant conflict,
+	// pointing the operator at retention instead of at a split.
 	rows, rerr := c.Query(ctx,
 		`SELECT coordinator FROM runtime_action_proofs
 		  WHERE lease_term = ? AND lease_key = ? AND executor_host = ?
-		    AND coordinator <> ? AND id <> ? AND deleted_at IS NULL LIMIT 1`,
+		    AND coordinator <> ? AND id <> ? LIMIT 1`,
 		fence.Term, fence.Key, executor, fence.Coordinator, id)
 	if rerr == nil && len(rows) > 0 {
 		return ErrTermClaimantConflict
@@ -456,6 +461,24 @@ const claimProofSQL = `UPDATE runtime_action_proofs
 // term says nothing about what this one may do; the guarantee is per-executor,
 // and matching any host's claim would make one node's action fence the whole
 // fleet.
+//
+// The subquery deliberately does NOT filter o.deleted_at. Everywhere else a
+// tombstone means "inert", because everywhere else a proof is a CONSUMABLE and
+// the tombstone is what stops it being consumed twice. Here the row is not a
+// consumable but EVIDENCE — this executor already acted for that coordinator at
+// that (key, term) — and spending the proof is precisely what creates the
+// evidence, so excluding spent rows excluded almost all of it. ReapSpentProofs
+// tombstones on AGE alone (default 24h) with no regard for whether the term is
+// still current, so a leader holding its lease longer than the retention window
+// — ordinary on a stable cluster — had its executors' bindings quietly erased
+// underneath it, and a second coordinator at the same live term could then claim
+// on a host that had already executed for the first. That is the two-claimants
+// -one-tenure split this fence is the last line against.
+//
+// Keeping tombstoned rows cannot over-fence: terms are monotone per key, so a
+// (key, term) pair never recurs once the lease moves on, and the evidence a
+// tombstone carries never stops being true. It also costs nothing to retain,
+// because ReapSpentProofs never hard-deletes.
 const claimProofFencedSQL = `UPDATE runtime_action_proofs
 	    SET status = 'in_progress',
 	        executor_host = ?,
@@ -466,7 +489,7 @@ const claimProofFencedSQL = `UPDATE runtime_action_proofs
 	    AND NOT EXISTS (
 	          SELECT 1 FROM runtime_action_proofs o
 	           WHERE o.lease_term = ? AND o.lease_key = ? AND o.executor_host = ?
-	             AND o.coordinator <> ? AND o.id <> ? AND o.deleted_at IS NULL)`
+	             AND o.coordinator <> ? AND o.id <> ?)`
 
 // CompleteVMStartProof marks a VM-start proof completed (terminal) AND clears the
 // VM's pending_action_id in the SAME mutation that moves it to 'running', so a

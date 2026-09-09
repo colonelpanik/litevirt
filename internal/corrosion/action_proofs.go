@@ -129,7 +129,7 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 		}
 		return existing == 0, nil
 	}, []Statement{
-		{SQL: insertProofSQL, Params: proofInsertParams(p, now)},
+		proofInsertStmt(c, p, now),
 		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
 		        WHERE name = ? AND deleted_at IS NULL`,
 			Params: []interface{}{destHost, p.ID, now, vmName}},
@@ -149,7 +149,16 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 // For a proof this node MINTED. For one an untrusted caller PRESENTED, use
 // WriteActionProofValidated: this function relays whatever it is given.
 func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
-	return c.Execute(ctx, insertProofSQL, proofInsertParams(p, c.NowTS())...)
+	// Branched with LITERAL SQL on each arm rather than through
+	// proofInsertStmt: stmtshapecheck resolves a replicated statement's shape
+	// statically, and handing it `st.SQL` makes the builder dynamic and
+	// unregisterable — correctly refused, since a shape it cannot see is a shape
+	// that could back-pressure a peer.
+	now := c.NowTS()
+	if c.MayEmitTermCarryingProof() {
+		return c.Execute(ctx, insertProofSQL, proofInsertParams(p, now)...)
+	}
+	return c.Execute(ctx, insertProofPreTermSQL, proofInsertParamsPreTerm(p, now)...)
 }
 
 // ErrProofDiverges means a row with this id already exists and disagrees with
@@ -238,7 +247,7 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 		}
 		return false, nil
 	}, []Statement{
-		{SQL: insertProofSQL, Params: proofInsertParams(p, now)},
+		proofInsertStmt(c, p, now),
 	})
 	return err
 }
@@ -249,6 +258,60 @@ const insertProofSQL = `INSERT OR IGNORE INTO runtime_action_proofs
 	 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
 	 created_at, updated_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
+
+// insertProofPreTermSQL is insertProofSQL without lease_term and lease_key: the
+// shape the PREVIOUS RELEASE emits, and therefore the only proof insert every
+// peer in a mixed-version fleet can resolve.
+//
+// It exists as a live emitter because widening insertProofSQL moved its
+// fingerprint, and a fingerprint is a property of the BINARY. A peer on the
+// previous release holds only this one, so it cannot resolve the widened form:
+// its apply fails closed, the whole batch rolls back, and its replication
+// watermark stalls, head-of-line blocking the stream into it. Nothing stopped
+// that happening — a proof write is gated by split_brain_gate_v1, which such a
+// peer DOES advertise, so peerLacksProofSupport is false and
+// dropUnsupportedProofEntries never fires — and no CI guard could see it:
+// runtime_action_proofs is in stmtshapecheck's replicatedTableBaseline, so the
+// first-shape guard skips the table entirely. Proofs mint far more often than
+// lease terms, so this was the wider exposure of the two.
+//
+// The retained receive-side entries in stmthistorical.go are the mirror of
+// this and not a substitute: they let us ACCEPT what an old peer emits, and say
+// nothing about what we emit at it.
+//
+// Dropping the two columns loses nothing pre-latch. Both take their DEFAULTs —
+// 0 and ”, the "minted without a term" sentinels — and there is no term to
+// carry anyway, because the mint is gated on the very same latch (see
+// AcquireLeaseWithTerm, which reports term 0 until it forms).
+const insertProofPreTermSQL = `INSERT OR IGNORE INTO runtime_action_proofs
+	(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,
+	 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+	 created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
+
+// proofInsertStmt picks the proof insert this node is allowed to emit.
+//
+// The wide form goes on the wire only once the term-carrying shapes are known
+// to be decodable by every peer this node replicates to — the same
+// lease_term_ledger_v1 latch that gates the mint, and for the same reason.
+// Before then every proof is written in the released shape.
+func proofInsertStmt(c *Client, p ActionProof, now string) Statement {
+	if c.MayEmitTermCarryingProof() {
+		return Statement{SQL: insertProofSQL, Params: proofInsertParams(p, now)}
+	}
+	return Statement{SQL: insertProofPreTermSQL, Params: proofInsertParamsPreTerm(p, now)}
+}
+
+// proofInsertParamsPreTerm is proofInsertParams minus the two term columns, in
+// the order insertProofPreTermSQL binds them.
+func proofInsertParamsPreTerm(p ActionProof, now string) []interface{} {
+	return []interface{}{
+		p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, p.Coordinator,
+		p.LeaseHolder, p.LeaseExpiresAt, p.QuorumLive, p.QuorumNeeded,
+		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, now, now,
+	}
+}
 
 func proofInsertParams(p ActionProof, now string) []interface{} {
 	return []interface{}{

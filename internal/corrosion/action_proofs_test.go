@@ -803,6 +803,64 @@ func TestClaimActionProofFenced_AnotherExecutorsClaimDoesNotFenceThisOne(t *test
 	}
 }
 
+// TestWriteActionProof_PreLatchEmitsTheReleasedShape: mid-roll, a proof must go
+// on the wire in the shape a previous-release peer can resolve.
+//
+// Widening insertProofSQL with lease_term and lease_key moved its fingerprint,
+// and a fingerprint is a property of the BINARY, not of the schema. A peer on
+// the previous release holds only the narrow one, so it cannot resolve the
+// widened form: applyStatementLWW rejects it, the batch rolls back, and that
+// peer's replication watermark stalls — head-of-line blocking the stream into
+// it. Nothing prevented this. A proof write is gated by split_brain_gate_v1,
+// which such a peer DOES advertise, so peerLacksProofSupport is false and
+// dropUnsupportedProofEntries never fires; and runtime_action_proofs sits in
+// stmtshapecheck's replicatedTableBaseline, so the first-shape guard skips the
+// table altogether. Proofs mint far more often than lease terms.
+//
+// The assertion is on the mutation_log payload rather than on the row, because
+// the row is identical either way — that is the point of the DEFAULTs, and it
+// is also why nothing local can detect the problem.
+func TestWriteActionProof_PreLatchEmitsTheReleasedShape(t *testing.T) {
+	ctx := context.Background()
+
+	emitted := func(t *testing.T, open bool) string {
+		t.Helper()
+		c := apTestClient(t)
+		c.SetLeaseTermLedgerGate(func() bool { return open })
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+			DestHost: "node-b", Coordinator: "node-a",
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("WriteActionProof: %v", err)
+		}
+		var stmts string
+		if err := c.db.QueryRow(
+			`SELECT stmts FROM mutation_log ORDER BY seq DESC LIMIT 1`).Scan(&stmts); err != nil {
+			t.Fatalf("read mutation_log: %v", err)
+		}
+		return stmts
+	}
+
+	t.Run("gate closed emits the narrow shape", func(t *testing.T) {
+		got := emitted(t, false)
+		if strings.Contains(got, "lease_term") || strings.Contains(got, "lease_key") {
+			t.Errorf("the replicated proof insert names the term columns while the ledger "+
+				"latch is unformed, so its fingerprint is one a previous-release peer "+
+				"cannot resolve — that peer's apply fails closed and its whole "+
+				"replication stream stalls. Emitted:\n%s", got)
+		}
+	})
+
+	t.Run("gate open emits the widened shape", func(t *testing.T) {
+		got := emitted(t, true)
+		if !strings.Contains(got, "lease_term") || !strings.Contains(got, "lease_key") {
+			t.Errorf("the term columns are absent once every peer can decode them, so a "+
+				"proof can never carry its fencing term. Emitted:\n%s", got)
+		}
+	})
+}
+
 // TestClaimActionProofFenced_ReapedClaimStillFences: garbage collection must not
 // erase the fence.
 //

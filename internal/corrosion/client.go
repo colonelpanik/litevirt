@@ -385,6 +385,24 @@ func (c *Client) MayMintLeaseTerm() bool {
 	return c.leaseTermLedger != nil && c.leaseTermLedger()
 }
 
+// MayEmitTermCarryingProof reports whether this node may put the WIDENED
+// runtime_action_proofs insert on the wire — the one carrying lease_term and
+// lease_key.
+//
+// Same gate as MayMintLeaseTerm, deliberately, because it answers the same
+// question: has every peer this node replicates to got a binary that can
+// resolve this release's term-carrying statement shapes. Adding the two columns
+// moved that insert's fingerprint, and a peer holding only the previous one
+// fails its apply closed and stalls its whole replication stream — so until the
+// latch forms, proofs go out in the released shape (see insertProofPreTermSQL).
+//
+// It is a separate name rather than a second call to MayMintLeaseTerm so each
+// site reads as what it is deciding. Proofs are written mid-roll and lease
+// terms are not, so a future change could legitimately split these two.
+func (c *Client) MayEmitTermCarryingProof() bool {
+	return c.MayMintLeaseTerm()
+}
+
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset
 // guard leaves the legacy no-skew-check behavior, so an old-binary node in a

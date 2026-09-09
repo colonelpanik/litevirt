@@ -264,5 +264,24 @@ func HistoricalShapes() []HistoricalShape {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
 		"proof_insert_pre_lease_term_v51")
 
+	// The proof INSERT at v52: lease_term present, lease_key not yet (v53). A
+	// peer on a v52 build emits this for every proof it mints, and a receiver
+	// that stopped recognising it would back-pressure that peer's entire
+	// replication stream mid-rolling-upgrade. It applies identically to the new
+	// form — the missing column takes its DEFAULT '', the "minted without a
+	// lease" sentinel that pairs with lease_term 0.
+	//
+	// Note there are now TWO retained proof-insert shapes, v51's and v52's, and
+	// both must stay while their emitters are supported. That is the cost of a
+	// second additive column on a replicated table in consecutive versions, not
+	// a sign either entry is redundant.
+	add(`INSERT OR IGNORE INTO runtime_action_proofs
+		(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+		 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term,
+		 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+		 created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
+		"proof_insert_pre_lease_key_v52")
+
 	return out
 }

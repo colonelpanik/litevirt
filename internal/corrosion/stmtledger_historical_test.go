@@ -81,7 +81,16 @@ import (
 // peer mints every proof with that shape, and it applies identically here (the
 // missing column takes its DEFAULT 0, the "minted without a term" sentinel). No
 // previously accepted historical identity was removed or changed.
-const compatibilityDigest = "aa6e56d76bd21b94162a6d896b27c6ab49667dd7999923025218f521234f02a1"
+// Updated again for schema v53, which appended lease_key to the same table one
+// version later. The v52 shape — lease_term present, lease_key absent — was
+// ADDED as receive-only proof_insert_pre_lease_key_v52 and applies identically
+// (the missing column takes its DEFAULT ”, the "minted without a lease"
+// sentinel that pairs with lease_term 0). There are now TWO retained
+// proof-insert shapes, v51's and v52's, and both stay while their emitters are
+// supported: that is the cost of additive columns on a replicated table in
+// consecutive versions, not a sign either is redundant. No previously accepted
+// historical identity was removed or changed.
+const compatibilityDigest = "cd2639959dd96ef59d619518f747dd5c51749a33bc55bbddbe4fc7f69234fe69"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -145,6 +154,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"failover_lease_literal_key_v50":        1,   // coordinator lease upsert with the key as a literal, before the shared bound-key helper
 	"lease_term_mint_or_ignore_v51":         1,   // lease-term mint's original INSERT OR IGNORE form, before the writer needed local constraint errors
 	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
+	"proof_insert_pre_lease_key_v52":        1,   // proof insert with lease_term but before lease_key (v52)
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

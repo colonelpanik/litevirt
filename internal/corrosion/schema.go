@@ -367,7 +367,16 @@ import (
 //	     lease_term_v1; 0 = minted without one. One additive column, appended
 //	     LAST in the CREATE TABLE so fresh and upgraded databases share one
 //	     physical column order (the v1 digest is positional).
-const CurrentSchemaVersion = 53
+//	v54: the proof's lease KEY — runtime_action_proofs gains lease_key, naming
+//	     which of the three shared leases its lease_term was allocated under.
+//	     A term is meaningless without it: leader_lease_terms is shared by the
+//	     failover coordinator, the rebalancer and the dual-run detector, and
+//	     their term numbers collide by design, so an executor holding only a
+//	     term cannot tell which ledger to judge it against. Validated against a
+//	     closed set on receipt — an unknown key would read an empty ledger,
+//	     find MAX(term) = 0, and make anything naming it look current.
+//	     One additive column, appended LAST for the same digest reason as v53.
+const CurrentSchemaVersion = 54
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1053,7 +1062,8 @@ var schemaDDL = []string{
 		-- freshly-initialised v52 node and a v51→v52 upgraded node disagree
 		-- about this table's digest forever with identical rows, wherever
 		-- digest_v2 is off. Put every future additive column here, not above.
-		lease_term        INTEGER NOT NULL DEFAULT 0 -- lease incarnation term (v52); 0 = proof minted without one
+		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
+		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v53); '' = minted without one
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -2733,6 +2743,11 @@ var schemaMigrations = []string{
 	// row reads as "minted without a term" — the sentinel the executor refuses
 	// once lease_term_v1 is enforced, never a valid term.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_term INTEGER NOT NULL DEFAULT 0`,
+	// v53: which lease the term belongs to. lease_term alone is ambiguous —
+	// three subsystems share leader_lease_terms and their term numbers collide
+	// by design — so a term is only interpretable together with its key.
+	// Additive with a '' default, which pairs with lease_term 0.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2823,6 +2838,7 @@ var alterVersions = []int{
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
 	51, // netbox_bindings.netbox_cluster
 	53, // runtime_action_proofs.lease_term
+	54, // runtime_action_proofs.lease_key
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

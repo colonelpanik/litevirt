@@ -21,6 +21,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
 		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
 		OwnerEpoch: p.GetOwnerEpoch(), LeaseTerm: p.GetLeaseTerm(),
+		LeaseKey: p.GetLeaseKey(),
 	}
 }
 

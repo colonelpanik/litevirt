@@ -1636,6 +1636,15 @@ message RuntimeActionProof {
     // ⇒ refused once lease_term_v1 is enforced, accepted before.
     // Additive/wire-compatible.
     int64  lease_term       = 14;
+    // lease_key names WHICH lease's ledger lease_term belongs to. Three
+    // subsystems share leader_lease_terms — the failover coordinator, the
+    // rebalancer and the dual-run detector — and their term numbers collide by
+    // design, so a term is not interpretable without it. The executor validates
+    // it against a CLOSED SET and refuses an unknown key: reading a nonexistent
+    // ledger yields MAX(term) = 0, which would pass every proof naming it.
+    // "" = minted by a pre-v53 node, and pairs with lease_term = 0.
+    // Additive/wire-compatible.
+    string lease_key        = 15;
 }
 
 message AcknowledgeLeaseTermTieRequest {

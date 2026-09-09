@@ -73,6 +73,12 @@ type ActionProof struct {
 	// holder adopt the winner's term (the hole Phase 1 closed). 0 means the
 	// proof was minted without one.
 	LeaseTerm int64
+	// LeaseKey names WHICH lease's ledger LeaseTerm belongs to. It is not
+	// optional decoration: leader_lease_terms is shared by three subsystems
+	// whose term numbers collide by design, so a term without its key cannot be
+	// judged against anything. "" means the proof was minted without a lease,
+	// and pairs with LeaseTerm 0.
+	LeaseKey string
 }
 
 // ProofRecord is a read-back proof row including lifecycle state.
@@ -172,7 +178,7 @@ func proofBindingEqual(a, b ActionProof) bool {
 		a.TargetName == b.TargetName && a.DestHost == b.DestHost &&
 		a.Coordinator == b.Coordinator && a.RelocationToken == b.RelocationToken &&
 		a.FenceEpoch == b.FenceEpoch && a.OwnerEpoch == b.OwnerEpoch &&
-		a.LeaseTerm == b.LeaseTerm
+		a.LeaseTerm == b.LeaseTerm && a.LeaseKey == b.LeaseKey
 }
 
 // WriteActionProofValidated seeds a proof row from an UNTRUSTED presented proof,
@@ -205,11 +211,12 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 		var existing ActionProof
 		err := tx.QueryRow(
 			`SELECT action, target_kind, target_name, dest_host, coordinator,
-			        relocation_token, fence_epoch, owner_epoch, lease_term
+			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
 			   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, p.ID).
 			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
 				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
-				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm)
+				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
+				&existing.LeaseKey)
 		if errors.Is(err, sql.ErrNoRows) {
 			return true, nil
 		}
@@ -228,16 +235,16 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 
 const insertProofSQL = `INSERT OR IGNORE INTO runtime_action_proofs
 	(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
-	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term,
+	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term, lease_key,
 	 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
 	 created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
 
 func proofInsertParams(p ActionProof, now string) []interface{} {
 	return []interface{}{
 		p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, p.Coordinator,
 		p.LeaseHolder, p.LeaseExpiresAt, p.QuorumLive, p.QuorumNeeded,
-		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, p.LeaseTerm, now, now,
+		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, p.LeaseTerm, p.LeaseKey, now, now,
 	}
 }
 
@@ -246,7 +253,7 @@ func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, boo
 	rows, err := c.Query(ctx,
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
-		        owner_epoch, fence_epoch, relocation_token, lease_term,
+		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key,
 		        status, step_state, result_code, result_detail, executor_host
 		   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, id)
 	if err != nil {
@@ -264,7 +271,7 @@ func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, boo
 			LeaseExpiresAt: r.String("lease_expires_at"), QuorumLive: r.Int("quorum_live"),
 			QuorumNeeded: r.Int("quorum_needed"), OwnerEpoch: r.String("owner_epoch"),
 			FenceEpoch: r.String("fence_epoch"), RelocationToken: r.String("relocation_token"),
-			LeaseTerm: r.Int64("lease_term"),
+			LeaseTerm: r.Int64("lease_term"), LeaseKey: r.String("lease_key"),
 		},
 		Status: r.String("status"), StepState: r.String("step_state"),
 		ResultCode: r.String("result_code"), ResultDetail: r.String("result_detail"),

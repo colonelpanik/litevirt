@@ -17752,7 +17752,16 @@ type RuntimeActionProof struct {
 	// the holder this node recorded at that term. 0 = minted by a pre-v52 node
 	// ⇒ refused once lease_term_v1 is enforced, accepted before.
 	// Additive/wire-compatible.
-	LeaseTerm     int64 `protobuf:"varint,14,opt,name=lease_term,json=leaseTerm,proto3" json:"lease_term,omitempty"`
+	LeaseTerm int64 `protobuf:"varint,14,opt,name=lease_term,json=leaseTerm,proto3" json:"lease_term,omitempty"`
+	// lease_key names WHICH lease's ledger lease_term belongs to. Three
+	// subsystems share leader_lease_terms — the failover coordinator, the
+	// rebalancer and the dual-run detector — and their term numbers collide by
+	// design, so a term is not interpretable without it. The executor validates
+	// it against a CLOSED SET and refuses an unknown key: reading a nonexistent
+	// ledger yields MAX(term) = 0, which would pass every proof naming it.
+	// "" = minted by a pre-v53 node, and pairs with lease_term = 0.
+	// Additive/wire-compatible.
+	LeaseKey      string `protobuf:"bytes,15,opt,name=lease_key,json=leaseKey,proto3" json:"lease_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -17883,6 +17892,13 @@ func (x *RuntimeActionProof) GetLeaseTerm() int64 {
 		return x.LeaseTerm
 	}
 	return 0
+}
+
+func (x *RuntimeActionProof) GetLeaseKey() string {
+	if x != nil {
+		return x.LeaseKey
+	}
+	return ""
 }
 
 type AcknowledgeLeaseTermTieRequest struct {
@@ -27021,7 +27037,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04data\x18\a \x01(\fR\x04data\"W\n" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xdc\x03\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xf9\x03\n" +
 	"\x12RuntimeActionProof\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06action\x18\x02 \x01(\tR\x06action\x12\x1f\n" +
@@ -27043,7 +27059,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vowner_epoch\x18\r \x01(\tR\n" +
 	"ownerEpoch\x12\x1d\n" +
 	"\n" +
-	"lease_term\x18\x0e \x01(\x03R\tleaseTerm\"F\n" +
+	"lease_term\x18\x0e \x01(\x03R\tleaseTerm\x12\x1b\n" +
+	"\tlease_key\x18\x0f \x01(\tR\bleaseKey\"F\n" +
 	"\x1eAcknowledgeLeaseTermTieRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x03R\x04term\"E\n" +

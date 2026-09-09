@@ -323,10 +323,10 @@ func TestActionProof_LeaseTermRoundTrips(t *testing.T) {
 }
 
 // TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless is a COMPATIBILITY
-// test, not a plumbing one. It inserts through the pre-v52 22-column proof shape
+// test, not a plumbing one. It inserts through the pre-v53 22-column proof shape
 // — the one a not-yet-upgraded peer still emits, retained as
 // proof_insert_pre_lease_term_v51 in HistoricalShapes() — and requires it to
-// (a) still apply against the v52 schema and (b) yield the termless sentinel.
+// (a) still apply against the v53 schema and (b) yield the termless sentinel.
 //
 // READ THIS BEFORE COUNTING IT AS COVERAGE. The 0 assertion is UNFALSIFIABLE by
 // any mutation of the lease_term plumbing, and an earlier version of this test
@@ -345,7 +345,7 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 	ctx := context.Background()
 	c := apTestClient(t)
 
-	// The pre-v52 shape verbatim: 22 columns, no lease_term. execLocal, because
+	// The pre-v53 shape verbatim: 22 columns, no lease_term. execLocal, because
 	// this is a receive-side compatibility contract, not something to replicate.
 	if err := c.execLocal(ctx,
 		`INSERT OR IGNORE INTO runtime_action_proofs
@@ -356,7 +356,7 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
 		"p2", ActionPromote, "vm", "vm2", "node-b", "node-a", "", "", 0, 0, "", "", "",
 		c.NowTS(), c.NowTS()); err != nil {
-		t.Fatalf("apply the pre-v52 proof shape against a v52 schema: %v — a supported peer "+
+		t.Fatalf("apply the pre-v53 proof shape against a v53 schema: %v — a supported peer "+
 			"still emits this and a receiver that cannot apply it back-pressures that peer's "+
 			"whole stream", err)
 	}
@@ -371,7 +371,7 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 	// It matters beyond tidiness: 0 is the enforcement sentinel for "minted
 	// without a term". If the column can arrive NULL, a proof with no term and a
 	// proof whose term failed to decode both read as 0, and the executor cannot
-	// tell a pre-v52 peer from a broken one.
+	// tell a pre-v53 peer from a broken one.
 	rows, err := c.Query(ctx,
 		`SELECT lease_term IS NULL AS is_null, lease_term AS term
 		   FROM runtime_action_proofs WHERE id = 'p2'`)
@@ -379,11 +379,11 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 		t.Fatalf("read lease_term column: err=%v rows=%d", err, len(rows))
 	}
 	if rows[0].Int("is_null") != 0 {
-		t.Errorf("the pre-v52 shape left lease_term NULL; it must take a non-NULL DEFAULT 0, " +
+		t.Errorf("the pre-v53 shape left lease_term NULL; it must take a non-NULL DEFAULT 0, " +
 			"or the termless sentinel is indistinguishable from a decode failure")
 	}
 	if n := rows[0].Int64("term"); n != 0 {
-		t.Errorf("the pre-v52 shape left lease_term = %d, want the DEFAULT 0", n)
+		t.Errorf("the pre-v53 shape left lease_term = %d, want the DEFAULT 0", n)
 	}
 
 	got, ok, err := GetActionProof(ctx, c, "p2")
@@ -395,8 +395,8 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 	}
 }
 
-// TestSchemaV53FreshAndUpgradedColumnOrderMatch pins the reason lease_term sits
-// LAST in the runtime_action_proofs CREATE TABLE, after deleted_at.
+// TestProofsFreshAndUpgradedColumnOrderMatch pins the reason every additive
+// runtime_action_proofs column sits LAST in the CREATE TABLE, after deleted_at.
 //
 // The v1 state digest hashes SELECT * POSITIONALLY (sync.go tableRowKeys →
 // encodeRowCells), and anti-entropy only prefers the order-invariant v2 hash
@@ -408,21 +408,26 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 // Nothing else in the package catches that: the v44 column-order test covers
 // only containers/hosts/notification_routes. Without this, the next additive
 // column on this table reintroduces the divergence silently.
-func TestSchemaV53FreshAndUpgradedColumnOrderMatch(t *testing.T) {
+func TestProofsFreshAndUpgradedColumnOrderMatch(t *testing.T) {
 	ctx := context.Background()
 	fresh := newTestDB(t)
 	upgraded := newTestDB(t)
 
-	// Rewind the upgraded DB to v52: drop the column and un-record its migration.
-	if err := upgraded.execLocal(ctx,
-		`ALTER TABLE runtime_action_proofs DROP COLUMN lease_term`); err != nil {
-		t.Fatalf("simulate v52 drop runtime_action_proofs.lease_term: %v", err)
+	// Rewind the upgraded DB to v52: drop both additive columns and un-record
+	// their migrations. Dropped in REVERSE order so each drop is the table's
+	// last column, which is what an upgrade never has to do and what makes the
+	// re-migration exercise the real append order.
+	for _, col := range []string{"lease_key", "lease_term"} {
+		if err := upgraded.execLocal(ctx,
+			`ALTER TABLE runtime_action_proofs DROP COLUMN `+col); err != nil {
+			t.Fatalf("simulate v52 drop runtime_action_proofs.%s: %v", col, err)
+		}
 	}
 	for _, m := range schemaMigrationLedger {
-		if m.Version == 53 {
+		if m.Version == 53 || m.Version == 54 {
 			if err := upgraded.execLocal(ctx,
 				`DELETE FROM applied_migrations WHERE id = ?`, m.ID); err != nil {
-				t.Fatalf("remove v53 ledger %s: %v", m.ID, err)
+				t.Fatalf("remove v53/v54 ledger %s: %v", m.ID, err)
 			}
 		}
 	}
@@ -431,7 +436,7 @@ func TestSchemaV53FreshAndUpgradedColumnOrderMatch(t *testing.T) {
 		t.Fatalf("stamp v52: %v", err)
 	}
 	if err := InitSchema(ctx, upgraded); err != nil {
-		t.Fatalf("migrate v52 to v53: %v", err)
+		t.Fatalf("migrate v52 to v54: %v", err)
 	}
 
 	freshColumns := tableColumnOrder(t, fresh, "runtime_action_proofs")
@@ -441,8 +446,15 @@ func TestSchemaV53FreshAndUpgradedColumnOrderMatch(t *testing.T) {
 			"in the CREATE TABLE so it lands where ALTER TABLE appends it:\nfresh:    %v\nupgraded: %v",
 			freshColumns, upgradedColumns)
 	}
-	if last := freshColumns[len(freshColumns)-1]; last != "lease_term" {
-		t.Errorf("last column = %q, want lease_term", last)
+	// The additive columns, in the order the ALTERs append them. Pinned as a
+	// SUFFIX rather than "lease_term is last", which had to change the moment
+	// v53 added another one — and the property was never about a particular
+	// column, only about additive columns going after deleted_at.
+	wantSuffix := []string{"deleted_at", "lease_term", "lease_key"}
+	got := freshColumns[len(freshColumns)-len(wantSuffix):]
+	if !slices.Equal(got, wantSuffix) {
+		t.Errorf("the table's trailing columns are %v, want %v — an additive column must go "+
+			"LAST in the CREATE TABLE, after deleted_at, in ALTER order", got, wantSuffix)
 	}
 }
 
@@ -558,5 +570,107 @@ func TestProofBindingEqual_IgnoresTheEvidenceOnlyFields(t *testing.T) {
 			t.Errorf("%s is not part of the binding; a divergent same-id row could differ on it "+
 				"and still be claimed", name)
 		}
+	}
+}
+
+// TestActionProof_LeaseKeyRoundTrips: same hazard as lease_term — the column can
+// be added to the DDL and dropped by the insert params or the scan, and the
+// compiler permits both.
+//
+// Unlike the termless test, this assertion IS falsifiable through the accessor,
+// because a real key is a non-empty string and Row.String's failure value is "".
+// That asymmetry is the whole reason lease_term needed a SQL-level NULL check
+// and this does not.
+func TestActionProof_LeaseKeyRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, ok, err := GetActionProof(ctx, c, "p1")
+	if err != nil || !ok {
+		t.Fatalf("read: ok=%v err=%v", ok, err)
+	}
+	if got.LeaseKey != LeaseKeyFailover {
+		t.Errorf("lease_key = %q, want %q", got.LeaseKey, LeaseKeyFailover)
+	}
+	if got.LeaseTerm != 7 {
+		t.Errorf("lease_term = %d, want 7 — adding a column must not shift the others", got.LeaseTerm)
+	}
+}
+
+// TestProofBindingEqual_BindsTheLeaseKey. A term is only interpretable together
+// with its key, so a divergent same-id row differing ONLY on the key must be
+// refused: term 4 under the rebalancer's ledger and term 4 under the failover
+// coordinator's are different authorizations that happen to share a number.
+func TestProofBindingEqual_BindsTheLeaseKey(t *testing.T) {
+	base := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 4, LeaseKey: LeaseKeyFailover,
+	}
+	other := base
+	other.LeaseKey = LeaseKeyRebalancer
+	if proofBindingEqual(base, other) {
+		t.Error("two proofs differing only on lease_key compared equal; the same term number " +
+			"under two different ledgers would be interchangeable")
+	}
+}
+
+// TestWriteActionProofValidated_ADivergentLeaseKeyIsRefused closes the loop
+// through the writer: the key must be part of the binding at the seed boundary
+// too, not only at the executor, or a divergent key is persisted and relayed.
+func TestWriteActionProofValidated_ADivergentLeaseKeyIsRefused(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 4, LeaseKey: LeaseKeyFailover,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before := mutationLogCount(t, c)
+
+	err := WriteActionProofValidated(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 4, LeaseKey: LeaseKeyRebalancer,
+	})
+	if !errors.Is(err, ErrProofDiverges) {
+		t.Fatalf("err = %v, want ErrProofDiverges", err)
+	}
+	if after := mutationLogCount(t, c); after != before {
+		t.Errorf("the refused proof queued %d statement(s) for replication", after-before)
+	}
+}
+
+// TestWriteActionProofValidated_AnIdenticalKeyedProofIsAccepted closes the gap a
+// mutation found: the "identical row is a no-op success" property was only ever
+// tested with an EMPTY lease_key.
+//
+// Dropping lease_key from the guard's SELECT leaves existing.LeaseKey always "",
+// which still refuses a divergent key — so the divergence test passes — but
+// wrongly refuses a valid retry of a proof that HAS a key. Since a retried RPC
+// and the coordinator's own replicated row both take this path, that would fail
+// every keyed proof-gated action closed on its second delivery.
+func TestWriteActionProofValidated_AnIdenticalKeyedProofIsAccepted(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	p := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 4, LeaseKey: LeaseKeyFailover,
+	}
+	if err := WriteActionProofValidated(ctx, c, p); err != nil {
+		t.Fatalf("seed a keyed proof: %v", err)
+	}
+	if err := WriteActionProofValidated(ctx, c, p); err != nil {
+		t.Fatalf("re-presenting an IDENTICAL keyed proof was refused: %v — a retry and the "+
+			"coordinator's own replicated row both land here, so this fails every keyed action "+
+			"closed on second delivery", err)
+	}
+	got, ok, _ := GetActionProof(ctx, c, "p1")
+	if !ok || got.LeaseKey != LeaseKeyFailover || got.LeaseTerm != 4 {
+		t.Errorf("proof after the retry = %+v, want term 4 under %q", got, LeaseKeyFailover)
 	}
 }

@@ -61,8 +61,16 @@ const (
 	//
 	// So the mint waits for proof that no such peer is listening, and a
 	// capability latch is exactly that proof: a node on the old build cannot
-	// advertise a token it has never heard of, so this latch CANNOT form
-	// mid-roll.
+	// advertise a token it has never heard of.
+	//
+	// That argument only holds over the right set of peers, which is why this
+	// token is in replicationGated. An ordinary latch is computed over
+	// VOTING-eligible members, and "listening" is not a property of voting: a
+	// host in `maintenance` — the normal state for one queued to be upgraded
+	// next — is skipped by the voting sweep while the replicator, which filters
+	// on nothing but memberlist membership, keeps streaming to it. Over the
+	// voting set alone this latch could form with the old-build peer still
+	// listening, proving nothing about the only host it was meant to wait for.
 	//
 	// Deliberately advertised UNCONDITIONALLY — no config flag, in the
 	// SplitBrainGateV1 style — so terms begin minting on their own the moment the
@@ -477,6 +485,43 @@ func All() []string {
 // Supported returns a copy of the tokens this build advertises.
 func Supported() []string {
 	return append([]string(nil), supported...)
+}
+
+// replicationGated is the set of tokens whose latch is a claim about what peers
+// can DECODE, rather than about what members agree to enforce.
+//
+// The distinction decides which peers must confirm the token before it latches,
+// and getting it wrong is silent. An ordinary token gates a DECISION — a fence,
+// a demote, a promote — so the members that must agree are the ones that vote,
+// and health.VotingEligible is exactly right: a host in maintenance does not
+// vote, and must not be able to hold a fencing decision hostage.
+//
+// A token in this set gates EMITTING a replicated statement shape that a
+// previous-release peer has no ledger entry for. That is not a vote, it is a
+// wire-format claim, and the peers it has to be true of are the ones this node
+// REPLICATES TO. Those two sets are not the same: the replicator derives its
+// targets from memberlist membership with no host-state filter, so a host in
+// maintenance — the normal state for a host queued to be upgraded next — is
+// skipped by the voting sweep while still receiving every statement we write.
+// A latch formed over the voting set alone therefore proved nothing about the
+// peer it was meant to wait for, and emitting the new shape stalled that peer's
+// replication watermark, which head-of-line blocks the stream into it. That is
+// the precise outage these tokens exist to prevent.
+//
+// Membership is the right set rather than "every host that is not
+// decommissioned", because a host outside memberlist receives nothing and so
+// cannot stall — whereas requiring an unreachable host to confirm would keep
+// the latch from ever forming, and the fail-closed side of these tokens costs
+// availability of the feature, not of the cluster.
+var replicationGated = map[string]bool{
+	LeaseTermLedgerV1: true,
+}
+
+// ReplicationGated reports whether token's latch must be confirmed by every
+// peer this node replicates to, not merely by every voting-eligible member.
+// See replicationGated for why the two sets differ.
+func ReplicationGated(token string) bool {
+	return replicationGated[token]
 }
 
 // Has reports whether tokens contains want.

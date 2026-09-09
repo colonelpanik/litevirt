@@ -186,6 +186,68 @@ func TestEveryPathThatMakesABindingLiveReProvesTheInventory(t *testing.T) {
 	}
 }
 
+// TestNoActivationPathDiscardsTheUnknownDriftAnswer is the same guard aimed at
+// the other way a door opens: not skipping the proof, but reading its FAILURE as
+// a pass.
+//
+// bindingDrift has three answers — clean, drifted, and could-not-be-read — and
+// the third is carried in an error precisely so no caller can mistake it for the
+// first. That is a convention the compiler enforces only as far as forcing a
+// second assignment target: `reason, _ :=` compiles, and it is the exact bug this
+// signature replaced, reintroduced in one character.
+//
+// So every path that ends in a binding going LIVE must BIND the error, and the
+// periodic pass is deliberately not on this list — it may only ever suspend, and
+// its tolerance for an unreadable NetBox is the correct behaviour there.
+func TestNoActivationPathDiscardsTheUnknownDriftAnswer(t *testing.T) {
+	fset := token.NewFileSet()
+	funcs := parseFuncs(t, fset, "netbox_revalidate.go")
+	for _, name := range []string{
+		"ResumeBinding",           // `lv netbox resume`
+		"rekeyBinding",            // `lv netbox rekey`, whose tail resumes
+		"resumeUnhydratedBinding", // the automatic completion, with no operator involved
+	} {
+		fn, ok := funcs[name]
+		if !ok {
+			t.Fatalf("%s is gone; if a door onto a live binding was renamed, this guard has "+
+				"to follow it rather than being deleted", name)
+		}
+		calls := 0
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok || len(as.Rhs) != 1 {
+				return true
+			}
+			call, ok := as.Rhs[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "bindingDrift" {
+				return true
+			}
+			calls++
+			if len(as.Lhs) != 2 {
+				t.Errorf("%s takes %d result(s) from bindingDrift: %s — the read-failure "+
+					"answer is the second one, and a caller that does not take it cannot "+
+					"refuse it", name, len(as.Lhs), renderNode(t, fset, as))
+				return true
+			}
+			if id, ok := as.Lhs[1].(*ast.Ident); ok && id.Name == "_" {
+				t.Errorf("%s DISCARDS bindingDrift's read-failure answer: %s — that is "+
+					"\"I could not look\" read as \"nothing is wrong\", and this path ends "+
+					"in a binding serving claims again", name, renderNode(t, fset, as))
+			}
+			return true
+		})
+		if calls == 0 {
+			t.Errorf("%s no longer re-checks the binding for drift at all, so it can make one "+
+				"live over a re-CIDRed prefix, a moved VRF or a VRF that stopped enforcing "+
+				"uniqueness", name)
+		}
+	}
+}
+
 // TestTheNetBoxAllocatorIsOnlyBuiltBehindTheGate pins the last door: the
 // allocator itself.
 //

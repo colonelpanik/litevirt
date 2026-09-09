@@ -22,6 +22,22 @@ func driftBinding(fp string) corrosion.BindingRecord {
 	}
 }
 
+// driftReason runs the predicate and fails the test if the answer was UNKNOWN.
+//
+// bindingDrift has three answers, and a helper that folded the error into "" for
+// brevity would be re-committing the bug the third answer exists to prevent — in
+// the tests, where it would then hide it everywhere else. Every scenario that
+// wants the unknown answer asks for it explicitly.
+func driftReason(t *testing.T, s *Server, b corrosion.BindingRecord, fp string) string {
+	t.Helper()
+	reason, err := s.bindingDrift(context.Background(), b, fp)
+	if err != nil {
+		t.Fatalf("the drift check could not read NetBox, which is not the answer this "+
+			"scenario is about: %v", err)
+	}
+	return reason
+}
+
 func liveFingerprint(t *testing.T, s *Server) string {
 	t.Helper()
 	fp, err := corrosion.ClusterFingerprint(context.Background(), s.db)
@@ -48,7 +64,7 @@ func TestBindingDriftFingerprintMismatchNamesTheRekey(t *testing.T) {
 		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
 		enforceUnique: true,
 	})
-	reason := s.bindingDrift(context.Background(), driftBinding("an-older-ca"), liveFingerprint(t, s))
+	reason := driftReason(t, s, driftBinding("an-older-ca"), liveFingerprint(t, s))
 	if reason == "" {
 		t.Fatal("a binding pinned to another fingerprint must be drift")
 	}
@@ -77,7 +93,7 @@ func TestBindingDriftCIDRChange(t *testing.T) {
 		enforceUnique: true,
 	})
 	fp := liveFingerprint(t, s)
-	reason := s.bindingDrift(context.Background(), driftBinding(fp), fp)
+	reason := driftReason(t, s, driftBinding(fp), fp)
 	if !strings.Contains(reason, "10.0.6.0/24") {
 		t.Fatalf("reason = %q, want it to name the CIDR NetBox now reports", reason)
 	}
@@ -88,7 +104,7 @@ func TestBindingDriftPrefixMovedToGlobalTable(t *testing.T) {
 		prefix: netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 0}, // no VRF
 	})
 	fp := liveFingerprint(t, s)
-	reason := s.bindingDrift(context.Background(), driftBinding(fp), fp)
+	reason := driftReason(t, s, driftBinding(fp), fp)
 	if !strings.Contains(reason, "global table") {
 		t.Fatalf("reason = %q, want it to name the global table", reason)
 	}
@@ -100,9 +116,66 @@ func TestBindingDriftVRFStoppedEnforcingUniqueness(t *testing.T) {
 		enforceUnique: false,
 	})
 	fp := liveFingerprint(t, s)
-	reason := s.bindingDrift(context.Background(), driftBinding(fp), fp)
+	reason := driftReason(t, s, driftBinding(fp), fp)
 	if !strings.Contains(reason, "unique") {
 		t.Fatalf("reason = %q, want it to name the uniqueness setting", reason)
+	}
+}
+
+// TestBindingDriftRejectsAMoveBetweenUniquenessEnforcingVRFs.
+//
+// The uniqueness read asks about the prefix's CURRENT VRF, which is a weaker
+// fact than the one a binding needs: a prefix moved from one enforcing VRF into
+// another satisfies it, while the binding's allocation scope is still pinned to
+// the VRF the prefix has left. Both VRFs enforce uniqueness here, so nothing but
+// an ID comparison can tell this apart from a healthy binding.
+//
+// AND THE REASON MUST NOT BE A REPIN. The row keeps the old vrf_id; re-pinning
+// would move the scope without establishing that the addresses this network's
+// guests already hold are unique inside the new one.
+func TestBindingDriftRejectsAMoveBetweenUniquenessEnforcingVRFs(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		// The prefix now sits in VRF 4; the binding below is pinned to VRF 3.
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 4},
+		enforceUnique: true,
+	})
+	fp := liveFingerprint(t, s)
+	reason := driftReason(t, s, driftBinding(fp), fp)
+	if reason == "" {
+		t.Fatal("a prefix moved into a DIFFERENT uniqueness-enforcing VRF left the binding " +
+			"live: the binding's allocation scope is still pinned to the VRF the prefix has " +
+			"left, so dynamic claims fail the returned-VRF check and explicit ones address " +
+			"the wrong VRF")
+	}
+	for _, want := range []string{"VRF 3", "VRF 4"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason = %q, want both VRFs named (%s)", reason, want)
+		}
+	}
+}
+
+// TestBindingDriftReportsAnUnreadableNetBoxAsUnknown pins the third answer, and
+// pins it as DISTINCT from both of the other two.
+//
+// This is the shape the whole finding rests on: with the prefix and VRF reads
+// failing, the predicate used to return the same empty string a clean
+// re-validation returns. "I could not look" and "nothing is wrong" have to be
+// different answers, or every caller that acts on the second acts on the first.
+func TestBindingDriftReportsAnUnreadableNetBoxAsUnknown(t *testing.T) {
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+		failReads:     true,
+	})
+	fp := liveFingerprint(t, s)
+	reason, err := s.bindingDrift(context.Background(), driftBinding(fp), fp)
+	if err == nil {
+		t.Fatal("an unreadable NetBox was reported as a completed check; a read failure must " +
+			"be its own answer, never the one a clean re-validation gives")
+	}
+	if reason != "" {
+		t.Errorf("reason = %q, want it empty: nothing was established, so there is no drift "+
+			"to state either", reason)
 	}
 }
 
@@ -115,7 +188,7 @@ func TestBindingDriftNoneWhenNothingChanged(t *testing.T) {
 		enforceUnique: true,
 	})
 	fp := liveFingerprint(t, s)
-	if reason := s.bindingDrift(context.Background(), driftBinding(fp), fp); reason != "" {
+	if reason := driftReason(t, s, driftBinding(fp), fp); reason != "" {
 		t.Fatalf("an unchanged binding must not drift, got %q", reason)
 	}
 }
@@ -495,6 +568,90 @@ func TestResumeBindingRefusesADriftedCIDRAndKeepsThePin(t *testing.T) {
 	if after.ObservedCIDR != "10.0.9.0/24" {
 		t.Fatalf("ObservedCIDR = %q, want the pinned 10.0.9.0/24 — resume must never "+
 			"re-observe the prefix", after.ObservedCIDR)
+	}
+}
+
+// TestResumeRefusesWhenTheBindingCouldNotBeRevalidated is the finding, at the
+// door it was found at.
+//
+// The binding is suspended for a VRF that stopped enforcing uniqueness — the
+// repair for which is made in NetBox — and NetBox is then unreadable. The resume
+// re-proves rather than taking an operator's word for the repair, so a re-proof
+// that could not run is a refusal: nothing has changed in NetBox, and lifting the
+// suspension would make the binding serve claims across a prefix whose
+// uniqueness enforcement may still be switched off.
+func TestResumeRefusesWhenTheBindingCouldNotBeRevalidated(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+		failReads:     true,
+	})
+	fp := liveFingerprint(t, s)
+	ours, err := corrosion.ClaimBinding(ctx, s.db, corrosion.BindingRecord{
+		Network: "bound", PrefixID: 7, ObservedCIDR: "10.0.5.0/24",
+		VRFID: 3, ClusterFingerprint: fp,
+	})
+	if err != nil || !ours {
+		t.Fatalf("seed the binding: ours=%v err=%v", ours, err)
+	}
+	if err := corrosion.SuspendBinding(ctx, s.db, 7,
+		"VRF 3 no longer enforces uniqueness"); err != nil {
+		t.Fatalf("suspend the binding: %v", err)
+	}
+
+	_, err = s.ResumeBinding(adminCtx(), &pb.ResumeBindingRequest{Network: "bound"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("got %v, want FailedPrecondition — a resume may not rest on a re-validation "+
+			"that never happened", err)
+	}
+	after, gerr := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if gerr != nil || after == nil {
+		t.Fatalf("re-read the binding: %v %v", after, gerr)
+	}
+	if !after.Suspended {
+		t.Fatal("the resume lifted a suspension while NetBox was unreadable, which is exactly " +
+			"the condition the binding was suspended for going unchecked")
+	}
+	if after.SuspendReason != "VRF 3 no longer enforces uniqueness" {
+		t.Errorf("SuspendReason = %q, want the original reason left standing", after.SuspendReason)
+	}
+}
+
+// TestRevalidationKeepsItsToleranceForAnUnreadableNetBox is the other half, and
+// the reason the fix is a signature change rather than a blanket refusal.
+//
+// The periodic pass may only ever make a binding LESS trusted, and a suspension
+// is sticky. So an unreadable NetBox must leave a LIVE binding live: suspending
+// on a maintenance window would turn a transient into a network that refuses
+// every create until a human intervenes, with nothing having actually changed.
+// The refusal belongs at the activation paths, not here.
+func TestRevalidationKeepsItsToleranceForAnUnreadableNetBox(t *testing.T) {
+	ctx := context.Background()
+	s := newTestServerWithNetBox(t, fakeNetBox{
+		prefix:        netboxPrefix{ID: 7, Prefix: "10.0.5.0/24", VRFID: 3},
+		enforceUnique: true,
+		failReads:     true,
+	})
+	fp := liveFingerprint(t, s)
+	ours, err := corrosion.ClaimBinding(ctx, s.db, corrosion.BindingRecord{
+		Network: "bound", PrefixID: 7, ObservedCIDR: "10.0.5.0/24",
+		VRFID: 3, ClusterFingerprint: fp,
+	})
+	if err != nil || !ours {
+		t.Fatalf("seed the binding: ours=%v err=%v", ours, err)
+	}
+
+	if err := s.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatalf("the pass must not fail over an unreadable NetBox: %v", err)
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, 7)
+	if err != nil || b == nil {
+		t.Fatalf("read the binding: %v %v", b, err)
+	}
+	if b.Suspended {
+		t.Fatalf("an unreadable NetBox suspended a live binding (%q); suspension is sticky, "+
+			"so a maintenance window would need an operator to undo", b.SuspendReason)
 	}
 }
 

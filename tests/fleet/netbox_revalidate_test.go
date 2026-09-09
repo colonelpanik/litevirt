@@ -217,6 +217,84 @@ func TestBindingSuspendsWhenPrefixMovesToGlobalTable(t *testing.T) {
 	}
 }
 
+// TestBindingSuspendsWhenPrefixMovesToAnotherUniquenessEnforcingVRF.
+//
+// The uniqueness check asks about the prefix's CURRENT VRF, which is a weaker
+// fact than the one the binding needs. Both VRFs here enforce uniqueness, so
+// nothing but comparing the VRF ID against the one PINNED on the binding can
+// tell this apart from a healthy binding — and while it goes unnoticed, the
+// binding's allocation scope is a VRF the prefix has left: dynamic claims fail
+// the returned-VRF validation, and explicit ones are addressed to the old VRF.
+func TestBindingSuspendsWhenPrefixMovesToAnotherUniquenessEnforcingVRF(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	if bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("control: the binding must start live")
+	}
+
+	// Same prefix, same CIDR, a DIFFERENT VRF that also enforces uniqueness.
+	nb.AddPrefix(orphanPrefixID, orphanSubnet, orphanVRF+1, true)
+	mustRevalidate(t, n)
+
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("moving a prefix into another uniqueness-enforcing VRF left its binding live " +
+			"under the OLD VRF as its allocation scope")
+	}
+	// And the reason must not read as a repin: the scope stays pinned where it
+	// was proved, because uniqueness in the new VRF says nothing about the
+	// addresses this network's guests already hold there.
+	reason := bindingSuspendReason(t, n, orphanPrefixID)
+	for _, want := range []string{"VRF 3", "VRF 4"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("suspend reason = %q, want both VRFs named (%s)", reason, want)
+		}
+	}
+	if binding(t, n, orphanPrefixID).VRFID != orphanVRF {
+		t.Errorf("the binding's pinned VRF was rewritten to %d; re-pinning moves the "+
+			"allocation scope without re-proving anything inside it",
+			binding(t, n, orphanPrefixID).VRFID)
+	}
+}
+
+// TestResumeRefusesWhenNetBoxCannotBeRead is the finding this whole signature
+// change came from.
+//
+// The binding is suspended because its VRF stopped enforcing uniqueness — a
+// repair an operator makes in NetBox — and NetBox is then unreachable. A resume
+// re-proves rather than taking the repair on trust, so a re-proof that could not
+// RUN must refuse: the drift predicate used to answer an unreadable NetBox with
+// the same empty string a clean re-validation gives, and the resume read that as
+// permission and lifted the suspension while uniqueness was still switched off.
+func TestResumeRefusesWhenNetBoxCannotBeRead(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	if err := corrosion.SuspendBinding(context.Background(), n.DB, orphanPrefixID,
+		"VRF no longer enforces uniqueness"); err != nil {
+		t.Fatalf("suspend the binding: %v", err)
+	}
+	// The cause is STILL THERE, which is the whole point: nothing was repaired.
+	nb.SetVRFEnforceUnique(orphanVRF, false)
+	nb.SetDown(true)
+
+	if err := resumeBinding(c, n, orphanNetwork); err == nil {
+		t.Fatal("a resume succeeded without reading the prefix or its VRF, although the " +
+			"uniqueness enforcement it was suspended for is still disabled")
+	}
+	if !bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("a validation that could not run lifted the suspension")
+	}
+
+	// AND IT IS NOT A BLANKET REFUSAL. Once NetBox answers and the repair is
+	// really there, the same command resumes — otherwise this test would pass
+	// against a resume that had simply stopped working.
+	nb.SetDown(false)
+	nb.SetVRFEnforceUnique(orphanVRF, true)
+	mustResume(t, c, n, orphanNetwork)
+	if bindingSuspended(t, n, orphanPrefixID) {
+		t.Fatal("a readable NetBox with the drift repaired must resume")
+	}
+}
+
 // TestBindingNotSuspendedWhenNetBoxUnreachable is the negative control for the
 // three above: an unreachable NetBox is not drift, it is silence.
 //

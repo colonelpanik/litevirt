@@ -91,11 +91,21 @@ type fakeNetBox struct {
 	// counter, when set, records every request. Optional so the fixtures that do
 	// not care keep their one-line literals.
 	counter *requestCounter
+	// failReads makes the two bind-time precondition endpoints — the prefix and
+	// its VRF — answer 500. It models the NetBox nobody can read: the state in
+	// which a drift check establishes NOTHING, which is a different answer from
+	// "nothing has drifted" and must never be confused with it.
+	failReads bool
 }
 
 func (f fakeNetBox) handler(w http.ResponseWriter, r *http.Request) {
 	f.counter.record(r.URL.Path)
 	w.Header().Set("Content-Type", "application/json")
+	if f.failReads && (strings.HasPrefix(r.URL.Path, "/api/ipam/prefixes/") ||
+		strings.HasPrefix(r.URL.Path, "/api/ipam/vrfs/")) {
+		http.Error(w, "fakeNetBox: this NetBox cannot be read", http.StatusInternalServerError)
+		return
+	}
 	switch {
 	case r.URL.Path == "/api/ipam/ip-addresses/" && r.Method == http.MethodGet:
 		// A re-key enumerates the bound prefix before rewriting anything. An

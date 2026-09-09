@@ -98,7 +98,20 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 			}
 			continue
 		}
-		reason := s.bindingDrift(ctx, b, fp)
+		reason, derr := s.bindingDrift(ctx, b, fp)
+		if derr != nil {
+			// THE ONE PLACE THE UNKNOWN ANSWER IS TOLERATED, and it is tolerated
+			// because this pass only ever makes a binding LESS trusted. A
+			// suspension is sticky, so suspending on a NetBox maintenance window
+			// would turn a transient into a network that refuses every create
+			// until a human intervenes, with nothing actually having changed.
+			// Preserving state is the conservative direction HERE and only here
+			// — every path that makes a binding LIVE must refuse this answer, and
+			// each of them does.
+			slog.Warn("netbox: binding could not be re-validated; it is left exactly as it is",
+				"network", b.Network, "prefix", b.PrefixID, "error", derr)
+			continue
+		}
 		if reason == "" {
 			continue
 		}
@@ -146,7 +159,20 @@ func (s *Server) revalidateBindings(ctx context.Context) error {
 // line: a pass that cannot resume this binding has no bearing on the rest of
 // revalidation, and returning an error would skip the orphan sweep behind it.
 func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.BindingRecord, fp string) {
-	if reason := s.bindingDrift(ctx, b, fp); reason != "" {
+	reason, derr := s.bindingDrift(ctx, b, fp)
+	if derr != nil {
+		// AN ACTIVATION PATH, so the unknown answer is a refusal. This function
+		// ends in a resume, and the enclosing pass's tolerance for an unreadable
+		// NetBox is a statement about leaving a binding ALONE — it cannot carry
+		// over to lifting a suspension, which is the one thing here that makes a
+		// binding serve claims again. Nothing changes: the reason stands, and the
+		// next pass asks again.
+		slog.Warn("netbox: binding stays suspended — its preconditions could not be "+
+			"re-checked, so the adoption that would resume it was not attempted",
+			"network", b.Network, "prefix", b.PrefixID, "error", derr)
+		return
+	}
+	if reason != "" {
 		slog.Warn("netbox binding suspended", "network", b.Network,
 			"prefix", b.PrefixID, "reason", reason)
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
@@ -203,15 +229,33 @@ func (s *Server) resumeUnhydratedBinding(ctx context.Context, b corrosion.Bindin
 		"network", b.Network, "prefix", b.PrefixID, "adopted", adopted)
 }
 
-// bindingDrift returns a non-empty reason when a binding is no longer valid.
+// bindingDrift re-runs every bind-time precondition and returns THREE
+// distinguishable answers, never two.
 //
-// Every branch that returns "" on an error is deliberate: an unreachable or
-// erroring NetBox is SILENCE, not drift. Suspension is sticky — nothing lifts it
-// but an operator — so suspending on a transport failure would turn a NetBox
-// maintenance window into a network that refuses every create until a human
-// intervenes, with nothing actually having changed. The failure is logged and
-// counted instead, and the next pass asks again.
-func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, liveFingerprint string) string {
+//	("", nil)        every precondition was READ and holds.
+//	(reason, nil)    a precondition was READ and does NOT hold.
+//	("", err)        a precondition could not be read at all.
+//
+// At most one of the two is ever non-zero, and the third answer is the whole
+// point of the signature. It used to be absent: a NetBox read failure returned
+// the same empty string as a clean re-validation, which is "I could not look"
+// reported as "nothing is wrong". The periodic pass reads that as "leave the
+// binding alone", which is right, and every path that makes a binding LIVE read
+// it as permission to resume — so a resume succeeded against an unreachable
+// NetBox while the VRF's uniqueness enforcement was still switched off, which is
+// the precise condition the binding had been suspended for.
+//
+// So the error is now unignorable at the type level, and the callers divide on
+// it: the periodic pass tolerates it (it can only ever suspend, and suspension
+// is sticky, so a maintenance window must not brick a network), while the resume,
+// the re-key's tail and the automatic unhydrated completion all REFUSE it. A
+// binding may go live only on preconditions somebody actually read.
+//
+// The API-error metric is counted here, because a failed NetBox read is a fact
+// about NetBox whichever caller asked. The LOG line is not: what a failure means
+// — "left as it is" or "stays suspended" — is the caller's, and only the caller
+// knows which.
+func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, liveFingerprint string) (string, error) {
 	// The PIN, not a recomputation. Recomputing here would compare a value with
 	// itself, never disagree, and quietly leave every existing NetBox object
 	// stranded under an identity this cluster no longer recognises as its own.
@@ -228,38 +272,60 @@ func (s *Server) bindingDrift(ctx context.Context, b corrosion.BindingRecord, li
 			"cluster identity fingerprint moved: this binding is pinned to %s and the cluster "+
 				"now derives %s from its replicated `cluster` row; run `lv netbox rekey %s` to "+
 				"re-stamp the objects still carrying the old one",
-			b.ClusterFingerprint, liveFingerprint, b.Network)
+			b.ClusterFingerprint, liveFingerprint, b.Network), nil
 	}
 
 	p, err := s.netbox.GetPrefix(ctx, b.PrefixID)
 	if err != nil {
 		s.nbMetrics().IncAPIError(netbox.Classify(err))
-		slog.Warn("netbox: prefix read failed during revalidation; binding left as it is",
-			"network", b.Network, "prefix", b.PrefixID, "error", err)
-		return ""
+		return "", fmt.Errorf("read prefix %d from NetBox: %w", b.PrefixID, err)
 	}
 	if p.Prefix != b.ObservedCIDR {
 		// The addresses already handed out do NOT move with the prefix, so the
 		// binding now names a range litevirt's leases are not inside.
-		return fmt.Sprintf("prefix re-CIDRed from %s to %s", b.ObservedCIDR, p.Prefix)
+		return fmt.Sprintf("prefix re-CIDRed from %s to %s", b.ObservedCIDR, p.Prefix), nil
 	}
 	if p.VRFID == 0 {
 		// The same refusal bind makes: NetBox does not expose the global
 		// ENFORCE_GLOBAL_UNIQUE setting, so uniqueness is unverifiable here.
-		return "prefix moved to the global table, where uniqueness is not verifiable"
+		return "prefix moved to the global table, where uniqueness is not verifiable", nil
+	}
+	// THE SAME VRF, not merely a VRF that happens to share its policy.
+	//
+	// The uniqueness read below asks whether the prefix's CURRENT VRF enforces
+	// uniqueness. On its own that is a weaker fact standing in for the one the
+	// binding needs: a prefix moved between two uniqueness-enforcing VRFs passes
+	// it, while the binding goes on carrying the OLD vrf_id as its allocation
+	// scope. Everything downstream then works in a scope nothing has re-proved —
+	// a dynamic claim fails the returned-VRF validation, and an explicit one is
+	// still addressed to the VRF the prefix has left.
+	//
+	// REJECTED, NEVER REPINNED, and that is the deliberate half. Writing the new
+	// id onto the row would move the allocation scope without establishing one
+	// thing inside it: uniqueness within the new VRF says nothing about whether
+	// the addresses this binding's guests already hold are unique THERE, and
+	// those leases were proved against the old one. It is the same class of error
+	// as resuming on a precondition nobody read. Moving a scope is an operator's
+	// decision, so this states it and stops.
+	if p.VRFID != b.VRFID {
+		return fmt.Sprintf(
+			"prefix moved out of VRF %d into VRF %d: the binding's allocation scope is pinned "+
+				"to VRF %d, and re-pinning it would move that scope without re-proving the "+
+				"addresses this network's guests already hold are unique inside the new one. "+
+				"Move the prefix back in NetBox, or delete and recreate the litevirt network "+
+				"to bind it against VRF %d",
+			b.VRFID, p.VRFID, b.VRFID, p.VRFID), nil
 	}
 
 	unique, err := s.netbox.VRFEnforcesUnique(ctx, p.VRFID)
 	if err != nil {
 		s.nbMetrics().IncAPIError(netbox.Classify(err))
-		slog.Warn("netbox: VRF read failed during revalidation; binding left as it is",
-			"network", b.Network, "vrf", p.VRFID, "error", err)
-		return ""
+		return "", fmt.Errorf("read whether VRF %d enforces uniqueness: %w", p.VRFID, err)
 	}
 	if !unique {
-		return fmt.Sprintf("VRF %d no longer enforces uniqueness", p.VRFID)
+		return fmt.Sprintf("VRF %d no longer enforces uniqueness", p.VRFID), nil
 	}
-	return ""
+	return "", nil
 }
 
 // ── the CA re-key ───────────────────────────────────────────────────────────
@@ -654,7 +720,19 @@ func (s *Server) rekeyBinding(ctx context.Context, b corrosion.BindingRecord) (r
 	// now under the reason an operator has to act on.
 	next := b
 	next.ClusterFingerprint = newFP
-	if reason := s.bindingDrift(ctx, next, newFP); reason != "" {
+	reason, derr := s.bindingDrift(ctx, next, newFP)
+	if derr != nil {
+		// AN ACTIVATION PATH: this tail ends in a resume, so a precondition that
+		// could not be READ is a refusal, not a pass. The identities have already
+		// been rewritten and that work is kept — the binding simply stays
+		// suspended under its existing reason, and the re-key is re-runnable
+		// exactly as every other error in this function promises.
+		return counts, fmt.Errorf(
+			"identities re-keyed, but the binding for prefix %d cannot be resumed because its "+
+				"NetBox preconditions could not be re-checked; it stays suspended, re-run to "+
+				"finish: %w", b.PrefixID, derr)
+	}
+	if reason != "" {
 		if err := corrosion.SuspendBinding(ctx, s.db, b.PrefixID, reason); err != nil {
 			return counts, fmt.Errorf("suspend binding %d after re-key: %w", b.PrefixID, err)
 		}
@@ -1158,7 +1236,29 @@ func (s *Server) ResumeBinding(ctx context.Context, req *pb.ResumeBindingRequest
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "derive cluster fingerprint: %v", err)
 	}
-	if reason := s.bindingDrift(ctx, *b, fp); reason != "" {
+	reason, derr := s.bindingDrift(ctx, *b, fp)
+	if derr != nil {
+		// A RESUME MAY NOT REST ON A VALIDATION THAT DID NOT HAPPEN.
+		//
+		// This is the door the empty-string-on-failure predicate walked straight
+		// through: NetBox unreachable, both reads failed, no reason came back, and
+		// the resume read that as "the drift is gone" and lifted a suspension
+		// whose cause — a VRF that had stopped enforcing uniqueness — was still
+		// there. An operator's word is not the premise this call rests on; the
+		// re-read is, and a re-read that failed is not one.
+		//
+		// FailedPrecondition, not Internal: nothing is broken here, the answer is
+		// simply not available yet, and the retry once NetBox answers is the same
+		// command.
+		s.audit(ctx, "netbox.resume", req.GetNetwork(),
+			fmt.Sprintf("prefix=%d refused: preconditions unread: %v", b.PrefixID, derr), "error")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"network %q stays suspended: its NetBox preconditions could not be re-checked, so "+
+				"nothing was resumed and nothing was written — a resume re-proves the binding "+
+				"rather than taking the repair on trust. Run it again once NetBox answers: %v",
+			req.GetNetwork(), derr)
+	}
+	if reason != "" {
 		s.audit(ctx, "netbox.resume", req.GetNetwork(),
 			fmt.Sprintf("prefix=%d refused: %s", b.PrefixID, reason), "error")
 		return nil, status.Errorf(codes.FailedPrecondition,

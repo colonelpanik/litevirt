@@ -1175,18 +1175,40 @@ it — and it was removed before release so that its authorization rules could b
 reviewed on their own terms rather than as a rider on an addressing change. No
 released version ever had it.
 
-> **If you ran a prerelease build and recorded a retirement with it**, the daemon
-> suspends every live NetBox binding on first start after the upgrade and drops
-> the three grant tables, logging what they held. (A prerelease database that
-> never recorded one has nothing to suspend: the tables are dropped and every
-> binding is left exactly as it was.) A binding never recorded which evidence its
-> inventory proof rested on, so one that went live on a grant cannot be told apart
-> from one proved against every participant — and inheriting that authority
-> silently is worse than a suspension. Re-prove each binding with
-> `lv netbox resume <network>`; it requires every participant to answer for its own
-> address-bearing tables. Claims and NetBox objects are untouched, and a
+> **If you ran a prerelease build of this feature, upgrading to this one is not
+> supported and the daemon refuses to start.** A database that carries the
+> prerelease permanent-loss trust schema — the three grant tables, or the removed
+> attestation evaluator's leftover `lv health` conditions on a database that was
+> already migrated once — is detected before any schema work, and startup stops
+> with a message naming what it found. **Nothing is modified**: no table is
+> dropped, no binding is suspended, no allocation or NetBox object is touched, and
+> no row is written, so every piece of evidence survives intact.
+>
+> The reason is that a binding never recorded which evidence its inventory proof
+> rested on. One that went live on a grant cannot be told apart from one proved
+> against every participant, so this build cannot work out which bindings were
+> affected — and both automatic answers are worse than stopping. Leaving them
+> alone inherits authority nothing can review; rewriting them and dropping the
+> grant tables destroys the only surviving account of what was granted, which is
+> also the record of what a permanently lost machine was holding.
+>
+> **What to do.** Take a backup of the cluster database on every node first — it
+> is the only remaining record of what was granted. Recovery is then a deliberate
+> **offline** procedure against that evidence, decided by an operator who can
+> establish what the lost machine held. **`lv netbox resume` is not sufficient
+> here** and must not be relied on: it re-proves a binding against the
+> participants that answer *now*, which cannot establish what a removed grant once
+> authorized — and on a database whose accounting has been dropped it proves a
+> smaller universe, which is how a stopped-but-defined guest's address came to be
+> reclaimed. There is no flag that skips the check. Until the recovery path in
+> [the frozen trust-recovery lifecycle scope](reviews/2026-09-08-trust-lifecycle-followup-scope.md)
+> ships, a cluster in this state stays on the prerelease build that wrote those
+> rows, which is the only build that understands them. Note also that a
 > reclamation that already rested on a grant has already deleted its NetBox
 > address and cannot be undone.
+>
+> No released version ever had this mechanism, so this cannot affect a cluster
+> that only ever ran releases.
 
 **During a rolling upgrade, reclamation pauses.** A peer running a build that
 does not implement the proof RPC counts as unreachable, so no proof is complete

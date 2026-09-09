@@ -210,22 +210,21 @@ func TestFleetPermanentLossSuspendsANewBindingAndNothingLiftsIt(t *testing.T) {
 }
 
 // TestFleetAnIndependentlyAuthorizedBindingKeepsAllocatingAcrossTheRemoval is
-// acceptance cases 1 and 5, and the liveness half of the grandfathering heal.
+// acceptance cases 1 and 5, and the liveness half of the prerelease boundary.
 //
-// Removing the prerelease trust mechanism added one startup step: a database that
-// recorded a grant has every live binding suspended pending re-proof. This is the
-// other side of that decision — a binding authorized the ordinary way, by a proof
-// over machine evidence, must be COMPLETELY unaffected. So:
+// Removing the prerelease trust mechanism added one startup check: a database
+// that carries its schema is an unsupported upgrade and the daemon refuses to
+// start on it. This is the other side of that decision — a cluster that never ran
+// those commits must be COMPLETELY unaffected. So:
 //
 //   - the binding is live and a guest claims an address from NetBox;
 //   - schema init runs again on every node, which is what a daemon restart after
 //     the upgrade does;
-//   - the binding is still live, the claim is still there, the NetBox object is
-//     still there, and a second guest still gets an address.
+//   - it succeeds, the binding is still live, the claim is still there, the
+//     NetBox object is still there, and a second guest still gets an address.
 //
-// Without this, "suspend everything if a grant was ever recorded" could have been
-// implemented as "suspend everything", and every scenario about the boundary
-// would still have passed.
+// Without this, the boundary could have been implemented as "refuse always", and
+// every scenario about the refusal would still have passed.
 func TestFleetAnIndependentlyAuthorizedBindingKeepsAllocatingAcrossTheRemoval(t *testing.T) {
 	ctx := context.Background()
 	nb, c := boundCluster(t, 2)
@@ -241,8 +240,9 @@ func TestFleetAnIndependentlyAuthorizedBindingKeepsAllocatingAcrossTheRemoval(t 
 		t.Fatalf("the claim must reach NetBox, got %d identities", claimed)
 	}
 
-	// THE UPGRADE. Schema init is where the removal's heal runs, and this
-	// database never recorded a grant — so it must find nothing to do.
+	// THE UPGRADE. Schema init is where the prerelease boundary is checked, and
+	// this database carries none of its schema — so it must find nothing and
+	// proceed exactly as it always has.
 	for _, n := range c.Nodes {
 		if err := corrosion.InitSchema(ctx, n.DB); err != nil {
 			t.Fatalf("re-init schema on %s: %v", n.Name, err)

@@ -351,8 +351,10 @@ import (
 //	     recovery lifecycle is specified in
 //	     docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md and will
 //	     arrive under its own schema version. A database that ran those
-//	     prerelease commits is healed on startup — see
-//	     healPrereleaseTrustTables in netbox_prerelease_trust.go.
+//	     prerelease commits is an UNSUPPORTED UPGRADE: this build refuses to
+//	     start on one rather than guessing at a migration, preserving the
+//	     evidence for a deliberate offline recovery — see
+//	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
 const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -383,6 +385,16 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
 func InitSchema(ctx context.Context, c *Client) error {
 	slog.Info("initializing schema")
+
+	// THE UNSUPPORTED-UPGRADE BOUNDARY, FIRST AND BEFORE ANY WRITE. A database
+	// that carries the prerelease permanent-loss trust schema cannot be migrated
+	// by this build — see netbox_prerelease_boundary.go for why an automatic
+	// answer is a guess. It refuses here, ahead of the DDL, the ledger and the
+	// data fixes, so the refusal is reached with the database untouched and its
+	// evidence intact for a deliberate offline recovery.
+	if err := refusePrereleaseTrustDatabase(ctx, c); err != nil {
+		return err
+	}
 
 	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
 	// guarantees every table exists before the ledger's presence checks run).
@@ -458,16 +470,6 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// the v32 columns + recovery_code_sets are guaranteed present.
 	if err := applyV32DataFixes(ctx, c, now); err != nil {
 		return fmt.Errorf("schema init: v32 data fixes: %w", err)
-	}
-
-	// The prerelease permanent-loss trust tables, if this database ever carried
-	// them: every live binding is suspended pending re-proof and the tables are
-	// dropped. LOCAL-only and idempotent, for the reasons in
-	// netbox_prerelease_trust.go. It is an ERROR rather than a warning — coming
-	// up with a binding that may hold authority a removed mechanism granted is
-	// exactly what must not happen quietly.
-	if err := healPrereleaseTrustTables(ctx, c, now); err != nil {
-		return fmt.Errorf("schema init: prerelease trust removal: %w", err)
 	}
 
 	for _, idx := range schemaIndexes {

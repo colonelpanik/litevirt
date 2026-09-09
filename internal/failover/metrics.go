@@ -25,6 +25,12 @@ const (
 	PhaseFence      = "fence"
 	PhaseSplitBrain = "split-brain-guard"
 	PhaseRecovery   = "recovery"
+	// PhaseStranded is the stranded-workload sweep, kept distinct from
+	// PhaseRecovery on purpose. PhaseRecovery+recovered fires when a HOST comes
+	// back to active, which is routine; this fires when WORKLOADS are recovered
+	// off a host an earlier refusal abandoned, which never is. Sharing a label
+	// would bury the second signal under the first.
+	PhaseStranded = "stranded-recovery"
 
 	ResultOK        = "ok"
 	ResultSkipped   = "skipped"

@@ -562,7 +562,7 @@ func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Warn("failover: list hosts for stranded-workload sweep", "error", err)
-		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		c.mAttempt(PhaseStranded, ResultError, ErrDBError)
 		return
 	}
 	for _, h := range hosts {
@@ -588,7 +588,7 @@ func (c *Coordinator) recoverStrandedWorkloads(ctx context.Context) {
 		}
 		slog.Warn("failover: finishing recovery for a fenced host with workloads left behind",
 			"host", host.Name)
-		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
+		c.mAttempt(PhaseStranded, ResultRecovered, errClassNone)
 		c.recoverWorkloads(ctx, &host)
 	}
 }

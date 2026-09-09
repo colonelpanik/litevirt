@@ -186,6 +186,8 @@ func TestRecoverStrandedWorkloads_RetriesAfterARefusal(t *testing.T) {
 	fenceQuorum(t, ctx, db, []string{"coord", "live"}, "dead")
 
 	c := newTestCoordinator("coord", db)
+	fm := newFakeMetrics()
+	c.Metrics = fm
 	// Enforce lease terms, then supersede this coordinator's term so the stamp
 	// site refuses. Any of the post-fence refusals would do; this is the one this
 	// work added, and it is the cheapest to induce deterministically.
@@ -248,6 +250,17 @@ func TestRecoverStrandedWorkloads_RetriesAfterARefusal(t *testing.T) {
 			"powered off and run() skips it forever, so nothing else will ever come back for this "+
 			"VM: state=%q detail=%q", vm.State, vm.StateDetail)
 	}
+
+	// The recovery must be attributable. phase="recovery" is a HOST returning to
+	// active and fires routinely; this signal is the one an operator alerts on,
+	// because a nonzero value means workloads were abandoned on a powered-off
+	// machine until the sweep came back for them. Emitting it under the routine
+	// phase would bury it.
+	if n := fm.attempts[foKey(PhaseStranded, ResultRecovered, "")]; n != 1 {
+		t.Errorf("stranded-recovery attempts = %d, want 1. Without its own phase label this "+
+			"event is indistinguishable from a host coming back healthy, which happens all "+
+			"the time — so the alert that should catch a stranding would be unusable", n)
+	}
 }
 
 // TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay: the sweep must go
@@ -296,7 +309,7 @@ func TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay(t *testing.T) {
 		c.recoverStrandedWorkloads(ctx)
 	}
 
-	if n := fm.attempts[foKey(PhaseRecovery, ResultRecovered, "")]; n != 0 {
+	if n := fm.attempts[foKey(PhaseStranded, ResultRecovered, "")]; n != 0 {
 		t.Errorf("the sweep ran recovery %d time(s) for a host whose only workloads are a "+
 			"policy=none VM and a Secure Boot VM. Both stay by design and the host stays "+
 			"offline, so that condition never goes false and the sweep would re-run every "+
@@ -517,3 +530,13 @@ func (stubPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch s
 // because broad costs one no-op pass and narrow strands forever. Mutation 9 is
 // that invariant on the error path, and it needed its own test — the review found
 // the gap, but nothing was asserting the direction.
+//
+// Mutation 10: point the sweep's success at PhaseRecovery instead of
+// PhaseStranded. SURVIVED at first and then KILLED, for the same reason
+// mutation 3 did — QuiescesOnWorkloadsThatStay asserts the count is ZERO, and
+// zero stays zero when the label moves. Only a POSITIVE assertion on the
+// success path can see it, so RetriesAfterARefusal now checks the label it
+// actually emits. The distinction is not cosmetic: PhaseRecovery+recovered is a
+// host returning to active and fires routinely, so an operator alerting on it
+// would drown the one event that means workloads were abandoned on a
+// powered-off machine.

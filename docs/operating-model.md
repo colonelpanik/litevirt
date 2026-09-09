@@ -306,6 +306,37 @@ quorum evidence, so alert on it separately and treat it as an availability
 signal rather than a safety one — this is the reason that appears when a
 partition, not a stale leader, is the problem.
 
+The three signals above are the EXECUTOR refusing. The coordinator has its own
+precheck, and its counters answer a different question — not "was a bad proof
+stopped" but "did a producer notice it had gone stale before writing one".
+
+`litevirt_failover_attempts_total{phase="lease",result="skipped",error_class="stale_lease_term"}`
+is that precheck firing. Read it against the executor's refusals: the
+coordinator catching it means the producer stood down at the source, and the
+executor catching it means one did not. A steady executor count with a flat
+coordinator count says some producer is not running the precheck at all.
+
+`litevirt_failover_attempts_total{phase="lease",result="error",error_class="db_error"}`
+is the precheck's threshold read failing. It stamps ANYWAY when this happens —
+deliberately, because refusing after the fence abandons the workload and the
+executor's barrier still guards the stale case. So this counter is the one place
+enforcement is permissive rather than fail-closed, and a persistent nonzero rate
+means the coordinator has effectively stopped prechecking.
+
+`litevirt_failover_attempts_total{phase="stranded-recovery",result="recovered"}`
+is the stranded-workload sweep finishing work an earlier refusal left behind.
+Any nonzero value is worth reading, because it does not mean the sweep is broken
+— it means something upstream refused AFTER the host was already fenced, and the
+workloads sat on a powered-off machine until this sweep came back for them.
+Alert on it and go find the refusal that preceded it; the sweep is the safety
+net, not the fix.
+
+Note the phase label. `phase="recovery"` with `result="recovered"` is a HOST
+returning to active, which is routine and which you do not want to alert on;
+`phase="stranded-recovery"` is workloads being evacuated from a host that never
+came back. The two are deliberately separate labels because alerting on the
+first would drown the second.
+
 `litevirt_ha_degraded{reason="capability_rollout_pending"}` says a mandatory
 token has not latched yet. During an upgrade that is expected and should not
 page; persisting long after one is the signal that a host is stuck — most often

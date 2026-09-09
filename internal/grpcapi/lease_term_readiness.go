@@ -77,6 +77,20 @@ func (s *Server) LeaseTermReadiness(ctx context.Context) (bool, string) {
 	// stop minting under a latched enforcement regime.
 	//
 	// Also a local in-memory read, so it is safe on the Ping path.
+	//
+	// This checks that the node CAN MINT, which is not the same as its producers
+	// STAMPING, and no runtime predicate here can check the latter — whether a
+	// proof literal populates LeaseTerm is a property of the build, not of any
+	// state this function can read. Three reviewers independently read this
+	// predicate as covering stamping; it does not, and the gap was real: the mint
+	// gate worked correctly while every reschedule proof went out with term 0,
+	// which would have refused every VM failover in the cluster the moment
+	// lease_term_v1 latched.
+	//
+	// What makes stamping safe to rely on cluster-wide is advertisement, not this
+	// check: a build that does not stamp does not advertise lease_term_v1, so the
+	// latch cannot form across one. The stamping itself is pinned by
+	// failover.TestVMRescheduleProofCarriesLeaseTerm.
 	if !s.db.MayMintLeaseTerm() {
 		return false, fmt.Sprintf(
 			"%s has not durably latched; this node mints no lease term yet, so enforcing on "+

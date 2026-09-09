@@ -1357,12 +1357,24 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			}
 			_, live, needed := c.Gate.QuorumProof(ctx)
 			leaseHolder, leaseExp := c.leaseSnapshot(ctx)
+			// The fencing term of THIS tenure, taken from what the coordinator
+			// recorded at acquisition — never from a fresh MAX(term) read, which
+			// would let a displaced holder adopt the winner's term.
+			//
+			// reschedule is the one action in leaseTermRequiredActions, and this
+			// is its only mint site, so an unstamped proof here is refused
+			// outright once lease_term_v1 latches: judgeProofLeaseTerm sees
+			// term 0 with an empty key and returns ReasonStaleLeaseTerm, so the
+			// VM is never started and sits pending forever. Nothing detected
+			// that, because LeaseTermReadiness checks whether this node can MINT
+			// a term, not whether its producers STAMP one.
 			proof := corrosion.ActionProof{
 				ID: randid.New(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
+				LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1490,6 +1502,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 				LeaseHolder: c.hostName, RelocationToken: token,
 				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
+				LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1642,6 +1655,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
 			LeaseHolder: c.hostName, RelocationToken: relocToken,
 			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
+			LeaseTerm:  c.LeaseTerm(), LeaseKey: corrosion.LeaseKeyFailover,
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)

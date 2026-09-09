@@ -217,14 +217,18 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 // would be broken by the feature meant to protect it.
 //
 // RESIDUAL, deliberately recorded rather than papered over: relocate has BOTH
-// kinds of producer — the failover coordinator's two mint sites and
-// mintRelocationProof — so a stale failover coordinator could mint an unstamped
-// relocate proof and skip the term arm. Closing that needs a decision this
-// phase does not get to make alone: either give mintRelocationProof a lease to
-// stamp from (a design change; it has none today) or refuse unstamped relocates
-// and accept that container cold migration then requires the coordinator. Task
-// 7 stamps the coordinator's relocate proofs, which is what makes the choice
-// concrete.
+// kinds of producer. The failover coordinator's two mint sites now DO stamp
+// (they hold the failover lease, so they always had a term to stamp), but
+// mintRelocationProof has no lease and stamps nothing, so relocate stays out of
+// this map — adding it would refuse every container cold migration.
+//
+// The consequence is narrower than it was but not gone: a relocate proof
+// arriving unstamped is now either mintRelocationProof's normal output or a
+// coordinator running a build older than this one, and the two are
+// indistinguishable. Closing it needs a decision this phase does not get to
+// make alone — either give mintRelocationProof a lease to stamp from (a design
+// change; it has none today) or refuse unstamped relocates and accept that
+// container cold migration then requires the coordinator.
 var leaseTermRequiredActions = map[string]bool{
 	corrosion.ActionReschedule: true,
 }

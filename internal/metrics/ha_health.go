@@ -7,7 +7,18 @@ import "github.com/prometheus/client_golang/prometheus"
 // conditions surface as a durable status, not merely a per-refusal counter:
 //   - unsupported_member   : an enforcement-relevant member can't be confirmed to support
 //     a flipped capability (unreachable / old binary) → enforcement
-//     (and thus HA) is held back cluster-wide.
+//     (and thus HA) is held back cluster-wide. Carries operator
+//     intent: a flag was turned on and the cluster has not
+//     confirmed it. Also covers a MANDATORY token that latched and
+//     later regressed.
+//   - capability_rollout_pending : a MANDATORY token (no config flag — see
+//     capabilities.MandatoryTokens) has not latched YET. The ordinary state of
+//     every cluster part-way through an upgrade, and permanent on one
+//     deliberately held with a host back, so it is deliberately NOT
+//     unsupported_member: there is no operator intent to have been let down and
+//     nothing to turn off, the only remedy being to finish the roll. Alert on it
+//     differently — a planned rollout is not a fault, a stalled one is worth a
+//     look.
 //   - demotion_unfenced    : a minority node's VIP self-demote FAILED and it has no verified
 //     self-fence, so the majority holds in the safe gap (no reclaim
 //     without proof) → a VIP outage until repaired / a fence is provided.

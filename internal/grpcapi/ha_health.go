@@ -18,14 +18,15 @@ import (
 
 // HA-degraded reasons (closed vocabulary for litevirt_ha_degraded{reason}).
 const (
-	haUnsupportedMember = "unsupported_member"      // a flipped capability can't be confirmed cluster-wide
-	haDemotionUnfenced  = "demotion_unfenced"       // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
-	haVIPNoHolder       = "vip_no_holder"           // a configured VIP is served by nobody
-	haStrandedPending   = "legacy_pending_stranded" // a markerless pending VM refused proof_missing forever
-	haRolledBackLatch   = "rolled_back_latch"       // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
+	haUnsupportedMember = "unsupported_member"         // a flipped capability can't be confirmed cluster-wide
+	haRolloutPending    = "capability_rollout_pending" // a MANDATORY token has not latched yet — mid-upgrade, not a fault
+	haDemotionUnfenced  = "demotion_unfenced"          // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
+	haVIPNoHolder       = "vip_no_holder"              // a configured VIP is served by nobody
+	haStrandedPending   = "legacy_pending_stranded"    // a markerless pending VM refused proof_missing forever
+	haRolledBackLatch   = "rolled_back_latch"          // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
 )
 
-var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
+var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -487,6 +488,33 @@ func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []deg
 			cause := s.capHealthCause[tok]
 			s.capHealthMu.Unlock()
 			healthy := latched && (!checked || lastOK)
+			if healthy {
+				continue
+			}
+			// A MANDATORY token that has NEVER latched is separated out, because
+			// it is the ordinary state of every cluster part-way through an
+			// upgrade rather than a fault. It has no config flag, so there is no
+			// operator intent behind it to have been let down and nothing to turn
+			// off in response: the only remedy is to finish the roll. Reporting it
+			// as unsupported_member raised a hard degraded alarm — with an
+			// ha.degraded event and a page-shaped gauge — on every node for the
+			// whole of every upgrade, and permanently on a cluster deliberately
+			// held with one host back, which docs/operating-model.md blesses as
+			// by-design and describes as "visible as an empty ledger rather than
+			// as an error".
+			//
+			// Not simply skipped: waiting-on-a-rollout is real, actionable state
+			// and an operator watching a stalled upgrade wants it. It gets its own
+			// reason so alerting can treat a planned rollout differently from a
+			// member that cannot support what this node was told to enforce.
+			//
+			// A mandatory token that latched and LATER regressed still reports
+			// unsupported_member — it reaches here with latched=true, so it falls
+			// through — which is the case that genuinely warrants the alarm.
+			if !latched && capabilities.Mandatory(tok) {
+				out[haRolloutPending] = true
+				continue
+			}
 			if r := capabilityDegradedReason(tok, healthy, cause); r != "" {
 				out[r] = true
 				unsupported = append(unsupported, degradedCapability{

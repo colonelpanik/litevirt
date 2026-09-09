@@ -1006,14 +1006,19 @@ func (s *Server) liveResizeActive(ctx context.Context) bool {
 
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
 // single source of "configured-to-enforce" the HA monitor uses to decide which
-// tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
-// is mandatory (no flag); every other token is gated by its config kill-switch.
+// tokens to latch-drive and which may contribute to HA-degraded. The tokens with
+// no config flag are capabilities.MandatoryTokens(); every other token is gated
+// by its config kill-switch.
 // NOTE: enabled ≠ latched ≠ advertised — advertisement is build-static, latch is
 // cluster confirmation, this is local config intent.
 func (s *Server) tokenEnabled(token string) bool {
-	switch token {
-	case capabilities.SplitBrainGateV1:
+	// The no-kill-switch set is declared once, in capabilities.mandatory. It
+	// used to be restated here in prose that named split_brain_gate_v1 as the
+	// only member, which stopped being true when the ledger token arrived.
+	if capabilities.Mandatory(token) {
 		return true
+	}
+	switch token {
 	case capabilities.SafeFenceDefaultV1:
 		return s.enfSafeFence
 	case capabilities.LWWSkewGuardV1:
@@ -1048,14 +1053,6 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
-	case capabilities.LeaseTermLedgerV1:
-		// No kill switch, like SplitBrainGateV1: the token means "this build
-		// understands the term ledger's statement shapes", which is a fact about
-		// the binary, not a policy an operator chooses. It also must return true
-		// unconditionally for the latch to be DRIVEN at all — driveCapabilityLatches
-		// skips an unlatched token whose flag is off, so a flag-gated ledger token
-		// would never latch and terms would never be minted.
-		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.IsolationEpochV1:

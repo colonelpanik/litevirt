@@ -95,8 +95,25 @@ Hardening features are gated on cluster-wide capability tokens
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing
 
-`hardware_v2` is the exception: no flag of its own, activation gated on each
-node's startup hardware audit plus a latched `operation_protocol_v1`.
+There are exceptions, of two different kinds, and neither is "the one":
+
+- **Mandatory** — no config flag, `tokenEnabled` returns true unconditionally,
+  so they latch on every cluster with no operator opt-in. The set is declared in
+  one place, `capabilities.mandatory` (read it; prose copies of it have gone
+  stale twice). They are reserved for a token stating a *fact about the binary*
+  rather than a policy: `split_brain_gate_v1` and `lease_term_ledger_v1`.
+  A mandatory token has no flag to turn off in an incident — see the
+  per-token stand-down notes beside that declaration.
+- **Conditionally advertised** — `hardware_v2` has no flag of its own either,
+  but it is gated differently: each node's startup hardware audit plus a latched
+  `operation_protocol_v1` decide whether it is advertised at all.
+
+One mandatory token, `lease_term_ledger_v1`, is additionally
+`capabilities.ReplicationGated`: its latch is a claim about which wire shapes
+peers can *decode*, so it is confirmed against every host still receiving
+replication — memberlist membership — and not merely against voting-eligible
+members. A host parked in `maintenance` on an older build therefore holds that
+latch off, which is the intended invariant and not a bug.
 
 **`enforcement.operation_protocol` is required for all hotplug.** Disk, NIC, and
 concrete-address PCI attach/detach are journaled and have no un-journaled path,

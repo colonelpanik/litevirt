@@ -12,6 +12,8 @@
 // than reverting to the legacy ungated path.
 package capabilities
 
+import "sort"
+
 const (
 	// SplitBrainGateV1 gates the composable dangerous-action gate (Phase 1): both
 	// the use of the non-LWW runtime_action_proofs table AND enforcement of the
@@ -402,16 +404,36 @@ const (
 // it before consulting current advertised support — the whole point of the
 // fail-closed latch (a partition mustn't silently re-open the legacy path).
 //
-// KILL SWITCH (the modern way — DO NOT delete marker files): every flippable token
-// EXCEPT split_brain_gate_v1 is gated `configFlag && Enforced/Latched` at its
+// KILL SWITCH (the modern way — DO NOT delete marker files): every FLIPPABLE token
+// is gated `configFlag && Enforced/Latched` at its
 // decision site (auth.strict_mtls_identity/forwarded_identity, and
 // enforcement.{safe_fence_default,lww_skew_guard,vip_self_demote,vip_proof_reclaim}).
 // The config flag is authoritative for enforcement AND recovery: set it false +
 // restart and enforcement stops regardless of the latch marker. Deleting a marker
 // file to "stand down" is retired — it confuses the state machine (the HA monitor
-// re-establishes the latch while the flag is on and the cluster is healthy). Only
-// split_brain_gate_v1 has no config flag; for it, marker deletion remains the sole
-// stand-down (it flips via `supported` alone).
+// re-establishes the latch while the flag is on and the cluster is healthy).
+//
+// The MANDATORY tokens are the exception and they are listed in one place, in
+// mandatory below — read it rather than trusting any prose, here or elsewhere,
+// that names a single one. A mandatory token has no config flag because it does
+// not state a policy an operator chooses; it states a FACT about this binary,
+// and letting an operator misreport that fact is how a cluster corrupts itself.
+//
+// Standing one down therefore differs per token and neither has a config flag
+// to turn off:
+//
+//   - split_brain_gate_v1 flips via `supported` alone, so marker deletion
+//     remains its sole stand-down.
+//   - lease_term_ledger_v1 has no stand-down at all, deliberately. Deleting its
+//     marker does nothing lasting, because the HA monitor re-establishes the
+//     latch the moment the fleet is uniform and there is no flag to stop it.
+//     The intended way to stop minting terms is to stop the fleet being
+//     uniform — roll a host back below this build, or leave one on the previous
+//     release — which the latch already reacts to, since it is
+//     ReplicationGated and so consults every host still receiving replication.
+//     Terms are additive audit facts and nothing reads them until
+//     enforcement.lease_term is on, which IS a flag, so the thing an operator
+//     might actually need to stop is reachable by ordinary means.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -522,6 +544,41 @@ var replicationGated = map[string]bool{
 // See replicationGated for why the two sets differ.
 func ReplicationGated(token string) bool {
 	return replicationGated[token]
+}
+
+// mandatory is every token with NO config kill switch — the ones enforced on
+// every cluster with no operator opt-in.
+//
+// THE set, in one place. It was previously spelled out in prose in four
+// (capabilities.go's KILL SWITCH block, grpcapi's tokenEnabled,
+// docs/diagnostics.md, CLAUDE.md), three of which still claimed
+// split_brain_gate_v1 was the only one long after it stopped being true, and
+// one of which named a token that is not in this set at all. Prose copies of a
+// set do not stay true; a declaration does.
+//
+// Adding an entry is a decision to be made in the open. It means the token
+// latches on every cluster, drives enforcement with no way for an operator to
+// decline, and has no config flag to turn off in an incident — so it is only
+// appropriate for a token stating a FACT about the binary (what wire shapes it
+// can decode, what merge resolver it carries) rather than a policy.
+var mandatory = map[string]bool{
+	SplitBrainGateV1:  true,
+	LeaseTermLedgerV1: true,
+}
+
+// Mandatory reports whether token is enforced with no config kill switch.
+func Mandatory(token string) bool {
+	return mandatory[token]
+}
+
+// MandatoryTokens lists the no-kill-switch tokens, sorted for stable output.
+func MandatoryTokens() []string {
+	out := make([]string, 0, len(mandatory))
+	for tok := range mandatory {
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Has reports whether tokens contains want.

@@ -74,6 +74,24 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		capabilities.LeaseTermLedgerV1: true,
 	}
 
+	// Cross-check the hand-written list against the ONE declaration, so adding a
+	// mandatory token cannot land without someone editing this list too. This is
+	// not the tautology that deriving from tokenEnabled would be: tokenEnabled is
+	// what the rest of this test exercises, and capabilities.mandatory is a
+	// declaration it consumes.
+	declared := capabilities.MandatoryTokens()
+	if len(declared) != len(mandatory) {
+		t.Errorf("capabilities.MandatoryTokens() = %v, but this test expects %d entries. Each "+
+			"mandatory token latches on every cluster with no operator opt-in and has no "+
+			"config flag to turn off in an incident — adding one is a decision to make in "+
+			"the open, not a list to sync silently", declared, len(mandatory))
+	}
+	for _, tok := range declared {
+		if !mandatory[tok] {
+			t.Errorf("%q is declared mandatory but this test does not expect it", tok)
+		}
+	}
+
 	g := &recordingGate{}
 	s := &Server{gate: g}
 	for i := 0; i < 10; i++ {
@@ -195,6 +213,60 @@ func TestSpendCapabilityPeerOp_FreshnessRunsWhileActivationIsStuck(t *testing.T)
 			"post-latch regression detection is off for the whole roll, and "+
 			"evaluateHADegraded then treats `latched` alone as healthy",
 			2*capFreshnessReserveEvery)
+	}
+}
+
+// TestEvaluateHADegraded_AnUnrolledMandatoryTokenIsNotUnsupportedMember: an
+// upgrade in progress must not raise the same alarm as a member that cannot
+// support what this node was told to enforce.
+//
+// A mandatory token has no config flag, so it is tokenEnabled from the first
+// boot and stays unlatched until the last host is upgraded. Folding that into
+// unsupported_member put every node of every cluster into a hard degraded state
+// — gauge set, ha.degraded event published — for the whole of every upgrade,
+// and permanently on a cluster deliberately held with one host back, which
+// docs/operating-model.md blesses as by-design and describes as visible "as an
+// empty ledger rather than as an error".
+//
+// It is reported, just not as a fault: there is no operator intent to have been
+// let down and nothing to turn off, the only remedy being to finish the roll.
+func TestEvaluateHADegraded_AnUnrolledMandatoryTokenIsNotUnsupportedMember(t *testing.T) {
+	// Nothing latched: the state of a node part-way through the first roll onto
+	// a release that adds a mandatory token.
+	s := inventoryServer(t)
+	s.SetGate(&recordingGate{})
+
+	cur := s.evaluateHADegraded(context.Background())
+
+	if cur[haUnsupportedMember] {
+		t.Errorf("%q raised while a mandatory token is merely un-rolled. That is the ordinary "+
+			"state of every cluster mid-upgrade, and permanent on one held with a host "+
+			"back — so this pages on a planned rollout and contradicts the operating "+
+			"model", haUnsupportedMember)
+	}
+	if !cur[haRolloutPending] {
+		t.Errorf("%q not raised; waiting on a rollout is real state and an operator watching a "+
+			"stalled upgrade needs it — it just is not a fault", haRolloutPending)
+	}
+}
+
+// TestEvaluateHADegraded_AMandatoryTokenThatRegressedStillAlarms is the other
+// half: separating the un-rolled case must not swallow the case that genuinely
+// warrants the alarm. A token that LATCHED and whose peer support later
+// disappeared is a regression, not a rollout.
+func TestEvaluateHADegraded_AMandatoryTokenThatRegressedStillAlarms(t *testing.T) {
+	s := inventoryServer(t)
+	s.SetGate(&recordingGate{latched: map[string]bool{capabilities.SplitBrainGateV1: true}})
+	// The freshness axis most recently found it unsupported.
+	s.capHealthMu.Lock()
+	s.capHealthLast = map[string]bool{capabilities.SplitBrainGateV1: false}
+	s.capHealthMu.Unlock()
+
+	cur := s.evaluateHADegraded(context.Background())
+
+	if !cur[haUnsupportedMember] {
+		t.Errorf("%q not raised for a latched mandatory token whose support regressed — that "+
+			"is exactly the condition the alarm exists for", haUnsupportedMember)
 	}
 }
 

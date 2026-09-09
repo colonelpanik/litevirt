@@ -22,7 +22,7 @@ clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
 ordinary mutation's `--force` never bypasses the barrier.
 
-## `hardware_v2` — typed hardware and the one capability with no kill switch
+## `hardware_v2` — typed hardware, with no kill switch of its own
 
 `hardware_v2` makes the typed hardware tables (disks, NICs, PCI intents) the
 source of truth instead of the free-form VM spec, and unlocks hardware mutation

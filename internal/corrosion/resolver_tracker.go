@@ -158,19 +158,29 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	// An acknowledged pair is not a tie any more, as far as the register is
 	// concerned. Checked BEFORE the map is touched so an acknowledged conflict
 	// costs no gauge movement and no repeated warning on every sweep.
-	if ack, ok := c.acknowledgedTies[key]; ok {
-		if ack == pair {
-			c.tieMu.Unlock()
-			return
-		}
-		// A different divergence on the same row: the acknowledgement described
-		// something else and must not cover this. The durable row is superseded
-		// too, best-effort — leaving it would re-suppress the OLD pair after a
-		// restart even though the row has moved on. Deleted without ctx because
-		// this runs inside a merge; a failure here costs a stale suppression of a
-		// pair that is no longer observed, never a missed live tie.
-		delete(c.acknowledgedTies, key)
-		c.deleteAcknowledgedTieRow(table, pk)
+	//
+	// A DIFFERENT pair on the same row falls straight through and registers:
+	// the acknowledgement describes one observed divergence and cannot cover
+	// another. The acknowledgement itself is deliberately left in place, in
+	// memory and in acknowledged_ties.
+	//
+	// THIS FUNCTION MUST NEVER ISSUE A DATABASE WRITE. It used to delete the
+	// superseded acknowledgement here, and that was a self-deadlock: it runs
+	// inside mergeChunk, which holds c.mu across the chunk, every local write
+	// path takes c.mu (execLocal does), and sync.RWMutex is not reentrant. The
+	// merge wedged permanently the first time a third distinct version reached
+	// an acknowledged row, and wedged while holding tieMu, so every tie read
+	// stopped with it — including the inventory collector behind readiness.
+	// TestAcknowledgedTie_ANewDivergenceDoesNotDeadlockTheMerge holds the line.
+	//
+	// Keeping the superseded row is also the more correct answer, which is why
+	// the fix costs nothing. Suppression demands an exact pair match, so a
+	// stale acknowledgement is inert — it cannot mask the live divergence. And
+	// if the acknowledged pair is ever observed again, the operator did
+	// acknowledge precisely that, so staying quiet is the answer they gave.
+	if ack, ok := c.acknowledgedTies[key]; ok && ack == pair {
+		c.tieMu.Unlock()
+		return
 	}
 	prev, existed := c.unresolvedTies[key]
 	isNew := !existed || prev.pair != pair
@@ -251,8 +261,14 @@ func (c *Client) UnresolvedTieCount() int {
 }
 
 // AcknowledgeUnresolvedTie records that an operator has seen the tie currently
-// tracked for (table,PK), and drops it from the live register. Reports whether
-// such a tie was tracked.
+// tracked for (table,PK), and drops it from the live register.
+//
+// true means the acknowledgement was RECORDED, which is very nearly the same
+// thing as "the register was cleared" but not exactly: if a merge replaces the
+// entry with a different divergence while the durable write is in flight, the
+// acknowledgement still stands for the pair the operator saw and the newer
+// conflict stays tracked. false means there was no tracked tie to acknowledge —
+// see TieAcknowledged to tell that from "already acknowledged".
 //
 // It exists because one class of tie can never clear on its own.
 // clearUnresolved fires when a remediating write lands on the row — the right
@@ -267,6 +283,13 @@ func (c *Client) UnresolvedTieCount() int {
 // acknowledged what. DO NOT extend this to delete a losing row: nothing here
 // knows which claim was legitimate, and implying otherwise is the one thing
 // this table's merge exists to avoid.
+// ackPersistedHook is a test-only seam fired after an acknowledgement's durable
+// write lands and BEFORE tieMu is re-acquired — precisely the window in which a
+// merge can replace the tracked pair. Nil in production. Same shape as
+// mergeChunkHook in sync.go, and for the same reason: the race is a two-lock
+// interleaving that no amount of goroutine scheduling reproduces reliably.
+var ackPersistedHook func()
+
 func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by string) (bool, error) {
 	key := unresolvedKey(table, pk)
 
@@ -293,23 +316,64 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 		table, pk, t.pair, time.Now().UTC().Format(time.RFC3339), by); err != nil {
 		return false, fmt.Errorf("persist acknowledgement of %s/%s: %w", table, pk, err)
 	}
+	if ackPersistedHook != nil {
+		ackPersistedHook()
+	}
 
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
-	// Re-check: a concurrent clearUnresolved (a real repair) may have removed it
-	// while the write was in flight. The durable row is harmless then — the pair
-	// it names is no longer tracked, and a future different divergence
-	// supersedes it.
 	if c.acknowledgedTies == nil {
 		c.acknowledgedTies = make(map[string]string, 1)
 	}
 	c.acknowledgedTies[key] = t.pair
-	if _, still := c.unresolvedTies[key]; still {
+
+	// Re-compare the PAIR before clearing anything, not just the key's
+	// presence. tieMu was released for the durable write, and a merge in that
+	// window can replace the register entry with a DIFFERENT divergence on the
+	// same row. Deleting whatever is there now would clear a conflict the
+	// operator never saw and report it acknowledged: the register would read
+	// clean until the next sweep put it back, and the audit row would name a
+	// pair nobody inspected.
+	//
+	// An entry that has vanished entirely is the other outcome and needs no
+	// action: a concurrent clearUnresolved (a real repair) removed it, and an
+	// acknowledgement of a pair that is no longer tracked is inert.
+	cur, still := c.unresolvedTies[key]
+	if still && cur.pair != t.pair {
+		slog.Warn("a different divergence appeared on this row while the acknowledgement was "+
+			"being recorded; the acknowledgement stands for the pair the operator saw and the "+
+			"new conflict stays tracked",
+			"table", table, "pk", pk, "acknowledged_pair", t.pair, "tracked_pair", cur.pair)
+		return true, nil
+	}
+	if still {
 		delete(c.unresolvedTies, key)
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
 		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
 	}
 	return true, nil
+}
+
+// TieAcknowledged reports whether this node holds an acknowledgement for
+// (table,PK), whatever pair it names.
+//
+// It exists so a caller can tell "already acknowledged" from "never a tie
+// here": AcknowledgeUnresolvedTie answers false to both, because both leave
+// the register untouched. The distinction matters to anything that has to be
+// written AFTER the acknowledgement commits — an audit record, say — and would
+// otherwise be unrepairable on a retry, since the retry sees only that false.
+func (c *Client) TieAcknowledged(table, pk string) bool {
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
+	_, ok := c.acknowledgedTies[unresolvedKey(table, pk)]
+	return ok
+}
+
+// LeaseTermTieAcknowledged is TieAcknowledged for a contested lease term, with
+// the PK spelling owned here for the same reason AcknowledgeLeaseTermTie owns
+// it.
+func (c *Client) LeaseTermTieAcknowledged(key string, term int64) bool {
+	return c.TieAcknowledged("leader_lease_terms", pkKey([]interface{}{key, term}))
 }
 
 // loadAcknowledgedTies primes the in-memory acknowledgement set from the
@@ -373,17 +437,4 @@ func (c *Client) UnresolvedTieTables() map[string]int {
 		}
 	}
 	return out
-}
-
-// deleteAcknowledgedTieRow drops one durable acknowledgement. Best-effort and
-// deliberately without a caller-supplied context: the only caller runs inside a
-// merge, where a failed delete costs a stale suppression of a content pair that
-// is no longer observed — never the suppression of a live tie, because the
-// in-memory entry has already been removed by then.
-func (c *Client) deleteAcknowledgedTieRow(table, pk string) {
-	if err := c.execLocal(context.Background(),
-		`DELETE FROM acknowledged_ties WHERE table_name = ? AND pk = ?`, table, pk); err != nil {
-		slog.Warn("could not drop a superseded tie acknowledgement",
-			"table", table, "pk", pk, "error", err)
-	}
 }

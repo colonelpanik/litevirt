@@ -354,6 +354,107 @@ func TestAcknowledgedTies_IsNotReplicated(t *testing.T) {
 	}
 }
 
+// TestAcknowledgeUnresolvedTie_DoesNotClearAPairThatChangedMidWrite closes the
+// window between the durable write and the register update.
+//
+// tieMu is deliberately released for the write — holding it across disk I/O
+// would block every merge — so a merge can replace the register entry with a
+// DIFFERENT divergence in that window. Deleting whatever is present on return
+// clears a conflict the operator never saw and reports it acknowledged: the
+// register reads clean until the next sweep puts it back, and the audit row
+// names a pair nobody inspected.
+//
+// Driven through ackPersistedHook rather than goroutines because the bug is a
+// specific interleaving of two locks; a scheduling race would reproduce it
+// once in a thousand runs and pass the rest.
+func TestAcknowledgeUnresolvedTie_DoesNotClearAPairThatChangedMidWrite(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	c.trackUnresolvedPair("vms", "vm1", "pair-a", pathAE, "runtime_owned")
+
+	ackPersistedHook = func() {
+		// The merge that lands mid-write. Not the acknowledged pair.
+		c.trackUnresolvedPair("vms", "vm1", "pair-B-different", pathAE, "runtime_owned")
+	}
+	defer func() { ackPersistedHook = nil }()
+
+	ok, err := c.AcknowledgeUnresolvedTie(ctx, "vms", "vm1", "tim")
+	if err != nil {
+		t.Fatalf("acknowledge: %v", err)
+	}
+	if !ok {
+		t.Error("reported nothing acknowledged; the operator's acknowledgement of pair-a was " +
+			"recorded and stands")
+	}
+	if n := c.UnresolvedTieCount(); n != 1 {
+		t.Errorf("register holds %d tie(s), want 1: an acknowledgement of pair-a cleared the "+
+			"newer pair-B divergence, so an operator sees a clean register for a conflict "+
+			"nobody has looked at", n)
+	}
+
+	// And the durable row names what the operator actually saw, not what
+	// arrived afterwards.
+	rows, err := c.Query(ctx, `SELECT content_pair FROM acknowledged_ties`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("acknowledged_ties rows = %d (err=%v), want 1", len(rows), err)
+	}
+	if got := rows[0].String("content_pair"); got != "pair-a" {
+		t.Errorf("content_pair = %q, want %q", got, "pair-a")
+	}
+}
+
+// TestAcknowledgedTie_ANewDivergenceDoesNotDeadlockTheMerge pins a
+// self-deadlock, not a logic error, which is why it drives the REAL merge path
+// instead of calling trackUnresolvedPair directly the way its neighbours do.
+//
+// trackUnresolvedPair runs inside mergeChunk, which holds c.mu for the whole
+// chunk. Every local write path takes c.mu — execLocal does — and sync.RWMutex
+// is not reentrant. So issuing any database write from the tracker deadlocks
+// the merge permanently, and does it while still holding tieMu, taking out
+// every tie read with it: UnresolvedTieCategories, the inventory collector
+// behind readiness, the lot.
+//
+// The trigger is a third distinct version of an ALREADY-ACKNOWLEDGED row, so
+// nothing in the direct-call tests could reach it: they never enter the merge,
+// where the lock is held.
+func TestAcknowledgedTie_ANewDivergenceDoesNotDeadlockTheMerge(t *testing.T) {
+	ctx := context.Background()
+	local, _ := contestedTermFixture(t)
+	if ok, err := local.AcknowledgeLeaseTermTie(ctx, LeaseKeyFailover, 1, "tim"); err != nil || !ok {
+		t.Fatalf("acknowledge: ok=%v err=%v", ok, err)
+	}
+
+	// A THIRD claimant for the same term. Its row differs from both
+	// acknowledged versions, so the pair the merge observes no longer equals
+	// the acknowledged one — the case that used to attempt a delete.
+	third := testClient(t)
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	if held, term, err := AcquireLeaseWithTerm(ctx, third, LeaseKeyFailover, "host-c", 30*time.Second, now); err != nil || !held || term != 1 {
+		t.Fatalf("third acquire: held=%v term=%d err=%v", held, term, err)
+	}
+
+	// Merged off the test goroutine so a deadlock FAILS rather than hanging the
+	// package: a hung merge holds c.mu and tieMu, so no assertion below could
+	// run either.
+	done := make(chan error, 1)
+	go func() { done <- local.MergeStateBytesLWW(third.DumpStateBytes()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("anti-entropy third→local: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("anti-entropy did not return within 15s: the merge deadlocked. A database " +
+			"write issued from the tie tracker re-enters c.mu, which mergeChunk already " +
+			"holds, and takes tieMu down with it")
+	}
+
+	if n := local.UnresolvedTieCount(); n != 1 {
+		t.Errorf("register holds %d tie(s), want 1: a divergence the operator never "+
+			"acknowledged must surface", n)
+	}
+}
+
 // TestAcknowledgeUnresolvedTie_ADurableWriteFailureIsNotSuccess: if the
 // acknowledgement cannot be recorded, it has not happened.
 //

@@ -58,16 +58,37 @@ func (s *Server) AcknowledgeLeaseTermTie(ctx context.Context, req *pb.Acknowledg
 		return nil, status.Errorf(codes.Unavailable,
 			"could not record the acknowledgement of %s term %d: %v", key, req.GetTerm(), err)
 	}
-	if acked {
-		// Audited only when something was actually cleared, so a retry does not
-		// produce a second record of one operator decision.
+	// Audited whenever this node holds an acknowledgement — the one just made,
+	// or one made by an earlier call — and NOT only when this call cleared
+	// something.
+	//
+	// The narrower version audited on acked alone, to keep one operator
+	// decision from producing two records. That made a missing record
+	// permanent: the suppression is durable the moment AcknowledgeLeaseTermTie
+	// returns, the audit insert happens afterwards and only warns when it
+	// fails (auditAs), and a retry then finds no tracked tie, answers false and
+	// audited nothing. A crash in that gap left a silenced conflict with
+	// nothing in the audit chain saying anyone had looked at it, and no command
+	// an operator could run to repair it.
+	//
+	// So the trade is inverted deliberately: a retry may add a second row
+	// naming one decision, which is noise an auditor can read past, whereas a
+	// missing row is not recoverable at all. The detail text says which case
+	// produced it.
+	if reaffirmed := !acked && s.db.LeaseTermTieAcknowledged(key, req.GetTerm()); acked || reaffirmed {
+		detail := fmt.Sprintf("acknowledged a contested lease term on %s; both claims remain in the ledger", s.hostName)
+		if reaffirmed {
+			detail = fmt.Sprintf("reaffirmed an existing acknowledgement of a contested lease term on %s; "+
+				"nothing was cleared by this call", s.hostName)
+		}
 		s.audit(ctx, "cluster.lease_term_tie.acknowledge",
-			fmt.Sprintf("%s:%d", key, req.GetTerm()),
-			fmt.Sprintf("acknowledged a contested lease term on %s; both claims remain in the ledger", s.hostName),
-			"ok")
+			fmt.Sprintf("%s:%d", key, req.GetTerm()), detail, "ok")
+	}
+	if acked {
 		// The inventory feeds readiness and the digest, and both read the tie
 		// counts. Without this the node reports the stale count until the cache
 		// expires, so an operator's acknowledgement appears not to have worked.
+		// Only when something changed: a reaffirmation moved nothing.
 		s.invalidateInventoryCache()
 	}
 	return &pb.AcknowledgeLeaseTermTieResponse{Acknowledged: acked}, nil

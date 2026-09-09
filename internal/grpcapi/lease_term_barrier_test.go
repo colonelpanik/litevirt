@@ -1,0 +1,398 @@
+package grpcapi
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
+	"google.golang.org/grpc"
+)
+
+// fakeHighWaterPeer answers GetLeaseTermHighWater and nothing else. The
+// embedded nil interface satisfies the rest of pb.LiteVirtClient, which is the
+// package's existing convention for peer doubles.
+type fakeHighWaterPeer struct {
+	pb.LiteVirtClient
+	term     int64
+	key      string        // when set, the key this peer answers ABOUT (to fake a wrong-key answer)
+	delay    time.Duration // block before answering, to fake an unreachable peer
+	err      error
+	requests *int64 // optional call counter
+}
+
+func (f *fakeHighWaterPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption) (*pb.GetLeaseTermHighWaterResponse, error) {
+	if f.requests != nil {
+		atomic.AddInt64(f.requests, 1)
+	}
+	if f.delay > 0 {
+		// An unreachable peer does NOT fail fast: pki.PeerDial wraps
+		// grpc.NewClient, which is lazy, so the dial returns immediately and the
+		// call blocks until the deadline. That is what this reproduces.
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	key := req.GetKey()
+	if f.key != "" {
+		key = f.key
+	}
+	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: f.term, Holder: "node-x"}, nil
+}
+
+// fakePeers wires a peer-name → newest-term map.
+func fakePeers(terms map[string]int64) func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+	return func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		term, ok := terms[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return &fakeHighWaterPeer{term: term}, func() {}, nil
+	}
+}
+
+// countingPeers is fakePeers that records how many answers it served, so a test
+// can assert a cached refusal cost no fan-out.
+func countingPeers(calls *int64, terms map[string]int64) func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+	return func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		term, ok := terms[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return &fakeHighWaterPeer{term: term, requests: calls}, func() {}, nil
+	}
+}
+
+// unreachablePeers fails every dial.
+func unreachablePeers() func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+	return func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return nil, nil, context.DeadlineExceeded
+	}
+}
+
+// fakePeersAnsweringKey answers about a DIFFERENT key than the one requested.
+func fakePeersAnsweringKey(key string, terms map[string]int64) func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+	return func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		term, ok := terms[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return &fakeHighWaterPeer{term: term, key: key}, func() {}, nil
+	}
+}
+
+// barrierNode is a server with a seeded local ledger and a quorum-holding gate.
+func barrierNode(t *testing.T, localTerm int64, needed int, peers ...string) *Server {
+	t.Helper()
+	s := inventoryServer(t)
+	if localTerm > 0 {
+		if held, term, err := corrosion.AcquireLeaseWithTerm(context.Background(), s.db,
+			corrosion.LeaseKeyFailover, "node-a", 30*time.Second,
+			time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)); err != nil || !held {
+			t.Fatalf("seed lease: held=%v term=%d err=%v", held, term, err)
+		}
+		// Walk the ledger up to localTerm with successive lapsed tenures, using
+		// the real allocator rather than inserting rows.
+		now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+		for term := int64(2); term <= localTerm; term++ {
+			now = now.Add(2 * time.Minute)
+			if held, got, err := corrosion.AcquireLeaseWithTerm(context.Background(), s.db,
+				corrosion.LeaseKeyFailover, "node-a", 30*time.Second, now); err != nil || !held || got != term {
+				t.Fatalf("seed term %d: held=%v got=%d err=%v", term, held, got, err)
+			}
+		}
+	}
+	s.SetGate(fakeServerGate{quorum: health.QuorumYes, needed: needed, healthy: peers})
+	return s
+}
+
+// TestLeaseTermBarrier_APeerHigherTermBeatsTheLocalReplica is the single case
+// the whole barrier exists for. The executor's own ledger says 4, a quorum peer
+// answers 6, and a term-5 proof must be refused.
+func TestLeaseTermBarrier_APeerHigherTermBeatsTheLocalReplica(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 4, 2, "node-c")
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 6})
+
+	verdict, threshold := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5)
+	if verdict != leaseTermStale {
+		t.Errorf("verdict = %v (threshold %d), want stale — the local MAX is 4 but a quorum "+
+			"peer holds 6, so term 5 is superseded", verdict, threshold)
+	}
+	if threshold != 6 {
+		t.Errorf("threshold = %d, want 6 (the highest across all answers)", threshold)
+	}
+}
+
+// TestLeaseTermBarrier_QuorumShortfallRefuses. Failing OPEN here would be worse
+// than having no barrier at all: it would present as protection while providing
+// none.
+func TestLeaseTermBarrier_QuorumShortfallRefuses(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 4, 3, "node-c")
+	s.peerClientOverride = unreachablePeers()
+
+	verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5)
+	if verdict != leaseTermUnconfirmed {
+		t.Errorf("verdict = %v, want unconfirmed — 1 answer against a needed 3 must refuse, "+
+			"and must be distinguishable from a stale-term refusal", verdict)
+	}
+}
+
+// TestLeaseTermBarrier_QuorumUnknownRefuses: QuorumProof is tri-state, and
+// Unknown means "neither proof nor loss". This is a gate, so it fails closed.
+func TestLeaseTermBarrier_QuorumUnknownRefuses(t *testing.T) {
+	ctx := context.Background()
+	s := inventoryServer(t)
+	s.SetGate(fakeServerGate{quorum: health.QuorumUnknown, needed: 1})
+
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5); verdict != leaseTermUnconfirmed {
+		t.Errorf("verdict = %v on QuorumUnknown, want unconfirmed", verdict)
+	}
+}
+
+// TestLeaseTermBarrier_NoGateRefuses: nothing wired means nothing established.
+func TestLeaseTermBarrier_NoGateRefuses(t *testing.T) {
+	s := inventoryServer(t)
+	s.gate = nil
+	if verdict, _ := s.leaseTermBarrier(context.Background(), corrosion.LeaseKeyFailover, 5); verdict != leaseTermUnconfirmed {
+		t.Errorf("verdict = %v with no gate, want unconfirmed", verdict)
+	}
+}
+
+// TestLeaseTermBarrier_AMalformedAnswerIsNotAgreement: a peer answering about a
+// different key, or erroring, counts as no answer — never as agreement, and
+// never as term 0.
+func TestLeaseTermBarrier_AMalformedAnswerIsNotAgreement(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 0, 2, "node-c")
+	s.peerClientOverride = fakePeersAnsweringKey(corrosion.LeaseKeyRebalancer, map[string]int64{"node-c": 9})
+
+	verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5)
+	if verdict != leaseTermUnconfirmed {
+		t.Errorf("verdict = %v, want unconfirmed — an answer about another key is no answer, "+
+			"so quorum was never reached", verdict)
+	}
+}
+
+// TestLeaseTermBarrier_AcceptsAtOrAboveTheThreshold: the barrier must not refuse
+// everything. A term equal to the threshold is the ordinary current-tenure case.
+func TestLeaseTermBarrier_AcceptsAtOrAboveTheThreshold(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 6, 2, "node-c")
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 6})
+
+	if verdict, th := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 6); verdict != leaseTermCurrent {
+		t.Errorf("verdict = %v (threshold %d) for a term EQUAL to the threshold, want current", verdict, th)
+	}
+}
+
+// TestLeaseTermBarrier_TheCacheNeverTurnsARefusalIntoAnAccept pins the
+// monotonicity argument that makes the cache safe at all.
+//
+// The high-water term only increases, so a cached value is a LOWER BOUND on the
+// truth. Refusing from a lower bound is sound: if cached > term, the true
+// maximum is at least that. ACCEPTING from one is not: the true maximum may have
+// moved past the proof's term since the cache was written. So an accept always
+// costs a fresh sweep.
+func TestLeaseTermBarrier_TheCacheNeverTurnsARefusalIntoAnAccept(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 4, 2, "node-c")
+
+	// Warm the cache at threshold 4.
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 4})
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5); verdict != leaseTermCurrent {
+		t.Fatalf("warmup: verdict = %v, want current", verdict)
+	}
+
+	// The truth advances to 6 while the cache still says 4.
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 6})
+	if verdict, th := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5); verdict != leaseTermStale {
+		t.Errorf("verdict = %v (threshold %d), want stale. Serving an ACCEPT from the cached "+
+			"lower bound accepts a proof a fresh sweep would refuse", verdict, th)
+	}
+}
+
+// TestLeaseTermBarrier_ACachedThresholdCanRefuseWithoutASweep is the other half:
+// the cache must actually be used, or it is dead weight on the recovery path.
+func TestLeaseTermBarrier_ACachedThresholdCanRefuseWithoutASweep(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 6, 2, "node-c")
+
+	var sweeps int64
+	s.peerClientOverride = countingPeers(&sweeps, map[string]int64{"node-c": 6})
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 6); verdict != leaseTermCurrent {
+		t.Fatalf("warmup: want current")
+	}
+	before := atomic.LoadInt64(&sweeps)
+
+	// A term below the cached threshold is refusable from the cache alone.
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 2); verdict != leaseTermStale {
+		t.Fatal("a term below the cached threshold must be refused")
+	}
+	if got := atomic.LoadInt64(&sweeps); got != before {
+		t.Errorf("the cached refusal cost a fresh sweep (%d → %d); on a 40-VM failover that is "+
+			"40 avoidable fan-outs on the recovery path", before, got)
+	}
+}
+
+// TestLeaseTermBarrier_ThresholdDoesNotRegressWithinTheTTL pins the clamp's
+// actual job: a slow sweep landing after a fast one must not walk the bound
+// backwards. That reordering resolves in milliseconds, so the clamp only ever
+// needs to hold inside the TTL — which is exactly as far as it may reach.
+//
+// THE MIDDLE QUERY MUST BE AT THE CACHED THRESHOLD, not below it. Asking about
+// a lower term short-circuits on the cached-refusal fast path and returns
+// before any sweep runs, so the clamp is never reached and the test passes with
+// the clamp deleted — verified by mutation. Querying AT the threshold forces a
+// fresh sweep, which is the only way the lower observation reaches
+// storeLeaseThreshold at all, and only then does the third query reveal which
+// value was kept.
+func TestLeaseTermBarrier_ThresholdDoesNotRegressWithinTheTTL(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 0, 2, "node-c")
+
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 6})
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 6); verdict != leaseTermCurrent {
+		t.Fatalf("warmup at 6: want current")
+	}
+
+	// A reordered slow sweep answers lower. Queried AT the cached threshold, so
+	// it takes the sweep path and the answer reaches the clamp.
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 4})
+	if verdict, got := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 6); verdict != leaseTermCurrent {
+		t.Fatalf("term 6 judged %v against threshold %d, want current", verdict, got)
+	}
+
+	// The bound must still be 6, which only shows up now: term 5 is below 6 and
+	// above the lower observation, so it is refused if and only if the clamp
+	// held.
+	if verdict, got := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5); verdict != leaseTermStale {
+		t.Errorf("term 5 judged %v against threshold %d; a reordered slow sweep walked a live "+
+			"bound backwards from 6 to 4", verdict, got)
+	}
+}
+
+// TestLeaseTermBarrier_ThresholdAdoptsARegressionAfterTheTTL is what makes
+// leaseBarrierCacheTTL mean anything at all.
+//
+// A reseed is the one event that walks the observed high water BACKWARDS: the
+// node loses exactly the terms its reseed source never received, so its
+// ledger's maximum legitimately drops. The TTL exists to bound how long a
+// pre-reseed observation can keep refusing proofs the post-reseed cluster
+// considers current.
+//
+// The clamp in storeLeaseThreshold must therefore read expiry. Clamping against
+// an EXPIRED entry keeps the higher value AND re-stamps `at`, so the entry never
+// ages out — and because every accept pays for a fresh sweep, ordinary traffic
+// renews it forever. The second half of this test is the one that catches that:
+// a single post-expiry sweep is not enough, because the bug only shows once the
+// renewed entry is consulted again.
+func TestLeaseTermBarrier_ThresholdAdoptsARegressionAfterTheTTL(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 0, 2, "node-c")
+
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 6})
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 6); verdict != leaseTermCurrent {
+		t.Fatalf("warmup at 6: want current")
+	}
+
+	// Age the cached observation past the TTL, in-package rather than by sleeping.
+	s.leaseBarrierMu.Lock()
+	e := s.leaseBarrierCache[corrosion.LeaseKeyFailover]
+	e.at = time.Now().Add(-2 * leaseBarrierCacheTTL)
+	s.leaseBarrierCache[corrosion.LeaseKeyFailover] = e
+	s.leaseBarrierMu.Unlock()
+
+	// Post-reseed the quorum answers lower. Term 5 is current again.
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 4})
+	for i, want := range []leaseTermVerdict{leaseTermCurrent, leaseTermCurrent} {
+		verdict, got := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 5)
+		if verdict != want {
+			t.Fatalf("sweep %d: term 5 judged %v against threshold %d, want %v — an EXPIRED "+
+				"threshold that survives its own TTL refuses valid proofs forever, because each "+
+				"accept's fresh sweep re-stamps it", i+1, verdict, got, want)
+		}
+	}
+}
+
+// TestLeaseTermBarrier_ConcurrentCallersShareOneSweep is the accept path's cost
+// bound, and it is the one the original design did not have.
+//
+// An accept can never be served from cache (see above), so every accepted proof
+// pays for a fresh sweep. A dead peer does not fail fast — pki.PeerDial wraps
+// grpc.NewClient, which is lazy, so the dial returns at once and the RPC blocks
+// until the deadline — and an unreachable peer is the DEFINING condition of a
+// failover. Without sharing, a host loss with 40 workloads ran 40 independent
+// fan-outs, each paying the full 3s budget: roughly two minutes of serialised
+// latency added to recovery, at the one moment the system is meant to be fast.
+//
+// The fix is deliberately NOT "return once answers >= needed". That would bound
+// the cost by discarding the very evidence the barrier exists to find — a peer
+// holding a HIGHER term than this node's replica — turning a refusal a complete
+// sweep would have produced into an accept.
+func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
+	s := barrierNode(t, 4, 2, "node-c")
+
+	var served int64
+	release := make(chan struct{})
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &blockingPeer{term: 6, requests: &served, gate: release}, func() {}, nil
+	}
+
+	const callers = 20
+	var wg sync.WaitGroup
+	verdicts := make([]leaseTermVerdict, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			verdicts[i], _ = s.leaseTermBarrier(context.Background(), corrosion.LeaseKeyFailover, 5)
+		}(i)
+	}
+
+	// Let every caller pile up on the one in-flight sweep, then release it.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&served); got != 1 {
+		t.Errorf("%d callers produced %d peer fan-outs, want 1. Each unshared sweep pays the "+
+			"full %s budget when a peer is unreachable, which is exactly the failover case",
+			callers, got, leaseBarrierBudget)
+	}
+	for i, v := range verdicts {
+		if v != leaseTermStale {
+			t.Errorf("caller %d got %v, want stale — every caller must get the shared sweep's "+
+				"real answer, not a degraded one", i, v)
+		}
+	}
+}
+
+// blockingPeer answers only once `gate` is closed, so a test can hold a sweep
+// open while other callers arrive.
+type blockingPeer struct {
+	pb.LiteVirtClient
+	term     int64
+	requests *int64
+	gate     chan struct{}
+}
+
+func (b *blockingPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption) (*pb.GetLeaseTermHighWaterResponse, error) {
+	atomic.AddInt64(b.requests, 1)
+	select {
+	case <-b.gate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &pb.GetLeaseTermHighWaterResponse{Key: req.GetKey(), Term: b.term, Holder: "node-c"}, nil
+}

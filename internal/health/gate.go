@@ -73,6 +73,16 @@ const (
 	ReasonProofConflict         = "proof_conflict"
 	ReasonProofClaimError       = "proof_claim_error" // transient DB error claiming a proof (not a spent/terminal proof)
 	ReasonStaleEpoch            = "stale_epoch"       // Phase 5 (fence/owner epoch staleness)
+	// ReasonStaleLeaseTerm: FENCED. The proof's lease term is below the
+	// quorum-observed high-water mark for its key, or its coordinator is not
+	// the holder this node recorded at that term.
+	ReasonStaleLeaseTerm = "stale_lease_term"
+	// ReasonLeaseTermUnconfirmed: NOT fenced — could not establish WHETHER it
+	// was fenced. Quorum was unreachable, or a ledger read failed. Kept
+	// distinct from ReasonStaleLeaseTerm because the first is the mechanism
+	// working and the second is the mechanism degraded; collapsing them loses
+	// the only signal that tells an operator which one is happening.
+	ReasonLeaseTermUnconfirmed  = "lease_term_unconfirmed"
 	ReasonFenceUnproven         = "fence_unproven"
 	ReasonDemotionFailed        = "demotion_failed"
 	ReasonVIPReleaseUnconfirmed = "vip_release_unconfirmed"

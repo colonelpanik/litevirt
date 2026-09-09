@@ -391,6 +391,14 @@ type Server struct {
 	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
 
+	// leaseBarrierCache holds the last quorum-observed lease-term threshold per
+	// key. Read ONLY to serve refusals — see leaseTermBarrier for why accepting
+	// from it would be unsound. leaseBarrierFlight collapses concurrent callers
+	// for one key onto a single in-flight sweep.
+	leaseBarrierMu     sync.Mutex
+	leaseBarrierCache  map[string]leaseBarrierEntry
+	leaseBarrierFlight map[string]*leaseBarrierSweep
+
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
@@ -780,6 +788,11 @@ type serverGate interface {
 	// healthy this run AND voting-eligible by host state). Used to pick a quorum-visible
 	// relay for the VIP absence proof when the target isn't directly reachable.
 	HealthyPeers(ctx context.Context) []string
+	// QuorumProof is the tri-state quorum view plus the live/needed counts. The
+	// lease-term barrier compares its own responder count against `needed`, so
+	// the barrier's denominator is the one every other gate in this path uses
+	// rather than a second quorum rule inside one failover decision.
+	QuorumProof(ctx context.Context) (health.QuorumState, int, int)
 }
 
 // SetGate injects the split-brain safety gate.

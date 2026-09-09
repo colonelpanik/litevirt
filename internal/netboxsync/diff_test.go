@@ -576,6 +576,232 @@ func TestDiffLetsAReplaceOwnTheInterfacesItCascades(t *testing.T) {
 	}
 }
 
+// ── the rename cycle ────────────────────────────────────────────────────────
+
+// nameSwapActual is two of our own objects holding each other's desired name.
+func nameSwapActual() Actual {
+	return Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u-a"): {ID: 11, Name: "vm-1", Identity: vmIdent("u-a"), VCPUs: 2},
+			vmIdent("u-b"): {ID: 12, Name: "vm-2", Identity: vmIdent("u-b"), VCPUs: 2},
+		},
+		NICs:            map[string]netbox.VMInterface{},
+		ForeignVMNames:  map[string]bool{},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{},
+	}
+}
+
+// swappedDesired is the same two VMs after each has taken the other's name.
+func swappedDesired() []DesiredVM {
+	return []DesiredVM{
+		{Name: "vm-2", UUID: "u-a", VCPUs: 2},
+		{Name: "vm-1", UUID: "u-b", VCPUs: 2},
+	}
+}
+
+func parkActions(actions []Action) []Action {
+	var out []Action
+	for _, a := range actions {
+		if a.Op == opPark {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// TestDiffBreaksARenameCycleWithOneParkAndNoRemoval.
+//
+// A name swap is a permutation, so it has no safe starting point: each object's
+// occupant is the other, both identities are in the desired set, and the
+// replacement refuses both — a live VM may never be removed to free a name. What
+// the diff does instead is move ONE member onto a temporary name it owns, which
+// leaves the other member's rename unblocked.
+func TestDiffBreaksARenameCycleWithOneParkAndNoRemoval(t *testing.T) {
+	got := Diff(swappedDesired(), nameSwapActual(), fp)
+
+	parks := parkActions(got)
+	if len(parks) != 1 {
+		t.Fatalf("got %+v, want exactly one vm/park: a cycle needs one name outside it, and "+
+			"parking both members frees nothing", got)
+	}
+	// The LOWEST identity, so a condition lasting several sweeps parks the same
+	// object rather than a different one each pass.
+	if parks[0].Key != vmIdent("u-a") || parks[0].NetBoxID != 11 {
+		t.Errorf("the park must name the lowest identity in the cycle, got %+v", parks[0])
+	}
+	if parks[0].FreesName != "vm-1" {
+		t.Errorf("FreesName = %q, want the name the park vacates", parks[0].FreesName)
+	}
+	// NOTHING IS REMOVED, and nothing is replaced: both identities are live.
+	for _, a := range got {
+		if a.Op == "delete" || a.Op == opReplace {
+			t.Fatalf("a rename cycle produced %+v — a collision between two live VMs may never "+
+				"be resolved by removing either of them", a)
+		}
+	}
+	// The OTHER member's rename goes this pass, onto the name the park frees.
+	var updates []string
+	for _, a := range got {
+		if a.Kind == "vm" && a.Op == "update" {
+			updates = append(updates, a.Key)
+		}
+	}
+	if !reflect.DeepEqual(updates, []string{vmIdent("u-b")}) {
+		t.Fatalf("vm updates = %v, want only the member the park unblocked: the parked object's "+
+			"own name is still held, and writing it would be the 400 all over again", updates)
+	}
+}
+
+// TestDiffDoesNotParkWhenTheTemporaryNameIsTaken is the fail-closed half.
+//
+// NetBox's rule is per name whoever holds it, so a park onto a taken name is the
+// identical refusal it exists to avoid. Refusing to plan it leaves the cycle
+// exactly as it was — which the sweep reports — rather than trading a stall for
+// a failed pass.
+func TestDiffDoesNotParkWhenTheTemporaryNameIsTaken(t *testing.T) {
+	actual := nameSwapActual()
+	// A co-tenant's object already holds the name the park would use for the
+	// lowest identity in the cycle.
+	actual.ForeignVMNames[parkedName(vmIdent("u-a"))] = true
+
+	got := Diff(swappedDesired(), actual, fp)
+
+	if parks := parkActions(got); len(parks) != 0 {
+		t.Fatalf("planned %+v onto a name this NetBox cluster already holds", parks)
+	}
+	for _, a := range got {
+		if a.Kind == "vm" && (a.Op == "update" || a.Op == "create") {
+			t.Fatalf("emitted %+v into an unbroken cycle; every such write is a 400 that fails "+
+				"the whole pass", a)
+		}
+	}
+}
+
+// TestDiffKeepsACycledVMsObjectsInTheDesiredSet is the property whose absence
+// would turn a name collision into a deletion.
+//
+// A VM whose upsert is deferred — parked or blocked — emits no NIC actions this
+// pass, so if it were also left out of the seen sets the delete half would reap
+// the objects of a VM that is very much alive.
+func TestDiffKeepsACycledVMsObjectsInTheDesiredSet(t *testing.T) {
+	actual := nameSwapActual()
+	actual.NICs = map[string]netbox.VMInterface{
+		nicIdent("u-a", "52:54:00:aa:00:01"): {
+			ID: 21, VMID: 11, Name: "eth0", MAC: "52:54:00:AA:00:01",
+			Identity: nicIdent("u-a", "52:54:00:aa:00:01"),
+		},
+		nicIdent("u-b", "52:54:00:aa:00:02"): {
+			ID: 22, VMID: 12, Name: "eth0", MAC: "52:54:00:AA:00:02",
+			Identity: nicIdent("u-b", "52:54:00:aa:00:02"),
+		},
+	}
+	desired := swappedDesired()
+	desired[0].NICs = []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:00:01"}}
+	desired[1].NICs = []DesiredNIC{{Name: "eth0", MAC: "52:54:00:aa:00:02"}}
+
+	got := Diff(desired, actual, fp)
+
+	for _, a := range got {
+		if a.Op == "delete" {
+			t.Fatalf("a deferred rename produced %+v: a VM waiting for its name is still in the "+
+				"desired set, objects and interfaces both", a)
+		}
+	}
+}
+
+// TestDiffDefersARenameChainWithoutFailingThePass.
+//
+// A CHAIN is not a cycle and needs no park: its head is unblocked, so it drains
+// one link per sweep. What it must not do is emit the blocked link's write, which
+// is a 400 that fails the whole pass — including work the pass had already done —
+// over a wait of one interval.
+func TestDiffDefersARenameChainWithoutFailingThePass(t *testing.T) {
+	actual := nameSwapActual()
+	// u-b wants a free name, so only u-a is waiting: a chain, not a cycle.
+	desired := []DesiredVM{
+		{Name: "vm-2", UUID: "u-a", VCPUs: 2},
+		{Name: "vm-3", UUID: "u-b", VCPUs: 2},
+	}
+
+	got := Diff(desired, actual, fp)
+
+	if parks := parkActions(got); len(parks) != 0 {
+		t.Fatalf("a chain needs no name outside it, got %+v", parks)
+	}
+	var updates []string
+	for _, a := range got {
+		if a.Kind == "vm" && a.Op == "update" {
+			updates = append(updates, a.Key)
+		}
+	}
+	if !reflect.DeepEqual(updates, []string{vmIdent("u-b")}) {
+		t.Fatalf("vm updates = %v, want only the chain's head", updates)
+	}
+}
+
+// TestUnconvergedRenamesNamesEveryVMStillWaiting is the reporting predicate.
+//
+// A parked member has NOT converged — its object sits under a temporary name —
+// and neither has a blocked one. Both must be reported, or a pass that made
+// progress would stamp the staleness gauge an operator alerts on.
+func TestUnconvergedRenamesNamesEveryVMStillWaiting(t *testing.T) {
+	desired, actual := swappedDesired(), nameSwapActual()
+	actions := Diff(desired, actual, fp)
+
+	got := unconvergedRenames(desired, actual, actions, fp)
+	if !reflect.DeepEqual(got, []string{"vm-2"}) {
+		t.Fatalf("unconverged renames = %v, want the parked member's desired name: the other "+
+			"member's rename landed this pass", got)
+	}
+	// And a pass with nothing outstanding reports nothing, or the gauge would
+	// never be stamped again.
+	settled := []DesiredVM{{Name: "vm-1", UUID: "u-a", VCPUs: 2}}
+	settledActual := Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u-a"): {ID: 11, Name: "vm-1", Identity: vmIdent("u-a"), VCPUs: 2},
+		},
+		NICs: map[string]netbox.VMInterface{}, ForeignVMNames: map[string]bool{},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{},
+	}
+	if got := unconvergedRenames(settled, settledActual, nil, fp); len(got) != 0 {
+		t.Fatalf("a converged pass reported %v as waiting", got)
+	}
+}
+
+// TestUnconvergedRenamesReportsADeferredCreateToo.
+//
+// A blocked CREATE has no NetBox object at all, so a predicate that compared the
+// desired name against an existing object's would skip it entirely — and the pass
+// would stamp the success gauge over a VM it wrote nothing for. The producible
+// shape: a live VM is renaming away from a name a brand-new VM has taken.
+func TestUnconvergedRenamesReportsADeferredCreateToo(t *testing.T) {
+	actual := Actual{
+		// Only the incumbent is mirrored; it still holds vm-1 and is moving off it.
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent("u-a"): {ID: 11, Name: "vm-1", Identity: vmIdent("u-a"), VCPUs: 2},
+		},
+		NICs: map[string]netbox.VMInterface{}, ForeignVMNames: map[string]bool{},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{},
+	}
+	desired := []DesiredVM{
+		{Name: "vm-9", UUID: "u-a", VCPUs: 2},   // renaming away, unblocked
+		{Name: "vm-1", UUID: "u-new", VCPUs: 2}, // a create onto the name it vacates
+	}
+
+	actions := Diff(desired, actual, fp)
+
+	for _, a := range actions {
+		if a.Kind == "vm" && a.Op == "create" {
+			t.Fatalf("emitted %+v while a live VM still holds the name; that is the 400 all "+
+				"over again", a)
+		}
+	}
+	if got := unconvergedRenames(desired, actual, actions, fp); !reflect.DeepEqual(got, []string{"vm-1"}) {
+		t.Fatalf("unconverged = %v, want the deferred CREATE's name: a VM with no NetBox object "+
+			"yet is exactly the one a name-comparison would miss", got)
+	}
+}
+
 func TestPhasesOrderParentsBeforeChildren(t *testing.T) {
 	actions := []Action{
 		{Kind: "vm", Op: "delete", Key: "vm-gone"},
@@ -602,6 +828,28 @@ func TestPhasesOrderParentsBeforeChildren(t *testing.T) {
 		if len(got[tc.phase]) != 1 || got[tc.phase][0].Key != tc.key {
 			t.Errorf("phase %d must be %s, got %+v", tc.phase, tc.what, got[tc.phase])
 		}
+	}
+}
+
+// TestPhasesPutTheRenameCycleParkAheadOfTheUpserts.
+//
+// A park frees a name a rename in the upsert phase needs, so it has to run in
+// the FIRST phase for the identical reason the replace does — the actions inside
+// one phase run in parallel, so anything but a phase boundary is a race. Falling
+// through to the default bucket would put it LAST, after the very write it exists
+// to unblock.
+func TestPhasesPutTheRenameCycleParkAheadOfTheUpserts(t *testing.T) {
+	got := Phases([]Action{
+		{Kind: "vm", Op: "update", Key: "vm-renaming", NetBoxID: 12},
+		{Kind: "vm", Op: opPark, Key: "vm-parked", NetBoxID: 11},
+	})
+
+	if len(got[PhaseVMSupersede]) != 1 || got[PhaseVMSupersede][0].Op != opPark {
+		t.Fatalf("the first phase must hold the park, got %+v", got[PhaseVMSupersede])
+	}
+	if len(got[PhaseVMDelete]) != 0 {
+		t.Fatalf("the park fell through to the last phase, behind the upsert it unblocks: %+v",
+			got[PhaseVMDelete])
 	}
 }
 

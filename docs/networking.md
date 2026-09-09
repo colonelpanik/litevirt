@@ -873,9 +873,31 @@ Two things it will never touch, both refused twice over (once when the action is
 planned, once again before the delete is issued): an object whose identity **is**
 in the desired set — a live VM of this cluster, which freeing a name may never
 remove — and an object carrying a **different** cluster's fingerprint, which
-belongs to another installation. Two VMs swapping names is the first case: each
-one's occupant is the other, both are live, and the mirror waits for one of the
-two renames to land rather than removing either.
+belongs to another installation.
+
+**A rename cycle is broken through a temporary name, not by removing anything.**
+Two VMs swapping names — or any permutation of names among live VMs — is the
+first of those two cases on both sides: each object's occupant is the other, both
+identities are in the desired set, so the replacement refuses both. There is also
+no order that works. Neither rename can land while the other holds the name, so
+**waiting does not resolve it**: every sweep computes the same updates and gets
+the same refusals, for as long as both VMs exist.
+
+The way out of a permutation is a name outside it. One member of the cycle is
+patched onto a temporary name the mirror derives and owns —
+`litevirt-renaming-<uuid>` — which turns the cycle into a chain, and a chain
+lands one link per sweep. Nothing is deleted, both objects keep their
+identities, and the parked object gets its own desired name on a later pass. A
+two-VM swap converges in two sweeps, and a cycle of *n* in *n*.
+
+While that is in progress the pass reports itself **unconverged** and logs the
+VMs still waiting, so the staleness gauge is not stamped over a fleet that does
+not match litevirt's own names — and an object may briefly be visible in NetBox
+under its temporary name. The one thing the mirror refuses is a temporary name
+that is *itself* taken by some other object in the same NetBox cluster: it
+declines to park rather than trade the stall for a failed sweep, and the log line
+says so. That is the only case where a rename cycle persists, and the repair is
+to free that name in NetBox by hand.
 
 #### A withheld replacement, and the collision it leaves behind
 
@@ -885,6 +907,14 @@ of the cluster is complete withholds the replacement along with its deletes — 
 same gate, for the same reason — and the create or rename then collides for that
 one VM. That is deliberate: a stalled mirror is fixed by the next healthy sweep,
 an object removed on partial evidence is not.
+
+The evidence the gate asks for names the **incarnation being replaced**, not the
+name it occupies: either a `vms` row of any kind — tombstone included — carrying
+that uuid, or the mirror's own record of having created that exact object. A name
+cannot answer the question, because the name a replacement frees is always a name
+some local row holds: the VM taking it. So a node that has never held the
+occupant's incarnation withholds the replacement, whatever else is sitting under
+that name.
 
 What you see is a failed sweep whose error is a NetBox refusal for a name
 litevirt can see is free:

@@ -855,6 +855,12 @@ func (s *stubVirt) UpdateVM(_ context.Context, id int, vm netbox.VirtualMachine)
 // Off unless enforceNames is set, so every existing scenario is untouched. `self`
 // is the object being patched, which of course may keep its own name.
 //
+// IT READS THE EFFECTIVE NAME, not the one the collection read served. Two things
+// free a name inside a pass — a delete and a RENAME — and a fake that only knew
+// about the delete would refuse the second half of every scenario where one
+// object moves out of the way of another. That is exactly what the cycle-breaker
+// does, so without this a correct park would still fail the pass that made it.
+//
 // A 400 with the `name` field named, which is what NetBox actually answers —
 // the annotation that explains a withheld replacement keys off the status and
 // the field, not the sentence.
@@ -863,7 +869,10 @@ func (s *stubVirt) nameConflictLocked(name string, self int) error {
 		return nil
 	}
 	for _, v := range s.listVMs {
-		if v.Name == name && v.ID != self && !s.deletedLocked(v.ID) {
+		if v.ID == self || s.deletedLocked(v.ID) {
+			continue
+		}
+		if s.effectiveNameLocked(v) == name {
 			return &netbox.APIError{
 				Status: 400,
 				Body:   `{"name":["A virtual machine with this name already exists in this cluster."]}`,
@@ -873,6 +882,18 @@ func (s *stubVirt) nameConflictLocked(name string, self int) error {
 	return nil
 }
 
+// effectiveNameLocked is the name an object holds NOW: the last patch's, or the
+// one the collection read served if this pass has not patched it.
+func (s *stubVirt) effectiveNameLocked(v netbox.VirtualMachine) string {
+	name := v.Name
+	for _, u := range s.updatedVMs {
+		if u.ID == v.ID {
+			name = u.VM.Name
+		}
+	}
+	return name
+}
+
 func (s *stubVirt) deletedLocked(id int) bool {
 	for _, d := range s.deleted {
 		if d == id {
@@ -880,6 +901,21 @@ func (s *stubVirt) deletedLocked(id int) bool {
 		}
 	}
 	return false
+}
+
+// updatedName is the name the LAST patch of this object wrote, or "" when the
+// sweep never patched it. It reads under the lock, so a scenario driving
+// concurrent passes can call it.
+func (s *stubVirt) updatedName(id int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out string
+	for _, u := range s.updatedVMs {
+		if u.ID == id {
+			out = u.VM.Name
+		}
+	}
+	return out
 }
 
 func (s *stubVirt) DeleteVM(_ context.Context, id int) error {

@@ -241,6 +241,29 @@ func seedClusterRow(t *testing.T, r *Reconciler) {
 	}
 }
 
+// seedMirroredObjectRef writes the `netbox_objects` mapping row the mirror's own
+// createVM records when it puts a virtual_machine into NetBox.
+//
+// A FIXTURE THAT PRE-POPULATES NETBOX HAS TO WRITE THIS TOO, or it models a
+// state no cluster reaches: an object under this cluster's identity exists only
+// because this cluster's mirror created it, and that write and the mapping row
+// are the same operation. Leaving it out understates what a caught-up node
+// holds, and the vm/replace premise reads exactly this row for the one
+// incarnation whose `vms` tombstone a same-name re-create purges.
+//
+// It is a REPLICATED row, so a node that has not hydrated does not hold it —
+// which is why the partial-read fixtures deliberately do NOT call this, and the
+// fully-hydrated ones do.
+func seedMirroredObjectRef(t *testing.T, r *Reconciler, identity string, netboxID int) {
+	t.Helper()
+	if err := corrosion.PutObjectRef(context.Background(), r.db, corrosion.ObjectRef{
+		LitevirtKind: kindVM, LitevirtKey: identity,
+		NetBoxKind: netboxKindVM, NetBoxID: netboxID,
+	}); err != nil {
+		t.Fatalf("seed object ref %s: %v", identity, err)
+	}
+}
+
 // seedMirrorableVM writes the rows one running VM with one NIC leaves behind,
 // plus the `cluster` row every identity is derived from.
 func seedMirrorableVM(t *testing.T, r *Reconciler, name, uuid, mac string) {

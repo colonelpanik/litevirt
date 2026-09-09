@@ -389,6 +389,28 @@ func (r *Reconciler) sweep(ctx context.Context) (bool, error) {
 			"vms", collided, "netbox_cluster", r.clusterID)
 		converged = false
 	}
+	// A RENAME THIS PASS DELIBERATELY DID NOT WRITE.
+	//
+	// Diff emits no upsert for a VM whose desired name a LIVE VM of ours still
+	// holds — writing it is a 400 that fails the whole sweep over a wait of one
+	// interval — and it breaks a rename CYCLE by parking one member on a
+	// temporary name, which is progress rather than convergence. Both leave
+	// NetBox not matching desired state, so both have to be said out loud and
+	// neither may stamp the success gauge.
+	//
+	// A condition that persists past a few sweeps is not the chain draining: it
+	// is a park that could not be planned because its temporary name is taken,
+	// which is the one case the cycle-breaker refuses (see renameCycleParks).
+	if pending := unconvergedRenames(desired, actual, actions, fp); len(pending) > 0 {
+		slog.Warn("netbox mirror: these VMs keep their previous NetBox name for now — each one's "+
+			"desired name is still held by another live VM of this cluster that is itself being "+
+			"renamed. A chain of renames lands one link per sweep; a cycle is broken by moving "+
+			"one member onto a temporary name, which this pass does. Nothing is removed either "+
+			"way. A condition that outlasts a few sweeps means the temporary name was itself "+
+			"taken — free a name in NetBox by hand",
+			"vms", pending, "netbox_vms", len(actual.VMs))
+		converged = false
+	}
 	// What a withholding gate took away from THIS pass, kept so the collision it
 	// causes can be reported with its cause rather than on its own. See
 	// withheldReplacementCause.
@@ -631,7 +653,7 @@ func (r *Reconciler) deleteBlocker(ctx context.Context, desired []DesiredVM, ski
 // the success stamp — and the next sweep re-derives everything from scratch.
 func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Action, actual Actual) ([]Action, int, int) {
 	if !hasRemovals(actions) {
-		// The evidence read costs four table scans, so a pass with nothing to
+		// The evidence read costs five table scans, so a pass with nothing to
 		// prove does not pay for them.
 		return actions, 0, 0
 	}
@@ -733,6 +755,22 @@ func destructive(a Action) bool {
 // names this address", and the lease row — live or tombstoned — is the evidence
 // for it.
 //
+// A REPLACE ASKS ABOUT THE INCARNATION, NOT THE NAME, and it is the one
+// destructive op here that cannot share the delete's question.
+//
+// The name a replace frees is, by construction, a name the local database holds
+// a row under: the VM taking it. So `KnowsVM(that name)` is answered by the
+// BENEFICIARY of the removal — the premise proves itself, and an unrelated VM's
+// row under the same name authorizes replacing an object whose incarnation this
+// node has never held. Its own NIC delete used to catch that by accident, being
+// keyed on (name, MAC); the cascade now owns those removals, correctly, so the
+// accident is gone and the parent premise has to carry the identity itself.
+// KnowsIncarnation is that question — the uuid inside the identity the action
+// targets, or the mirror's own mapping row for exactly that identity — and it
+// cannot be satisfied by a different VM sharing the name. See
+// corrosion.MirrorEvidence.KnowsIncarnation for both records and for the window
+// it does not close.
+//
 // An op or Kind it does not recognise is NOT proven. A third of either added
 // without a matching evidence question must fail closed rather than inherit a
 // permissive default.
@@ -740,11 +778,16 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string, known cor
 	if a.Op == "clear" {
 		return known.KnowsAddress(a.IPID)
 	}
-	// A REPLACE asks the identical question the delete it took over would have
-	// been asked: its Kind and Key are a VM delete's, so it falls through to the
-	// same branch below rather than getting an evidence rule of its own to drift
-	// from that one.
-	if a.Op != "delete" && a.Op != opReplace {
+	if a.Op == opReplace {
+		// Kind is checked, not assumed: Diff only ever builds a vm/replace, and
+		// a NIC-kinded one reaching here would be asking a VM question about an
+		// interface identity.
+		if a.Kind != "vm" {
+			return false
+		}
+		return known.KnowsIncarnation(a.Key, netbox.IdentityVMUUID(a.Key))
+	}
+	if a.Op != "delete" {
 		return false
 	}
 	switch a.Kind {
@@ -781,13 +824,19 @@ func hasRemovals(actions []Action) bool {
 // through would detach the whole fleet's addressing on the pass that proved it
 // could not be trusted to.
 //
-// Creates, updates and assigns are kept deliberately. They are additive, so the
-// worst a partial read costs there is an object or an assignment that a later
-// pass reconciles — leak over collision, the same direction every other
+// Creates, updates, assigns and PARKS are kept deliberately. They are additive,
+// so the worst a partial read costs there is an object or an assignment that a
+// later pass reconciles — leak over collision, the same direction every other
 // fail-closed decision in this package takes. The one create that is NOT purely
 // additive — the one whose name is held by a superseded incarnation — does not
 // carry the removal itself: that is a separate vm/replace action, which
 // destructive covers and this therefore drops.
+//
+// The park stays for the same reason an update does, and its own premise cannot
+// be weakened by a partial read: every edge of the blocked-by graph requires the
+// holder's identity to be IN the desired set, so a read missing rows loses edges
+// and can only make a cycle vanish. What it writes is a name on a live object of
+// ours that the next pass renames again — see opPark.
 //
 // It filters the ACTION LIST rather than skipping the destructive PHASES: a
 // phase is a scheduling boundary, and one skipped by a flag is one a later

@@ -253,6 +253,8 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 	switch {
 	case a.Kind == kindVM && a.Op == opReplace:
 		return r.replaceSuperseded(ctx, a, idx, fingerprint)
+	case a.Kind == kindVM && a.Op == opPark:
+		return r.parkForRenameCycle(ctx, a, idx, fingerprint)
 	case a.Kind == kindVM && a.Op == "create":
 		return r.createVM(ctx, a, idx, fingerprint)
 	case a.Kind == kindVM && a.Op == "update":
@@ -390,6 +392,81 @@ func (r *Reconciler) replaceSuperseded(ctx context.Context, a Action, idx desire
 	slog.Info("netbox mirror: replaced the superseded incarnation of a reused VM name",
 		"identity", a.Key, "netbox_id", a.NetBoxID, "name", a.FreesName)
 	return nil
+}
+
+// parkForRenameCycle moves ONE object of a rename cycle onto a temporary name
+// this mirror derives, so the cycle becomes a chain and converges. See opPark for
+// why a permutation of names has no other way out and why nothing is deleted.
+//
+// IT RE-PROVES ITS PREMISE BEFORE IT WRITES, from the applier's own desired index
+// rather than from the fact that Diff emitted the action — the same
+// two-independent-guards rule replaceSuperseded follows, and the guards are the
+// EXACT INVERSE of that one's:
+//
+//   - THE IDENTITY MUST BE IN THE DESIRED SET. A park is only ever applied to a
+//     live VM of this cluster's own, because its whole justification is that the
+//     object may not be removed. An identity absent from desired is a superseded
+//     incarnation, and the answer to one of those is the replace, which deletes
+//     it — so parking one would leave a stray object under a temporary name that
+//     no later sweep has a reason to touch.
+//   - THE FINGERPRINT MUST BE OURS. Another installation's object is not this
+//     mirror's to rename any more than it is to delete.
+//
+// It writes the DESIRED fields with the temporary name, not a name-only patch:
+// the object's other drift is converged in the same request, so the pass that
+// parks it leaves nothing but the name outstanding. The mapping is re-recorded
+// for the reason updateVM re-records it — a lost netbox_objects row heals on the
+// next write rather than only on a delete and re-create.
+func (r *Reconciler) parkForRenameCycle(ctx context.Context, a Action, idx desiredIndex, fingerprint string) error {
+	d, live := idx.VMs[a.Key]
+	if !live {
+		return fmt.Errorf(
+			"netboxsync: vm/park %s would move an object off the name %q, but that identity is "+
+				"NOT in this sweep's desired set — a park is only ever applied to a live VM of "+
+				"this cluster, and a superseded incarnation is the replace's to remove",
+			a.Key, a.FreesName)
+	}
+	if !ownedBy(a.Key, fingerprint) {
+		return fmt.Errorf(
+			"netboxsync: vm/park %s does not carry this cluster's identity fingerprint — "+
+				"another installation's object, or an operator's, and not this mirror's to "+
+				"rename to free the name %q",
+			a.Key, a.FreesName)
+	}
+	if a.NetBoxID == 0 {
+		return fmt.Errorf("netboxsync: vm/park %s carries no NetBox object to move", a.Key)
+	}
+	// The temporary name is DERIVED from the incarnation uuid, so an identity
+	// that carries none would park every such object onto one shared name — a
+	// collision manufactured by the thing that exists to avoid one. Diff cannot
+	// produce that (desiredState skips a VM with no uuid), which is exactly why
+	// it is checked here rather than trusted.
+	if netbox.IdentityVMUUID(a.Key) == "" {
+		return fmt.Errorf(
+			"netboxsync: vm/park %s carries no incarnation uuid, so no temporary name can be "+
+				"derived for it", a.Key)
+	}
+	temp := parkedName(a.Key)
+	if err := r.nb.UpdateVM(ctx, a.NetBoxID, netbox.VirtualMachine{
+		Name:      temp,
+		ClusterID: r.clusterID,
+		DeviceID:  d.DeviceID,
+		VCPUs:     netbox.VCPUs(d.VCPUs),
+		MemoryMB:  d.MemoryMB,
+		DiskMB:    d.DiskMB,
+		Status:    d.Status,
+		Identity:  a.Key,
+	}); err != nil {
+		return fmt.Errorf("netboxsync: park VM %d onto %q to free the name %q: %w",
+			a.NetBoxID, temp, a.FreesName, err)
+	}
+	r.sink().IncMirrorObject(netboxKindVM, opUpdated)
+	slog.Info("netbox mirror: parked one object of a rename cycle on a temporary name, which "+
+		"frees the name the rename behind it needs; the next sweep writes this object's own "+
+		"desired name",
+		"identity", a.Key, "netbox_id", a.NetBoxID, "freed_name", a.FreesName,
+		"temporary_name", temp, "desired_name", d.Name)
+	return r.recordRef(ctx, kindVM, a.Key, netboxKindVM, a.NetBoxID)
 }
 
 // updateVM patches the object the diff resolved.

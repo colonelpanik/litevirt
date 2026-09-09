@@ -25,6 +25,7 @@ package fleet
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -189,6 +190,110 @@ func TestRenameIntoAFreedNameConvergesRatherThanStallingTheMirror(t *testing.T) 
 	if got := nb.InterfaceCount(); got != 1 {
 		t.Fatalf("interface objects = %d, want 1 — the superseded VM's interface goes with it "+
 			"and the survivor keeps its own", got)
+	}
+}
+
+// TestALiveNameSwapConvergesWithoutRemovingEitherObject is the permutation the
+// freed-name replacement above cannot touch.
+//
+// Two VMs SWAP names. Each one's occupant is the other, both identities are in
+// the desired set, and the replacement refuses both — correctly, because freeing
+// a name may never remove a live VM. So neither rename can land first and
+// WAITING DOES NOT RESOLVE IT: every sweep computes the same two updates and gets
+// the same two NetBox 400s, for as long as both VMs exist. The documentation used
+// to say the mirror waits for one of the two to land, which is a wait that never
+// ends.
+//
+// The way out of a permutation is a name outside it, so the mirror moves ONE
+// member onto a temporary name it derives and owns, which turns the cycle into a
+// chain, and a chain drains one link per sweep. Three passes are driven because
+// that is what a two-cycle costs: the park and the freed rename, then the parked
+// object's own name, then a pass with nothing to do.
+//
+// WHAT MUST HOLD THROUGHOUT: both objects survive, both keep their identities,
+// and neither is deleted to resolve the collision. Asserted on the identities
+// rather than the names, because a mirror that deleted one VM and re-created it
+// under the other's name would satisfy every name-shaped assertion.
+func TestALiveNameSwapConvergesWithoutRemovingEitherObject(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustCreateVM(t, n, "vm-2", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	wasVM1 := vmIdentityOf(t, nb, "vm-1")
+	wasVM2 := vmIdentityOf(t, nb, "vm-2")
+	before := nb.VMIdentities()
+
+	// The swap, with no mirror pass anywhere inside it. A local rename needs a
+	// free name at each step, so an operator reaches this with a scratch name in
+	// the middle — the mirror never sees the intermediate state, only the
+	// permutation it produces.
+	mustRenameVM(t, n, "vm-1", "vm-scratch")
+	mustRenameVM(t, n, "vm-2", "vm-1")
+	mustRenameVM(t, n, "vm-scratch", "vm-2")
+
+	for i := 0; i < 3; i++ {
+		if err := n.SyncNetBoxMirror(); err != nil {
+			t.Fatalf("mirror pass %d: a rename cycle must be broken, not refused forever: %v", i, err)
+		}
+	}
+
+	// CONVERGED, and swapped: each name is held by the OTHER VM's identity.
+	if got := vmIdentityOf(t, nb, "vm-1"); got != wasVM2 {
+		t.Fatalf("the object named vm-1 carries %s, want %s — the swap did not converge", got, wasVM2)
+	}
+	if got := vmIdentityOf(t, nb, "vm-2"); got != wasVM1 {
+		t.Fatalf("the object named vm-2 carries %s, want %s — the swap did not converge", got, wasVM1)
+	}
+	// NOTHING WAS REMOVED AND NOTHING WAS ADDED: the same two identities, and no
+	// object left parked under a temporary name.
+	if got := nb.VMIdentities(); !slices.Equal(got, before) {
+		t.Fatalf("virtual_machine identities = %v, want the same two the swap started with %v — "+
+			"a collision was resolved by removing or re-creating an object", got, before)
+	}
+	if got := nb.VMCountAll(); got != 2 {
+		t.Fatalf("virtual_machine objects = %d, want 2", got)
+	}
+	if got := nb.InterfaceCount(); got != 2 {
+		t.Fatalf("interface objects = %d, want 2 — a rename keeps the object it renames", got)
+	}
+}
+
+// TestALiveNameSwapKeepsBothObjectsWhileTheCycleIsBroken is the intermediate
+// state, asserted rather than assumed.
+//
+// The pass that breaks the cycle does it by MOVING an object, not by removing
+// one, so after it: both identities are still there, one of them sits under a
+// name litevirt does not use, and one of the two swapped names has already
+// landed. Without this the convergence above would be satisfied by a mirror that
+// deleted an object and re-created it three passes later.
+func TestALiveNameSwapKeepsBothObjectsWhileTheCycleIsBroken(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustCreateVM(t, n, "vm-2", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	before := nb.VMIdentities()
+	mustRenameVM(t, n, "vm-1", "vm-scratch")
+	mustRenameVM(t, n, "vm-2", "vm-1")
+	mustRenameVM(t, n, "vm-scratch", "vm-2")
+
+	if err := n.SyncNetBoxMirror(); err != nil {
+		t.Fatalf("the pass that breaks the cycle must not fail: %v", err)
+	}
+
+	if got := nb.VMIdentities(); !slices.Equal(got, before) {
+		t.Fatalf("virtual_machine identities = %v, want the same two %v — the cycle was broken "+
+			"by removing or re-creating an object, not by moving one", got, before)
+	}
+	// A two-cycle cannot converge in one pass, and the object that has not
+	// landed is the parked one: exactly one of the two swapped names is held.
+	held := nb.VMCount("vm-1") + nb.VMCount("vm-2")
+	if held != 1 {
+		t.Fatalf("objects holding one of the swapped names = %d, want exactly 1: one member is "+
+			"parked on a temporary name and the other has taken the name it freed", held)
 	}
 }
 

@@ -93,11 +93,11 @@ type GateResult struct {
 func gateOK() GateResult         { return GateResult{OK: true} }
 func gateNo(r string) GateResult { return GateResult{OK: false, Reason: r} }
 
-// votingEligible mirrors failover.countLiveHosts' predicate exactly: a host is a
+// VotingEligible mirrors failover.countLiveHosts' predicate exactly: a host is a
 // live voting member iff its state is not offline/maintenance/fenced (witnesses
 // included, since countLiveHosts counts them in the denominator). The self-count
 // predicate and the quorum denominator MUST be identical or quorum skews.
-func votingEligible(state string) bool {
+func VotingEligible(state string) bool {
 	switch state {
 	case "offline", "maintenance", "fenced":
 		return false
@@ -154,7 +154,7 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	denom := 0
 	selfEligible := false
 	for _, h := range hosts {
-		if !votingEligible(h.State) {
+		if !VotingEligible(h.State) {
 			continue
 		}
 		denom++
@@ -168,7 +168,7 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		live++
 	}
 	for _, h := range hosts {
-		if h.Name == c.hostName || !votingEligible(h.State) {
+		if h.Name == c.hostName || !VotingEligible(h.State) {
 			continue
 		}
 		if healthy[h.Name] {
@@ -256,7 +256,7 @@ func (c *Checker) DecisionGate(ctx context.Context) GateResult {
 	// stopping the rebalance executor (decideGate) on a healthy even cluster.
 	workers, witnesses := 0, 0
 	for i := range hosts {
-		if !votingEligible(hosts[i].State) {
+		if !VotingEligible(hosts[i].State) {
 			continue
 		}
 		if hosts[i].IsWitness() {

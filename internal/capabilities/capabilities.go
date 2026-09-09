@@ -46,6 +46,35 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+
+	// LeaseTermV1 gates leader-lease term enforcement: once active, a
+	// runtime-action proof must carry the lease term of the incarnation that
+	// minted it, and an executor refuses a proof whose term is below the
+	// QUORUM-observed high-water mark for that key, or whose coordinator is not
+	// the holder this node recorded at that term.
+	//
+	// Advertised CONDITIONALLY on enforcement.lease_term AND local readiness
+	// (three or more voting-eligible hosts, a readable ledger, and
+	// SplitBrainGateV1 already latched), so the fleet cannot latch across a node
+	// that would refuse recovery — or across one that would accept a PROOFLESS
+	// protected call ungated, which is what that last predicate is for: this
+	// regime gates proof-bearing calls only.
+	//
+	// Config-gated in the REVERSIBLE StrictMTLSIdentityV1 style rather than
+	// latch-only, and for a specific reason: the quorum barrier makes protected
+	// actions refuse on a partition minority, and a latched cluster that later
+	// shrinks below three voting-eligible hosts arrives at that cliff with no way
+	// back — a latch is one-way. Enforcement is config AND Enforced, so clearing
+	// the flag is the operator's exit.
+	//
+	// It does NOT fix two nodes each believing they hold the lease; that needs
+	// consensus. What it gives is per-executor: no single host executes for two
+	// claimants of one tenure, because the CLAIM binds that host to the first
+	// claimant it acted for at that term. The equal-term ledger arm alone would
+	// not deliver that — it fires only once a term row has replicated, and
+	// during a partition neither claimant's has. The cluster still does not
+	// agree on which claimant is legitimate.
+	LeaseTermV1 = "lease_term_v1"
 	// IsolationEpochV1 gates the §A isolation regime: a host recorded with a
 	// nonzero hosts.isolation_epoch has its replication REFUSED by every peer
 	// until a verified reseed clears it. Gated because it can refuse a peer
@@ -390,6 +419,10 @@ var supported = []string{
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
 	OwnerEpochV1,
+	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
+	// this node ready (>= 3 voting-eligible hosts, readable ledger,
+	// SplitBrainGateV1 latched). See grpcapi.LeaseTermReadiness.
+	LeaseTermV1,
 	// IsolationEpochV1 is advertised CONDITIONALLY on enforcement.isolation_epoch,
 	// like OperationProtocolV1: the regime REFUSES a peer's replication, so the
 	// fleet-wide latch must require CONFIG uniformity — a node that isn't
@@ -402,7 +435,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

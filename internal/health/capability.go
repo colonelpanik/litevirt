@@ -185,7 +185,7 @@ func (c *Checker) PeerSupports(ctx context.Context, peer, token string) bool {
 // still refreshes the cache for subsequent cheap PeerSupports reads.
 // HealthyPeers returns the peers this daemon currently counts toward quorum: probed healthy
 // at least once THIS run AND currently voting-eligible by host state (the SAME two predicates
-// QuorumProof applies — probe freshness + votingEligible). A peer since marked
+// QuorumProof applies — probe freshness + VotingEligible). A peer since marked
 // offline/maintenance/fenced is therefore excluded, matching the "quorum-counted this run"
 // relay constraint. Used to pick a "quorum-visible" relay peer for the VIP absence proof (the
 // caller still confirms reachability by dialing it). Fail closed: if the host table can't be
@@ -197,7 +197,7 @@ func (c *Checker) HealthyPeers(ctx context.Context) []string {
 	}
 	eligible := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
-		if votingEligible(h.State) {
+		if VotingEligible(h.State) {
 			eligible[h.Name] = true
 		}
 	}
@@ -236,7 +236,7 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 
 // CapabilityActive reports whether `token` is advertised by every
 // enforcement-relevant member (non-deleted, non-fenced, non-maintenance,
-// non-offline — i.e. votingEligible), computed from fresh Pings. On any
+// non-offline — i.e. VotingEligible), computed from fresh Pings. On any
 // unreachable or unsupporting relevant member it returns (false, reason) so the
 // caller stays log-only and surfaces HA-degraded. Recomputed every call.
 func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, string) {
@@ -260,7 +260,7 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 	defer cancel()
 
 	for _, h := range hosts {
-		if !votingEligible(h.State) {
+		if !VotingEligible(h.State) {
 			continue // decommissioned/offline/maintenance/fenced don't gate enforcement
 		}
 		reqStart := time.Now()

@@ -839,6 +839,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return ready
 	})
+	// Phase 2: lease_term_v1 is advertised only when the operator opted in AND
+	// this node can enforce — a readable ledger, split_brain_gate_v1 already
+	// latched, and a cluster large enough that the quorum barrier does not break
+	// failover.
+	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+	svc.SetLeaseTermReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ready, reason := svc.LeaseTermReadiness(ctx)
+		if !ready {
+			slog.Debug("lease_term_v1 readiness withheld", "reason", reason)
+		}
+		return ready
+	})
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.
 	//

@@ -284,6 +284,11 @@ type Server struct {
 	// (the health backfill reports it). Both required — the fleet must never
 	// latch across a node whose workloads are ungraduated.
 	enfOwnerEpoch bool
+	// enfLeaseTerm + leaseTermReady gate lease_term_v1 advertisement: the flag
+	// is the operator opt-in, readiness is "this node can enforce and the
+	// cluster is big enough that enforcing does not break failover".
+	enfLeaseTerm   bool
+	leaseTermReady func() bool
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool
@@ -719,6 +724,15 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
 		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
 	}
+	// lease_term_v1 (Phase 2) follows the same model: the operator opt-in plus
+	// local readiness. Readiness here is deliberately LOCAL-ONLY (no Ping, no
+	// Enforced, no barrier) — this function runs inside the Ping handler, and
+	// hardwareV2Ready already documents why anything that Pings from here
+	// recurses. A nil probe is NOT ready: the fleet must not latch a regime
+	// across a node that never proved it could honour it.
+	if !s.enfLeaseTerm || s.leaseTermReady == nil || !s.leaseTermReady() {
+		caps = withoutCapability(caps, capabilities.LeaseTermV1)
+	}
 	return caps
 }
 
@@ -921,6 +935,23 @@ func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
 // SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
 func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
 
+// SetLeaseTermEnforce wires the Phase 2 config flag (enforcement.lease_term).
+// It is both the opt-in that lets the fleet latch and the reversible kill
+// switch afterwards — see capabilities.LeaseTermV1.
+func (s *Server) SetLeaseTermEnforce(on bool) { s.enfLeaseTerm = on }
+
+// SetLeaseTermReady wires the readiness probe consulted before advertising
+// lease_term_v1 (nil = never ready).
+func (s *Server) SetLeaseTermReady(fn func() bool) { s.leaseTermReady = fn }
+
+// leaseTermEnforced reports whether this node refuses proofs on their lease
+// term: the config flag AND the cluster-wide latch, the same model as the rest
+// of the family. The flag is the way back out of a latched cluster that has
+// since shrunk below leaseTermMinVotingHosts.
+func (s *Server) leaseTermEnforced(ctx context.Context) bool {
+	return s.enfLeaseTerm && s.gate != nil && s.gate.Enforced(ctx, capabilities.LeaseTermV1)
+}
+
 // SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
 // it on and the token latched, this node refuses replication from a host the
 // cluster recorded as isolated.
@@ -993,6 +1024,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.LeaseTermV1:
+		return s.enfLeaseTerm
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:

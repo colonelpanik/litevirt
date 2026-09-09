@@ -274,3 +274,45 @@ func TestClaimCarriedProof_SeedsTheCarriedLeaseTerm(t *testing.T) {
 			"unenforceable: the executor would read 0 and treat it as pre-term", pr.LeaseTerm)
 	}
 }
+
+// TestClaimCarriedProof_ADivergentProofIsNotRelayedToPeers is the end-to-end
+// form of the ordering fix: the refusal was always correct, what was wrong was
+// that the forged statement had already been queued for replication by the time
+// it happened.
+//
+// Asserting on the refusal alone cannot catch this — the old code refused too.
+// The assertion has to be on what a peer would be sent.
+func TestClaimCarriedProof_ADivergentProofIsNotRelayedToPeers(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // host name "host-a"
+
+	if err := corrosion.WriteActionProof(ctx, s.db, corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a", LeaseTerm: 3,
+	}); err != nil {
+		t.Fatalf("seed genuine: %v", err)
+	}
+	rows, err := s.db.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	before := rows[0].Int("n")
+
+	_, err = s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+		Id: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a", LeaseTerm: 9,
+	}, corrosion.ActionReschedule, "vm", "vm1")
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v (err %v), want FailedPrecondition", status.Code(err), err)
+	}
+
+	rows, err = s.db.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	if after := rows[0].Int("n"); after != before {
+		t.Errorf("the refused proof queued %d statement(s) for peers; the term it carries would "+
+			"become the permanent record on any peer that has not yet received the genuine row",
+			after-before)
+	}
+}

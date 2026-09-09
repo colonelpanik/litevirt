@@ -139,8 +139,91 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 
 // WriteActionProof inserts a standalone 'prepared' proof (for direct-RPC actions
 // that carry it in metadata rather than via a pending link). Idempotent by id.
+//
+// For a proof this node MINTED. For one an untrusted caller PRESENTED, use
+// WriteActionProofValidated: this function relays whatever it is given.
 func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 	return c.Execute(ctx, insertProofSQL, proofInsertParams(p, c.NowTS())...)
+}
+
+// ErrProofDiverges means a row with this id already exists and disagrees with
+// the presented proof on a field that AUTHORIZES the action. Distinct from
+// ErrNoRowsAffected so a caller can refuse with FailedPrecondition rather than
+// retrying.
+var ErrProofDiverges = errors.New("a persisted proof with this id disagrees with the presented one")
+
+// proofBindingEqual compares the fields that AUTHORIZE an action.
+//
+// It is the ONE definition of that field set. claimCarriedProof compares the
+// carried proto against the persisted row through it, and
+// WriteActionProofValidated compares the presented proof against the persisted
+// row through it, so the two can never drift — a field bound in one place and
+// unchecked in the other is either forgeable or refuses valid actions. Three of
+// this phase's findings were a field added to the row and silently left out of
+// the hand-written comparison.
+//
+// The evidence-only fields are deliberately EXCLUDED. lease_holder,
+// lease_expires_at, quorum_live and quorum_needed are an honesty record the
+// coordinator persists and does not carry — leaseSnapshot returns "" on a read
+// error by design, because an honesty record must not fabricate a holder — so
+// binding them would refuse perfectly valid proofs.
+func proofBindingEqual(a, b ActionProof) bool {
+	return a.Action == b.Action && a.TargetKind == b.TargetKind &&
+		a.TargetName == b.TargetName && a.DestHost == b.DestHost &&
+		a.Coordinator == b.Coordinator && a.RelocationToken == b.RelocationToken &&
+		a.FenceEpoch == b.FenceEpoch && a.OwnerEpoch == b.OwnerEpoch &&
+		a.LeaseTerm == b.LeaseTerm
+}
+
+// WriteActionProofValidated seeds a proof row from an UNTRUSTED presented proof,
+// doing the seed and the divergence check in ONE guarded transaction.
+//
+// The ORDERING is the whole point. WriteActionProof followed by a separate
+// GetActionProof comparison rejects correctly on the validating node, but by
+// then the presented statement has already been committed to mutation_log —
+// ExecuteBatchGuarded and Execute both write it inside the transaction and log
+// the WHOLE batch, not only the statements that changed a row, so an INSERT OR
+// IGNORE that is a local no-op still relays. A peer that has not yet received
+// the coordinator's genuine row applies the forged one; the genuine row then
+// arrives, collides on the primary key under INSERT OR IGNORE, and is silently
+// dropped. The forged value becomes that peer's permanent record.
+//
+// Refusing therefore has to mean nothing was written AND nothing was logged,
+// which is exactly what a false guard gives: ExecuteBatchGuarded rolls the
+// transaction back before the mutation_log insert.
+//
+// Three outcomes, and the third is not an error:
+//   - no row yet            → seed it, and replicate the seed
+//   - a row that disagrees  → ErrProofDiverges, nothing written, nothing logged
+//   - an identical row      → nothing to write, success
+//
+// A retried RPC and the coordinator's own replicated row both land in the third
+// case. Conflating it with the second would refuse every retry.
+func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) error {
+	now := c.NowTS()
+	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var existing ActionProof
+		err := tx.QueryRow(
+			`SELECT action, target_kind, target_name, dest_host, coordinator,
+			        relocation_token, fence_epoch, owner_epoch, lease_term
+			   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, p.ID).
+			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
+				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
+				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !proofBindingEqual(existing, p) {
+			return false, ErrProofDiverges
+		}
+		return false, nil
+	}, []Statement{
+		{SQL: insertProofSQL, Params: proofInsertParams(p, now)},
+	})
+	return err
 }
 
 const insertProofSQL = `INSERT OR IGNORE INTO runtime_action_proofs

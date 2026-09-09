@@ -379,7 +379,7 @@ func TestActionProof_PreV52ShapeStillAppliesAndReadsAsTermless(t *testing.T) {
 		t.Fatalf("read lease_term column: err=%v rows=%d", err, len(rows))
 	}
 	if rows[0].Int("is_null") != 0 {
-		t.Errorf("the pre-v52 shape left lease_term NULL; it must take a non-NULL DEFAULT 0, "+
+		t.Errorf("the pre-v52 shape left lease_term NULL; it must take a non-NULL DEFAULT 0, " +
 			"or the termless sentinel is indistinguishable from a decode failure")
 	}
 	if n := rows[0].Int64("term"); n != 0 {
@@ -443,5 +443,120 @@ func TestSchemaV53FreshAndUpgradedColumnOrderMatch(t *testing.T) {
 	}
 	if last := freshColumns[len(freshColumns)-1]; last != "lease_term" {
 		t.Errorf("last column = %q, want lease_term", last)
+	}
+}
+
+// TestWriteActionProofValidated_ADivergentSeedIsNotReplicated is the point of
+// the task, and it asserts on mutation_log rather than on the returned error.
+//
+// The error was ALREADY correct before this change, which is exactly why the
+// hole went unnoticed: claimCarriedProof seeded the row from the untrusted proof
+// and only then compared it, so the validating node refused correctly while the
+// forged statement had already been committed to mutation_log and queued for
+// every peer. ExecuteBatchGuarded writes mutation_log INSIDE the transaction and
+// logs the whole batch — not only the statements that changed a row — so an
+// INSERT OR IGNORE that is a local no-op still relays.
+func TestWriteActionProofValidated_ADivergentSeedIsNotReplicated(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+
+	// The genuine row, as the coordinator minted it.
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 3,
+	}); err != nil {
+		t.Fatalf("seed genuine: %v", err)
+	}
+	before := mutationLogCount(t, c)
+
+	// A peer presents the same id at term 9.
+	err := WriteActionProofValidated(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 9,
+	})
+	if !errors.Is(err, ErrProofDiverges) {
+		t.Fatalf("err = %v, want ErrProofDiverges", err)
+	}
+	if after := mutationLogCount(t, c); after != before {
+		t.Errorf("a refused divergent proof queued %d statement(s) for replication; a peer that "+
+			"has not yet received the genuine row would apply the forged term, and the real row "+
+			"would then be dropped on the PK by INSERT OR IGNORE", after-before)
+	}
+	if got, _, _ := GetActionProof(ctx, c, "p1"); got.LeaseTerm != 3 {
+		t.Errorf("local lease_term = %d, want the genuine 3", got.LeaseTerm)
+	}
+}
+
+// TestWriteActionProofValidated_AMatchingProofSeedsAndReplicates: the ordinary
+// path, and the reason this cannot simply refuse when no row exists. The
+// coordinator's replicated row routinely arrives AFTER the direct RPC carrying
+// the proof, so the carried fields must be able to seed it — and that write must
+// replicate, or a peer never learns the proof at all.
+func TestWriteActionProofValidated_AMatchingProofSeedsAndReplicates(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+	before := mutationLogCount(t, c)
+
+	p := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 5,
+	}
+	if err := WriteActionProofValidated(ctx, c, p); err != nil {
+		t.Fatalf("seed a fresh proof: %v", err)
+	}
+	if after := mutationLogCount(t, c); after <= before {
+		t.Error("the seeding write did not replicate; a peer would never learn the proof")
+	}
+	got, ok, _ := GetActionProof(ctx, c, "p1")
+	if !ok || got.LeaseTerm != 5 {
+		t.Fatalf("seeded proof = %+v, want term 5", got)
+	}
+
+	// A retry, and a replicated copy of the coordinator's own row, both land
+	// here: an IDENTICAL proof is a no-op success, never a divergence. Treating
+	// it as one would refuse every retried RPC.
+	if err := WriteActionProofValidated(ctx, c, p); err != nil {
+		t.Errorf("re-presenting an identical proof failed: %v — a retry and a replicated "+
+			"identical row must both be accepted", err)
+	}
+}
+
+// TestProofBindingEqual_IgnoresTheEvidenceOnlyFields. lease_holder,
+// lease_expires_at, quorum_live and quorum_needed are an honesty record the
+// coordinator PERSISTS and does not carry — leaseSnapshot deliberately returns
+// "" on a read error rather than fabricating a holder — so binding them would
+// refuse valid proofs. The authorization-bearing fields are bound; the evidence
+// is not.
+func TestProofBindingEqual_IgnoresTheEvidenceOnlyFields(t *testing.T) {
+	base := ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a", LeaseTerm: 5,
+	}
+	withEvidence := base
+	withEvidence.LeaseHolder = "node-a"
+	withEvidence.LeaseExpiresAt = "2026-09-08T12:00:30Z"
+	withEvidence.QuorumLive, withEvidence.QuorumNeeded = 3, 2
+	if !proofBindingEqual(base, withEvidence) {
+		t.Error("the evidence-only fields are bound; a proof whose LeaseHolder is empty (the " +
+			"documented behaviour on a read error) would be refused")
+	}
+
+	for name, mutate := range map[string]func(*ActionProof){
+		"action":           func(p *ActionProof) { p.Action = ActionPromote },
+		"target_kind":      func(p *ActionProof) { p.TargetKind = "container" },
+		"target_name":      func(p *ActionProof) { p.TargetName = "vm2" },
+		"dest_host":        func(p *ActionProof) { p.DestHost = "node-z" },
+		"coordinator":      func(p *ActionProof) { p.Coordinator = "node-z" },
+		"relocation_token": func(p *ActionProof) { p.RelocationToken = "tok" },
+		"fence_epoch":      func(p *ActionProof) { p.FenceEpoch = "host=x;fence_id=1;ts=t" },
+		"owner_epoch":      func(p *ActionProof) { p.OwnerEpoch = "7" },
+		"lease_term":       func(p *ActionProof) { p.LeaseTerm = 9 },
+	} {
+		other := base
+		mutate(&other)
+		if proofBindingEqual(base, other) {
+			t.Errorf("%s is not part of the binding; a divergent same-id row could differ on it "+
+				"and still be claimed", name)
+		}
 	}
 }

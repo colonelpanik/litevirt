@@ -51,31 +51,28 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 			p.GetId(), action, targetKind, targetName, s.hostName,
 			p.GetAction(), p.GetTargetKind(), p.GetTargetName(), p.GetDestHost())
 	}
-	if err := corrosion.WriteActionProof(ctx, s.db, proofFromPB(p)); err != nil {
-		return "", status.Errorf(codes.Unavailable, "persist proof %s: %v", p.GetId(), err)
-	}
-	// WriteActionProof is INSERT OR IGNORE: if a row with this id already existed
-	// (replicated, or seeded), re-read it and require it to EXACTLY match the carried
-	// proof's action/target/dest/coordinator AND relocation_token before claiming — a
-	// divergent persisted row must never be claimed under a mismatched carried proof.
-	// relocation_token is part of the binding: for a container relocation the caller
-	// verified carried-token == the token that will be STAMPED, so a persisted row whose
-	// token differs (a divergent same-id seed) must refuse — otherwise we'd claim the
-	// token-A ledger row while stamping token B, diverging proof from provenance.
+	// Seed the row from the carried proof AND check it against any row already
+	// present, in ONE guarded transaction.
 	//
-	// lease_term is in the binding for the same reason as relocation_token: it
-	// is an AUTHORIZATION-bearing field. A divergent same-id row carrying a
-	// different term, claimed under a matching carried proof, would let the
-	// caller choose which term is enforced against — which is the whole column.
-	if pr, ok, err := corrosion.GetActionProof(ctx, s.db, p.GetId()); err != nil {
-		return "", status.Errorf(codes.Unavailable, "read proof %s: %v", p.GetId(), err)
-	} else if !ok || pr.Action != p.GetAction() || pr.TargetKind != p.GetTargetKind() ||
-		pr.TargetName != p.GetTargetName() || pr.DestHost != p.GetDestHost() ||
-		pr.Coordinator != p.GetCoordinator() || pr.RelocationToken != p.GetRelocationToken() ||
-		pr.FenceEpoch != p.GetFenceEpoch() || pr.OwnerEpoch != p.GetOwnerEpoch() ||
-		pr.LeaseTerm != p.GetLeaseTerm() {
-		return "", status.Errorf(codes.FailedPrecondition,
-			"persisted proof %s does not match the carried proof (divergent/seeded row)", p.GetId())
+	// The order matters and used to be wrong. Seeding first with WriteActionProof
+	// and comparing afterwards refused a divergent proof correctly HERE, but the
+	// presented statement was already committed to mutation_log and queued for
+	// every peer by then — the log records the whole batch, not only statements
+	// that changed a row, so an INSERT OR IGNORE that is a local no-op still
+	// relays. A peer lacking the coordinator's genuine row would apply the
+	// forged one and then drop the real row on the primary key.
+	//
+	// The field set compared is proofBindingEqual's, shared with the writer, so
+	// the two cannot disagree about which fields authorize an action. It covers
+	// action/target/dest/coordinator, relocation_token (a container relocation's
+	// binding key — claiming the token-A ledger row while stamping token B would
+	// diverge proof from provenance), fence_epoch, owner_epoch and lease_term.
+	if err := corrosion.WriteActionProofValidated(ctx, s.db, proofFromPB(p)); err != nil {
+		if errors.Is(err, corrosion.ErrProofDiverges) {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"persisted proof %s does not match the carried proof (divergent/seeded row)", p.GetId())
+		}
+		return "", status.Errorf(codes.Unavailable, "persist proof %s: %v", p.GetId(), err)
 	}
 	// VM proofs additionally bind to the current workload ownership generation.
 	// A valid prepared row can outlive an A→B→A ownership cycle; without this

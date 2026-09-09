@@ -28,6 +28,7 @@ import (
 	"go/token"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -35,7 +36,7 @@ import (
 )
 
 // peerAgreesLive wires every peer dial to a peer whose inventory is identical to
-// this node's AT THE MOMENT IT IS ASKED.
+// this node's AT THE MOMENT IT IS ASKED, and counts the dials.
 //
 // That is the shape a real converged cluster has, and the shape the fleet's
 // shared-database fixture has exactly: a row this node has just received is a
@@ -43,8 +44,18 @@ import (
 // from a freshly sampled one — a peer answering a FIXED digest disagrees with a
 // moved local read all by itself, which would withhold for a reason that has
 // nothing to do with the binding.
-func peerAgreesLive(s *Server) {
+//
+// THE COUNT IS THE ATTRIBUTION, and it is what the liveness scenarios below rest
+// on. A proof that agreed and a proof that was never asked both leave the peers
+// blameless, and only one of them is the cluster confirming anything; and in the
+// other direction the change check answers BEFORE the fan-out, so a conclusion
+// discarded by the binding dials nobody at all. The dial count therefore says
+// WHICH HALF of the proof decided, which is not otherwise observable from
+// outside it.
+func peerAgreesLive(s *Server) *atomic.Int64 {
+	var dials atomic.Int64
 	s.peerClientOverride = func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		dials.Add(1)
 		digests, err := s.localTableDigests(ctx, adoptionInventoryTables())
 		if err != nil {
 			return nil, nil, err
@@ -56,6 +67,7 @@ func peerAgreesLive(s *Server) {
 		return &answeringPeer{tables: tables, membership: viewLikeThisNodes(ctx, s, host)},
 			func() {}, nil
 	}
+	return &dials
 }
 
 // boundSample is the sample a production pass binds itself to, as the digests it
@@ -158,6 +170,59 @@ func TestAnIrrelevantWriteDoesNotDiscardTheConclusion(t *testing.T) {
 	}
 }
 
+// TestARowInsideTheSampleDoesNotDiscardTheConclusion is the LIVENESS control
+// for the write the scenario above discards on, and it is a different claim from
+// the irrelevant one.
+//
+// Same fixture, same table, same production write — one moment EARLIER, so it is
+// inside the sample rather than after it. That makes it the write most likely to
+// be handled wrongly: an implementation that sampled its digests a moment too
+// late, or compared the sample against a baseline older than it, would find a
+// difference and withhold here too. Every removal on a cluster with any
+// inventory churn would then be withheld, permanently, by arrivals the pass's own
+// conclusions already account for — and it would look like the safe direction
+// while being a mirror that never converges again. The irrelevant-write scenario
+// cannot cover it: that one turns on the table being outside the proof's scope,
+// and this row is squarely inside it.
+//
+// The proof is taken through the PRODUCTION sampler and asked afterwards, the
+// two steps a pass does either side of reading its state, so what agrees here is
+// the object the mirror actually carries.
+func TestARowInsideTheSampleDoesNotDiscardTheConclusion(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+	dials := peerAgreesLive(s)
+	seedVMInState(t, s, "known", "other-net", "aa:bb:cc:00:26:01", "10.90.0.69",
+		"17171717-1717-1717-1717-171717171717", "running")
+
+	// REPLICATION COMPLETING BEFORE THE PASS BEGINS. This is the same arrival
+	// the discard scenario drives, landing before the sample instead of after
+	// it.
+	seedVMInState(t, s, "newcomer", "other-net", "aa:bb:cc:00:26:02", "10.90.0.70",
+		"18181818-1818-1818-1818-181818181818", "running")
+	if got := localDigestFor(t, s, vmsTableName).Count; got != 2 {
+		t.Fatalf("precondition: both rows must be in this node's inventory BEFORE it samples, "+
+			"got %d vms row(s) — otherwise this scenario is not about an early arrival", got)
+	}
+
+	// The pass samples, reads its state, and asks its proof later.
+	proof := s.NetBoxInventorySnapshotOnce(ctx)
+	ok, why := proof.Corroborated(ctx)
+
+	if !ok {
+		t.Fatalf("a row that arrived before the digests were collected is IN the sample the "+
+			"conclusions were drawn from, so it cannot be a read that moved under them; "+
+			"withholding here withholds every removal on any cluster whose inventory "+
+			"changes at all: %q", why)
+	}
+	if n := dials.Load(); n == 0 {
+		t.Fatal("no peer was asked, so this corroboration is not the one production runs: the " +
+			"binding check must pass the sample THROUGH to the fan-out, and a proof that " +
+			"agreed without asking anybody would agree with a divergent cluster too")
+	}
+}
+
 // TestABoundProofIsNotAFreshOne pins the binding at the point a caller could
 // undo it by accident: an empty sample.
 //
@@ -194,16 +259,22 @@ func TestABoundProofIsNotAFreshOne(t *testing.T) {
 // adoption step exists to prevent.
 //
 // The row lands through the production write path in the production window (see
-// SetOnInventoryRead), and the peer agrees with this node's inventory as it
-// stands when asked — so nothing but the binding can be what withholds the
-// activation. Either safe outcome is acceptable and both are the same one here:
-// the binding is suspended under the self-lifting reason, and the revalidation
-// pass re-plans from a fresh sample.
+// SetOnInventoryRead). Either safe outcome is acceptable and both are the same
+// one here: the binding is suspended under the self-lifting reason, and the
+// revalidation pass re-plans from a fresh sample.
+//
+// WHICH HALF OF THE PROOF WITHHELD IT IS ASSERTED, and it has to be, because a
+// live-agreeing peer is not the neutral bystander it looks like: the fan-out is
+// handed the BOUND sample, so a peer answering with this node's rows as they
+// stand now necessarily disagrees with a sample taken before the arrival — and
+// it withholds this bind all by itself, with the local change check deleted. The
+// dial count is what tells the two apart: the change check answers BEFORE the
+// fan-out, so a plan discarded by the binding asks no peer at all.
 func TestBindDoesNotGoLiveOnAPlanThatMissedARowEveryPeerHoldsNow(t *testing.T) {
 	s := newAdoptTestServer(t)
 	ctx := context.Background()
 	seedPeerHost(t, s, "peer-b")
-	peerAgreesLive(s)
+	dials := peerAgreesLive(s)
 
 	// The binder's own world: one VM, on a network with nothing to do with the
 	// prefix. Enough that no check keyed on an empty read is what answers.
@@ -245,6 +316,106 @@ func TestBindDoesNotGoLiveOnAPlanThatMissedARowEveryPeerHoldsNow(t *testing.T) {
 		t.Fatalf("reason = %q, want the uncorroborated-read one the revalidation pass lifts "+
 			"by itself — a plan whose inputs moved is re-derived, not repaired by an operator",
 			b.SuspendReason)
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("the discarded plan dialled %d peer(s), so what withheld it is the peer half "+
+			"disagreeing with the bound sample — which it does whatever the local change check "+
+			"says, and this scenario is about the change check", n)
+	}
+}
+
+// TestABindGoesLiveOnceTheRowThatDiscardedItIsInsideTheSample is the bind's
+// liveness half, and it is what makes the scenario above a DELAY rather than a
+// stall.
+//
+// ONE row, TWO passes, and the difference between them is only when it arrived.
+// It lands inside the first plan's window — after the enumeration that plan is
+// built from — so that plan's sample does not carry it and the plan is
+// discarded, correctly. By the second pass the same row is older than everything
+// that pass reads, its digests included: the plan and the proof are one read
+// again, they agree about the row, and the binding has to GO LIVE. An
+// implementation that sampled after its reads, or compared its sample against
+// anything older than itself, would keep discarding — a prefix suspended for as
+// long as the cluster keeps creating VMs, with no operator action that could
+// finish it, which is the cost of reading this binding as safety alone.
+//
+// The row is outside the bound prefix, so there is nothing to adopt in either
+// pass and the only question left is whether the read can be certified — the
+// binding is live or it is suspended under the uncorroborated reason, with no
+// third outcome to confuse the two.
+//
+// WHAT WITHHELD THE FIRST PASS IS ASSERTED, not assumed: the change check
+// answers before the fan-out, so a plan discarded by the binding dials no peer
+// at all, and a first pass that had asked the cluster would be suspended for the
+// peer half's reasons instead — which would make the resume below a statement
+// about a different gate. The resume is asserted the same way from the other
+// side: the pass that goes live must have ASKED somebody.
+func TestABindGoesLiveOnceTheRowThatDiscardedItIsInsideTheSample(t *testing.T) {
+	s := newAdoptTestServer(t)
+	ctx := context.Background()
+	seedPeerHost(t, s, "peer-b")
+	dials := peerAgreesLive(s)
+
+	// The binder's own world: one VM on a network with nothing to do with the
+	// prefix, so no check keyed on an empty read is what answers here.
+	seedVMInState(t, s, "unrelated", "other-net", "aa:bb:cc:00:27:01", "10.90.0.71",
+		"19191919-1919-1919-1919-191919191919", "running")
+
+	// THE ARRIVAL, once, inside the first plan's window. One-shot deliberately:
+	// the second pass re-plans, and a row landing in ITS window too would make
+	// this a scenario about an endlessly moving inventory rather than about a
+	// read that has settled.
+	var arrived bool
+	s.SetOnInventoryRead(func() {
+		if arrived {
+			return
+		}
+		arrived = true
+		seedVMInState(t, s, "newcomer", "other-net", "aa:bb:cc:00:27:02", "10.90.0.72",
+			"20202020-2020-2020-2020-202020202020", "running")
+	})
+
+	if err := s.validateAndBindPrefix(ctx, "shared", adoptTestPrefix, noDHCPNetworkDef); err != nil {
+		t.Fatalf("a plan whose read moved leaves the binding suspended; it does not refuse the "+
+			"bind: %v", err)
+	}
+	if !arrived {
+		t.Fatal("the plan never reached its inventory read, so nothing arrived in the window " +
+			"the first pass is supposed to discard on")
+	}
+	b, err := corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil || b == nil {
+		t.Fatalf("binding row: %+v (err %v)", b, err)
+	}
+	if !b.Suspended || !isUnhydratedSuspension(b.SuspendReason) {
+		t.Fatalf("the first pass must be discarded by the binding — suspended=%v reason=%q; "+
+			"without that this scenario never reaches the state whose self-clearing is the "+
+			"property under test", b.Suspended, b.SuspendReason)
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("the discarded plan dialled %d peer(s): the change check answers before the "+
+			"fan-out, so either the peer half is what withheld this pass or that order has "+
+			"changed — and the resume below would then be about a different gate", n)
+	}
+
+	// THE NEXT PASS, over a read that has settled.
+	if err := s.RevalidateBindingsOnce(ctx); err != nil {
+		t.Fatalf("revalidation pass: %v", err)
+	}
+	b, err = corrosion.GetBindingByPrefix(ctx, s.db, adoptTestPrefix)
+	if err != nil || b == nil {
+		t.Fatalf("binding row: %+v (err %v)", b, err)
+	}
+	if b.Suspended {
+		t.Fatalf("the row arrived before this pass collected its digests, so it is inside the "+
+			"sample the plan was built from and the cluster agrees about it: the binding must "+
+			"be live, got %q. A binding still suspended here is one no arrival can ever "+
+			"finish, because every arrival looks like a read that moved", b.SuspendReason)
+	}
+	if dials.Load() == 0 {
+		t.Fatal("the binding went live without the cluster ever being asked: the resume has to " +
+			"come from a corroborated read, and a pass that dialled nobody would resume over " +
+			"an unhydrated inventory just as happily")
 	}
 }
 

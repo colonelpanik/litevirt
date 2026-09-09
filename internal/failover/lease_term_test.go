@@ -425,10 +425,59 @@ func TestCoordinator_RefusesToRescheduleWhenSuperseded(t *testing.T) {
 		seedLeaseTerm(t, db, c.LeaseTerm()+499, "node-b")
 		c.failover(context.Background(), dead)
 		if got := proofCount(t, db); got != 0 {
-			t.Errorf("a superseded coordinator wrote %d reschedule proof(s); the precheck must "+
-				"fail fast before any destructive work", got)
+			t.Errorf("a superseded coordinator wrote %d reschedule proof(s); a coordinator whose "+
+				"term a peer has taken must not mint fresh authority", got)
 		}
 	})
+}
+
+// TestCoordinator_ThresholdReadErrorFailsOpen: an unreadable threshold must NOT
+// refuse the stamp.
+//
+// Every stamp site is past the fence — the host is powered off and persisted
+// offline, and a fenced host is processed only once — so a refusal abandons the
+// workload rather than deferring it. An unreadable threshold is no evidence this
+// coordinator is superseded; the likely cause is a transient DB error on a
+// perfectly current holder. Since the executor's barrier is the actual guarantee
+// and runs either way, failing closed here trades a guaranteed stranded workload
+// for a check that was never load-bearing.
+func TestCoordinator_ThresholdReadErrorFailsOpen(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+
+	c := NewCoordinator("me", db)
+	c.Now = func() time.Time { return now }
+	c.LeaseTermEnforce = true
+	c.Gate = fakeFailoverGate{enforced: map[string]bool{capabilities.LeaseTermV1: true}}
+	if !c.acquireLease(ctx) {
+		t.Fatal("must acquire an unheld lease")
+	}
+	mine := c.LeaseTerm()
+	if mine <= 0 {
+		t.Fatal("no term after acquiring; the rest of this test is vacuous")
+	}
+
+	// Make the threshold read fail. Dropping the ledger table is the cheapest
+	// injection that leaves the lease row itself readable, so the failure is
+	// isolated to the threshold query.
+	if err := db.Execute(ctx, `DROP TABLE leader_lease_terms`); err != nil {
+		t.Fatalf("drop the term ledger: %v", err)
+	}
+	if _, err := corrosion.CurrentLeaseTerm(ctx, db, failoverLeaseKey); err == nil {
+		t.Fatal("threshold read still succeeds; this test is not injecting the error it claims to")
+	}
+
+	_, _, term, ok := c.leaseStamp(ctx)
+	if !ok {
+		t.Fatal("an unreadable threshold refused the stamp. The host is already fenced and is " +
+			"processed only once, so this does not defer the reschedule — it abandons it, and the " +
+			"VM stays assigned to a powered-off host. The executor's barrier still guards the " +
+			"stale case, so refusing here buys nothing")
+	}
+	if term != mine {
+		t.Errorf("stamped term %d, want this coordinator's own %d", term, mine)
+	}
 }
 
 // TestContainerRelocationProofsCarryLeaseTerm gives each of the two container
@@ -517,6 +566,8 @@ func TestContainerRelocationProofsCarryLeaseTerm(t *testing.T) {
 //	  |                                                   |   AHolder
 //	7 | hoist the `term <= 0` guard ABOVE the enforcement | KILLED StampAllowed × 2
 //	  |   check (the implementation plan's own ordering)  |   + PreLatchHolderStamps
+//	8 | threshold read failure returns false (fail        | KILLED ThresholdReadError-
+//	  |   CLOSED) instead of true                         |   FailsOpen
 //
 // Mutation 3 is why this block exists. It SURVIVED the first run: the
 // "no recorded term" case seeds a ledger maximum of 6, so `term < threshold`
@@ -526,6 +577,14 @@ func TestContainerRelocationProofsCarryLeaseTerm(t *testing.T) {
 // Adding "no term anywhere" killed it, and only that case goes red, which is the
 // proof the other cases never covered the guard. The plan's mutation table had
 // predicted this mutation would be caught by a test that could not have caught it.
+//
+// Mutation 8 exists because a two-codex crossexam found, and source confirmed,
+// that every stamp site is reached AFTER the host has been fenced: c.fenced is
+// set and the fencer has run, and the host row is persisted offline, all before
+// the stamp. A fenced host is processed only once, so a refusal here abandons the
+// workload instead of deferring it. That makes fail-closed on an unreadable
+// threshold the wrong trade — it converts a transient DB blip into a VM stranded
+// on a powered-off host, to protect a check that was never the guarantee.
 //
 // Mutation 7 is the ordering this task was written against. The plan put the
 // `term <= 0` guard first, unconditionally, above any enforcement check. Pre-latch

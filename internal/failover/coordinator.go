@@ -180,10 +180,18 @@ type Coordinator struct {
 	// LeaseTermV1 capability latch, matching the executor's own predicate
 	// (grpcapi's leaseTermEnforced) — the two halves of one decision, and they
 	// must agree. When enforced, the coordinator refuses to stamp a proof whose
-	// term has been superseded, failing fast at the SOURCE before any destructive
-	// work. It is a precheck, not the guarantee: the executor's quorum barrier is,
-	// because a stale coordinator can skip this and nothing can skip that. Wired
-	// by the daemon.
+	// term has been superseded. It is a precheck, not the guarantee: the
+	// executor's quorum barrier is, because a stale coordinator can skip this and
+	// nothing can skip that. Wired by the daemon.
+	//
+	// It does NOT run "before any destructive work", and must not be described
+	// that way. Every stamp site is reached AFTER the host has been fenced —
+	// c.fenced is set and the fencer has run long before, and the host row is
+	// already persisted offline — so a refusal here abandons a workload whose host
+	// is already powered off. A fenced host is processed only once (see the
+	// auto-promote fallback comment in failover), so nothing revisits it: that is
+	// why the threshold read below fails OPEN, and why a refusal on this path is a
+	// last resort rather than a cheap safety net.
 	LeaseTermEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
@@ -805,9 +813,27 @@ func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
 	}
 	threshold, err := corrosion.CurrentLeaseTerm(ctx, c.db, failoverLeaseKey)
 	if err != nil {
-		slog.Error("failover: read lease term threshold", "error", err)
+		// FAIL OPEN, deliberately, and this is the one place in the family that
+		// does. Every caller is past the fence: the host is powered off and its
+		// row is persisted offline, and a fenced host is processed only once, so
+		// refusing here does not defer the work — it abandons it, and the
+		// workload stays assigned to a dead host until an operator intervenes.
+		//
+		// Weigh that against what refusing buys. This precheck is an
+		// optimisation; the executor's quorum barrier is the guarantee and runs
+		// regardless. An unreadable threshold is no evidence we are superseded —
+		// the overwhelmingly likely cause is a transient DB error on a
+		// coordinator whose term is perfectly current — so stamping produces a
+		// valid proof the executor accepts, and in the rare case we ARE stale the
+		// barrier refuses it exactly as designed. Fail-closed here trades a
+		// guaranteed stranded workload for a check that was never the guarantee.
+		//
+		// The error is still counted, so a threshold read that fails persistently
+		// is visible rather than silently permissive.
+		slog.Error("failover: read lease term threshold — stamping anyway (precheck fails open)",
+			"error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		return false
+		return true
 	}
 	if term < threshold {
 		slog.Warn("failover: this coordinator's lease term is superseded — refusing to stamp",

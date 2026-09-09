@@ -158,11 +158,18 @@ type Client struct {
 	// so the resolver (called while mu is held during a merge) records without
 	// re-entrancy.
 	tieMu sync.Mutex
-	// unresolvedTies records, per (table,PK), the sorted content-hash pair of the
-	// last classified-unresolved tie. It makes lww_tie_unresolved count DISTINCT
-	// rows (re-observing the same divergence is a no-op) and drives the alert.
-	// Cleared when the row converges or is repaired (a newer write to the PK).
-	unresolvedTies map[string]string
+	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
+	// its sorted content-hash pair and its CATEGORY. The pair makes
+	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is
+	// a no-op) and drives the alert. Cleared when the row converges or is
+	// repaired (a newer write to the PK).
+	//
+	// The category is retained because "is this tie about a workload's ownership"
+	// is a property of the CONFLICT, not of the table's name, and a consumer in
+	// another package cannot keep a table list in step with this package's
+	// schema. It used to be passed in and dropped, which is what forced
+	// internal/grpcapi to maintain one.
+	unresolvedTies map[string]unresolvedTie
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.

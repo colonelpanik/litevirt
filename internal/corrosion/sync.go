@@ -1275,7 +1275,12 @@ func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []i
 	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
 		return true, nil // idempotent re-delivery
 	}
-	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, "immutable_conflict")
+	// The category is chosen per TABLE, not fixed for this merge, because this one
+	// function serves both ownership-bearing tables (operations, operation_steps —
+	// whose owner_epoch is in the primary key) and the lease ledger. A single
+	// category forced consumers to re-derive which was which from the table name.
+	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE,
+		immutableTieCategory(table.Name))
 	return true, nil
 }
 

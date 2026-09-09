@@ -275,3 +275,61 @@ func TestOwnerEpochReadiness_OwnershipTieStillWithholds(t *testing.T) {
 
 	requireWithheld(t, s, "ownership")
 }
+
+// TestOwnershipTieCategory_FailsClosedOnAnUnknownCategory is the property that
+// makes the category filter safe to add categories to.
+//
+// A category nobody classified must withhold. This latch is monotone and never
+// re-opens, so a wrongly-withheld capability is recoverable by classifying the
+// category, while a capability latched over a live ownership dispute is not.
+func TestOwnershipTieCategory_FailsClosedOnAnUnknownCategory(t *testing.T) {
+	for _, category := range []string{"", "brand_new_category", "typo_runtime_owned"} {
+		if !ownershipTieCategory(category) {
+			t.Errorf("category %q did not withhold; an unclassified category must fail closed", category)
+		}
+	}
+}
+
+// TestOwnershipTieCategory_ClassifiesTheCategoriesCorrosionEmits pins the verdict
+// for every category the resolver and the merges actually produce today, with
+// the four Task 0 got wrong called out.
+//
+// The category strings are the contract between the two packages. A rename in
+// corrosion without a change here would silently reclassify a tie — in the
+// fail-closed direction, which is why this is a table rather than a derivation:
+// see the note in the test body.
+func TestOwnershipTieCategory_ClassifiesTheCategoriesCorrosionEmits(t *testing.T) {
+	// Deriving this list dynamically — driving every capabilityMap chain with an
+	// all-columns-differ rowView — was considered and rejected. It is possible
+	// (newRowView is reachable from a corrosion test), but the only drift it
+	// would catch beyond the table below is a NEW category that should have been
+	// non-ownership being left unclassified, and that direction fails closed:
+	// it over-withholds, which is visible and recoverable. The dangerous
+	// direction — a table that carries an owner epoch not being recognised — is
+	// caught in corrosion by
+	// TestOwnershipBearingTables_CoverEveryOwnerEpochColumn, derived from
+	// schemaDDL.
+	for _, tc := range []struct {
+		category  string
+		withholds bool
+		why       string
+	}{
+		{"runtime_owned", true, "vms.host_name / pending_action_id, containers"},
+		{"tenancy", true, "a project ownership split"},
+		{"control_plane", true, "hosts.state IS the voting roster this latch is derived from"},
+		{"immutable_ownership_conflict", true, "operations, operation_steps — owner_epoch is in the PK"},
+		{"identity_content_conflict", true, "a workload identity conflict"},
+		{"workload_identity_conflict", true, "the anti-entropy authority guard's identity fault"},
+		{"uncategorized", true, "the resolver could not classify it ⇒ unknown ⇒ closed"},
+
+		{"immutable_ledger_conflict", false, "a contested lease term is not evidence about a workload's owner epoch"},
+		{"opaque", false, "a differing spec/create_spec blob, no ownership column"},
+		{"content", false, "benign content convergence"},
+		{"policy", false, "a policy blob"},
+	} {
+		if got := ownershipTieCategory(tc.category); got != tc.withholds {
+			t.Errorf("ownershipTieCategory(%q) = %v, want %v — %s",
+				tc.category, got, tc.withholds, tc.why)
+		}
+	}
+}

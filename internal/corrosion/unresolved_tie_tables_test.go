@@ -12,10 +12,10 @@ func TestUnresolvedTieTables(t *testing.T) {
 	defer c.Close()
 
 	c.tieMu.Lock()
-	c.unresolvedTies = map[string]string{
-		unresolvedKey("vms", "a"):      "h1",
-		unresolvedKey("vms", "b"):      "h2",
-		unresolvedKey("vm_locks", "c"): "h3",
+	c.unresolvedTies = map[string]unresolvedTie{
+		unresolvedKey("vms", "a"):      {pair: "h1", category: "runtime_owned"},
+		unresolvedKey("vms", "b"):      {pair: "h2", category: "runtime_owned"},
+		unresolvedKey("vm_locks", "c"): {pair: "h3", category: "content"},
 	}
 	c.tieMu.Unlock()
 

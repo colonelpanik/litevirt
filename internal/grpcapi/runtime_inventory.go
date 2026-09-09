@@ -71,15 +71,60 @@ type runtimeInventory struct {
 	SampledAt     string
 }
 
-// ownershipTieTables are the tables whose rows carry a workload's owner epoch,
-// which makes them the only rows OwnerEpochReadiness reads and therefore the
-// only ones a tie can hide from it.
+// ownershipTieCategories are the tie CATEGORIES that can hide an ownership
+// decision from OwnerEpochReadiness, and therefore the only ones that withhold
+// owner_epoch_v1.
 //
-// Adding a table here widens a fail-closed predicate. Adding an owner_epoch
-// column to a table WITHOUT adding it here silently narrows one.
-var ownershipTieTables = map[string]bool{
-	"vms":        true, // vms.vm_owner_epoch
-	"containers": true, // containers.owner_epoch
+// Categories, not table names. This used to be a map of tables maintained here,
+// in a package that cannot see internal/corrosion's schema — its own comment
+// admitted the hazard ("Adding an owner_epoch column to a table WITHOUT adding
+// it here silently narrows one") and nothing could enforce it from here. It was
+// already wrong on four tables: runtime_action_proofs, operations,
+// operation_steps and project_authority_epochs all carry an owner epoch and all
+// answered "not an ownership table".
+//
+// The resolver already computes a category per conflict and corrosion splits its
+// immutable-row conflicts into an ownership and a ledger flavour, so the
+// classification now lives beside the schema and is tested against it
+// (TestOwnershipBearingTables_CoverEveryOwnerEpochColumn).
+//
+// An UNRECOGNISED category counts as ownership — fail closed. This latch is
+// monotone and never re-opens, so withholding it wrongly is recoverable while
+// latching over a live ownership dispute is not.
+var ownershipTieCategories = map[string]bool{
+	"runtime_owned":                true,
+	"tenancy":                      true, // a project ownership split
+	"control_plane":                true, // hosts.state IS the voting roster this latch is derived from
+	"immutable_ownership_conflict": true,
+	"identity_content_conflict":    true,
+	"workload_identity_conflict":   true,
+	"uncategorized":                true, // unclassified by the resolver ⇒ unknown ⇒ closed
+}
+
+// nonOwnershipTieCategories are the categories deliberately EXCLUDED, listed
+// explicitly so the two sets together are a partition and a new category cannot
+// be silently absent from both.
+//
+//   - immutable_ledger_conflict: a contested lease term. Two nodes claiming one
+//     tenure is real and must stay visible, but it is not evidence about any
+//     workload's owner epoch — this is the whole point of the fix that scoped
+//     this predicate in the first place.
+//   - opaque / content / policy: a differing spec, label or policy blob. No
+//     ownership column is involved.
+var nonOwnershipTieCategories = map[string]bool{
+	"immutable_ledger_conflict": true,
+	"opaque":                    true,
+	"content":                   true,
+	"policy":                    true,
+}
+
+// ownershipTieCategory reports whether a category withholds the owner-epoch
+// regime. Unknown ⇒ true (closed).
+func ownershipTieCategory(category string) bool {
+	if nonOwnershipTieCategories[category] {
+		return false
+	}
+	return true
 }
 
 // find returns the inventory entry for (kind, name), if present.
@@ -223,9 +268,14 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 	}
 
 	if s.db != nil {
-		inv.UnresolvedTies = s.db.UnresolvedTieCount()
-		for table, n := range s.db.UnresolvedTieTables() {
-			if ownershipTieTables[table] {
+		// ONE lock acquisition, and the fleet-wide total is DERIVED from the same
+		// snapshot rather than read separately. Two acquisitions could straddle a
+		// concurrent merge and yield a snapshot where OwnershipTies exceeded
+		// UnresolvedTies — its own superset — so readiness withheld while the state
+		// digest on the same snapshot reported the node clean.
+		for category, n := range s.db.UnresolvedTieCategories() {
+			inv.UnresolvedTies += n
+			if ownershipTieCategory(category) {
 				inv.OwnershipTies += n
 			}
 		}

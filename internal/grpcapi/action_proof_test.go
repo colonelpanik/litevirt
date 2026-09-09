@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -314,5 +315,73 @@ func TestClaimCarriedProof_ADivergentProofIsNotRelayedToPeers(t *testing.T) {
 		t.Errorf("the refused proof queued %d statement(s) for peers; the term it carries would "+
 			"become the permanent record on any peer that has not yet received the genuine row",
 			after-before)
+	}
+}
+
+// TestClaimCarriedProof_ANegativeLeaseTermIsMalformed refuses a term below zero
+// at the trust boundary, PRE-LATCH.
+//
+// proofFromPB forwards a peer-supplied int64 straight into the database, and
+// nothing validated the range: -5 marshals and unmarshals over the wire
+// cleanly. nextLeaseTerm returns COALESCE(MAX(term),0)+1, so a negative term is
+// not something allocation can produce — it is neither the 0 "minted without a
+// term" sentinel nor a real tenure, and it has no defined behaviour in either
+// enforcement arm.
+//
+// Refused before any capability latches, because it is not a legacy proof that
+// predates stamping; it is a broken one, and accepting it would persist a value
+// no reader can interpret.
+func TestClaimCarriedProof_ANegativeLeaseTermIsMalformed(t *testing.T) {
+	ctx := context.Background()
+	s := apServer(t) // host name "host-a"
+
+	for _, term := range []int64{-1, math.MinInt64} {
+		_, err := s.claimCarriedProof(ctx, &pb.RuntimeActionProof{
+			Id: "p-neg", Action: corrosion.ActionReschedule, TargetKind: "vm",
+			TargetName: "vm1", DestHost: "host-a", Coordinator: "node-a",
+			LeaseTerm: term, LeaseKey: corrosion.LeaseKeyFailover,
+		}, corrosion.ActionReschedule, "vm", "vm1")
+		if err == nil {
+			t.Fatalf("claimed a proof carrying lease term %d; a term below zero is malformed "+
+				"input and no enforcement arm defines what it means", term)
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("term %d: code = %v, want InvalidArgument (malformed input, not a stale tenure)",
+				term, status.Code(err))
+		}
+	}
+
+	// And nothing was persisted on the way to the refusal: the row must not
+	// exist at all, or a later valid proof for this id would hit the field
+	// match against a term no allocation produced.
+	rows, err := s.db.Query(ctx, `SELECT id FROM runtime_action_proofs WHERE id = 'p-neg'`)
+	if err != nil {
+		t.Fatalf("read proofs: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("a refused negative-term proof persisted %d row(s)", len(rows))
+	}
+}
+
+// TestInventoryProto_OwnershipTiesRoundTrip: runtimeInventory is explicitly the
+// shared local/remote struct, so a field the proto drops makes a peer with
+// several ownership ties decode as a clean one — the fail-OPEN answer, for a
+// latch that never re-opens.
+//
+// Only the local collector feeds readiness today, which is why this was latent
+// rather than broken. The field's doc comment does not mark it local-only, and
+// the predicate's own header calls the latch "the fleet AND", so a cross-node
+// reader is the obvious next step.
+func TestInventoryProto_OwnershipTiesRoundTrip(t *testing.T) {
+	in := runtimeInventory{
+		Host: "host-a", UnresolvedTies: 5, OwnershipTies: 3, Complete: true,
+	}
+	out := inventoryFromProto(inventoryToProto(in))
+	if out.OwnershipTies != 3 {
+		t.Errorf("OwnershipTies = %d after a proto round-trip, want 3: a peer's ownership ties "+
+			"decode as zero, which reads as a clean node", out.OwnershipTies)
+	}
+	if out.UnresolvedTies != 5 {
+		t.Errorf("UnresolvedTies = %d, want 5", out.UnresolvedTies)
 	}
 }

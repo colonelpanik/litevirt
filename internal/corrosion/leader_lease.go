@@ -165,6 +165,15 @@ func CurrentLeaseTerm(ctx context.Context, c *Client, key string) (int64, error)
 // Tombstones are excluded, matching newestLeaseTerm: a deleted incarnation is
 // not a tenure anyone holds. nextLeaseTerm's inclusion of tombstones is about
 // ALLOCATION never reusing a number and does not apply to this read.
+//
+// READ err FIRST. err != nil means the answer is UNKNOWN, and found is
+// MEANINGLESS then — not false-meaning-unseen. The two are otherwise
+// indistinguishable, because a query failure and a genuinely unseen term both
+// return ("", false, ...), while the doc above tells an enforcement path that
+// found == false is a normal answer it may proceed on. So an enforcement path
+// must fail closed on an error and may proceed only on
+// (found == false, err == nil). Written while this function still has no
+// caller, which is the cheapest moment to fix a contract.
 func LeaseTermHolder(ctx context.Context, c *Client, key string, term int64) (string, bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT holder FROM leader_lease_terms

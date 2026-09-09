@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 )
 
@@ -234,6 +235,17 @@ func TestRow_Int64(t *testing.T) {
 	}{
 		{"float64", float64(1e12), int64(1e12)},
 		{"int64", int64(999999), 999999},
+		// int and json.Number are the arms Int64 was missing while Int and
+		// Float both had them. sync.go documents that a cell's Go type follows
+		// the READ PATH — int64 from direct SQL, float64 or json.Number from a
+		// JSON state dump — so either of these decoding to 0 is not a rounding
+		// nuisance: 0 is lease_term's "minted without a term" sentinel, and an
+		// enforcement path would read a decode failure as a legacy proof.
+		{"int", int(7), 7},
+		{"json.Number", json.Number("7"), 7},
+		// A json.Number that is not an integer has no answer to give, so it
+		// takes the same 0 as any other unusable cell.
+		{"json.Number not an integer", json.Number("nope"), 0},
 		{"nil", nil, 0},
 		{"string", "not a number", 0},
 	}

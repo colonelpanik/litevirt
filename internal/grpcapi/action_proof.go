@@ -52,6 +52,28 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 			p.GetId(), action, targetKind, targetName, s.hostName,
 			p.GetAction(), p.GetTargetKind(), p.GetTargetName(), p.GetDestHost())
 	}
+	// A NEGATIVE lease term is malformed input, refused here and not only where
+	// enforcement compares terms.
+	//
+	// proofFromPB forwards a peer-supplied int64 straight into the DB, and
+	// -5 marshals and unmarshals over the wire cleanly. nextLeaseTerm returns
+	// COALESCE(MAX(term),0)+1, which is >= 1, so a term below zero is not
+	// something allocation can produce: it is neither the 0 "minted without a
+	// term" sentinel nor a real tenure, and it has no defined behaviour in
+	// either enforcement arm. Contrast OwnerEpoch, which is parsed and compared
+	// against the live row a few lines below.
+	//
+	// Refused PRE-LATCH, unlike the term comparison, because this is not a
+	// legacy proof that predates stamping — it is a broken one, and accepting
+	// it until a capability latches would persist a value no reader can
+	// interpret. (The post-latch `term <= 0` refusal belongs to Task 6, which
+	// also decides which actions it applies to.)
+	if p.GetLeaseTerm() < 0 {
+		return "", status.Errorf(codes.InvalidArgument,
+			"runtime-action proof %s carries lease term %d; a lease term is never negative "+
+				"(allocation starts at 1, and 0 means the proof was minted without one)",
+			p.GetId(), p.GetLeaseTerm())
+	}
 	// Seed the row from the carried proof AND check it against any row already
 	// present, in ONE guarded transaction.
 	//
@@ -67,7 +89,8 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 	// the two cannot disagree about which fields authorize an action. It covers
 	// action/target/dest/coordinator, relocation_token (a container relocation's
 	// binding key — claiming the token-A ledger row while stamping token B would
-	// diverge proof from provenance), fence_epoch, owner_epoch and lease_term.
+	// diverge proof from provenance), fence_epoch, owner_epoch, lease_term and
+	// lease_key.
 	if err := corrosion.WriteActionProofValidated(ctx, s.db, proofFromPB(p)); err != nil {
 		if errors.Is(err, corrosion.ErrProofDiverges) {
 			return "", status.Errorf(codes.FailedPrecondition,

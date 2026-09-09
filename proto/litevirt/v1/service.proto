@@ -297,6 +297,13 @@ message RuntimeInventory {
     bool complete = 5;
     repeated string errors = 6;
     string sampled_at = 7;          // RFC3339
+    // Unresolved ties restricted to the tables that carry an owner epoch. A
+    // subset of unresolved_tie_count, and the one an ownership reader cares
+    // about: a contested lease term is an unresolved tie but is not evidence
+    // about any workload's owner epoch. Absent from this message until v53,
+    // which meant a peer with several ownership ties decoded as a clean one —
+    // the fail-OPEN answer for a latch that never re-opens.
+    int32 ownership_tie_count = 8;
 }
 
 // OrphanProofRequest asks ONE host whether anything on it still claims an

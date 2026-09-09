@@ -3479,11 +3479,18 @@ type RuntimeInventory struct {
 	// list/state, LB-config read, the kernel `ip` dump, or a marker read). Positive
 	// entries are still real, but ABSENCE is unreliable: a caller must never treat
 	// an incomplete inventory as proof a workload is gone.
-	Complete      bool     `protobuf:"varint,5,opt,name=complete,proto3" json:"complete,omitempty"`
-	Errors        []string `protobuf:"bytes,6,rep,name=errors,proto3" json:"errors,omitempty"`
-	SampledAt     string   `protobuf:"bytes,7,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"` // RFC3339
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Complete  bool     `protobuf:"varint,5,opt,name=complete,proto3" json:"complete,omitempty"`
+	Errors    []string `protobuf:"bytes,6,rep,name=errors,proto3" json:"errors,omitempty"`
+	SampledAt string   `protobuf:"bytes,7,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"` // RFC3339
+	// Unresolved ties restricted to the tables that carry an owner epoch. A
+	// subset of unresolved_tie_count, and the one an ownership reader cares
+	// about: a contested lease term is an unresolved tie but is not evidence
+	// about any workload's owner epoch. Absent from this message until v53,
+	// which meant a peer with several ownership ties decoded as a clean one —
+	// the fail-OPEN answer for a latch that never re-opens.
+	OwnershipTieCount int32 `protobuf:"varint,8,opt,name=ownership_tie_count,json=ownershipTieCount,proto3" json:"ownership_tie_count,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *RuntimeInventory) Reset() {
@@ -3563,6 +3570,13 @@ func (x *RuntimeInventory) GetSampledAt() string {
 		return x.SampledAt
 	}
 	return ""
+}
+
+func (x *RuntimeInventory) GetOwnershipTieCount() int32 {
+	if x != nil {
+		return x.OwnershipTieCount
+	}
+	return 0
 }
 
 // OrphanProofRequest asks ONE host whether anything on it still claims an
@@ -25884,7 +25898,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\buncapped\x18\t \x01(\bR\buncapped\x12\x1f\n" +
 	"\vprobe_error\x18\n" +
 	" \x01(\tR\n" +
-	"probeError\"\x99\x02\n" +
+	"probeError\"\xc9\x02\n" +
 	"\x10RuntimeInventory\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12:\n" +
 	"\tworkloads\x18\x02 \x03(\v2\x1c.litevirt.v1.RuntimeWorkloadR\tworkloads\x120\n" +
@@ -25893,7 +25907,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bcomplete\x18\x05 \x01(\bR\bcomplete\x12\x16\n" +
 	"\x06errors\x18\x06 \x03(\tR\x06errors\x12\x1d\n" +
 	"\n" +
-	"sampled_at\x18\a \x01(\tR\tsampledAt\"Y\n" +
+	"sampled_at\x18\a \x01(\tR\tsampledAt\x12.\n" +
+	"\x13ownership_tie_count\x18\b \x01(\x05R\x11ownershipTieCount\"Y\n" +
 	"\x12OrphanProofRequest\x12\x17\n" +
 	"\avm_uuid\x18\x01 \x01(\tR\x06vmUuid\x12\x10\n" +
 	"\x03mac\x18\x02 \x01(\tR\x03mac\x12\x18\n" +

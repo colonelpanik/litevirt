@@ -277,3 +277,34 @@ func TestValidLeaseKey_RejectsAnythingNotALease(t *testing.T) {
 		}
 	}
 }
+
+// TestLeaseTermHolder_AQueryFailureIsNotAnUnseenTerm pins the contract the doc
+// block states, by reading err FIRST — which is the whole point.
+//
+// The two answers are otherwise identical: a failed query and a genuinely
+// unseen term both return ("", false, ...). The doc above tells an enforcement
+// path that found == false is a normal answer it may proceed on, so a caller
+// written as `holder, found, _ :=` or one that checks !found before err would
+// treat a broken database as "nobody holds that term" and proceed. Fixed while
+// the function still has no caller.
+func TestLeaseTermHolder_AQueryFailureIsNotAnUnseenTerm(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	// Take the ledger away underneath it.
+	if err := c.execLocal(ctx, `DROP TABLE leader_lease_terms`); err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+
+	holder, found, err := LeaseTermHolder(ctx, c, LeaseKeyFailover, 1)
+	if err == nil {
+		t.Fatal("a failed ledger read reported no error; an enforcement path cannot then tell " +
+			"'this node has not seen that term' (proceed) from 'the database failed' (fail closed)")
+	}
+	if holder != "" {
+		t.Errorf("holder = %q on an error, want the zero value", holder)
+	}
+	if found {
+		t.Error("found = true alongside an error")
+	}
+}

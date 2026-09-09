@@ -1221,6 +1221,18 @@ func (r Row) Int64(col string) int64 {
 		return int64(n)
 	case int64:
 		return n
+	case int:
+		// Int and Float have always had this arm; Int64 did not, and the gap
+		// matters now. sync.go documents that a cell's runtime Go type depends
+		// on the READ PATH — int64 from direct SQL, float64 or json.Number from
+		// a JSON state dump — so an int reaching here read as 0, which is
+		// lease_term's "minted without a term" sentinel, with nothing logged.
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+		return 0
 	default:
 		return 0
 	}

@@ -70,6 +70,62 @@ func TestDeletedVMRemovedFromNetBox(t *testing.T) {
 	}
 }
 
+// TestSameNameRecreationConvergesRatherThanStallingTheMirror.
+//
+// Delete a VM and recreate it under the same name before the next sweep. The new
+// incarnation has a new UUID, so a new identity, so the diff calls for a CREATE
+// — and NetBox enforces one VM name per cluster, so that create is a 400 while
+// the old object still holds the name. The old object is in this sweep's delete
+// set, but deletes run in the last phase, and the pass aborts on the 400 before
+// reaching it. Every subsequent pass does the same: a PERMANENT stall on an
+// ordinary operation, which is why three passes are driven here rather than one.
+//
+// What resolves it is proof from the identity, not a reordering of every delete:
+// the occupying object carries this cluster's fingerprint and a UUID absent from
+// the desired set, which makes it a superseded incarnation of that name and the
+// one removal allowed to run ahead of a create.
+func TestSameNameRecreationConvergesRatherThanStallingTheMirror(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 1)
+	n := c.Nodes[0]
+
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+	mustSyncAllNodes(t, c)
+	if nb.VMCount("vm-1") != 1 {
+		t.Fatalf("precondition: want the first incarnation mirrored, got %d",
+			nb.VMCount("vm-1"))
+	}
+	firstIdentities := nb.VMIdentities()
+
+	// No mirror pass between the delete and the create, which is the window an
+	// operator recreating a VM by hand goes straight through.
+	mustDeleteVM(t, n, "vm-1")
+	mustCreateVM(t, n, "vm-1", orphanNetwork)
+
+	for i := 0; i < 3; i++ {
+		if err := n.SyncNetBoxMirror(); err != nil {
+			t.Fatalf("mirror pass %d cannot replace the old same-name incarnation: %v", i, err)
+		}
+	}
+
+	// CONVERGED, not merely un-errored: one object under that name, and it is
+	// the NEW incarnation.
+	if got := nb.VMCount("vm-1"); got != 1 {
+		t.Fatalf("virtual_machine objects named vm-1 = %d, want exactly 1", got)
+	}
+	after := nb.VMIdentities()
+	if len(after) != 1 {
+		t.Fatalf("VM identities in NetBox = %v, want exactly the new incarnation's", after)
+	}
+	if after[0] == firstIdentities[0] {
+		t.Fatalf("NetBox still holds the SUPERSEDED incarnation %s; the name was freed for "+
+			"an object that was never created", after[0])
+	}
+	if got := nb.InterfaceCount(); got != 1 {
+		t.Fatalf("interface objects = %d, want 1 — the superseded VM's interfaces go with it "+
+			"and the new incarnation gets its own", got)
+	}
+}
+
 func TestRenameDoesNotForkAnInterface(t *testing.T) {
 	nb, c := boundMirrorCluster(t, 1)
 	n := c.Nodes[0]

@@ -605,16 +605,28 @@ func (r *Reconciler) withoutUnprovenRemovals(ctx context.Context, actions []Acti
 	return kept, deletes, len(unprovenAddrs)
 }
 
-// destructive reports whether an action TAKES something away. The two ops are
-// the delete and the clear.
+// destructive reports whether an action TAKES something away. Three ops do: the
+// delete, the clear, and the replace.
 //
-// This is the ONLY spelling of that pair: hasRemovals, withoutUnprovenRemovals
+// This is the ONLY spelling of that set: hasRemovals, withoutUnprovenRemovals
 // and withoutDestructive all call it rather than re-testing the ops, so the
 // per-object gate and the whole-list drop cannot come to disagree about what
-// they cover. A third destructive op therefore reaches both gates the moment it
+// they cover. A fourth destructive op therefore reaches both gates the moment it
 // is added here — and provenRemovable fails it closed until someone gives it an
 // evidence question.
-func destructive(a Action) bool { return a.Op == "delete" || a.Op == "clear" }
+//
+// THE REPLACE IS IN HERE, and it is the reason this comment says three. It reads
+// like part of a create — it exists to free a name a create needs — but it
+// deletes a NetBox object, and half of its proof is that the object's UUID is
+// absent from the DESIRED set. That premise is only as good as the desired read
+// is whole, which is exactly the question both gates ask. So a sweep that cannot
+// prove its read whole withholds the replace with the deletes; the create then
+// collides as it did before the replace existed, which leaves the mirror stalled
+// for that one VM rather than removing an object on evidence just admitted to be
+// partial.
+func destructive(a Action) bool {
+	return a.Op == "delete" || a.Op == "clear" || a.Op == opReplace
+}
 
 // provenRemovable reports whether the local database holds a record — live or
 // tombstoned — of the thing this destructive action would take away.
@@ -633,7 +645,11 @@ func provenRemovable(a Action, actual Actual, nameByID map[int]string, known cor
 	if a.Op == "clear" {
 		return known.KnowsAddress(a.IPID)
 	}
-	if a.Op != "delete" {
+	// A REPLACE asks the identical question the delete it took over would have
+	// been asked: its Kind and Key are a VM delete's, so it falls through to the
+	// same branch below rather than getting an evidence rule of its own to drift
+	// from that one.
+	if a.Op != "delete" && a.Op != opReplace {
 		return false
 	}
 	switch a.Kind {
@@ -673,7 +689,10 @@ func hasRemovals(actions []Action) bool {
 // Creates, updates and assigns are kept deliberately. They are additive, so the
 // worst a partial read costs there is an object or an assignment that a later
 // pass reconciles — leak over collision, the same direction every other
-// fail-closed decision in this package takes.
+// fail-closed decision in this package takes. The one create that is NOT purely
+// additive — the one whose name is held by a superseded incarnation — does not
+// carry the removal itself: that is a separate vm/replace action, which
+// destructive covers and this therefore drops.
 //
 // It filters the ACTION LIST rather than skipping the destructive PHASES: a
 // phase is a scheduling boundary, and one skipped by a flag is one a later

@@ -251,6 +251,8 @@ func (r *Reconciler) apply(ctx context.Context, actions []Action, idx desiredInd
 // is a mirror that never converges and never says why.
 func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, fingerprint string) error {
 	switch {
+	case a.Kind == kindVM && a.Op == opReplace:
+		return r.replaceSuperseded(ctx, a, idx, fingerprint)
 	case a.Kind == kindVM && a.Op == "create":
 		return r.createVM(ctx, a, idx, fingerprint)
 	case a.Kind == kindVM && a.Op == "update":
@@ -324,6 +326,70 @@ func (r *Reconciler) createVM(ctx context.Context, a Action, idx desiredIndex, f
 		id = vm.ID
 	}
 	return r.recordRef(ctx, kindVM, identity, netboxKindVM, id)
+}
+
+// replaceSuperseded removes the superseded incarnation holding a name a create
+// needs, then retires its mapping. See opReplace for what it is for and why one
+// removal — and only this one — runs ahead of the creates.
+//
+// IT RE-PROVES BOTH REFUSALS BEFORE IT TOUCHES ANYTHING, from the applier's own
+// desired index rather than from the fact that Diff emitted the action. Same
+// two-independent-guards rule the delete path follows, and for the same reason:
+// this is the irreversible direction, and a proof made in one function and acted
+// on in another is one refactor away from being a proof of nothing.
+//
+//   - AN IDENTITY IN THE DESIRED SET IS A LIVE VM, and freeing a name may never
+//     remove one. A create that cannot be made is a stalled mirror, which the
+//     next sweep can still fix; a mirrored VM deleted out of NetBox is gone. So
+//     this refuses and the sweep fails LOUDLY rather than proceeding.
+//   - A FOREIGN FINGERPRINT is another installation's object, or an operator's.
+//     Diff's foreign-name branch emits nothing at all for such a VM, so an
+//     action carrying one means something upstream is wrong — and the answer to
+//     that is to stop, never to delete somebody else's inventory.
+//
+// The mapping is retired HERE because this action owns the removal: Diff emits no
+// separate delete for a replaced identity, so nothing else would prune the row.
+// A NetBox object already gone (404) still reaches that retirement, exactly as
+// deleteObject does, because a stranded mapping is how a re-created object comes
+// to adopt a dead id.
+func (r *Reconciler) replaceSuperseded(ctx context.Context, a Action, idx desiredIndex, fingerprint string) error {
+	if _, live := idx.VMs[a.Key]; live {
+		return fmt.Errorf(
+			"netboxsync: vm/replace %s would free the name %q, but that identity IS in this "+
+				"sweep's desired set — it is a live VM of this cluster, not a superseded "+
+				"incarnation, and freeing a name may never remove one",
+			a.Key, a.FreesName)
+	}
+	if !ownedBy(a.Key, fingerprint) {
+		return fmt.Errorf(
+			"netboxsync: vm/replace %s does not carry this cluster's identity fingerprint — "+
+				"another installation's object, or an operator's, and not this mirror's to "+
+				"remove at any cost to free the name %q",
+			a.Key, a.FreesName)
+	}
+	if a.NetBoxID == 0 {
+		return fmt.Errorf("netboxsync: vm/replace %s carries no NetBox object to remove", a.Key)
+	}
+	err := r.nb.DeleteVM(ctx, a.NetBoxID)
+	switch {
+	case err == nil:
+		r.sink().IncMirrorObject(netboxKindVM, opDeleted)
+	case isNotFound(err):
+		// Already gone IS the end state this action wants, so it falls through
+		// to the mapping retirement below.
+		slog.Info("netbox mirror: the superseded incarnation was already absent; retiring its mapping",
+			"identity", a.Key, "netbox_id", a.NetBoxID)
+	default:
+		return fmt.Errorf(
+			"netboxsync: replace the superseded incarnation %s (netbox id %d) holding the name "+
+				"%q: %w", a.Key, a.NetBoxID, a.FreesName, err)
+	}
+	if err := corrosion.DeleteObjectRef(ctx, r.db, kindVM, a.Key); err != nil {
+		return fmt.Errorf("netboxsync: retire mapping %s/%s: %w", kindVM, a.Key, err)
+	}
+	slog.Info("netbox mirror: replaced the superseded incarnation of a reused VM name",
+		"identity", a.Key, "netbox_id", a.NetBoxID, "name", a.FreesName)
+	return nil
 }
 
 // updateVM patches the object the diff resolved.

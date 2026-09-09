@@ -194,6 +194,56 @@ func TestSweepStillDeletesOnWholeEvidence(t *testing.T) {
 	}
 }
 
+// TestSweepWithholdsTheNameReplacementOnAPartialRead.
+//
+// A vm/replace frees a reused name from its superseded incarnation, and half of
+// its proof is that the occupying object's UUID is NOT in the desired set. That
+// premise is only as good as the desired read is whole — on a partial read the
+// UUID may simply be missing from it — so the replacement is withheld exactly as
+// every delete is, and the create then collides as it did before the replacement
+// existed. A stalled mirror for one VM, rather than an object removed on evidence
+// the pass has just admitted is partial.
+func TestSweepWithholdsTheNameReplacementOnAPartialRead(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	// vm-1 recreated under a NEW uuid: NetBox still holds the old incarnation
+	// (id 11, uuid-1) under that name.
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-new","cpu":2,"memory_mib":1024}`, macGuard)
+	// …and a second VM whose spec carries no uuid, which desiredState SKIPS.
+	// That is what makes this read partial.
+	seedVMRow(t, r, "vm-2", `{"cpu":1,"memory_mib":512}`, "52:54:00:aa:bb:dd")
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatalf("the sweep must still run its non-destructive phases: %v", err)
+	}
+
+	vms, ifaces := deletes(nb)
+	if len(vms) != 0 || len(ifaces) != 0 {
+		t.Fatalf("a partial read replaced the object holding a reused name (VMs %v, "+
+			"interfaces %v); \"this UUID is not in the desired set\" is not a fact a partial "+
+			"desired read can establish", vms, ifaces)
+	}
+}
+
+// TestSweepReplacesTheSupersededNameHolderOnWholeEvidence is the negative
+// control for the scenario above: with the read whole, the replacement runs.
+// Without this, a mirror that never replaced anything would satisfy it.
+func TestSweepReplacesTheSupersededNameHolderOnWholeEvidence(t *testing.T) {
+	nb, r, _ := guardReconciler(t)
+	ctx := context.Background()
+	seedVMRow(t, r, "vm-1", `{"uuid":"uuid-new","cpu":2,"memory_mib":1024}`, macGuard)
+
+	if err := r.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	vms, _ := deletes(nb)
+	if len(vms) != 1 || vms[0] != 11 {
+		t.Fatalf("the superseded incarnation holding the reused name must be replaced, "+
+			"deleted %v", vms)
+	}
+}
+
 // TestSweepRetiresTheLastVMOnItsTombstone is the case an unqualified
 // empty-desired refusal would strand forever.
 //

@@ -294,6 +294,115 @@ func TestDiffClearsAStaleDeviceLinkUsingDecodedActual(t *testing.T) {
 	}
 }
 
+// ── the superseded incarnation of a reused name ─────────────────────────────
+
+// supersededActual is one of THIS cluster's objects holding `name` under `uuid`,
+// which is the shape every scenario below varies one property of.
+func supersededActual(name, uuid string) Actual {
+	return Actual{
+		VMs: map[string]netbox.VirtualMachine{
+			vmIdent(uuid): {ID: 11, Name: name, Identity: vmIdent(uuid)},
+		},
+		NICs:            map[string]netbox.VMInterface{},
+		ForeignVMNames:  map[string]bool{},
+		OwnedIPsByIface: map[int][]netbox.IPAddress{},
+	}
+}
+
+func replaceActions(actions []Action) []Action {
+	var out []Action
+	for _, a := range actions {
+		if a.Op == opReplace {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// TestDiffReplacesASupersededIncarnationOfAReusedName is the positive case: our
+// object, holding the name, under a UUID the cluster no longer has.
+func TestDiffReplacesASupersededIncarnationOfAReusedName(t *testing.T) {
+	// "u-old" was deleted; "u-new" is the same name recreated.
+	got := Diff([]DesiredVM{{Name: "vm-1", UUID: "u-new", VCPUs: 2}},
+		supersededActual("vm-1", "u-old"), fp)
+
+	rep := replaceActions(got)
+	if len(rep) != 1 {
+		t.Fatalf("got %+v, want exactly one vm/replace freeing the reused name", got)
+	}
+	if rep[0].Key != vmIdent("u-old") || rep[0].NetBoxID != 11 {
+		t.Errorf("the replace must name the superseded object, got %+v", rep[0])
+	}
+	if rep[0].FreesName != "vm-1" {
+		t.Errorf("FreesName = %q, want the name being freed", rep[0].FreesName)
+	}
+	// STRICTLY EARLIER THAN THE CREATE, stated as an inequality on the phases:
+	// a create cannot use a name another object still holds.
+	if Phase(rep[0]) >= Phase(Action{Kind: "vm", Op: "create"}) {
+		t.Errorf("the replace runs in phase %d and the create in phase %d; freeing the name "+
+			"must happen strictly first", Phase(rep[0]), Phase(Action{Kind: "vm", Op: "create"}))
+	}
+	// And exactly ONE removal is emitted for that object: the delete half must
+	// not also claim it.
+	for _, a := range got {
+		if a.Op == "delete" && a.Key == vmIdent("u-old") {
+			t.Errorf("the superseded object has two owners — a replace AND a delete: %+v", got)
+		}
+	}
+}
+
+// TestDiffNeverReplacesAnIdentityInTheDesiredSet is the first refusal, and the
+// one that matters most: an identity in the desired set is a LIVE VM.
+//
+// Here two desired VMs briefly disagree about a name — one renamed onto a name
+// the other still holds — so the occupant IS in the desired set. Freeing a name
+// may never remove a mirrored VM: the collision is lived with, and the sweep
+// converges once the rename lands.
+func TestDiffNeverReplacesAnIdentityInTheDesiredSet(t *testing.T) {
+	got := Diff([]DesiredVM{
+		{Name: "vm-1", UUID: "u-new", VCPUs: 2},
+		// Still desired, and still named vm-1 in NetBox.
+		{Name: "vm-2", UUID: "u-live", VCPUs: 2},
+	}, supersededActual("vm-1", "u-live"), fp)
+
+	if rep := replaceActions(got); len(rep) != 0 {
+		t.Fatalf("a LIVE VM's object was scheduled for replacement to free a name: %+v", rep)
+	}
+}
+
+// TestDiffNeverReplacesAForeignIdentity is the second refusal. An object under
+// another installation's fingerprint is untouchable at any cost — the name
+// collision it causes is reported and lived with, never resolved by deleting
+// somebody else's inventory.
+//
+// The object is placed in actual.VMs deliberately, which is a state BuildActual
+// does not produce (it files a foreign object's name under ForeignVMNames). That
+// is the point: this pins the guard in Diff rather than relying on the
+// collection filter upstream, so a mis-scoped read cannot become a deletion.
+func TestDiffNeverReplacesAForeignIdentity(t *testing.T) {
+	actual := supersededActual("vm-1", "u-old")
+	foreign := netbox.Identity("another-installation", "u-old", "")
+	actual.VMs = map[string]netbox.VirtualMachine{
+		foreign: {ID: 11, Name: "vm-1", Identity: foreign},
+	}
+
+	got := Diff([]DesiredVM{{Name: "vm-1", UUID: "u-new", VCPUs: 2}}, actual, fp)
+	if rep := replaceActions(got); len(rep) != 0 {
+		t.Fatalf("an object under another installation's fingerprint was scheduled for "+
+			"replacement: %+v", rep)
+	}
+}
+
+// TestDiffDoesNotReplaceWhenTheNameIsFree is the negative control: without it a
+// Diff that emitted a replace unconditionally would satisfy the positive case.
+func TestDiffDoesNotReplaceWhenTheNameIsFree(t *testing.T) {
+	got := Diff([]DesiredVM{{Name: "vm-1", UUID: "u-new", VCPUs: 2}},
+		supersededActual("vm-other", "u-old"), fp)
+	if rep := replaceActions(got); len(rep) != 0 {
+		t.Fatalf("nothing holds the name vm-1, so no replacement is warranted: %+v", rep)
+	}
+}
+
 func TestPhasesOrderParentsBeforeChildren(t *testing.T) {
 	actions := []Action{
 		{Kind: "vm", Op: "delete", Key: "vm-gone"},
@@ -301,6 +410,7 @@ func TestPhasesOrderParentsBeforeChildren(t *testing.T) {
 		{Kind: "nic", Op: "create", Key: "nic-new"},
 		{Kind: "nic", Op: "clear", Key: "nic-stale", IPID: 41},
 		{Kind: "vm", Op: "create", Key: "vm-new"},
+		{Kind: "vm", Op: opReplace, Key: "vm-superseded", NetBoxID: 11},
 	}
 	got := Phases(actions)
 
@@ -309,6 +419,7 @@ func TestPhasesOrderParentsBeforeChildren(t *testing.T) {
 		key   string
 		what  string
 	}{
+		{PhaseVMSupersede, "vm-superseded", "freeing a reused name"},
 		{PhaseVMUpsert, "vm-new", "VM creates/updates"},
 		{PhaseIPClear, "nic-stale", "IP clears"},
 		{PhaseNICUpsert, "nic-new", "NIC create/update/assign"},

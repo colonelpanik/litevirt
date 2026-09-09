@@ -61,6 +61,81 @@ func TestApplyDeleteUsesTheActionsObjectID(t *testing.T) {
 	}
 }
 
+// ── vm/replace: the applier's own, independent proof ────────────────────────
+
+// TestApplyReplaceRemovesTheSupersededObjectAndRetiresItsMapping is the positive
+// case. The identity is absent from the desired set and carries this cluster's
+// fingerprint, which is the whole proof — and the mapping is retired here
+// because Diff emits no separate delete for a replaced identity, so nothing else
+// would ever prune it.
+func TestApplyReplaceRemovesTheSupersededObjectAndRetiresItsMapping(t *testing.T) {
+	nb := &stubVirt{}
+	r := newTestReconciler(t, nb)
+	old := netbox.Identity(fp, "uuid-old", "")
+	if err := r.recordRef(context.Background(), "vm", old, netboxKindVM, 11); err != nil {
+		t.Fatalf("seed the superseded mapping: %v", err)
+	}
+
+	if err := r.apply(context.Background(),
+		[]Action{{Kind: "vm", Op: opReplace, Key: old, NetBoxID: 11, FreesName: "vm-1"}},
+		indexDesired([]DesiredVM{{Name: "vm-1", UUID: "uuid-new"}}, fp), fp,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(nb.deleted) != 1 || nb.deleted[0] != 11 {
+		t.Fatalf("want the superseded object 11 removed, got %v", nb.deleted)
+	}
+	if ref, _ := getRef(r, "vm", old); ref != nil {
+		t.Fatal("the superseded identity's mapping must be retired with its object; nothing " +
+			"else prunes it, and a stranded row is how a re-created object adopts a dead id")
+	}
+}
+
+// TestApplyReplaceRefusesAnIdentityInTheDesiredSet re-proves the first refusal
+// where the delete is actually issued.
+//
+// Diff already refuses this, so reaching the applier with such an action means
+// something upstream is wrong — and the answer to that is to STOP, loudly, not
+// to trust the flag. A create that cannot be made is a stalled mirror the next
+// sweep can still fix; a mirrored VM deleted out of NetBox is gone.
+func TestApplyReplaceRefusesAnIdentityInTheDesiredSet(t *testing.T) {
+	nb := &stubVirt{}
+	r := newTestReconciler(t, nb)
+	live := netbox.Identity(fp, "uuid-live", "")
+
+	err := r.apply(context.Background(),
+		[]Action{{Kind: "vm", Op: opReplace, Key: live, NetBoxID: 11, FreesName: "vm-1"}},
+		// The very identity the action would remove is DESIRED.
+		indexDesired([]DesiredVM{{Name: "vm-2", UUID: "uuid-live"}}, fp), fp,
+	)
+	if err == nil {
+		t.Fatal("the applier removed an object whose identity IS in the desired set — a live " +
+			"VM of this cluster — to free a name")
+	}
+	if len(nb.deleted) != 0 {
+		t.Fatalf("nothing may be deleted on a refused replacement, got %v", nb.deleted)
+	}
+}
+
+// TestApplyReplaceRefusesAForeignIdentity re-proves the second refusal: another
+// installation's object is untouchable at any cost.
+func TestApplyReplaceRefusesAForeignIdentity(t *testing.T) {
+	nb := &stubVirt{}
+	r := newTestReconciler(t, nb)
+	foreign := netbox.Identity("another-installation", "uuid-old", "")
+
+	err := r.apply(context.Background(),
+		[]Action{{Kind: "vm", Op: opReplace, Key: foreign, NetBoxID: 11, FreesName: "vm-1"}},
+		indexDesired([]DesiredVM{{Name: "vm-1", UUID: "uuid-new"}}, fp), fp,
+	)
+	if err == nil {
+		t.Fatal("the applier removed an object carrying ANOTHER installation's fingerprint")
+	}
+	if len(nb.deleted) != 0 {
+		t.Fatalf("nothing may be deleted on a refused replacement, got %v", nb.deleted)
+	}
+}
+
 func TestApplyDeletesADetachedInterface(t *testing.T) {
 	nb := &stubVirt{}
 	r := newTestReconciler(t, nb)

@@ -301,26 +301,40 @@ in calm conditions means a producer is minting proofs from a tenure it no longer
 holds, and that producer is worth finding.
 
 `litevirt_failover_stranded_workloads` is the one to alert on, and it is a
-GAUGE rather than a rate: it counts workloads sitting on a host this cluster
-fenced that failover would have moved and did not.
+GAUGE rather than a rate: it counts workloads still assigned to a host in state
+`fenced` or `offline` that failover would move off a dead host.
 
-Zero is the normal value. Non-zero means a refusal landed AFTER the fence — a
-lost quorum, an ungated target, a superseded lease term, a transient store error
-on the proof write — and because a fenced host is processed at most once per
-outage, nothing will revisit it. Those workloads stay assigned to a powered-off
-machine until you act.
+It is the lease holder's view. Every node runs a coordinator and serves
+`/metrics`, but a node that is not driving failover publishes `0`, so alert on
+`max()` across instances — or join on `litevirt_failover_leader` — and never on
+`avg()`, which divides the real count by your fleet size.
 
-That window cannot be closed. The checks that can refuse sit as late as they do
-deliberately, because they close races against the writes they guard, and moving
-them before the fence would make them staler than the thing they protect. So the
-coordinator reports the condition instead of retrying it.
+Zero is the normal value. Non-zero means workloads are sitting on a host the
+cluster considers down, and **what you should do depends on why it is down.**
+Check `lv host inspect <host>` and the last `fencing_log` row before acting:
 
-**Recovering by hand.** Confirm the host really is down, then `lv host undrain
-<host>` to return it to `active`. Its workloads become eligible again: if the
-host is genuinely dead, quorum re-fences it and the ordinary failover path runs
-from the start, this time without the refusal. If it has come back, its own
-reconciler picks the workloads up. Either way the gauge returns to zero, which is
-how you confirm the fix.
+| Why the host is down | What to do |
+| --- | --- |
+| Fence never confirmed — `manual` strategy awaiting confirmation, a `best-effort` fence with a writable shared disk, or a fence that failed | `lv host fence-confirm <host>`, **after** you have confirmed the power state yourself. This is a normal state for a `manual`-strategy host, and the likeliest non-zero you will see. |
+| Fenced successfully, but recovery was then refused — lost quorum, an ungated target, a superseded lease term, no placement candidate, a store error on the proof write | `lv host undrain <host>` once you have confirmed the host is dead. |
+| Marked down by hand — `lv host fence <host>`, which never enumerates workloads | Nothing, if intended; the state clears on its own once quorum sees the host healthy. Use `lv host drain <host>` first next time, which moves the workloads. |
+
+Do **not** reach for `lv host undrain` on an unconfirmed fence. It returns the
+host to `active` while the machine may still be running, which is exactly the
+split-brain the gate refused to create.
+
+Two things the gauge will not tell you. Dropping to zero is not proof of
+recovery: any command that moves the host out of `fenced`/`offline` — `undrain`
+included — takes it out of the count whether or not the workloads went anywhere,
+so confirm placement with `lv ls --host <host>` rather than trusting the
+metric. And a re-fence is not immediate: a successful fence inside the last five
+minutes suppresses the next one, so expect a delay before the ordinary failover
+path runs again.
+
+The refusal window itself cannot be closed. The checks that can refuse sit as
+late as they do deliberately, because they close races against the writes they
+guard, and moving them before the fence would make them staler than the thing
+they protect. So the coordinator reports the condition instead of retrying it.
 
 Automatic recovery was built, reviewed and withdrawn, and the reason is worth
 knowing before anyone proposes it again. Acting unattended requires proving the

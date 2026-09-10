@@ -341,6 +341,11 @@ Scrape `http://<host>:7444/metrics` for:
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
   (`action` = `relocate`)
+- `litevirt_failover_stranded_workloads` — GAUGE: workloads still assigned to a host in state
+  `fenced`/`offline` that failover would move off a dead host. This node's view, so it reads `0`
+  unless the node holds the failover lease — alert on `max()` across instances, never `avg()`.
+  Zero is normal; the remedy for a sustained non-zero depends on why the host is down (see
+  [operating-model.md](operating-model.md))
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up

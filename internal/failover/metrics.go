@@ -12,10 +12,17 @@ type Metrics interface {
 	VMAction(action, result, errorClass string)
 	// ContainerAction records a per-container failover action outcome (relocate).
 	ContainerAction(action, result, errorClass string)
-	// StrandedWorkloads reports how many workloads are sitting on hosts this
-	// cluster fenced that the coordinator would have moved and did not. A GAUGE,
-	// not a counter: it is a current condition an operator resolves, not an event
-	// rate. Zero is the normal value and any sustained non-zero needs a human.
+	// StrandedWorkloads reports how many workloads are still assigned to a host
+	// in state 'fenced' or 'offline' that failover would move off a dead host. A
+	// GAUGE, not a counter: it is a current condition an operator resolves, not
+	// an event rate.
+	//
+	// It is the LEASE HOLDER's view — every node calls this, and a node that is
+	// not driving failover reports 0 (see stepDownGauges), so a fleet-wide alert
+	// must take the max across instances or join on litevirt_failover_leader
+	// rather than averaging. Zero is the normal value; a sustained non-zero needs
+	// a human, and what they should do depends on WHY the host is down — see
+	// strandedWorkloads.
 	StrandedWorkloads(n int)
 }
 

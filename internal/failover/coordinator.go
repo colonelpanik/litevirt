@@ -350,11 +350,13 @@ func (c *Coordinator) run(ctx context.Context) {
 	// stops renewing coordinator leadership.
 	if c.selfFenced() {
 		c.mAttempt(PhaseSkip, ResultSkipped, ErrSelfFenced)
+		c.stepDownGauges()
 		return
 	}
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
 	if !c.acquireLease(ctx) {
+		c.stepDownGauges()
 		return
 	}
 
@@ -434,6 +436,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		if !c.holdLease(ctx) {
 			slog.Warn("failover: lease lost mid-cycle, aborting", "host", c.hostName)
 			c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
+			// Losing the lease is a step-down: the node that takes it owns the
+			// fleet's view from here.
+			c.stepDownGauges()
 			return
 		}
 
@@ -505,10 +510,33 @@ func (c *Coordinator) run(ctx context.Context) {
 	// won't re-run for it) — so a deferred restore still gets resolved.
 	c.resolvePendingRelocations(ctx)
 
-	// Report workloads a post-fence refusal left on a host we fenced. Read-only:
-	// see strandedWorkloads for why this reports rather than recovers.
-	c.mStranded(c.strandedWorkloads(ctx))
+	// Report workloads left on a host the cluster considers down. Read-only: see
+	// strandedWorkloads for what the number does and does not mean, and for why
+	// this reports rather than recovers. Runs after recoverHosts and
+	// resolvePendingRelocations so a host or marker settled THIS cycle is already
+	// out of the count.
+	if n, err := c.strandedWorkloads(ctx); err != nil {
+		// Leave the gauge holding its last measured value: publishing 0 here
+		// would clear an operator's alert using a number we failed to read.
+		slog.Error("failover: count stranded workloads", "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+	} else {
+		c.mStranded(n)
+	}
 }
+
+// stepDownGauges clears the gauges this node owns when it is NOT driving
+// failover — self-fenced, or not the lease holder. Every node runs a coordinator
+// and every node serves /metrics, so without this a demoted leader pins its last
+// value forever (Prometheus gauges retain) and pages the fleet after the
+// condition heals, while every node that never held the lease publishes a
+// permanent 0 that hides a real one. Same contract as stepDownDualRun: the
+// leader's view is the fleet's view, and the rest keep their series clear.
+//
+// Nothing durable is lost by clearing. strandedWorkloads holds no state between
+// cycles — it re-derives the count from hosts/vms/containers — so the new
+// leader's first pass republishes the true value within one poll interval.
+func (c *Coordinator) stepDownGauges() { c.mStranded(0) }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
@@ -1199,39 +1227,35 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
-	// Recovery is a separate step from the fence, and everything it needs is
-	// re-derived from persisted state rather than carried across: fenceEpoch from
-	// fencing_log, the candidates from healthyHosts, the work from the rows still
-	// pointing at h. It has one caller today. It is separate because the fence and
-	// the recovery answer different questions, and because a refusal inside it
-	// leaves work behind that strandedWorkloads then reports.
+	// The fence is done and h's state row is written; everything below is
+	// recovery, and every refusal in it is therefore post-fence.
 	c.recoverWorkloads(ctx, h)
 }
 
 // recoverWorkloads moves every recoverable workload off a host that is already
 // fenced: VMs by replica promotion or reschedule, containers by relocation.
 //
-// It performs NO fencing and must not, because it has two callers with
-// different histories. failover calls it having just fenced h. Retries call it
-// for a host fenced on an earlier cycle, where re-running the fence would
-// power-cycle a machine that is already down and mint a second fence epoch for
-// the same outage.
+// It performs NO fencing. failover has already fenced h and written its state
+// row by the time this runs, so re-fencing here would power-cycle a machine
+// that is already down and mint a second fence epoch for one outage.
 //
-// Everything it needs is re-derived from persisted state rather than passed in,
-// which is what makes the second caller possible: fenceEpoch comes from
-// fencing_log via proofGradeFenceRef, the candidate set from healthyHosts, and
-// the work itself from the rows still pointing at h. That also makes it
-// idempotent — a successful reschedule re-homes the VM row and a successful
-// relocation tombstones the source row, so a workload already recovered is
-// simply not in the list on the next pass.
+// Everything it needs is re-derived from persisted state rather than passed in:
+// fenceEpoch from fencing_log via proofGradeFenceRef, the candidate set from
+// healthyHosts, and the work itself from the rows still pointing at h. That
+// makes it idempotent — a successful reschedule re-homes the VM row and a
+// successful relocation tombstones the source row — which is what lets it be
+// read as a separate step rather than as the tail of the fence.
 //
-// One consequence is deliberate and worth stating: proofGradeFenceRef only
-// counts a fence inside recentFenceWindow, so a retry after that window finds
-// fenceEpoch empty and a VM with a writable shared disk fails CLOSED at the
-// shared-storage gate. That is the correct outcome — the evidence of power-off
-// has aged out, and transferring a shared disk on stale evidence is the
-// split-brain this gate exists to prevent — while a local-disk VM still
-// recovers whenever its blocker clears.
+// It is a separate function because the fence and the recovery answer different
+// questions, and because every refusal inside it happens AFTER the fence: the
+// host is already marked down, so a decline here leaves work assigned to a
+// machine that will not run it. strandedWorkloads reports that condition.
+//
+// One consequence of taking fenceEpoch from fencing_log is deliberate:
+// proofGradeFenceRef only counts a fence inside recentFenceWindow, so a VM with
+// a writable shared disk fails CLOSED at the shared-storage gate once that
+// window lapses. Transferring a shared disk on aged-out evidence of power-off is
+// the split-brain the gate exists to prevent.
 func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRecord) {
 	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
 	// shared disk the executor requires a proof-grade power-off of the old owner
@@ -1987,58 +2011,102 @@ func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
 	// Already triaged as unrecoverable on an earlier pass (no re-pullable image
 	// and no usable backup) and left in place on purpose so an operator can see
 	// it. Re-processing it would loop on a decision already made.
-	return ct.StateDetail != corrosion.ContainerRelocateSkippedDetail
+	if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
+		return false
+	}
+	// A relocate-restore marker means this row has an ACTIVE owner, not that it
+	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
+	// on EVERY cycle, independent of the fence path, and retries until the marker
+	// ages out at defaultRelocateRestoreTimeout. Counting these reports work
+	// somebody is doing — and in the worst case inverts the truth, since a
+	// restore that LANDED but failed to tombstone its source row leaves the
+	// container running on the target with only this row behind.
+	if _, _, ok := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); ok {
+		return false
+	}
+	return true
 }
 
-// strandedWorkloads counts workloads left on a host this cluster fenced that the
-// coordinator would have moved and did not.
+// strandedWorkloads counts workloads still assigned to a host in state 'fenced'
+// or 'offline' that the coordinator would move off a dead host.
 //
-// It REPORTS and does not act, and that is the whole design. Every refusal inside
-// recoverWorkloads happens after the fence — the checks that can refuse are
-// deliberately as late as possible, because they close races, and moving them
-// earlier would make them staler than the writes they guard. So the window where
-// a fence succeeds and recovery is then refused cannot be closed; it is
-// structural. A fenced host is also processed at most once per outage, so nothing
-// revisits it: the workload stays assigned to a powered-off machine until a human
-// looks.
+// It measures exactly that and claims nothing more. It is NOT a count of
+// post-fence refusals, and the difference matters because the two sets are not
+// the same. A refusal inside recoverWorkloads does land here — the host is
+// already marked down when the refusal happens. But three ordinary paths reach
+// those states with their workloads intact and no refusal anywhere:
 //
-// Automatic recovery from that state was attempted and withdrawn. Acting on it
-// safely requires proving the host was POWERED OFF, and the evidence available to
-// a coordinator does not support that: hosts.state records only that somebody
-// decided it — `lv host fence-confirm` writes "fenced" on any host with no
-// precondition, so a mistyped hostname marks a live one — while health quorum
-// proves unreachability, which is also true of a partitioned host still running
-// its VMs. Evacuating on either produces two writers on one disk. Proving it
-// needs a fence proof bound to the current outage, which the schema does not
-// carry today. Until it does, this surfaces the condition in seconds instead of
-// whenever somebody notices VMs are down, and the recovery stays a decision an
-// operator makes with a command they already have.
-func (c *Coordinator) strandedWorkloads(ctx context.Context) int {
+//   - `lv host fence` marks a host 'offline' unconditionally and never
+//     enumerates workloads (see FenceHost's own comment), so it counts a live
+//     host's VMs until recoverHosts clears the state.
+//   - `lv host fence-confirm` writes 'fenced' on any host with no precondition.
+//   - failover itself writes 'offline' and RETURNS above recoverWorkloads when a
+//     safe-fence or manual fence is unconfirmed, or the fence failed. For a
+//     manual-strategy host that is a documented NORMAL state, awaiting an
+//     operator's confirmation — and it is the likeliest real non-zero.
+//
+// So a non-zero value means "workloads are sitting on a host the cluster
+// considers down", which is worth an operator's attention however it arose, and
+// the remedy depends on which of the above it is. docs/operating-model.md
+// branches on that; a blanket `lv host undrain` is wrong for the third case,
+// where the fence was never confirmed and undraining is the split-brain move the
+// gate refused to make.
+//
+// Two limits are inherent to deriving this from hosts.state. A host whose state
+// write failed after a successful fence is invisible here even with work
+// stranded on it (the write logs and does not return, by design, so the fence
+// still counts). And a workload counted here may have an owner: containers with
+// a live relocate-restore marker are excluded for that reason, but a VM the
+// operator is restoring by hand is not distinguishable.
+//
+// It REPORTS and does not act. Every refusal inside recoverWorkloads happens
+// after the fence, because the checks that can refuse are deliberately as late
+// as possible — they close races, and moving them earlier would make them staler
+// than the writes they guard. That window is structural and cannot be reordered
+// away. Automatic recovery from it was attempted and withdrawn: acting safely
+// requires proving the host was POWERED OFF, and no evidence available to a
+// coordinator supports that. hosts.state records only that somebody decided it,
+// while health quorum proves unreachability — equally true of a partitioned host
+// still running its VMs. Evacuating on either produces two writers on one disk.
+// Proving it needs a fence proof bound to the current outage, which the schema
+// does not carry today. Until it does, this surfaces the condition in seconds
+// instead of whenever somebody notices VMs are down, and the recovery stays a
+// decision an operator makes with commands they already have.
+//
+// Returns an error rather than a partial count: a number the caller publishes as
+// a gauge must be measured, not guessed. A read failure leaves the previous
+// value in place and reports through the error metric instead, because "0"
+// during a store outage is the all-clear on the one signal an operator alerts on.
+func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
-		return 0
+		return 0, err
+	}
+	// Read ONCE per cycle, not once per down host: ListBackupSchedules has no
+	// host or vm_name predicate (a full scan), and the map it builds is keyed by
+	// VM name across the whole fleet, so it is byte-identical for every host.
+	// The c.Promoter guard mirrors the reschedule loop's, so a VM is treated as
+	// promotable here exactly when that loop would try to promote it.
+	enrolled := map[string]bool{}
+	if c.Promoter != nil {
+		rows, serr := corrosion.ListBackupSchedules(ctx, c.db)
+		if serr != nil {
+			return 0, serr
+		}
+		for _, r := range rows {
+			if r.Type == "replication" && r.AutoPromote {
+				enrolled[r.VMName] = true
+			}
+		}
 	}
 	total := 0
 	for _, h := range hosts {
 		if h.State != "fenced" && h.State != "offline" {
 			continue
 		}
-		// One schedule read per fenced host, not one per VM: this runs every poll
-		// cycle for as long as the host stays down, and ListBackupSchedules is an
-		// unfiltered scan.
-		enrolled := map[string]bool{}
-		if c.Promoter != nil {
-			if rows, serr := corrosion.ListBackupSchedules(ctx, c.db); serr == nil {
-				for _, r := range rows {
-					if r.Type == "replication" && r.AutoPromote {
-						enrolled[r.VMName] = true
-					}
-				}
-			}
-		}
 		vms, verr := corrosion.ListVMs(ctx, c.db, "", h.Name)
 		if verr != nil {
-			continue
+			return 0, verr
 		}
 		for _, vm := range vms {
 			if vmNeedsFailover(vm, enrolled[vm.Name]) {
@@ -2047,7 +2115,7 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) int {
 		}
 		cts, cerr := corrosion.ListContainers(ctx, c.db, h.Name)
 		if cerr != nil {
-			continue
+			return 0, cerr
 		}
 		for _, ct := range cts {
 			if containerNeedsFailover(ct) {
@@ -2055,7 +2123,7 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) int {
 			}
 		}
 	}
-	return total
+	return total, nil
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.

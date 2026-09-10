@@ -39,8 +39,10 @@ func newFailoverMetrics(reg prometheus.Registerer) *FailoverMetrics {
 		}, []string{"action", "result", "error_class"}),
 		stranded: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "litevirt_failover_stranded_workloads",
-			Help: "Workloads left on a fenced host that failover would have moved and did not " +
-				"(a post-fence refusal). Zero is normal; sustained non-zero needs an operator.",
+			Help: "Workloads still assigned to a host in state fenced/offline that failover " +
+				"would move off a dead host. THIS NODE's view: 0 unless it holds the " +
+				"failover lease, so alert on max() across instances, not avg(). Zero is " +
+				"normal; sustained non-zero needs an operator.",
 		}),
 	}
 	reg.MustRegister(m.attempts, m.vmActions, m.containerActions, m.stranded)

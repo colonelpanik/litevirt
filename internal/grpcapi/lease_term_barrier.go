@@ -36,10 +36,6 @@ func (v leaseTermVerdict) String() string {
 }
 
 const (
-	// leaseBarrierBudget bounds ONE sweep in total — not per peer. A per-peer
-	// timeout multiplies by the fleet size exactly when the fleet is unreachable,
-	// which is when the barrier runs.
-	leaseBarrierBudget = 3 * time.Second
 	// leaseBarrierCacheTTL bounds how stale a cached threshold may be.
 	//
 	// It is NOT protecting the refusal path. A cached threshold was a real
@@ -59,6 +55,45 @@ const (
 	// 3s matches health.capActiveNegTTL, the one short-lived negative cache
 	// already in service.
 	leaseBarrierCacheTTL = 3 * time.Second
+	// leaseBarrierSilentTTL bounds how long a peer stays remembered as silent.
+	//
+	// It only has to span one reconciler pass, which is the burst this exists
+	// for: internal/health's reconciler walks pending VMs SERIALLY, so a 40-VM
+	// host loss makes 40 back-to-back accept sweeps, each of which used to wait
+	// out the full budget on the same unreachable peer. Shorter than
+	// reconcileInterval so a peer cannot stay remembered across two passes
+	// without re-proving itself silent in between.
+	leaseBarrierSilentTTL = 10 * time.Second
+)
+
+// The barrier's wall-clock budgets. These are vars rather than consts ONLY so
+// tests can shrink them; nothing in production reassigns them. A test that had
+// to spend real seconds to observe the burst behaviour would be too slow to run
+// on every change, which is how a cost bound stops being checked.
+var (
+	// leaseBarrierBudget bounds ONE sweep in total — not per peer. A per-peer
+	// timeout of this length would multiply by the fleet size exactly when the
+	// fleet is unreachable, which is when the barrier runs.
+	//
+	// (leaseBarrierSilentProbe is a per-peer deadline, but a much shorter one and
+	// only for a peer that already proved silent; the fan-out is concurrent and
+	// still sits inside this budget, so it cannot multiply either.)
+	leaseBarrierBudget = 3 * time.Second
+
+	// leaseBarrierSilentProbe is the deadline given to a peer that gave no answer
+	// on this node's previous sweep for the same key.
+	//
+	// The RPC it serves is one SELECT MAX over an append-only table, so a healthy
+	// peer on a cluster network answers in single-digit milliseconds; this is two
+	// orders of magnitude of headroom. A peer that needs longer than this WHILE
+	// having already missed an entire 3s budget is indistinguishable, from here,
+	// from one that is gone.
+	//
+	// Guessing wrong costs nothing that is not immediately repaired: a shortfall
+	// re-runs the fan-out at full budget before refusing anything (see
+	// runLeaseTermSweep), so the memo can only ever accelerate a sweep that was
+	// already going to succeed, and total cost stays inside leaseBarrierBudget.
+	leaseBarrierSilentProbe = 250 * time.Millisecond
 )
 
 type leaseBarrierEntry struct {
@@ -272,24 +307,74 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	if err != nil {
 		return 0, false
 	}
-	highest, answers := local, 1
+	// Peers that gave no answer on this node's PREVIOUS sweep for this key are
+	// probed on a short deadline rather than the full budget.
+	//
+	// HealthyPeers already drops a peer whose last probe failed, so what reaches
+	// here is a peer that died within the health-probe interval — and that
+	// residual is expensive in exactly one shape: the reconciler walks pending
+	// VMs serially, so a 40-workload host loss makes 40 back-to-back accept
+	// sweeps (every accept pays for a fresh sweep, by the cache asymmetry above),
+	// and each one used to wait out the whole budget on the same dead peer.
+	//
+	// This does not change WHICH peers are asked, and it is not a circuit
+	// breaker: a peer that has recovered still answers, because answering takes
+	// milliseconds. The one thing it can cost is an answer from a peer that
+	// recovered but is slow, which is repaired below rather than left to a retry.
+	silent := s.recentlySilentPeers(peers)
 
-	// Concurrent, unlike CapabilityActive's sequential sweep. Sequential is fine
-	// for a periodic capability check; here it would serialise one timeout per
-	// unreachable peer up to the whole budget, on the recovery path. The peer
-	// count is already bounded by the host table.
+	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
+
+	// A shortfall must never be caused by our own shortcut. If the quorum was
+	// missed and any peer was short-deadlined, pay full price before refusing —
+	// sctx still bounds the whole sweep, so this cannot exceed the budget a
+	// single-pass sweep would have spent anyway.
+	if answers < needed && len(silent) > 0 {
+		highest, answers, answered = s.fanOutHighWater(sctx, key, local, peers, nil)
+	}
+
+	s.noteSilentPeers(peers, answered)
+
+	if answers < needed {
+		return 0, false
+	}
+	return highest, true
+}
+
+// fanOutHighWater asks every peer for key's high-water term in parallel and
+// folds the answers into (highest, count). Peers named in `silent` get
+// leaseBarrierSilentProbe instead of the caller's full deadline.
+//
+// Concurrent, unlike CapabilityActive's sequential sweep. Sequential is fine
+// for a periodic capability check; here it would serialise one timeout per
+// unreachable peer up to the whole budget, on the recovery path. The peer count
+// is already bounded by the host table.
+func (s *Server) fanOutHighWater(
+	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
+) (highest int64, answers int, answered map[string]bool) {
+	highest, answers = local, 1 // this node's own ledger is one answer
+	answered = make(map[string]bool, len(peers))
+
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, peer := range peers {
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
-			cl, closer, derr := s.dialPeer(sctx, peer)
+
+			pctx := ctx
+			if silent[peer] {
+				var cancel context.CancelFunc
+				pctx, cancel = context.WithTimeout(ctx, leaseBarrierSilentProbe)
+				defer cancel()
+			}
+
+			cl, closer, derr := s.dialPeer(pctx, peer)
 			if derr != nil {
 				return // no answer; never agreement
 			}
 			defer closer()
-			resp, rerr := cl.GetLeaseTermHighWater(sctx, &pb.GetLeaseTermHighWaterRequest{Key: key})
+			resp, rerr := cl.GetLeaseTermHighWater(pctx, &pb.GetLeaseTermHighWaterRequest{Key: key})
 			// A transport error, a nil response, or an answer about a DIFFERENT key
 			// all count as no answer. Following the repo's rule that unknown must
 			// never read as covered, none of them may count as agreement at 0.
@@ -298,6 +383,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 			}
 			mu.Lock()
 			answers++
+			answered[peer] = true
 			if t := resp.GetTerm(); t > highest {
 				highest = t
 			}
@@ -305,9 +391,50 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		}(peer)
 	}
 	wg.Wait()
+	return highest, answers, answered
+}
 
-	if answers < needed {
-		return 0, false
+// recentlySilentPeers returns the subset of peers this node remembers answering
+// nothing, within leaseBarrierSilentTTL.
+func (s *Server) recentlySilentPeers(peers []string) map[string]bool {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	if len(s.leaseBarrierSilent) == 0 {
+		return nil
 	}
-	return highest, true
+	var out map[string]bool
+	for _, p := range peers {
+		at, ok := s.leaseBarrierSilent[p]
+		if !ok {
+			continue
+		}
+		if time.Since(at) > leaseBarrierSilentTTL {
+			delete(s.leaseBarrierSilent, p)
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool, len(peers))
+		}
+		out[p] = true
+	}
+	return out
+}
+
+// noteSilentPeers records which peers answered nothing and forgets the ones that
+// answered. Keyed by peer rather than by (peer, key) on purpose: silence here is
+// a property of reaching the peer at all, and the three keys are served by one
+// RPC on one connection.
+func (s *Server) noteSilentPeers(peers []string, answered map[string]bool) {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	for _, p := range peers {
+		if answered[p] {
+			delete(s.leaseBarrierSilent, p)
+			continue
+		}
+		if s.leaseBarrierSilent == nil {
+			s.leaseBarrierSilent = make(map[string]time.Time, len(peers))
+		}
+		s.leaseBarrierSilent[p] = time.Now()
+	}
 }

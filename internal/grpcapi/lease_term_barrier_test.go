@@ -514,3 +514,162 @@ func (b *blockingPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLea
 	}
 	return &pb.GetLeaseTermHighWaterResponse{Key: req.GetKey(), Term: b.term, Holder: "node-c"}, nil
 }
+
+// shrinkBarrierKnobs scales the barrier's wall-clock budgets down so a burst is
+// observable in milliseconds. Mirrors fence.shrinkVerifyKnobs.
+func shrinkBarrierKnobs(t *testing.T, budget, silentProbe time.Duration) {
+	t.Helper()
+	origBudget, origProbe := leaseBarrierBudget, leaseBarrierSilentProbe
+	leaseBarrierBudget, leaseBarrierSilentProbe = budget, silentProbe
+	t.Cleanup(func() {
+		leaseBarrierBudget, leaseBarrierSilentProbe = origBudget, origProbe
+	})
+}
+
+// hangingHighWaterPeer accepts the call and then never answers, which is the
+// shape that actually costs the budget. A dial failure is cheap; a peer that
+// took the connection before it died is not.
+type hangingHighWaterPeer struct {
+	pb.LiteVirtClient
+}
+
+func (hangingHighWaterPeer) GetLeaseTermHighWater(
+	ctx context.Context, _ *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption,
+) (*pb.GetLeaseTermHighWaterResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// mixedPeers answers for the hosts in terms and hangs for every host in hang.
+func mixedPeers(terms map[string]int64, hang map[string]bool) func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+	return func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		if hang[host] {
+			return hangingHighWaterPeer{}, func() {}, nil
+		}
+		term, ok := terms[host]
+		if !ok {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return &fakeHighWaterPeer{term: term}, func() {}, nil
+	}
+}
+
+// TestLeaseTermBarrier_ASerialBurstDoesNotPayTheBudgetPerProof is the cost bound
+// Task 5 claimed and did not have.
+//
+// The claim was that singleflight bounds the accept-path cost. It does not, on
+// the path this phase exists for: internal/health's reconciler walks pending VMs
+// in ONE serial loop on one ticker, so two accepts are never in flight together
+// and there is nothing for singleflight to coalesce. Every accept pays for a
+// fresh sweep (the cache asymmetry means only refusals may be served from
+// cache), so a 40-workload host loss used to serialise 40 full budgets — about
+// two minutes of added latency at the one moment the system is supposed to be
+// fast — whenever a peer had died within the health-probe interval and so was
+// still in HealthyPeers.
+//
+// What bounds it is remembering that the peer answered nothing and probing it on
+// leaseBarrierSilentProbe next time. This test measures the burst rather than
+// asserting the mechanism, because the mechanism is not the promise.
+func TestLeaseTermBarrier_ASerialBurstDoesNotPayTheBudgetPerProof(t *testing.T) {
+	ctx := context.Background()
+	const proofs = 6
+
+	shrinkBarrierKnobs(t, 400*time.Millisecond, 20*time.Millisecond)
+
+	// needed = 2, so node-b's answer carries the quorum and node-c is pure cost:
+	// it took the connection and will never reply.
+	s := barrierNode(t, 4, 2, "node-b", "node-c")
+	s.peerClientOverride = mixedPeers(
+		map[string]int64{"node-b": 4},
+		map[string]bool{"node-c": true},
+	)
+
+	start := time.Now()
+	for i := 0; i < proofs; i++ {
+		verdict, threshold := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 4)
+		if verdict != leaseTermCurrent {
+			t.Fatalf("proof %d: verdict = %v (threshold %d), want current — the shortcut must "+
+				"not change any verdict, only the time spent reaching it", i, verdict, threshold)
+		}
+	}
+	elapsed := time.Since(start)
+
+	perProof := leaseBarrierBudget * proofs
+	// One full budget for the sweep that discovers the silence, then a short
+	// probe each. Generous headroom for scheduling on a loaded machine, while
+	// still an order of magnitude below the per-proof cost.
+	bound := leaseBarrierBudget + time.Duration(proofs)*leaseBarrierSilentProbe*6
+	t.Logf("%d serial accepts with one connected-but-silent peer: %v "+
+		"(budget-per-proof would be %v; bound %v)", proofs, elapsed, perProof, bound)
+
+	if elapsed > bound {
+		t.Errorf("the burst took %v, over the %v bound — with %d proofs at a %v budget the "+
+			"unbounded shape is %v, and a serial reconciler pass over a lost host's "+
+			"workloads is exactly this shape at 40x",
+			elapsed, bound, proofs, leaseBarrierBudget, perProof)
+	}
+}
+
+// TestLeaseTermBarrier_ARecoveredPeerIsStillCountedBeforeRefusing: the shortcut
+// must not be able to cause a refusal.
+//
+// A peer probed on the short deadline may have recovered and simply be slower
+// than it — so a sweep that falls short of quorum re-runs the fan-out at full
+// budget before refusing anything. Without that, a peer that is reachable but
+// consistently slower than leaseBarrierSilentProbe would be memoed, missed,
+// memoed again, and refuse every reschedule indefinitely while being perfectly
+// healthy.
+func TestLeaseTermBarrier_ARecoveredPeerIsStillCountedBeforeRefusing(t *testing.T) {
+	ctx := context.Background()
+	shrinkBarrierKnobs(t, 2*time.Second, 5*time.Millisecond)
+
+	// needed = 2, and node-b is the ONLY peer, so its answer is mandatory.
+	s := barrierNode(t, 4, 2, "node-b")
+
+	// First sweep: node-b hangs, so the barrier cannot confirm and remembers it.
+	s.peerClientOverride = mixedPeers(nil, map[string]bool{"node-b": true})
+	if verdict, _ := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 4); verdict != leaseTermUnconfirmed {
+		t.Fatalf("first sweep: verdict = %v, want unconfirmed", verdict)
+	}
+	if silent := s.recentlySilentPeers([]string{"node-b"}); !silent["node-b"] {
+		t.Fatal("node-b answered nothing and was not remembered as silent, so the rest of " +
+			"this test would prove nothing")
+	}
+
+	// It recovers, but answers slower than the short probe. The full-budget
+	// re-run must find it rather than refusing on the shortcut's evidence.
+	s.peerClientOverride = func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		if host != "node-b" {
+			return nil, nil, context.DeadlineExceeded
+		}
+		return slowHighWaterPeer{term: 4, delay: 60 * time.Millisecond}, func() {}, nil
+	}
+	verdict, threshold := s.leaseTermBarrier(ctx, corrosion.LeaseKeyFailover, 4)
+	if verdict != leaseTermCurrent {
+		t.Fatalf("verdict = %v (threshold %d), want current — node-b is healthy and merely "+
+			"slower than leaseBarrierSilentProbe; refusing here would strand every "+
+			"reschedule on a cluster whose peer is a little slow", verdict, threshold)
+	}
+	if silent := s.recentlySilentPeers([]string{"node-b"}); silent["node-b"] {
+		t.Error("node-b answered and is still remembered as silent, so it will keep being " +
+			"short-probed and every sweep will pay for the full-budget re-run")
+	}
+}
+
+// slowHighWaterPeer answers correctly, after delay.
+type slowHighWaterPeer struct {
+	pb.LiteVirtClient
+	term  int64
+	delay time.Duration
+}
+
+func (f slowHighWaterPeer) GetLeaseTermHighWater(
+	ctx context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption,
+) (*pb.GetLeaseTermHighWaterResponse, error) {
+	select {
+	case <-time.After(f.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return &pb.GetLeaseTermHighWaterResponse{Key: req.GetKey(), Term: f.term, Holder: "node-b"}, nil
+}

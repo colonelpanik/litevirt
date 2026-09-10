@@ -410,6 +410,14 @@ type Server struct {
 	leaseBarrierCache  map[string]leaseBarrierEntry
 	leaseBarrierFlight map[string]*leaseBarrierSweep
 
+	// leaseBarrierSilent remembers, per peer, when it last gave the barrier no
+	// answer at all. A remembered peer is probed on a SHORT deadline instead of
+	// the full budget on the next sweep — see runLeaseTermSweep. It never
+	// changes which peers are asked, only how long a peer that just proved
+	// silent is waited on, and any sweep that then falls short of quorum pays
+	// full price before refusing.
+	leaseBarrierSilent map[string]time.Time
+
 	// leaseBarrierArrived is a test seam called once per caller, immediately
 	// after it stamps the instant it began validating and before it can publish
 	// or join a flight. Production leaves it nil.

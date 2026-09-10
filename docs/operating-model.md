@@ -197,15 +197,36 @@ happened, which is why they are separate strings rather than one "refused".
 
 #### What it costs
 
-An **accepted** proof pays one bounded peer fan-out — a quorum read of every
-reachable peer's newest term for that lease key. The budget is 3s for the whole
-sweep, not per peer, so an unreachable fleet cannot multiply it. Concurrent
-callers share one sweep, which matters because the load arrives in bursts: a
-host loss with 40 workloads would otherwise run 40 fan-outs at the one moment
-the system is meant to be fast. A **refusal** can be served from a short-lived
-cache without any fan-out, because the observed high water only rises — so an
-old reading is a lower bound, and refusing on a lower bound is sound while
-accepting on one is not.
+An **accepted** proof pays one peer fan-out — a quorum read of every reachable
+peer's newest term for that lease key. The budget is 3s for the whole sweep, not
+per peer, so an unreachable fleet cannot multiply a single sweep. A **refusal**
+can be served from a short-lived cache without any fan-out, because the observed
+high water only rises — so an old reading is a lower bound, and refusing on a
+lower bound is sound while accepting on one is not. Accepts are never served
+from that cache, so **every accepted proof pays for a fresh sweep**.
+
+That makes the recovery burst the cost that matters, and it does not coalesce.
+Concurrent callers do share one sweep, but the reschedule path has no concurrent
+callers: the destination's reconciler walks pending workloads in one serial
+loop, so a host loss with 40 workloads is 40 back-to-back sweeps rather than a
+burst. Sharing is real and does nothing here.
+
+What that costs depends on whether a peer is *connected but silent* — one that
+died within the health-probe interval, so it is still counted as reachable and
+still accepts a connection. There is normally no such peer, and a sweep then
+costs milliseconds. When there is one, the numbers are:
+
+| 40-workload host loss | added latency |
+| --- | --- |
+| every peer answering | milliseconds per proof |
+| one connected-but-silent peer | ~13s total (one 3s sweep, then a 250ms probe per proof) |
+| the same, before this was bounded | up to 120s total (3s per proof) |
+
+The bound comes from remembering that a peer answered nothing and giving it a
+250ms probe on the next sweep instead of the full budget, for up to 10s. It
+never changes which peers are asked, and it cannot cause a refusal: a sweep that
+falls short of quorum re-runs the fan-out at full budget before refusing
+anything, so a peer that recovered but is merely slow is still counted.
 
 #### What enforcement does NOT do
 

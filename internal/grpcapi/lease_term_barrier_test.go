@@ -350,6 +350,26 @@ func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
 	}
 
 	const callers = 20
+
+	// Every caller must have ARRIVED before any of them starts reading —
+	// otherwise the ones that arrive mid-sweep correctly pay for their own, and
+	// this measures the scheduler rather than the sharing.
+	//
+	// This used to be a 100ms sleep, which held only because a multi-core
+	// scheduler happened to interleave the callers. Pinned to one CPU the
+	// callers serialise, all 20 ran their own sweep, and the assertion below
+	// failed 20 times out of 20 against code doing exactly what it specifies.
+	// The seam makes the premise a fact of the test rather than a hope about
+	// the runtime.
+	arrivedAll := make(chan struct{})
+	var arrivals int64
+	s.leaseBarrierArrived = func() {
+		if atomic.AddInt64(&arrivals, 1) == callers {
+			close(arrivedAll)
+		}
+		<-arrivedAll
+	}
+
 	var wg sync.WaitGroup
 	verdicts := make([]leaseTermVerdict, callers)
 	for i := 0; i < callers; i++ {
@@ -360,8 +380,7 @@ func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
 		}(i)
 	}
 
-	// Let every caller pile up on the one in-flight sweep, then release it.
-	time.Sleep(100 * time.Millisecond)
+	<-arrivedAll // all 20 are past the arrival stamp; one will now publish a flight
 	close(release)
 	wg.Wait()
 

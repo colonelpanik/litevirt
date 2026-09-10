@@ -410,6 +410,16 @@ type Server struct {
 	leaseBarrierCache  map[string]leaseBarrierEntry
 	leaseBarrierFlight map[string]*leaseBarrierSweep
 
+	// leaseBarrierArrived is a test seam called once per caller, immediately
+	// after it stamps the instant it began validating and before it can publish
+	// or join a flight. Production leaves it nil.
+	//
+	// It exists because sweep SHARING is only reachable when a burst of callers
+	// all arrive before the first of them starts reading, and no amount of
+	// sleeping in a test establishes that: serialise the callers (GOMAXPROCS=1)
+	// and each correctly runs its own sweep. See sweepLeaseTermHighWater.
+	leaseBarrierArrived func()
+
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is

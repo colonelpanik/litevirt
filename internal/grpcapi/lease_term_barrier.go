@@ -186,6 +186,19 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 	// onwards can authorise it; see leaseBarrierSweep.startedAt.
 	arrived := time.Now()
 
+	// A seam for the sharing test, nil everywhere else.
+	//
+	// Whether a burst of callers SHARES one sweep depends on them arriving before
+	// the first of them publishes its flight — which is the accept-safety rule
+	// working as designed, not a tunable. A test cannot establish that premise
+	// with a sleep: under GOMAXPROCS=1 the callers serialise, each arrives after
+	// the previous sweep began, and every one of them correctly pays for its own.
+	// The cost-bound assertion then fails on a single-CPU runner while the code
+	// is behaving exactly as specified.
+	if s.leaseBarrierArrived != nil {
+		s.leaseBarrierArrived()
+	}
+
 	// Join an in-flight sweep for this key, or become the one that runs it.
 	//
 	// The loop exists for the caller that arrives mid-sweep. It waits out the

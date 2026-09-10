@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/placement"
@@ -499,6 +501,26 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var ifaceRecords []corrosion.InterfaceRecord
 	var nicRecords []corrosion.NICRecord // v42 dual-write alongside ifaceRecords (vm_nics)
 
+	// External-IPAM claims taken for this create. A NetBox claim is a synchronous
+	// REMOTE side-effect: it cannot join the local atomic write, so every failure
+	// path from here to the end of CreateVM compensates it explicitly.
+	claims := &claimSet{srv: s}
+
+	// The cluster fingerprint is read at most ONCE, and only if some NIC is
+	// actually on a bound network. A VM on unbound networks must not gain a DB
+	// read it does not have today.
+	clusterFP := ""
+	fingerprint := func() (string, error) {
+		if clusterFP == "" {
+			fp, err := corrosion.ClusterFingerprint(ctx, s.db)
+			if err != nil {
+				return "", err
+			}
+			clusterFP = fp
+		}
+		return clusterFP, nil
+	}
+
 	for i, n := range spec.Network {
 		bridge := n.Name // default: use network name as bridge
 		mac := n.Mac
@@ -519,6 +541,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// create if nft can't apply it: host isolation must not be fail-open
 			// (nor NAT silently absent) on a VM we report as created.
 			if ferr := s.reconcileFirewallRequired(ctx); ferr != nil {
+				claims.releaseAll(ctx)
 				return nil, status.Errorf(codes.Internal,
 					"apply firewall after provisioning network %q: %v", n.Name, ferr)
 			}
@@ -540,6 +563,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			// Bridge preflight: ensure the bridge exists on this host.
 			// For plain bridges, auto-create if missing.
 			if err := s.ensureBridge(bridge); err != nil {
+				claims.releaseAll(ctx)
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"network bridge %q not found on host %s and auto-create failed: %v", bridge, s.hostName, err)
 			}
@@ -551,12 +575,85 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			})
 		}
 
+		// Claim the address BEFORE the NIC records are built, and after the NIC's
+		// host wiring is known to be viable — a claim taken and then abandoned by
+		// a bridge preflight failure is a remote round trip for nothing.
+		//
+		// Populating ifaceRecords[i].IP is enough for everything downstream: the
+		// static-config loop below already falls back to it, so cloud-init
+		// network-config, the vm_nics row and the lease all pick the address up
+		// with no further changes.
+		nicIP := n.Ip
+		alloc, binding, aerr := s.allocatorFor(ctx, "vm", n.Name)
+		if aerr != nil {
+			claims.releaseAll(ctx)
+			cleanupDisks()
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", aerr)
+		}
+		if alloc != nil {
+			// allocatorFor pairs a VM allocator with the binding it claims from,
+			// and only ever hands a VM the NetBox one. An allocator with no
+			// binding would mean claiming from a prefix nothing reserved, so it
+			// fails closed here rather than being assumed impossible.
+			if binding == nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.Internal,
+					"network %q: an address allocator was selected for a VM with no NetBox binding", n.Name)
+			}
+			fp, ferr := fingerprint()
+			if ferr != nil {
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.Internal, "cluster fingerprint: %v", ferr)
+			}
+			identity := netbox.Identity(fp, spec.Uuid, mac)
+			subnet := ""
+			if def, _ := lookupNetworkDef(ctx, s.db, n.Name); def != nil {
+				subnet = def.Subnet
+			}
+			res, cerr := alloc.Claim(ctx, network.ClaimRequest{
+				Network:    n.Name,
+				Subnet:     subnet,
+				MAC:        mac,
+				OwnerKind:  "vm",
+				OwnerHost:  "", // VM names are cluster-global
+				Name:       spec.Name,
+				Identity:   identity,
+				ExplicitIP: n.Ip,
+				PrefixID:   binding.PrefixID,
+				PrefixCIDR: binding.ObservedCIDR,
+				VRFID:      binding.VRFID,
+			})
+			if cerr != nil {
+				// ErrClaimUnknown means we never learned whether NetBox committed.
+				// There may be an object out there carrying this identity and
+				// nothing referencing it, so name it for the sweep — releasing
+				// blind would risk freeing an address another incarnation holds.
+				if errors.Is(cerr, network.ErrClaimUnknown) {
+					if eerr := s.enqueueOrphanCheck(ctx, identity); eerr != nil {
+						slog.Error("netbox: could not enqueue orphan check for an unknown claim",
+							"identity", identity, "error", eerr)
+					}
+				}
+				claims.releaseAll(ctx)
+				cleanupDisks()
+				return nil, status.Errorf(codes.FailedPrecondition, "claim address from NetBox: %v", cerr)
+			}
+			nicIP = res.IP
+			claims.add(claimedAddr{
+				Network: n.Name, IP: res.IP, MAC: mac,
+				OwnerKind: "vm", OwnerHost: "", Name: spec.Name,
+				Identity: identity, NetBoxID: res.NetBoxIPID,
+			})
+		}
+
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName:         spec.Name,
 			NetworkName:    n.Name,
 			Ordinal:        i,
 			MAC:            mac,
-			IP:             n.Ip,
+			IP:             nicIP,
 			SecurityGroups: n.SecurityGroups,
 		})
 
@@ -572,7 +669,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			Model:          n.Model,
 			MAC:            mac,
 			Ordinal:        i,
-			IP:             n.Ip,
+			IP:             nicIP,
 			TapDevice:      "",
 			SecurityGroups: encodeSecurityGroups(n.SecurityGroups),
 		})
@@ -584,7 +681,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	var staticNetCfg string
 	var staticIfaces []isolatedIface
 	for i, n := range spec.Network {
-		netDef := lookupNetworkDef(ctx, s.db, n.Name)
+		netDef, _ := lookupNetworkDef(ctx, s.db, n.Name)
 		ip := n.Ip
 		if ip == "" && i < len(ifaceRecords) {
 			ip = ifaceRecords[i].IP
@@ -661,6 +758,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			NetworkConfig: netCfg,
 		}, isoPath)
 		if err != nil {
+			claims.releaseAll(ctx)
 			cleanupDisks()
 			return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 		}
@@ -691,6 +789,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
 	if err := s.applyFirmwareConfig(&vmCfg, spec); err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, err
 	}
@@ -700,6 +799,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if len(spec.Devices) > 0 {
 		pciAddrs, devFinish, devErr := s.allocateDevices(ctx, spec.Name, spec.Devices, deviceLeaseStageBound)
 		if devErr != nil {
+			claims.releaseAll(ctx)
 			cleanupDisks()
 			return nil, devErr
 		}
@@ -721,6 +821,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	domXML, err := lv.GenerateDomainXML(vmCfg)
 	if err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		return nil, status.Errorf(codes.Internal, "generate domain XML: %v", err)
 	}
@@ -740,6 +841,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
@@ -747,6 +849,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // failed first boot must not strand TPM/NVRAM (G1)
 		return nil, status.Errorf(codes.Internal, "start domain: %v", err)
@@ -831,11 +934,33 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 				"name", spec.Name, "error", derr)
 		}
 		_ = s.virt.UndefineDomain(spec.Name, false)
+		claims.releaseAll(ctx)
 		cleanupDisks()
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
 		return nil, ferr
 	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
+		// Scoped to creates that took an EXTERNAL-IPAM claim, so every existing
+		// deployment keeps today's behaviour exactly. With a claim in play, a
+		// running VM with no row is the one state that lets the orphan sweeper
+		// release a LIVE guest's address: the address carries our identity, and
+		// the proof the sweeper reclaims on is that no VM row anywhere in the
+		// cluster references it. Nothing later re-creates the row, so the only
+		// fail-closed answer is to undo the create — teardown, disks, firmware
+		// state, and the claims themselves, matching the admission fence above.
+		if !claims.empty() {
+			slog.Error("vm create: row persistence failed after an address claim — aborting",
+				"name", spec.Name, "error", err)
+			if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
+				slog.Warn("vm create: teardown after failed persistence also failed",
+					"name", spec.Name, "error", derr)
+			}
+			_ = s.virt.UndefineDomain(spec.Name, false)
+			cleanupDisks()
+			lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+			claims.releaseAll(ctx)
+			return nil, status.Errorf(codes.Internal, "persist VM state: %v", err)
+		}
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	}
@@ -977,13 +1102,17 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		for _, iface := range allIfaces[vm.Name] {
 			ip := iface.IP
 			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromARP(iface.MAC)
-			}
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
+				ip = s.discoverNICAddress(iface.MAC)
 			}
 			if ip != "" && ip != iface.IP {
-				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
+				// GATED. A read RPC persisting a discovered address is still a
+				// write, and on a bound network the same one SetVMIP refuses. It
+				// records on an unbound network exactly as before and records
+				// NOTHING on a bound one — it does not claim, because a list must
+				// not POST to NetBox once per undiscovered NIC. The IP scanner on
+				// this host covers the same population every 30 seconds. The
+				// address is still REPORTED below either way.
+				s.recordDiscoveredVMIPIfUnbound(ctx, &vm, iface.NetworkName, iface.MAC, ip)
 			}
 			pbVM.Interfaces = append(pbVM.Interfaces, &pb.VMInterface{
 				NetworkName: iface.NetworkName,
@@ -1603,6 +1732,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
 			return nil, err
 		}
+		// Give the addresses back BEFORE the row goes. The lease outlives the VM
+		// row, and once the row is gone the sweeper's live-lease veto — correct,
+		// and what protects a running guest — refuses to reclaim that lease
+		// forever. Best-effort, unlike the main delete path below: this cleanup
+		// runs because the domain no longer exists anywhere, and refusing to
+		// remove the ghost row over a release failure would leave a row every
+		// node keeps scheduling around. A failure is logged and every NIC named
+		// for the orphan sweep, never swallowed.
+		s.releaseNICLeasesBestEffort(ctx, vm, "delete-stale-record")
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 			// A declined delete means the stale row is still live cluster-wide;
 			// claiming OK here would hide it. Idempotent — retry.
@@ -1721,12 +1859,57 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		slog.Warn("failed to delete DNS record", "vm", req.Name, "error", err)
 	}
 
-	// Release per-interface IP allocations.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, req.Name)
-	for _, iface := range ifaces {
-		if err := network.ReleaseIP(ctx, s.db, iface.NetworkName, req.Name); err != nil {
-			slog.Warn("failed to release IP", "vm", req.Name, "network", iface.NetworkName, "error", err)
+	// Release per-interface IP allocations, ONE LEASE AT A TIME, and before the
+	// mandatory tombstone below so a failure here is retryable.
+	//
+	// The old ReleaseIP is keyed (network, vm_name), which cannot name a single
+	// lease: with two NICs on one network the first iteration tombstoned BOTH.
+	// Reading the lease by its (network, ip) key is also what carries the NetBox
+	// join id, and without it a release could never delete the remote object.
+	var releaseErrs []string
+	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.Name)
+	if nerr != nil {
+		// Fail closed: an unreadable NIC list means we do not know which
+		// addresses this VM holds, and tombstoning the row over that is what
+		// strands them. Retryable — nothing destructive is skipped by returning.
+		return nil, status.Errorf(codes.Internal,
+			"delete %s: could not read NICs to release their addresses (retry is safe): %v", req.Name, nerr)
+	}
+	for _, nic := range nics {
+		// ONE implementation, shared verbatim with the hot-detach path
+		// (releaseOneNICLease): the lease — read owner-scoped, keyed on its own
+		// (network, ip) so a VM's other NICs keep theirs — decides whether there
+		// is anything to release; a suspended binding still tombstones the local
+		// half and hands the now-unreferenced remote object to the sweep; and an
+		// unbound network is left exactly as it has always been.
+		//
+		// A failure is SURFACED, not just logged. It means either the lease is
+		// still live (so the external object must stay, and the operator has to
+		// know litevirt still holds the address) or ownership moved under us.
+		//
+		// A retry is SAFE, but it does not re-run the same release, and the two
+		// failures differ in what it finishes. The release tombstones the local
+		// lease first and deletes the remote object second, so:
+		//   - LOCAL tombstone failed: nothing was freed, and the retry re-runs
+		//     the whole release from a live lease. This is the one a retry fixes.
+		//   - local tombstone landed and the REMOTE delete failed: the lease is
+		//     already gone, so the retry finds none, has no local proof of
+		//     ownership left to re-release with, and takes the no-lease branch —
+		//     it finishes the DELETE and hands the remote object to the orphan
+		//     sweep instead. The address is not released by the retry.
+		if err := s.releaseOneNICLease(ctx, vm, nic); err != nil {
+			slog.Error("release IP failed", "vm", req.Name, "network", nic.NetworkName, "ip", nic.IP, "error", err)
+			releaseErrs = append(releaseErrs, fmt.Sprintf("%s: %v", nic.NetworkName, err))
 		}
+	}
+	if len(releaseErrs) > 0 {
+		return nil, status.Errorf(codes.Internal,
+			"delete %s: address release failed, so the VM was NOT deleted: %s. "+
+				"Retrying the delete is safe and completes it; whether it also frees the "+
+				"address depends on which half failed — a failed local release is re-run, "+
+				"while an address already released locally is handed to the orphan sweep "+
+				"instead of being freed by the retry",
+			req.Name, strings.Join(releaseErrs, "; "))
 	}
 
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.
@@ -1744,6 +1927,12 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 
 	slog.Info("VM deleted", "name", req.Name)
+	// The mirror's latency shortcut, AFTER the mandatory tombstone: the VM is
+	// gone from the cluster state, so a sweep that reads this item finds no
+	// desired VM and removes the NetBox object. Never before it — a delete queued
+	// while the row is still live would name an object the very next sweep
+	// re-creates.
+	s.enqueueMirrorSync(ctx, req.Name, mirrorOpDelete)
 	s.recordVMEvent(ctx, req.Name, "vm.deleted", "ok", "")
 	s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project)+" keep_disks="+fmt.Sprintf("%t", req.KeepDisks), "ok")
 	if s.tenancy != nil {
@@ -1822,14 +2011,13 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	for _, iface := range ifaces {
 		ip := iface.IP
 		if ip == "" && vm.HostName == s.hostName {
-			ip = lv.GetIPFromARP(iface.MAC)
+			ip = s.discoverNICAddress(iface.MAC)
 		}
-		if ip == "" && vm.HostName == s.hostName {
-			ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
-		}
-		// If we discovered a new IP, persist it.
+		// If we discovered a new IP, persist it — through the same gate ListVMs
+		// uses, and for the same reason (netbox_discovery.go): on a bound network
+		// this read RPC records nothing and leaves the claim to the IP scanner.
 		if ip != "" && ip != iface.IP {
-			corrosion.UpdateVMInterfaceIP(ctx, s.db, name, iface.NetworkName, ip)
+			s.recordDiscoveredVMIPIfUnbound(ctx, vm, iface.NetworkName, iface.MAC, ip)
 		}
 		pbVM.Interfaces = append(pbVM.Interfaces, &pb.VMInterface{
 			NetworkName: iface.NetworkName,
@@ -2163,7 +2351,11 @@ func provisionNetworkForVM(ctx context.Context, db *corrosion.Client, networkNam
 // resolveBridge maps a compose network name to the actual host bridge interface.
 // Falls back to networkName itself if no network record exists (flat bridge mode).
 func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string) string {
-	def := lookupNetworkDef(ctx, db, networkName)
+	// An unreadable record resolves exactly like a missing one here: this is a
+	// device-name resolution with a documented flat-bridge fallback, and it has
+	// no fail-closed answer to give. The admission decisions that DO need one
+	// (allocatorFor) read the record themselves and surface the error.
+	def, _ := lookupNetworkDef(ctx, db, networkName)
 	if def == nil {
 		return networkName
 	}
@@ -2190,20 +2382,32 @@ func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string
 }
 
 // lookupNetworkDef fetches a network definition from Corrosion.
-// Returns nil if the network is not found (flat bridge mode).
-func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName string) *compose.NetworkDef {
+//
+// (nil, nil) means the network is not there — flat bridge mode, which most
+// callers treat as "no managed definition" and carry on from. A non-nil ERROR
+// means we could not find out, which is a different thing entirely and is why
+// the two are now distinguishable: allocatorFor's "config names a prefix but no
+// binding exists" guard is a read of exactly this record, and swallowing the DB
+// error turned that fail-closed guard into a fail-OPEN one — a transient read
+// failure read as "no prefix named" and the create sailed past it. A config
+// parse failure stays a nil def with no error: the row EXISTS and is simply not
+// one this build understands, which is the flat-bridge case, not an unknown.
+func lookupNetworkDef(ctx context.Context, db *corrosion.Client, networkName string) (*compose.NetworkDef, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
 		networkName)
-	if err != nil || len(rows) == 0 {
-		return nil
+	if err != nil {
+		return nil, fmt.Errorf("read network %q: %w", networkName, err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
 	}
 	var def compose.NetworkDef
 	if err := json.Unmarshal([]byte(rows[0].String("config")), &def); err != nil {
-		return nil
+		return nil, nil
 	}
 	def.Type = rows[0].String("type")
-	return &def
+	return &def, nil
 }
 
 // buildIsolatedNetworkConfig generates a cloud-init V1 network-config YAML
@@ -2333,6 +2537,51 @@ func (s *Server) SetVMIP(ctx context.Context, req *pb.SetVMIPRequest) (*pb.VM, e
 		networkName = "production"
 	}
 
+	// A bound network's addresses are NetBox's. This call is a RECORD-ONLY
+	// edit — it writes `vm_interfaces.ip` and a DNS record, and configures
+	// nothing in the guest — so on a bound network it records a claim litevirt
+	// cannot honour, over an address the allocator claimed and the inventory
+	// mirror keeps assigned. The same refusal the container path already makes
+	// on this question.
+	//
+	// Asked through allocatorFor, like every other address decision in this
+	// server, rather than by reading the binding row directly. The row is not
+	// the whole question: a network whose CONFIG names a prefix while no binding
+	// exists is a disagreement allocatorFor refuses loudly, and a direct read
+	// answers "nil, so unbound" and lets the write through — recording an
+	// operator-chosen address across a space someone believes is externally
+	// managed. A suspended binding and a bound network on a node with no NetBox
+	// client are refused there too, and both mean the addresses are still
+	// NetBox's.
+	//
+	// FAIL CLOSED on the read, which allocatorFor also does. The container guard
+	// was fail-open once: a swallowed error turned "could not read the record"
+	// into "this network names no prefix", and the write went ahead.
+	alloc, binding, err := s.allocatorFor(ctx, "vm", networkName)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot record an IP on network %q: %v", networkName, err)
+	}
+	if alloc != nil {
+		// Branched on the ALLOCATOR, as every other allocatorFor call site is.
+		// "An allocator was selected" is the question that means "these
+		// addresses are not the operator's to name"; the binding is what says
+		// WHICH prefix owns them. Branching on the binding alone would let an
+		// allocator paired with no binding through — the state CreateVM and the
+		// hotplug attach both treat as a fail-closed impossibility — and this
+		// call site would be the one that silently allowed it.
+		if binding == nil {
+			return nil, status.Errorf(codes.Internal,
+				"network %q: an address allocator was selected for a VM with no NetBox binding",
+				networkName)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"network %q is bound to NetBox prefix %d, so its addresses are allocated and "+
+				"recorded in NetBox; recording an operator-chosen IP here would describe an "+
+				"address litevirt does not hold",
+			networkName, binding.PrefixID)
+	}
+
 	if err := corrosion.UpdateVMInterfaceIP(ctx, s.db, req.Name, networkName, req.Ip); err != nil {
 		return nil, status.Errorf(codes.Internal, "update VM interface IP: %v", err)
 	}
@@ -2409,6 +2658,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return client.RebuildVM(ctx, req)
 	}
 
+	// BEFORE anything destructive: a VM holding an address on a NetBox-bound
+	// network cannot be rebuilt at all. The recreate below mints a fresh spec
+	// uuid, so the claim for the address this rebuild carries forward would be
+	// refused under the new identity — with the disks and firmware already gone.
+	if err := s.refuseRebuildIfBound(ctx, req.Name); err != nil {
+		return nil, err
+	}
+
 	// Parse the stored spec.
 	spec := &pb.VMSpec{}
 	if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
@@ -2454,6 +2711,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// makes the CreateVM below fail AlreadyExists — surfacing the real cause
 	// here beats erroring one step later with a misleading message. The rebuild
 	// is retryable: everything before this point is idempotent teardown.
+	//
+	// The addresses go back first, for the same reason as every other row
+	// removal: a lease that outlives its row can never be reclaimed. On a
+	// NetBox-bound network this rebuild was already refused above, so in
+	// practice this only ever retires builtin leases — but the ordering rule is
+	// the row-deleting path's, not the binding's, and a rebuild must not be the
+	// one place it is missing.
+	s.releaseNICLeasesBestEffort(ctx, vm, "rebuild")
 	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
 		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
 	}
@@ -2545,6 +2810,14 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		// would leave the replaced VM's row live (a duplicate identity) while
 		// its disks and firmware are already gone. Everything up to here is
 		// idempotent teardown, so the cutover can simply be retried.
+		//
+		// The replaced VM's addresses go back BEFORE its row does: the lease
+		// survives the row otherwise, and the sweeper's live-lease veto then
+		// makes it unreclaimable for good. Best-effort — the -next VM is about
+		// to take this name, and a cutover halted between the two would leave
+		// two rows claiming one identity — but a failure is logged at ERROR and
+		// every NIC handed to the orphan sweep rather than passing silently.
+		s.releaseNICLeasesBestEffort(ctx, oldVM, "cutover")
 		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
 			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
 		}
@@ -2554,6 +2827,14 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if err := corrosion.RenameVM(ctx, s.db, nextName, req.VmName); err != nil {
 		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
 	}
+	// The SURVIVING name, once. A cutover leaves NetBox two things to do — retire
+	// the replaced incarnation's object and mirror the promoted one — but the
+	// queue names a trigger, not a work item: the sweep it wakes resolves both,
+	// because the two incarnations carry distinct identities and the diff sees
+	// one desired and one no longer desired. Naming `nextName` as well would
+	// enqueue a name that answers to nothing — the rename above just moved it —
+	// and cost a replicated write to say so.
+	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
 	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
 	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal

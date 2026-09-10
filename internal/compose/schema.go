@@ -104,6 +104,16 @@ type NetworkDef struct {
 	External      bool     `yaml:"external"`       // use pre-existing network, don't create/destroy
 	HostIsolation bool     `yaml:"host-isolation"` // block VM→host management traffic
 	DNS           []string `yaml:"dns"`            // DNS resolvers for isolated VMs (default: 1.1.1.1, 8.8.8.8)
+
+	// NetBoxPrefixID binds this network to a NetBox prefix. Zero means unbound,
+	// which is every network today.
+	//
+	// This field needs NO migration: network defs are persisted as
+	// json.Marshal(def) into networks.config, and nothing in the tree decodes
+	// strictly, so an older node ignores the unknown key. What actually makes a
+	// mixed-version cluster safe is the netbox_ipam_v1 latch, because an older
+	// node would otherwise allocate from the builtin allocator across the prefix.
+	NetBoxPrefixID int `yaml:"netbox-prefix-id"`
 }
 
 // NATEnabled returns true unless NAT is explicitly disabled.

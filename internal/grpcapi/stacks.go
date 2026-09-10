@@ -462,8 +462,19 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 	} else {
 		// Not a target — still persist network records to Corrosion so the
 		// cluster knows about them, but don't provision locally.
+		//
+		// The SAME refusal as the target path above. This branch writes the
+		// config blob verbatim, NetBoxPrefixID included, so without it a deploy
+		// entered on a non-target node persisted exactly the def the target path
+		// refuses — a network naming a prefix nothing ever claimed, on which
+		// every later VM create fails.
+		var netErrs []string
 		for name, netDef := range f.Networks {
 			if netDef.External {
+				continue
+			}
+			if msg := composeNetBoxPrefixRefusal(name, netDef); msg != "" {
+				netErrs = append(netErrs, msg)
 				continue
 			}
 			ntype := netDef.Type
@@ -477,6 +488,13 @@ func (s *Server) provisionPlannedNetworks(ctx context.Context, f *compose.File, 
 				Type:      ntype,
 				Config:    string(cfgJSON),
 			})
+		}
+		if len(netErrs) > 0 {
+			detail := ""
+			for _, e := range netErrs {
+				detail += "\n  - " + e
+			}
+			return status.Errorf(codes.FailedPrecondition, "network provisioning failed:%s", detail)
 		}
 	}
 
@@ -1481,6 +1499,30 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 	return errs
 }
 
+// composeNetBoxPrefixRefusal returns the refusal message for a compose network
+// that names a NetBox prefix, or "" when there is nothing to refuse.
+//
+// A compose file cannot create a NetBox binding. Both compose paths call
+// provisionAndPersistNetwork (or UpsertNetwork) directly, so neither runs bind
+// validation — prefix exists, VRF enforces uniqueness, prefix unclaimed — and
+// neither takes the claim. Persisting the def anyway writes a network whose
+// config names a prefix nothing reserved, which is precisely the disagreement
+// allocatorFor then refuses every allocation on: the network deploys and every
+// VM on it fails to create, with the cause a stack deploy never mentioned.
+// Stack networks are also scoped, torn down and recreated with the stack, and a
+// prefix binding does not follow that lifecycle.
+//
+// Shared so BOTH deploy paths refuse identically: the target-host path that
+// provisions, and the non-target path that only persists the record for the
+// cluster. The second one was silently writing the very def the first refuses.
+func composeNetBoxPrefixRefusal(name string, netDef compose.NetworkDef) string {
+	if netDef.NetBoxPrefixID == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"network %q: NetBox prefix bindings are created with `lv network create --netbox-prefix-id`, not from a compose file", name)
+}
+
 // provisionComposeNetworks ensures all networks defined in the compose file
 // exist on this host (creates bridges, VXLAN tunnels, etc.).
 func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) []string {
@@ -1496,6 +1538,10 @@ func (s *Server) provisionComposeNetworks(ctx context.Context, f *compose.File) 
 			} else {
 				slog.Info("pre-deploy: using external network", "name", name)
 			}
+			continue
+		}
+		if msg := composeNetBoxPrefixRefusal(name, netDef); msg != "" {
+			errs = append(errs, msg)
 			continue
 		}
 		if netDef.Interface == "" {

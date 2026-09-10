@@ -596,6 +596,12 @@ poll:
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
 	}
 
+	// The host link is what the mirror now has to catch up on: the VM's NetBox
+	// object still points at the source's device. Queued on a DETACHED context,
+	// like the rest of the post-commit work — the request context may already be
+	// cancelled by the time the cutover finishes.
+	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
+
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
 	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
@@ -1079,6 +1085,10 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 
 	_ = send(pb.MigratePhase_MIGRATE_CUTOVER, 100, 0)
 	_ = send(pb.MigratePhase_MIGRATE_COMPLETING, 100, 0)
+	// The same host-link catch-up as the runtime path above. This is the OTHER
+	// migration — a firmware VM takes it instead — and the ownership move it
+	// commits is just as invisible to NetBox.
+	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 	s.recordMigrationMetrics("cold", "success", time.Since(start), 0, 0)
 	slog.Info("cold firmware migration complete", "vm", vm.Name, "from", s.hostName, "to", targetHost.Name, "state", vm.State)
 	s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+targetHost.Name+" (cold firmware, "+vm.State+")")

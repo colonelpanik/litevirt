@@ -25,6 +25,7 @@ import (
 
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -60,6 +62,30 @@ type Options struct {
 	SharedCRDT bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
+	// NetBoxURL points every node's NetBox client at an external IPAM — in
+	// practice a *NetBoxFake started by the scenario. Empty (the default)
+	// leaves the client nil and netbox_ipam_v1 unadvertised, so every existing
+	// scenario is untouched.
+	NetBoxURL string
+	// NamePrefix names the nodes ("node-" by default, giving node-0, node-1…).
+	//
+	// It is REQUIRED for a second cluster in the same test, and the reason is a
+	// trap: each node's in-memory SQLite DB is a shared-cache database NAMED
+	// after the node ("file:fleet-node-0?mode=memory&cache=shared"). Two
+	// clusters whose nodes share a name therefore share one database — every
+	// row, including the `cluster` row every identity is derived from — and a
+	// scenario meaning "two independent installations" would silently be
+	// testing one.
+	NamePrefix string
+	// NetBoxClusterName sets config `netbox.cluster_name` on every node, giving
+	// this cluster a NetBox cluster object of its own.
+	//
+	// It is what a second installation sharing one NetBox needs: a NetBox
+	// cluster is the scope in which NetBox enforces one VM name per cluster, so
+	// two installations under one cluster name cannot both mirror a same-named
+	// VM. Empty (the default) leaves every existing scenario resolving the
+	// `cluster` row's name, exactly as before.
+	NetBoxClusterName string
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -70,6 +96,19 @@ type Cluster struct {
 	caCert  string
 	caKey   string
 	tmpRoot string
+	// opts is the bootstrap request, kept so per-node wiring (buildServer) can
+	// read options the harness applies after the nodes exist.
+	opts Options
+	// ctx bounds every background loop the harness starts on a node's behalf
+	// (the NetBox maintenance loop today). Cancelled by Stop, so a scenario's
+	// goroutines never outlive the cluster that owns them.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// reach is the cluster-wide "this peer is up again" overlay every node's
+	// gate unions into HealthyPeers. Nothing populates the real health
+	// checker's peer table in-process (no probe loop runs), so without this a
+	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
+	reach *reachSet
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -91,9 +130,23 @@ type Node struct {
 	// that want to call this node's RPCs from the test thread.
 	selfConn *grpc.ClientConn
 
+	// cluster is the fleet this node belongs to, so a node-scoped helper can
+	// reach cluster-wide state (the self client, the reachability overlay).
+	cluster *Cluster
+
 	// repl is the node's Replicator (wired into the server for PushMutations;
 	// background loop not started — see buildServer).
 	repl *corrosion.Replicator
+
+	// netboxMaintenance records what StartNetBoxMaintenance ANSWERED for this
+	// node. The harness does not decide for itself whether the loop runs — the
+	// server does, from whether it has a NetBox client — so a scenario asserting
+	// "no config, no goroutine" asserts on production code.
+	netboxMaintenance bool
+
+	// netboxMirror records what StartNetBoxMirror ANSWERED for this node, for
+	// the same reason as netboxMaintenance above.
+	netboxMirror bool
 
 	// partition gate: replication/state-sync RPCs whose mTLS caller CN is in
 	// blockedFrom are refused, modeling a network partition on the real
@@ -122,20 +175,26 @@ func New(t *testing.T, opts Options) *Cluster {
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
-	c := &Cluster{t: t, tmpRoot: t.TempDir()}
+	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.mintCA()
 
 	// Step 1 — mint pki for every node and pre-allocate ports so the
 	// host records can carry the right addresses before any daemon
 	// starts listening.
+	namePrefix := opts.NamePrefix
+	if namePrefix == "" {
+		namePrefix = "node-"
+	}
 	for i := 0; i < opts.Nodes; i++ {
-		name := fmt.Sprintf("node-%d", i)
+		name := fmt.Sprintf("%s%d", namePrefix, i)
 		n := &Node{
 			Name:        name,
 			Region:      regionFor(opts.RegionByIndex, i),
 			Address:     "127.0.0.1",
 			PKIDir:      filepath.Join(c.tmpRoot, name, "pki"),
 			blockedFrom: make(map[string]bool),
+			cluster:     c,
 		}
 		c.mintHostCert(n)
 		// Reserve an ephemeral port — close the listener immediately
@@ -160,6 +219,10 @@ func New(t *testing.T, opts Options) *Cluster {
 	// host-add path produces.
 	c.crossRegisterHosts()
 
+	// Step 3b — gossip membership, which every node in a real cluster has and
+	// this harness did not.
+	c.seedGossipMembership()
+
 	// Step 4 — build grpcapi.Server per node, attach replicator,
 	// start gRPC server on the pre-allocated listener.
 	for _, n := range c.Nodes {
@@ -172,6 +235,9 @@ func New(t *testing.T, opts Options) *Cluster {
 
 // Stop tears down every daemon in the fleet. Idempotent.
 func (c *Cluster) Stop() {
+	if c.cancel != nil {
+		c.cancel()
+	}
 	for _, n := range c.Nodes {
 		if n.selfConn != nil {
 			_ = n.selfConn.Close()
@@ -326,6 +392,49 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	n.DB = db
 }
 
+// seedGossipMembership gives every node the memberlist view a real node has:
+// each of its PEERS, by name and address, with itself excluded exactly as
+// corrosion.Client.Members() excludes it.
+//
+// It is a fidelity fix, not a convenience. The in-process fleet joins no gossip
+// mesh, so Members() answered empty on every node — and every production path
+// that consults it as a SECOND, non-CRDT source of membership was therefore
+// untestable here, silently. That is not a hypothetical gap: the two proofs in
+// netbox_adopt.go and netbox_sweeper.go both union gossip into their participant
+// universe precisely because the replicated `hosts` table can be missing a peer,
+// and with Members() empty a scenario that deleted a `hosts` row proved nothing
+// about the union at all.
+//
+// WHAT A GOSSIP-ONLY PEER CAN AND CANNOT DO HERE. It is NAMED, so it lands in
+// every participant universe. It is not DIALABLE: corrosion's resolver takes the
+// host from the membership address and defaults the port to 7443 — right for a
+// real cluster, wrong for a harness whose daemons listen on ephemeral ports — so
+// a peer known only to gossip answers as unreachable. Both outcomes are
+// fail-closed and the proofs treat them the same way, which is why a scenario
+// can rely on either; a scenario that needs the peer to ANSWER has to leave its
+// `hosts` row in place.
+func (c *Cluster) seedGossipMembership() {
+	for _, target := range c.Nodes {
+		self := target.Name
+		nodes := c.Nodes
+		target.DB.SetMembersForTests(func() []corrosion.PeerInfo {
+			var peers []corrosion.PeerInfo
+			for _, n := range nodes {
+				if n.Name == self {
+					continue
+				}
+				// The gossip port, not the gRPC one: memberlist advertises where
+				// it gossips, and the resolver discards that port anyway.
+				peers = append(peers, corrosion.PeerInfo{
+					Name: n.Name,
+					Addr: net.JoinHostPort(n.Address, "7946"),
+				})
+			}
+			return peers
+		})
+	}
+}
+
 func (c *Cluster) crossRegisterHosts() {
 	ctx := context.Background()
 	for _, target := range c.Nodes {
@@ -413,6 +522,31 @@ func (c *Cluster) buildServer(n *Node) {
 		n.Server.SetOpJournal(j)
 	}
 	n.Server.SetHostNetworkEnv(n.HostNet, "127.0.0.1")
+
+	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
+	// scenario's fake server, plus the config kill-switch that lets this node
+	// ADVERTISE netbox_ipam_v1. Both together are what the daemon does from
+	// config, so a scenario exercises the same wiring production uses rather
+	// than reaching past it.
+	if c.opts.NetBoxURL != "" {
+		c.wireNetBox(n)
+	}
+	// The maintenance loop, started exactly as the daemon starts it — through
+	// the server's own guard, on EVERY node, so an unconfigured cluster
+	// exercises the refusal rather than a harness branch that skipped the call.
+	// The interval is the production default (15 minutes), which is far longer
+	// than any scenario: nothing ticks under a test, and scenarios drive a pass
+	// explicitly through RunNetBoxMaintenanceOnce.
+	n.netboxMaintenance = n.Server.StartNetBoxMaintenance(c.ctx, 0)
+	// The inventory mirror, started exactly as the daemon starts it and on every
+	// node, so a scenario exercises the server's own "is this node configured"
+	// guard rather than a harness branch. Same production default cadences, and
+	// scenarios drive a pass explicitly through SyncNetBoxMirror. The 15-minute
+	// sweep tick cannot fire under a test; the mirror's faster QUEUE POLL can, at
+	// one minute — two orders of magnitude beyond the slowest scenario here, but
+	// the reason a scenario that both queues work and counts NetBox writes must
+	// not be made to run for minutes.
+	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
 	// path are exercised. Its background push loop is deliberately NOT started: it
@@ -566,3 +700,283 @@ func regionFor(by []string, i int) string {
 // HLCClock returns a node's HLC. Used by scenarios that need to
 // fabricate mutation entries with deterministic timestamps.
 func (n *Node) HLCClock() *hlc.Clock { return n.DB.Clock() }
+
+// NetBoxMaintenanceRunning reports whether this node started the NetBox
+// maintenance loop (binding revalidation + the orphan sweep).
+func (n *Node) NetBoxMaintenanceRunning() bool { return n.netboxMaintenance }
+
+// NetBoxMirrorRunning reports whether this node started the inventory mirror.
+func (n *Node) NetBoxMirrorRunning() bool { return n.netboxMirror }
+
+// SyncNetBoxMirror runs ONE leader-gated mirror pass on this node.
+//
+// It goes through the same gate the loop does, so a node that loses the lease
+// race does nothing and returns nil — which is the point: every configured node
+// runs a pass, and only one of them writes.
+func (n *Node) SyncNetBoxMirror() error {
+	return n.Server.RunNetBoxMirrorOnce(context.Background())
+}
+
+// ExpireLeaderLeaseAfter makes this node's mirror hold the `netbox` leader
+// lease for exactly `batches` per-batch re-validations and lose it thereafter.
+//
+// It models a leadership handover that lands MID-SWEEP. A real lease can be
+// stolen between passes, which a scenario can already do with stealNetBoxLease
+// — but not between two write batches of ONE pass without racing the test, and
+// mid-sweep is the only window the per-batch re-validation exists for.
+//
+// The ACQUIRE is untouched: this node still genuinely takes the lease, so the
+// pass starts for the real reason and only the re-validation is steered.
+func (n *Node) ExpireLeaderLeaseAfter(batches int) {
+	var mu sync.Mutex
+	seen := 0
+	n.Server.SetNetBoxLeaseProbe(func(context.Context) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		seen++
+		return seen <= batches
+	})
+}
+
+// ClearSyncQueue tombstones every netbox_sync_queue row on this node — the
+// state a node that died before enqueueing, or a peer that drained an item and
+// then died, leaves behind. The mirror's correctness may not depend on it.
+func (n *Node) ClearSyncQueue() {
+	if err := n.DB.Execute(context.Background(),
+		`UPDATE netbox_sync_queue SET deleted_at = ?, updated_at = ? WHERE deleted_at IS NULL`,
+		n.DB.NowWall(), n.DB.NowTS()); err != nil {
+		n.cluster.t.Fatalf("clear sync queue on %s: %v", n.Name, err)
+	}
+}
+
+// ── external IPAM wiring ────────────────────────────────────────────────────
+
+// NewClusterWithNetBox brings up a fleet whose every node talks to nb. It is the
+// entry point for scenarios that assert on NetBox-backed addressing: the fake
+// hands out addresses from a band the builtin allocator never produces, so an
+// assertion on the address genuinely distinguishes "NetBox supplied it" from
+// "the wiring is missing and the builtin allocator answered".
+func NewClusterWithNetBox(t *testing.T, nodes int, nb *NetBoxFake) *Cluster {
+	t.Helper()
+	return New(t, Options{Nodes: nodes, NetBoxURL: nb.URL()})
+}
+
+// NewClusterWithNetBoxNamed is NewClusterWithNetBox for a SECOND cluster in the
+// same test — two installations sharing one NetBox.
+//
+// The distinct name prefix is load-bearing, not cosmetic: node names are the
+// in-memory database names (see Options.NamePrefix), so two clusters both
+// calling their node "node-0" would share one DB and one cluster row, and a
+// scenario about two installations would quietly be about one.
+func NewClusterWithNetBoxNamed(t *testing.T, nodes int, nb *NetBoxFake, namePrefix string) *Cluster {
+	t.Helper()
+	return New(t, Options{Nodes: nodes, NetBoxURL: nb.URL(), NamePrefix: namePrefix})
+}
+
+// wireNetBox gives one node the two things the daemon derives from
+// config.netbox: a real *netbox.Client built from a token FILE (the production
+// constructor, not a hand-assembled struct) and the advertise kill-switch.
+//
+// It also brings up the `cluster` row every node needs to derive a cluster
+// fingerprint — through the PRODUCTION heal, corrosion.EnsureClusterRecord,
+// reading this node's own pki/ca.crt exactly as the daemon does at startup.
+//
+// Deliberately not a hand-written INSERT any more. It used to be, and that hid a
+// blocker for the whole feature: nothing in production ever wrote the row, so on
+// a real cluster no fingerprint could be derived and every bind, claim, mirror
+// pass and re-key refused — while the fleet stayed green because this harness
+// created what the daemon never did. Driving the daemon's own heal means a heal
+// that stops working takes the NetBox fleet suite down with it.
+//
+// Every node's pki/ca.crt is a copy of the one fleet CA, so every node derives
+// the SAME fingerprint, which is the property a real cluster has.
+//
+// The NAME is the one thing still set by hand. The heal deliberately leaves it
+// empty (nothing in litevirt takes a cluster name), and scenarios that assert
+// which NetBox cluster object the mirror wrote into need a stable one.
+func (c *Cluster) wireNetBox(n *Node) {
+	c.t.Helper()
+
+	if err := corrosion.EnsureClusterRecord(context.Background(), n.DB, n.PKIDir); err != nil {
+		c.t.Fatalf("derive cluster record for %s: %v", n.Name, err)
+	}
+	rows, err := n.DB.ExecuteRows(context.Background(),
+		`UPDATE cluster SET name = ?, domain = ?, updated_at = ? WHERE id = 'default'`,
+		"fleet", "fleet.local", n.DB.NowTS())
+	if err != nil {
+		c.t.Fatalf("name the cluster row for %s: %v", n.Name, err)
+	}
+	if rows == 0 {
+		c.t.Fatalf("no cluster row for %s after the startup heal — the daemon's "+
+			"EnsureClusterRecord wrote nothing, so no NetBox identity can be minted", n.Name)
+	}
+
+	tokenDir := filepath.Join(c.tmpRoot, n.Name, "netbox")
+	if err := mkdirAll(tokenDir); err != nil {
+		c.t.Fatalf("mkdir netbox dir for %s: %v", n.Name, err)
+	}
+	tokenPath := filepath.Join(tokenDir, "token")
+	// PER NODE, not one shared token. The token is what every request carries in
+	// its Authorization header, so it is the only thing that tells the fake
+	// WHICH node issued a write — and "exactly one of N masterless nodes writes
+	// the inventory" is otherwise unobservable from outside the cluster.
+	if err := os.WriteFile(tokenPath, []byte("fleet-netbox-token-"+n.Name+"\n"), 0o600); err != nil {
+		c.t.Fatalf("write netbox token for %s: %v", n.Name, err)
+	}
+	client, err := netbox.New(netbox.Config{
+		BaseURL:   c.opts.NetBoxURL,
+		TokenPath: tokenPath,
+		Timeout:   5 * time.Second,
+	})
+	if err != nil {
+		c.t.Fatalf("netbox client for %s: %v", n.Name, err)
+	}
+	n.Server.SetNetBoxClient(client)
+	n.Server.SetNetBoxClusterName(c.opts.NetBoxClusterName)
+	n.Server.SetNetBoxIPAM(true)
+	// The INVENTORY MIRROR's own opt-in (`netbox.mirror_inventory`), which drives
+	// netbox_mirror_v1 the same conditional-advertisement way. Set alongside the
+	// client because the mirror scenarios are the reason this wiring exists: a
+	// fixture that left it off would model a pure-IPAM cluster and every mirror
+	// assertion would pass by declining. A scenario whose subject IS the opt-in
+	// turns it off on the node it wants to model.
+	n.Server.SetNetBoxMirrorInventory(true)
+
+	// Host bridges: CreateVM preflights every non-macvtap NIC with ensureBridge,
+	// which runs `ip link add … type bridge` when the interface is missing. The
+	// harness is unprivileged, so a VM on ANY network would fail there for want
+	// of root — a property of the test process, not of the code under test.
+	// Stubbing the seam lets NetBox scenarios reach the addressing logic; the
+	// bridge itself is not what they assert on.
+	//
+	// Scoped to NetBox clusters (like the `cluster` row above) so every existing
+	// scenario keeps the real validation path byte-for-byte.
+	n.Server.SetBridgeEnsure(func(string) error { return nil })
+}
+
+// MoveClusterFingerprint rewrites cluster.ca_cert on EVERY node, which is the
+// ONLY thing that moves the cluster identity fingerprint.
+//
+// It is deliberately NOT named after a CA replacement.
+// corrosion.EnsureClusterRecord mints the fingerprint once and never rewrites
+// the row, so replacing `ca.crt` on disk does not reach it; the producible cause
+// is exactly what this helper does — an out-of-band rewrite of the replicated
+// row (an operator edit, or a restore carrying another installation's CA).
+//
+// No real TLS re-issue happens, and none is needed: corrosion.ClusterFingerprint
+// is a SHA-256 of that column, so ANY different string is a different cluster
+// identity. Re-minting the PKI would additionally invalidate every node
+// certificate the harness dials with — a second, unrelated failure that would
+// stop these scenarios reaching the binding logic at all. Every node is written
+// so the fleet stays uniform, exactly as a replicated row would be.
+func (c *Cluster) MoveClusterFingerprint() {
+	c.t.Helper()
+	replacement := fmt.Sprintf("-----BEGIN CERTIFICATE-----\nreplacement-ca-%d\n-----END CERTIFICATE-----\n",
+		time.Now().UnixNano())
+	for _, n := range c.Nodes {
+		if err := n.DB.Execute(context.Background(),
+			`UPDATE cluster SET ca_cert = ?, updated_at = ? WHERE id = 'default'`,
+			replacement, n.DB.NowWall()); err != nil {
+			c.t.Fatalf("move the cluster fingerprint on %s: %v", n.Name, err)
+		}
+	}
+}
+
+// ── induced write failures ──────────────────────────────────────────────────
+//
+// Both seams install a SQLite trigger that aborts one specific write. A trigger
+// is the only way to reach these windows from the fleet: the failure has to
+// happen INSIDE the daemon's own transaction, after every earlier step has
+// really run, which no stub above the corrosion client can produce. Reads stay
+// unaffected, so the operation under test proceeds normally right up to the
+// write that must fail.
+//
+// Each returns a drop function so a scenario can restore normal writes partway
+// through, and each also registers that drop with t.Cleanup so a trigger can
+// never leak into another test sharing the process.
+
+// FailVMRowWrites aborts every INSERT into `vms` on this node. It is how a
+// scenario reaches the window between a started domain and its durable row.
+func (n *Node) FailVMRowWrites(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_vm_insert BEFORE INSERT ON vms
+		 BEGIN SELECT RAISE(ABORT, 'induced vm persist failure'); END`); err != nil {
+		t.Fatalf("install vm-insert failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_vm_insert`); err != nil {
+			t.Fatalf("drop vm-insert failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// FailNICRowWrites aborts every INSERT into `vm_interfaces` on this node — the
+// pre-latch dual-write half of a NIC attach, which runs AFTER the live hotplug
+// and after the authoritative vm_nics row has landed. It is how a scenario
+// reaches an attach that has to be rolled back with real forward progress
+// already on the ground.
+func (n *Node) FailNICRowWrites(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_legacy_nic_insert BEFORE INSERT ON vm_interfaces
+		 BEGIN SELECT RAISE(ABORT, 'induced legacy interface persist failure'); END`); err != nil {
+		t.Fatalf("install legacy-interface-insert failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_legacy_nic_insert`); err != nil {
+			t.Fatalf("drop legacy-interface-insert failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// FailNICRowDelete aborts every vm_nics TOMBSTONE on this node (an UPDATE that
+// sets deleted_at on a live row). The attach path writes its row with INSERT OR
+// REPLACE, so that write is untouched and only the UNDO fails — which is how a
+// scenario reaches a rollback that could not put the rows back, and therefore
+// must NOT give the claimed address away.
+func (n *Node) FailNICRowDelete(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_nic_tombstone BEFORE UPDATE ON vm_nics
+		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
+		 BEGIN SELECT RAISE(ABORT, 'induced nic tombstone failure'); END`); err != nil {
+		t.Fatalf("install nic-tombstone failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_nic_tombstone`); err != nil {
+			t.Fatalf("drop nic-tombstone failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// FailLeaseTombstones aborts every ip_allocations TOMBSTONE on this node
+// (an UPDATE that sets deleted_at on a live row), leaving inserts and every
+// other update alone. It is how a scenario reaches a release whose LOCAL half
+// failed while the remote IPAM object still exists.
+func (n *Node) FailLeaseTombstones(t *testing.T) func() {
+	t.Helper()
+	if err := n.DB.Execute(context.Background(),
+		`CREATE TRIGGER test_fail_lease_tombstone BEFORE UPDATE ON ip_allocations
+		 WHEN NEW.deleted_at IS NOT NULL AND OLD.deleted_at IS NULL
+		 BEGIN SELECT RAISE(ABORT, 'induced tombstone failure'); END`); err != nil {
+		t.Fatalf("install lease-tombstone failure trigger on %s: %v", n.Name, err)
+	}
+	drop := func() {
+		if err := n.DB.Execute(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_lease_tombstone`); err != nil {
+			t.Fatalf("drop lease-tombstone failure trigger on %s: %v", n.Name, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}

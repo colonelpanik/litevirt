@@ -708,6 +708,31 @@ networks:
     external: true          # Use pre-existing network, don't create/destroy
 ```
 
+### `netbox-prefix-id` is parsed and refused
+
+`netbox-prefix-id` is a real key on a compose network definition — the parser
+accepts it — but a deploy that sets it is **refused**:
+
+```
+network "production": NetBox prefix bindings are created with
+`lv network create --netbox-prefix-id`, not from a compose file
+```
+
+That is deliberate, not a gap. Binding a prefix is a claim on an external
+authority: it validates that the prefix exists, that its VRF enforces address
+uniqueness, and that nothing else already holds it, and then it RESERVES the
+prefix for one litevirt network. A compose deploy creates its networks
+directly and runs none of that, so it would persist a network whose config names
+a prefix nothing reserved — and every VM create on that network then fails,
+because litevirt refuses to allocate across an address space it believes is
+externally managed but never claimed. Stack networks are also scoped, torn down
+and recreated with the stack, and a prefix binding does not follow that
+lifecycle.
+
+Bind the network first with `lv network create --netbox-prefix-id`, then
+reference it from the stack as `external: true`. See
+[networking.md](networking.md#binding-a-network-to-netbox).
+
 ### Host isolation
 
 Setting `host-isolation: true` on a network blocks all traffic from VMs to the hypervisor's management plane (SSH, gRPC, metrics, etc.) while preserving VM-to-VM communication, including across hosts via VXLAN.

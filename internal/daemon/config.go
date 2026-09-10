@@ -199,8 +199,69 @@ type Config struct {
 	// PROVIDE_*/OTEL_* env vars override these fields.
 	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
 
+	// NetBox is the external IPAM integration. Absent or disabled means the
+	// client is never constructed: no HTTP, no goroutine, no behaviour change.
+	NetBox NetBoxConfig `yaml:"netbox"`
+
 	// Version is set at startup from build-time ldflags (not from config file).
 	Version string `yaml:"-"`
+}
+
+// NetBoxConfig configures the external NetBox IPAM integration. Default off.
+type NetBoxConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	URL       string `yaml:"url"`
+	TokenPath string `yaml:"token_path"`
+	// ClusterName overrides the NetBox `virtualization.cluster` this
+	// installation mirrors its inventory into. Empty (the default) uses the
+	// local cluster name.
+	//
+	// It exists because a NetBox cluster is the scope in which NetBox enforces
+	// one VM name per cluster, so two litevirt installations sharing one NetBox
+	// under one cluster name share that namespace — and the first same-named VM
+	// makes the second installation's create a 400 it cannot get past. Setting
+	// a distinct name here gives each installation a namespace of its own.
+	//
+	// Deliberately operator-chosen and NOT derived from the cluster
+	// fingerprint: a fingerprint-derived name would move whenever the
+	// fingerprint did, pointing the mirror at a fresh cluster object on the next
+	// sweep, duplicating the whole inventory and leaving `lv netbox rekey` —
+	// which resolves the cluster by this same name — with nothing to repair.
+	//
+	// It MUST be set identically on every node, or left unset on every node.
+	// Unlike the `enforcement.*` flags this one has NO latch to mediate
+	// uniformity: it names the NetBox cluster a sweep writes into, and the sweep
+	// runs on whichever node holds the `netbox` leader lease. Set it on some
+	// nodes only and the first leadership handover mirrors the entire inventory
+	// a second time, into a second `virtualization.cluster`, under the same
+	// identities — and the old objects are then invisible to every sweep that
+	// resolves the other name, so nothing reaps them. Nothing detects this: a
+	// node has no way to read a peer's configured value, so the requirement is
+	// the operator's to hold. The mirror logs the name it resolved at startup so
+	// a disagreement is one comparison across the fleet's logs.
+	ClusterName string `yaml:"cluster_name,omitempty"`
+	// MirrorInventory opts this node into the INVENTORY MIRROR — the half of the
+	// integration that creates NetBox `virtual_machine` and `vminterface`
+	// objects and assigns addresses to them. Default FALSE: NetBox is pure IPAM.
+	//
+	// With it off, NetBox holds `ip_address` objects carrying this cluster's
+	// identity and nothing else. That is a complete configuration rather than a
+	// degraded one — the identity in the address's custom field is what makes an
+	// address litevirt's, and the orphan sweeper proves an address unclaimed by
+	// a per-host negative fan-out that never asks what the address is assigned
+	// to. Binding a prefix, claiming from it, revalidation and reclamation all
+	// work exactly the same.
+	//
+	// It gates a CAPABILITY TOKEN (capabilities.NetBoxMirrorV1), advertised only
+	// while this flag is set, so the cluster-wide latch requires config
+	// uniformity: enabling on one node changes nothing. That matters because the
+	// mirror sweep runs on whichever node holds the `netbox` leader lease — set
+	// non-uniformly, the inventory would appear and disappear as leadership
+	// moved. The flag remains the reversible kill switch, since a latch is
+	// monotone and durable.
+	MirrorInventory  bool `yaml:"mirror_inventory"`
+	TimeoutSec       int  `yaml:"timeout_sec"`
+	SweepIntervalSec int  `yaml:"sweep_interval_sec"`
 }
 
 // TelemetryConfig maps litevirt's daemon config onto the provide-telemetry

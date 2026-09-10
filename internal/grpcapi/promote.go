@@ -554,6 +554,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	}
 	spec.Name = targetName
 
+	// A RENAMED promotion writes a SECOND VM row from this spec, with fresh MACs
+	// and no claim, while the original still holds its addresses — a guaranteed
+	// duplicate on a NetBox-bound network. Refused before the define/start below.
+	//
+	// A TAKEOVER promotion (same name) is deliberately untouched: it re-homes the
+	// existing row, keeping the uuid and the MACs, so the identity behind every
+	// claim survives and no new address is needed. It is also the automated
+	// failover path, and refusing that would leave a fenced host's VMs down on
+	// exactly the networks an external IPAM manages.
+	if renamed {
+		if err := s.refuseIfBound(ctx, "promote --new-name", specNetworkNames(spec.Network)); err != nil {
+			return err
+		}
+	}
+
 	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
 	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought
 	// back up. A takeover promote (same name) carries the original VM's adoption state, so

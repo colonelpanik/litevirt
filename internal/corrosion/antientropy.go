@@ -165,6 +165,33 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
 }
 
+// TableDigestsAgree reports whether one table's local digest and a peer's say
+// the two nodes hold the same rows.
+//
+// Exported because it is not only anti-entropy's question. Any caller that has
+// to establish "my view of this table is the cluster's view" — the NetBox bind's
+// VM-inventory corroboration is the other one — must ask it the SAME way, or two
+// answers to one question drift apart: the v1/v2 negotiation below is subtle
+// enough that a second copy would eventually compare a v1 hash against a v2 one
+// and report permanent, false disagreement.
+//
+// Pairwise negotiation: compare the order-invariant v2 hash ONLY when BOTH sides
+// supplied it (⇒ both have digest_v2 enabled); otherwise compare the positional
+// v1 hash. Count is always compared.
+func TableDigestsAgree(local TableDigest, remote *pb.TableDigest) bool {
+	lh, rh := localAndRemoteHash(local, remote)
+	return local.Count == int(remote.GetCount()) && lh == rh
+}
+
+// localAndRemoteHash picks the pair of hashes to compare, so the predicate and
+// the log line that explains a mismatch cannot disagree about which was used.
+func localAndRemoteHash(local TableDigest, remote *pb.TableDigest) (string, string) {
+	if local.HashV2 != "" && remote.GetHashV2() != "" {
+		return local.HashV2, remote.GetHashV2()
+	}
+	return local.Hash, remote.GetHash()
+}
+
 // digestMismatches returns the tables whose digest differs from the peer.
 func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string]TableDigest) []string {
 	var out []string
@@ -175,19 +202,11 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 			out = append(out, r.Name)
 			continue
 		}
-		// Pairwise negotiation: compare the order-invariant v2 hash ONLY when BOTH sides
-		// supplied it (⇒ both have digest_v2 enabled); otherwise compare the positional v1
-		// hash. Count is always compared.
-		useV2 := local.HashV2 != "" && r.GetHashV2() != ""
-		var lh, rh string
-		if useV2 {
-			lh, rh = local.HashV2, r.GetHashV2()
-		} else {
-			lh, rh = local.Hash, r.Hash
-		}
-		if local.Count == int(r.Count) && lh == rh {
+		if TableDigestsAgree(local, r) {
 			continue // in sync
 		}
+		lh, rh := localAndRemoteHash(local, r)
+		useV2 := local.HashV2 != "" && r.GetHashV2() != ""
 		slog.Info("anti-entropy: drift detected",
 			"peer", peer, "table", r.Name, "digest", map[bool]string{true: "v2", false: "v1"}[useV2],
 			"local_hash", lh, "remote_hash", rh)

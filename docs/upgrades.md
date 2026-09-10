@@ -215,13 +215,51 @@ ExecStart=/bin/sh -c '\
   fi'
 ```
 
+### What the rollback is conditional on — and what has not been verified
+
+The rollback fires only when **both** conditions hold:
+
+1. **The `.upgrade-pending` sentinel exists.** Without it the rollback service
+   deliberately does nothing and leaves the failed binary in place, logging that
+   it declined. That is the intended behaviour, not a fault: a failed state with
+   no upgrade in progress must not silently downgrade a healthy binary.
+2. **`/usr/local/bin/litevirt.old` exists.** With the sentinel present but no
+   `.old`, the service logs that there is nothing to roll back to and exits
+   non-zero, leaving the unit failed.
+
+So a daemon that will not start is **not** evidence that a rollback was
+attempted. Read the journal before concluding anything.
+
+**This path has not been confirmed end to end through a live systemd upgrade.**
+The unit wiring, the sentinel gate and the shell logic are as documented and
+reviewed, but no rollout has yet driven a real panic-loop through it on a live
+host. Treat the behaviour above as **expected**, not verified, and check the
+journals rather than assuming it ran.
+
+**Restoring `.old` restores the previous binary's behaviour in full** — including
+any limitations that build had. A rollback is a return to a known state, not a
+repair: whatever the older binary refused, mis-handled or did not yet implement,
+it will refuse, mis-handle and not implement again. In particular a build carrying
+prerelease behaviour that a later build deliberately refuses to migrate is exactly
+the build the cluster returns to.
+
 ### Verifying a rollback fired
 
+Check **both** journals. They answer different questions, and the rollback
+service's own log is the only place its *decision* is recorded:
+
 ```bash
-journalctl -t litevirt-rollback         # rollback log entries
+journalctl -t litevirt-rollback          # did the rollback run, decline, or find no .old?
+journalctl -u litevirt-rollback.service  # the unit's own start/exit status
+journalctl -u litevirt.service           # why the daemon failed in the first place
 systemctl status litevirt                # should be active again, on the .old binary
 litevirt --version                       # confirms the rolled-back version
 ```
+
+A `litevirt.service` journal showing repeated startup failures with **nothing**
+in the `litevirt-rollback` journal means the rollback service never fired at all
+— check `OnFailure=` wiring and whether the unit actually reached `failed`
+state rather than being restarted indefinitely.
 
 The systemd rollback unit handles the **panic-loop** case: a binary that
 crashes/exits on startup. The **post-upgrade health watchdog** (below) covers
@@ -515,7 +553,7 @@ schema change can't silently make the migration tool lie.
 
 ### CI guardrails
 
-Three checks run on every push and pull request (`.github/workflows/ci.yml`)
+These checks run on every push and pull request (`.github/workflows/ci.yml`)
 to keep the invariants above from rotting. Run them locally with
 `make ci-guards`.
 
@@ -540,6 +578,35 @@ to keep the invariants above from rotting. Run them locally with
    tree or appear as a string literal in the code. Intentional exceptions use
    a `ci:skip-cmd` / `ci:skip-metric` line marker or the `knownAbsentIdentifiers`
    allowlist (for documented-but-roadmap metrics).
+
+4. **Every replicated statement is one a peer can still apply.**
+   `scripts/ci/stmtshapecheck` statically enumerates every SQL statement our
+   builders send down the replicated path, fingerprints each with the same
+   primitive the runtime uses at apply time, and makes three separate
+   assertions about it:
+
+   - **registered** — the fingerprint is in the checked-in compatibility
+     ledger. An unregistered shape does not fail on the receiving peer, it
+     *back-pressures*: the apply fails closed, the batch rolls back and that
+     peer's replication watermark stops advancing, head-of-line blocking every
+     later statement on the stream.
+   - **emitted** — a builder nothing calls never reaches a peer at all, so a
+     registered shape with no caller is a feature that silently does nothing
+     (`reachable.go`).
+   - **gated, if it is a table's first-ever shape** (`newtables.go`). A table
+     that carried no accepted shape at the previous release, and carries one
+     now, is the shape a not-yet-upgraded peer cannot resolve *by
+     construction* — and the receiver on the old binary is the one that
+     stalls. The guard fails until the table is acknowledged in
+     `firstShapeAcks` with the mechanism that keeps the write off that peer's
+     stream: a capability latch that cannot form until the roll completes, or
+     a local-only write on a table anti-entropy already carries (anti-entropy
+     performs no ledger check, so a row that every node derives identically
+     converges without replicating a statement at all).
+
+   `scripts/ci/check-ledger-drift.sh` covers the opposite direction: a
+   fingerprint that *disappeared* from the ledgers while a supported peer can
+   still emit it.
 
 ## See also
 

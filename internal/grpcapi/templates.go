@@ -85,6 +85,15 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		_ = json.Unmarshal([]byte(src.Spec), &srcSpec)
 	}
 
+	// A clone does not claim. It rebuilds the source's NIC list with fresh MACs
+	// and persists it directly, so on a NetBox-bound network it would either
+	// copy the source's address onto a second VM or leave the clone addressless
+	// on a network where nothing hands out addresses but NetBox. Refused before
+	// admission, so nothing is reserved and no disk is written.
+	if err := s.refuseIfBound(ctx, "clone", specNetworkNames(srcSpec.Network)); err != nil {
+		return nil, err
+	}
+
 	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
 	// memory, its own disks — so it consumes exactly what CreateVM would, and
 	// skipping this let a clone walk past both the host's capacity and the
@@ -389,6 +398,15 @@ func (s *Server) ConvertToTemplate(ctx context.Context, req *pb.ConvertToTemplat
 
 	if vm.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition, "%q is already a template", req.Name)
+	}
+	// Before the stopped check, and before anything is written: a VM holding a
+	// NetBox address becomes invisible to the inventory mirror the moment this
+	// flag is set, and the address it leaves behind is reclaimable by neither the
+	// mirror nor the orphan sweep. See refuseTemplateIfBound. Placed here rather
+	// than after the state check so an operator is not made to stop a VM only to
+	// be told the conversion was never available.
+	if err := s.refuseTemplateIfBound(ctx, req.Name); err != nil {
+		return nil, err
 	}
 	// A template must not be running (its disks are about to become immutable
 	// clone sources). Require it stopped.

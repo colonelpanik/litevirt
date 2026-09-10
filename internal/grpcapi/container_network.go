@@ -99,13 +99,26 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		var def *compose.NetworkDef
 		switch {
 		case netName != "":
-			if def = lookupNetworkDef(ctx, s.db, netName); def == nil {
+			var derr error
+			if def, derr = lookupNetworkDef(ctx, s.db, netName); derr != nil {
+				// Fail closed on a read failure rather than report the network
+				// missing: "not found" is a definite answer this read did not
+				// give, and the def is what decides raw-bridge admission and the
+				// bound-network refusal below.
+				return nil, status.Errorf(codes.Internal, "read network %q: %v", netName, derr)
+			} else if def == nil {
 				return nil, status.Errorf(codes.InvalidArgument, "network %q not found", netName)
 			}
 		case n.Bridge != "":
 			if name, ok := s.resolveBridgeToNetwork(ctx, n.Bridge); ok {
 				netName = name
-				def = lookupNetworkDef(ctx, s.db, name)
+				var derr error
+				// Same reason: a bridge that RESOLVES to a managed network must
+				// not degrade to the legacy raw-bridge path (no isolation check,
+				// no bound-network refusal) because its record could not be read.
+				if def, derr = lookupNetworkDef(ctx, s.db, name); derr != nil {
+					return nil, status.Errorf(codes.Internal, "read network %q: %v", name, derr)
+				}
 			}
 		}
 
@@ -132,6 +145,16 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		// is denied here (an unresolved raw bridge stays legacy/global above).
 		if err := s.admitNetworkAttach(ctx, project, netName); err != nil {
 			return nil, err
+		}
+
+		// Allocator selection happens HERE, before any provisioning or address
+		// work, because for a container it is also an ADMISSION decision: a
+		// NetBox-bound network is VM-only and must be refused outright rather
+		// than allocated around. Resolving it early makes the refusal cover the
+		// static-IP and subnet-less NICs too, which never reach the claim below.
+		alloc, _, aerr := s.allocatorFor(ctx, "ct", netName)
+		if aerr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", aerr)
 		}
 
 		// Managed NIC. Containers support only L2 bridge-family networks; direct
@@ -186,11 +209,18 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 			}
 			ip = n.Ip
 		case def.Subnet != "":
-			cand, aerr := network.AllocateIPFor(ctx, s.db, netName, def.Subnet, mac, "ct", s.hostName, ctName)
+			cand, aerr := alloc.Claim(ctx, network.ClaimRequest{
+				Network:   netName,
+				Subnet:    def.Subnet,
+				MAC:       mac,
+				OwnerKind: "ct",
+				OwnerHost: s.hostName,
+				Name:      ctName,
+			})
 			if aerr != nil {
 				return nil, status.Errorf(codes.ResourceExhausted, "allocate IP on network %q: %v", netName, aerr)
 			}
-			ip = cand
+			ip = cand.IP
 		}
 		p.lxcNics = append(p.lxcNics, ContainerNICOpt{Name: n.Name, Bridge: bridge, IP: ip, MAC: mac, Veth: veth})
 		p.ifaces = append(p.ifaces, corrosion.ContainerInterfaceRecord{

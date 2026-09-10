@@ -12,6 +12,11 @@
 // the guard fails it: every replicated statement must be finite static SQL (a literal string per
 // statement) whose shape is in the ledger. There is no dynamic-policy escape hatch.
 //
+// Two further checks run over the same scan, because registration alone proves neither of them:
+// a builder nothing calls never reaches a peer at all (reachable.go), and a table's FIRST-EVER
+// replicated shape needs a human decision about what keeps it off a previous-release peer's
+// stream (newtables.go).
+//
 // Usage:
 //
 //	stmtshapecheck -root .            # check every builder against the ledger; exit 1 on any gap
@@ -114,17 +119,21 @@ func main() {
 	gaps := computeGaps(findings)
 	// A registered shape with no caller never reaches a peer — see reachable.go.
 	gaps = append(gaps, unreachableEmitters(pkgs, findings)...)
+	// A table's FIRST replicated shape needs a human gating decision — see newtables.go.
+	gaps = append(gaps, newTableShapeGaps(firstShapeTables(findings), replicatedTableBaseline, firstShapeAcks)...)
 	if len(gaps) == 0 {
 		fmt.Printf("stmtshapecheck: %d replicated builder statement(s) all registered; OK\n", len(findings))
 		return
 	}
-	fmt.Fprintf(os.Stderr, "stmtshapecheck: FAIL — %d unregistered/unparseable replicated statement(s):\n", len(gaps))
+	fmt.Fprintf(os.Stderr, "stmtshapecheck: FAIL — %d replicated-statement finding(s):\n", len(gaps))
 	for _, g := range gaps {
 		fmt.Fprintf(os.Stderr, "  %s\n", g)
 	}
 	fmt.Fprintf(os.Stderr, "\nEvery replicated statement must be finite static SQL registered in the ledger: add a ledger entry\n"+
 		"(run with -report for the fingerprint, then regenerate with -emit-ledger), or rewrite a dynamic/\n"+
-		"unresolved builder into literal per-statement SQL. An unregistered shape would back-pressure at apply time.\n")
+		"unresolved builder into literal per-statement SQL. An unregistered shape would back-pressure at apply time.\n"+
+		"A shape nothing calls, or a table's first-ever shape with no recorded gating decision, is reported above\n"+
+		"with its own remedy.\n")
 	os.Exit(1)
 }
 

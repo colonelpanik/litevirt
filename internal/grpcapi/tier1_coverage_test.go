@@ -146,7 +146,10 @@ func TestLookupNetworkDef_NotFound(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
 
-	def := lookupNetworkDef(ctx, s.db, "nonexistent-net")
+	def, err := lookupNetworkDef(ctx, s.db, "nonexistent-net")
+	if err != nil {
+		t.Fatalf("a missing network is (nil, nil), not an error: %v", err)
+	}
 	if def != nil {
 		t.Errorf("expected nil for nonexistent network, got %+v", def)
 	}
@@ -165,7 +168,10 @@ func TestLookupNetworkDef_Found(t *testing.T) {
 		t.Fatalf("UpsertNetwork: %v", err)
 	}
 
-	def := lookupNetworkDef(ctx, s.db, "test-net")
+	def, err := lookupNetworkDef(ctx, s.db, "test-net")
+	if err != nil {
+		t.Fatalf("lookupNetworkDef: %v", err)
+	}
 	if def == nil {
 		t.Fatal("expected non-nil for existing network")
 	}
@@ -189,7 +195,12 @@ func TestLookupNetworkDef_BadJSON(t *testing.T) {
 		t.Fatalf("UpsertNetwork: %v", err)
 	}
 
-	def := lookupNetworkDef(ctx, s.db, "bad-json-net")
+	// An unparseable config is a row this build does not understand — the
+	// flat-bridge case, not an unknown — so it is (nil, nil), never an error.
+	def, err := lookupNetworkDef(ctx, s.db, "bad-json-net")
+	if err != nil {
+		t.Fatalf("an unparseable config must not be reported as a read failure: %v", err)
+	}
 	if def != nil {
 		t.Errorf("expected nil for invalid JSON config, got %+v", def)
 	}

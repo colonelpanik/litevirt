@@ -123,6 +123,12 @@ type collector struct {
 	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
 	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
+	// NetBox IPAM gauges. Both are CURRENT state, which the NetBox counters
+	// cannot express: a counter of suspensions keeps rising after an operator
+	// has repaired one, and queued mirror work is a depth, not a total.
+	netboxSyncQueueDepth    *prometheus.Desc // pending netbox_sync_queue items
+	netboxBindingsSuspended *prometheus.Desc // bindings refusing new allocations right now
+
 	// placement / rebalancer metrics.
 	placementDecisions *prometheus.Desc // counter labeled by policy + result
 	hostPressure       *prometheus.Desc // post-snapshot pressure per host × dimension
@@ -273,6 +279,16 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
 			[]string{"peer"}, prometheus.Labels{"host": hostName},
 		),
+		netboxSyncQueueDepth: prometheus.NewDesc(
+			"litevirt_netbox_sync_queue_depth",
+			"Pending items in netbox_sync_queue (the inventory mirror's work queue). A depth that never returns to 0 means the mirror is not draining",
+			nil, prometheus.Labels{"host": hostName},
+		),
+		netboxBindingsSuspended: prometheus.NewDesc(
+			"litevirt_netbox_bindings_suspended",
+			"NetBox prefix bindings currently suspended by revalidation drift. Each one refuses every new allocation on its network until an operator runs `lv netbox resume` or `lv netbox rekey`",
+			nil, prometheus.Labels{"host": hostName},
+		),
 		placementDecisions: prometheus.NewDesc(
 			"litevirt_placement_decisions_total",
 			"Cumulative placement decisions emitted by the engine",
@@ -326,6 +342,8 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.replicationMinSeq
 	ch <- c.replicationPending
 	ch <- c.replicationPeerLag
+	ch <- c.netboxSyncQueueDepth
+	ch <- c.netboxBindingsSuspended
 	ch <- c.placementDecisions
 	ch <- c.hostPressure
 	ch <- c.rebalanceProposals
@@ -534,6 +552,19 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.replicationPeerLag,
 				prometheus.GaugeValue, float64(lag), row.String("peer_name"))
 		}
+	}
+
+	// NetBox IPAM current state. Both tables are small (one row per bound
+	// prefix; one per queued mirror item), so these are two counting reads.
+	if qr, qerr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS cnt FROM netbox_sync_queue WHERE deleted_at IS NULL`); qerr == nil && len(qr) > 0 {
+		ch <- prometheus.MustNewConstMetric(c.netboxSyncQueueDepth,
+			prometheus.GaugeValue, float64(qr[0].Int("cnt")))
+	}
+	if br, berr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS cnt FROM netbox_bindings WHERE suspended = 1 AND deleted_at IS NULL`); berr == nil && len(br) > 0 {
+		ch <- prometheus.MustNewConstMetric(c.netboxBindingsSuspended,
+			prometheus.GaugeValue, float64(br[0].Int("cnt")))
 	}
 
 	// Per-host CPU + RAM pressure. Cheap: uses the same data the

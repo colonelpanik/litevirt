@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -110,6 +112,7 @@ func newNetworkCreateCmd() *cobra.Command {
 		pf         string
 		spoofCheck bool
 		project    string
+		netboxID   int
 	)
 	cmd := &cobra.Command{
 		Use:   "create <name>",
@@ -125,20 +128,28 @@ Examples:
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				ni, err := c.CreateNetwork(ctx, &pb.CreateNetworkRequest{
-					Name:       args[0],
-					Type:       ntype,
-					Iface:      iface,
-					Vlan:       int32(vlan),
-					Vni:        int32(vni),
-					Underlay:   underlay,
-					Subnet:     subnet,
-					Dhcp:       dhcp,
-					Pf:         pf,
-					SpoofCheck: spoofCheck,
-					Project:    project,
+					Name:           args[0],
+					Type:           ntype,
+					Iface:          iface,
+					Vlan:           int32(vlan),
+					Vni:            int32(vni),
+					Underlay:       underlay,
+					Subnet:         subnet,
+					Dhcp:           dhcp,
+					Pf:             pf,
+					SpoofCheck:     spoofCheck,
+					Project:        project,
+					NetboxPrefixId: int32(netboxID),
 				})
 				if err != nil {
-					return fmt.Errorf("create network: %w", err)
+					// The server's own message, not a wrapped rpc error. This
+					// RPC reports PARTIAL SUCCESS — "network X was created and
+					// its NetBox binding is SUSPENDED" — and `%w` prefixed that
+					// with "create network:" plus grpc's "rpc error: code = ...
+					// desc =", so the line said failure while the sentence
+					// inside said the network exists. status.Convert gives the
+					// server's sentence verbatim.
+					return errors.New(status.Convert(err).Message())
 				}
 
 				owner := ni.Project
@@ -160,6 +171,8 @@ Examples:
 	cmd.Flags().StringVar(&pf, "pf", "", "SR-IOV physical function")
 	cmd.Flags().BoolVar(&spoofCheck, "spoof-check", false, "Enable SR-IOV spoof checking")
 	cmd.Flags().StringVar(&project, "project", "", "Owning project (empty = global/shared, usable by all projects)")
+	cmd.Flags().IntVar(&netboxID, "netbox-prefix-id", 0,
+		"bind this network to a NetBox prefix, claiming VM addresses from it")
 	return cmd
 }
 

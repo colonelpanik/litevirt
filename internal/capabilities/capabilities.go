@@ -243,6 +243,46 @@ const (
 	// enabling on one node changes nothing until every node has opted in. Default-off,
 	// and the flag is the reversible kill switch (off → sign nothing, refuse nothing).
 	AuditSignatureV1 = "audit_signature_v1"
+	// NetBoxIPAMV1 gates binding a litevirt network to a NetBox prefix.
+	//
+	// The latch is required because an OLDER binary does not parse the
+	// NetBoxPrefixID field on a network definition at all, and would silently
+	// allocate from the builtin allocator across the whole prefix. Every node
+	// observing the same replicated binding is not the same thing as every node
+	// INTERPRETING it — which is why replicated state alone is not sufficient here.
+	NetBoxIPAMV1 = "netbox_ipam_v1"
+	// NetBoxMirrorV1 gates the NetBox INVENTORY MIRROR — the half that creates
+	// `virtual_machine` and `vminterface` objects and assigns addresses to them.
+	//
+	// NetBox is two integrations behind one config block, and only one of them is
+	// the default. The IPAM half makes NetBox the address authority: it claims
+	// `ip_address` objects carrying this cluster's identity, and that identity is
+	// what makes an address ours. The INVENTORY half additionally rewrites the VM
+	// inventory, which an installation that already models its VMs elsewhere has
+	// every reason to refuse. So mirroring is opt-in (`netbox.mirror_inventory`),
+	// and with it off NetBox holds addresses carrying our identity and nothing
+	// else — no `virtual_machine`, no `vminterface`, no assign or clear.
+	//
+	// A TOKEN rather than a plain config read, and advertised CONDITIONALLY on
+	// that flag exactly as NetBoxIPAMV1 is. The mirror sweep runs on whichever
+	// node holds the `netbox` leader lease, so "this installation mirrors" is a
+	// CLUSTER-WIDE fact: set on some nodes only, the inventory would appear and
+	// disappear as leadership moved, and every object the mirroring node created
+	// would be left for a non-mirroring successor that never reaps it.
+	// Withholding advertisement while the flag is off is what makes the latch
+	// require CONFIG uniformity rather than merely a uniform build — enabling on
+	// one node changes nothing.
+	//
+	// It does NOT replace NetBoxIPAMV1 for the mirror. The mirror's own tables
+	// (`netbox_objects`, `netbox_sync_queue`) are v51, and a statement against a
+	// table a peer's ledgers do not carry back-pressures that peer's whole
+	// replication stream; netbox_ipam_v1 is the token that says every peer
+	// carries them. The mirror requires BOTH latches plus the local flag.
+	//
+	// Default false, and the flag stays the reversible kill switch: a latch is
+	// monotone and durable, so the flag has to gate the DECISION and not only the
+	// advertisement or the mirror could never be turned off again.
+	NetBoxMirrorV1 = "netbox_mirror_v1"
 )
 
 // supported is the set of tokens THIS build both implements AND advertises. A
@@ -333,6 +373,14 @@ var supported = []string{
 	HardwareV2,
 	ProjectAuthorityV1,
 	AuditSignatureV1,
+	NetBoxIPAMV1,
+	// NetBoxMirrorV1 is advertised CONDITIONALLY on netbox.mirror_inventory,
+	// like OperationProtocolV1: the mirror sweep runs on ONE node under the
+	// `netbox` leader lease, so a cluster that latched across a node which will
+	// never mirror would have its inventory appear and disappear with
+	// leadership. Withholding advertisement while the flag is off keeps the
+	// cluster from latching until every node has opted in.
+	NetBoxMirrorV1,
 	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
@@ -349,7 +397,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

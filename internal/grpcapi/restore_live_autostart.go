@@ -84,6 +84,16 @@ func (s *Server) autoDefineRestoredVM(
 	if !validRestoreName(targetName) {
 		return "", "", status.Errorf(codes.InvalidArgument, "invalid restore name %q", targetName)
 	}
+
+	// A restore does not claim. It rebuilds the NIC rows straight from the
+	// backed-up spec — carrying that spec's addresses verbatim — so restoring
+	// onto a NetBox-bound network would boot a guest holding an address the
+	// external IPAM either still assigns to the original or never issued at all.
+	// Refused before admission, the firmware bundle and DefineDomain, so nothing
+	// is reserved and nothing is written.
+	if err := s.refuseIfBound(ctx, "restore", specNetworkNames(spec.Network)); err != nil {
+		return "", "", err
+	}
 	// This path creates a RUNNING managed VM, so beyond backup.restore the caller
 	// must hold vm.create on the target name in the (authorized) restore project.
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, targetName), "vm.create", "operator"); err != nil {

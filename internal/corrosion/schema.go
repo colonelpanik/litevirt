@@ -325,7 +325,37 @@ import (
 //	     mixed-version operation; this branch keeps its existing authority-ledger
 //	     admission implementation, so upstream's emitted statement shapes are
 //	     retained as historical receiver contracts. Four new tables.
-const CurrentSchemaVersion = 50
+//	v51: NetBox IPAM foundation — netbox_bindings (one row per bound NetBox
+//	     prefix; PK is prefix_id, not network, which makes "one litevirt
+//	     network per NetBox prefix" structural, since ip_allocations keys leases
+//	     on the litevirt network name), netbox_objects (litevirt object -> NetBox
+//	     object identity map, PK (litevirt_kind, litevirt_key)), and
+//	     netbox_sync_queue (work queue for the P2 inventory mirror; a latency
+//	     optimisation only, since the periodic full sweep is the correctness
+//	     mechanism), and netbox_host_config (each node's published NetBox cluster
+//	     name — a value no capability token can carry, so uniformity is checked
+//	     by comparing what live hosts published; a table rather than a `hosts`
+//	     column because a peer that has not migrated discards a whole dump whose
+//	     column set it does not recognise, and `hosts` is the wrong table to do
+//	     that to). Also ip_allocations.netbox_ip_id / netbox_prefix_id — the
+//	     join keys linking a lease back to its NetBox IP/prefix — and
+//	     netbox_bindings.netbox_cluster, the cluster name the first bind pinned.
+//	     Four new tables + three ADD COLUMNs.
+//
+//	     There is deliberately NO table here for recovering from a permanent
+//	     host loss. Three prerelease v51 tables (netbox_recovery_manifests,
+//	     netbox_host_retirements, netbox_retirement_withdrawals) carried an
+//	     operator-attested substitute for machine evidence; they were removed
+//	     before release, together with the RPC and CLI surface that wrote them,
+//	     so every premise in this subsystem is machine-verified again. The
+//	     recovery lifecycle is specified in
+//	     docs/reviews/2026-09-08-trust-lifecycle-followup-scope.md and will
+//	     arrive under its own schema version. A database that ran those
+//	     prerelease commits is an UNSUPPORTED UPGRADE: this build refuses to
+//	     start on one rather than guessing at a migration, preserving the
+//	     evidence for a deliberate offline recovery — see
+//	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
+const CurrentSchemaVersion = 51
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -355,6 +385,16 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 // gap from the old swallow-benign loop is healed rather than falsely claimed.
 func InitSchema(ctx context.Context, c *Client) error {
 	slog.Info("initializing schema")
+
+	// THE UNSUPPORTED-UPGRADE BOUNDARY, FIRST AND BEFORE ANY WRITE. A database
+	// that carries the prerelease permanent-loss trust schema cannot be migrated
+	// by this build — see netbox_prerelease_boundary.go for why an automatic
+	// answer is a guess. It refuses here, ahead of the DDL, the ledger and the
+	// data fixes, so the refusal is reached with the database untouched and its
+	// evidence intact for a deliberate offline recovery.
+	if err := refusePrereleaseTrustDatabase(ctx, c); err != nil {
+		return err
+	}
 
 	// Tables first (CREATE TABLE IF NOT EXISTS — genuinely idempotent, and it
 	// guarantees every table exists before the ledger's presence checks run).
@@ -1645,6 +1685,8 @@ var schemaDDL = []string{
 		vm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind
 		owner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)
 		owner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)
+		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
+		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		allocated_at TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
@@ -2096,6 +2138,83 @@ var schemaDDL = []string{
 		deleted_at         TEXT,
 		PRIMARY KEY (host_name)
 	)`,
+
+	// ═══════════ NETBOX IPAM (v51) ═══════════
+	// One row per BOUND prefix. The PK is prefix_id, not network, which makes
+	// "one litevirt network per NetBox prefix" structural: two networks bound to
+	// one prefix would allocate the same address independently, because
+	// ip_allocations is keyed (network, ip) on the LITEVIRT network name.
+	`CREATE TABLE IF NOT EXISTS netbox_bindings (
+		prefix_id           INTEGER PRIMARY KEY,
+		network             TEXT NOT NULL,
+		observed_cidr       TEXT NOT NULL,
+		vrf_id              INTEGER NOT NULL,
+		cluster_fingerprint TEXT NOT NULL,
+		-- The NetBox virtualization.cluster name the FIRST bind resolved, pinned
+		-- so a node whose netbox.cluster_name resolves to something else can
+		-- discover the disagreement and refuse to mirror. It has to be uniform
+		-- cluster-wide and, unlike an enforcement.* flag, has no latch to make it
+		-- so: a capability token cannot express a string. Defaulted rather than
+		-- NOT NULL-without-default so an older peer's writes still land.
+		netbox_cluster      TEXT NOT NULL DEFAULT '',
+		suspended           INTEGER NOT NULL DEFAULT 0,
+		suspend_reason      TEXT NOT NULL DEFAULT '',
+		validated_at        TEXT NOT NULL,
+		created_at          TEXT NOT NULL,
+		updated_at          TEXT NOT NULL,
+		deleted_at          TEXT
+	)`,
+
+	// Identity map: litevirt object -> NetBox object. Interfaces key on MAC, NOT
+	// on DeterministicNICID, because that id is derived from the VM name and
+	// RenameVM re-derives it — keying on it would fork a duplicate vminterface
+	// on every rename.
+	`CREATE TABLE IF NOT EXISTS netbox_objects (
+		litevirt_kind TEXT NOT NULL,
+		litevirt_key  TEXT NOT NULL,
+		netbox_kind   TEXT NOT NULL,
+		netbox_id     INTEGER NOT NULL,
+		synced_at     TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (litevirt_kind, litevirt_key)
+	)`,
+
+	// Work queue for the P2 inventory mirror. A LATENCY optimisation only — the
+	// full sweep is the correctness mechanism, because a node that dies mid-create
+	// never enqueues anything.
+	`CREATE TABLE IF NOT EXISTS netbox_sync_queue (
+		id         TEXT PRIMARY KEY,
+		kind       TEXT NOT NULL,
+		key        TEXT NOT NULL,
+		op         TEXT NOT NULL,
+		attempts   INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+
+	// Per-host publication of the one NetBox setting no capability latch can
+	// make uniform: the virtualization.cluster name this node resolves. A token
+	// is a name that is advertised or not and cannot carry a VALUE, so
+	// uniformity of `netbox.cluster_name` has to be checked by comparing what
+	// each node published. host_name is the PK and only that host writes its own
+	// row — the same ownership shape as host_networks.
+	//
+	// A TABLE rather than a column on `hosts`, deliberately: a receiver discards
+	// a whole table dump whose column set it does not recognise, so a new `hosts`
+	// column makes a not-yet-migrated peer drop the entire `hosts` dump for the
+	// length of the upgrade window — and `hosts` is the table whose divergence
+	// takes the control plane with it. A table the older peer does not have is
+	// just a table it does not have. See internal/corrosion/netbox_host_config.go.
+	`CREATE TABLE IF NOT EXISTS netbox_host_config (
+		host_name      TEXT PRIMARY KEY,
+		netbox_cluster TEXT NOT NULL DEFAULT '',
+		created_at     TEXT NOT NULL,
+		updated_at     TEXT NOT NULL,
+		deleted_at     TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2251,6 +2370,10 @@ var tablePrimaryKeys = map[string][]string{
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
 	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
+	"netbox_bindings":         {"prefix_id"},
+	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
+	"netbox_sync_queue":       {"id"},
+	"netbox_host_config":      {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2466,6 +2589,18 @@ var schemaMigrations = []string{
 	// writer. 0 = not isolated (the legacy-compatible default).
 	`ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''`,
+	// v51: NetBox join keys on the lease.
+	`ALTER TABLE ip_allocations ADD COLUMN netbox_ip_id INTEGER`,
+	`ALTER TABLE ip_allocations ADD COLUMN netbox_prefix_id INTEGER`,
+	// v51: the pinned NetBox cluster name on a binding. Also present in the
+	// netbox_bindings CREATE TABLE above, which is where a fresh database gets
+	// it — this unit exists because the ledger's presence predicate is what
+	// heals a database created by an EARLIER v51 build, whose table already
+	// exists and whose CREATE TABLE IF NOT EXISTS is therefore a no-op. On a
+	// fresh database the column is already there, so the unit is recorded
+	// mark-only and this ALTER never runs. Same belt-and-braces shape as every
+	// other column here.
+	`ALTER TABLE netbox_bindings ADD COLUMN netbox_cluster TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2553,6 +2688,8 @@ var alterVersions = []int{
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
 	49, 49, // hosts.isolation_epoch/isolation_reason
+	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
+	51, // netbox_bindings.netbox_cluster
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2582,6 +2719,8 @@ var createTableUnits = []struct {
 	{50, "health_conditions"}, {50, "health_evaluator_status"},
 	{50, "host_capacity_observations"},
 	{50, "quota_reservations"},
+	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
+	{51, "netbox_host_config"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

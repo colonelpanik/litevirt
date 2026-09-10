@@ -303,6 +303,86 @@ enforcement:
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
 
+# External NetBox IPAM integration. Disabled by default; when disabled no
+# NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).
+netbox:
+  enabled: false            # advertise netbox_ipam_v1 and allow prefix bindings
+                            # (`lv network create --netbox-prefix-id`). Must be
+                            # uniform cluster-wide for the latch to form — an older
+                            # binary does not parse the prefix-binding field at all
+                            # and would silently allocate from the builtin
+                            # allocator across the whole prefix, so replicated
+                            # state alone cannot make a bound prefix safe.
+  url: ""                   # NetBox base URL, e.g. "https://netbox.corp".
+  token_path: ""            # path to a file containing the API token. The token
+                            # is read from this file at startup and is NEVER held
+                            # inline in config.
+  cluster_name: ""          # NetBox `virtualization.cluster` to mirror inventory
+                            # into. Empty uses the local cluster name. NetBox
+                            # allows one VM name per cluster, so two litevirt
+                            # installations sharing one NetBox need a distinct
+                            # name here or same-named VMs collide. Set it before
+                            # the first sweep — changing it later strands
+                            # everything written under the previous cluster.
+                            # MUST BE UNIFORM CLUSTER-WIDE: identical on every
+                            # node, or unset on every node. Unlike the
+                            # enforcement.* flags there is no latch mediating
+                            # this one, and the sweep runs on whichever node
+                            # holds the `netbox` leader lease — so a value set
+                            # on only some nodes duplicates the whole inventory
+                            # into a second virtualization.cluster at the first
+                            # leadership handover, and no sweep can then see the
+                            # objects written under the other name. Nothing
+                            # ENFORCED from the first bind onward: the bind
+                            # PINS the name it resolved onto the
+                            # netbox_bindings row, and any node whose own
+                            # config resolves to a different one refuses to
+                            # mirror and refuses `lv netbox rekey`, raising a
+                            # netbox_cluster_name_mismatch health condition
+                            # naming both values. Address allocation is
+                            # unaffected. Unset on every node agrees (it
+                            # resolves to the local cluster name); set on some
+                            # nodes only does not. NOT enforced on a cluster
+                            # with no bound network — there is no binding row
+                            # to pin — so compare the mirror's startup log line
+                            # across nodes there.
+  mirror_inventory: false   # opt into the INVENTORY MIRROR — the half that
+                            # creates NetBox virtual_machine / vminterface
+                            # objects and assigns addresses to them. Default
+                            # false: NetBox is pure IPAM, holding ip_address
+                            # objects that carry this cluster's identity and
+                            # nothing else. That is a complete configuration,
+                            # not a degraded one — the identity is what makes an
+                            # address litevirt's, and the orphan sweeper proves
+                            # an address unclaimed by a per-host negative
+                            # fan-out that never reads what it is assigned to,
+                            # so bind, claim, revalidate and reclaim all behave
+                            # identically. Advertises netbox_mirror_v1 only
+                            # while set, so the cluster-wide latch requires
+                            # config uniformity: enabling on one node changes
+                            # nothing, which matters because the sweep runs on
+                            # whichever node holds the `netbox` leader lease and
+                            # a non-uniform flag would make the inventory appear
+                            # and disappear with leadership. Mirroring also
+                            # still needs netbox_ipam_v1 (its tables are v51).
+                            # The flag stays the reversible kill switch — a
+                            # latch is monotone and durable.
+  timeout_sec: 10           # per-request timeout.
+  sweep_interval_sec: 900   # how often each configured node runs one maintenance
+                            # pass: re-validate every binding, then reclaim
+                            # NetBox addresses nothing claims. Unset (or <= 0)
+                            # means 15 minutes. The sweep's leader lease is
+                            # derived from this value, so exactly one node
+                            # reclaims however many run the loop. Reclamation
+                            # needs a complete whole-cluster proof, so a longer
+                            # interval only delays it — it never weakens it.
+                            # See docs/networking.md, "Maintenance and
+                            # reclamation".
+  # Binding a network to a NetBox prefix requires the netbox_ipam_v1 latch, and the
+  # prefix must belong to a VRF with enforce_unique set. Global-table prefixes are
+  # refused, because NetBox does not expose the global uniqueness setting through a
+  # supported API.
+
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
 # LDAP realms are loaded into a Registry at startup; `Login` dispatches

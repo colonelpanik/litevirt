@@ -306,12 +306,65 @@ lv network create <name> --type bridge [flags]    # Create a network
   --subnet <cidr> [--dhcp]
   --pf <iface> --spoof-check                      # SR-IOV variants
   --project <name>                                # owning project (empty = global/shared)
+  --netbox-prefix-id <id>                         # bind to a NetBox prefix
 lv network rm <name> [--force]
 ```
 
 `--project` makes the network owned + isolated: only that project's workloads (or
 a root operator) may attach. Omit it for a global/shared network. `lv network ls`
 shows the owner. See `docs/tenancy.md`.
+
+`--netbox-prefix-id` binds the network to a NetBox prefix so VM NICs on it claim
+their address from NetBox. See `docs/networking.md#binding-a-network-to-netbox`
+for the preconditions (VRF with `enforce_unique`, the `netbox_ipam_v1` latch).
+
+## NetBox IPAM
+
+```bash
+lv netbox rekey <network>                         # re-stamp a bound network's identities under the current fingerprint
+lv netbox rekey                                   # re-stamp the mirrored inventory, cluster-wide
+lv netbox resume <network>                        # finish an owed adoption and lift a suspension
+```
+
+A bound network's binding is suspended when the NetBox prefix drifts out of what
+the bind validated, or when the cluster fingerprint stamped on every NetBox
+object litevirt owns no longer matches the one the binding recorded. New
+allocations then refuse while running VMs continue untouched. Replacing the
+cluster CA on disk does **not** move that fingerprint — it is minted once from
+the replicated `cluster` row, which nothing rewrites — so it does not produce
+this suspension.
+
+`lv netbox rekey <network>` is the moved-fingerprint case: it rewrites those identities under
+the current fingerprint and resumes the binding, and is safe to re-run. It covers
+the bound prefix's addresses, the mirrored VM and interface objects, and
+litevirt's local identity index — in that order. It resumes nothing while another
+drift is still present.
+
+`lv netbox rekey` with no network is the same operation for a cluster that
+mirrors inventory without binding a prefix, where there is no binding row to take
+the old fingerprint from. It re-stamps the mirrored objects and the local index
+only, deriving its pin from that index, and resumes nothing. With no old
+fingerprint recorded anywhere it refuses rather than re-stamping by any other
+rule. See `docs/networking.md#recovering-from-a-moved-cluster-fingerprint` for what the
+order buys and why the refusal matters.
+
+`lv netbox resume` is every other case, and it does two things rather than one:
+
+- it re-checks the bind-time preconditions and clears the suspension, refusing
+  while the drift is still there and never accepting a changed CIDR (re-CIDRing
+  a bound prefix is unsupported);
+- it **finishes any adoption the bind left owed** — the addresses this network's
+  guests already hold that NetBox has not been told about — and lifts the
+  suspension only once every one of them is recorded. That is what makes "re-run
+  to finish" true for a bind whose adoption stopped partway, and it is why a
+  resume is a NetBox *write* pass: it refuses while another pass or a re-key is
+  running on the same node.
+
+A binding suspended because the node could not corroborate its VM inventory
+lifts itself on the next NetBox maintenance pass; running this finishes it
+immediately instead. See `docs/networking.md#resuming-a-suspended-binding`,
+`docs/networking.md#adopting-the-addresses-guests-already-hold` and
+`docs/networking.md#recovering-from-a-moved-cluster-fingerprint`.
 
 ## Storage pools
 

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -98,6 +99,104 @@ func TestDeleteContainer_CascadesNICs(t *testing.T) {
 	if al, _ := network.GetAllocationFor(ctx, s.db, "net1", "ct", "test-host", "web"); al != nil {
 		t.Fatalf("CT lease must be released on delete, still held: %+v", al)
 	}
+}
+
+// TestDeleteContainer_ReleasesThroughTheOldLeaseShape is a REACHABILITY test,
+// and the thing it protects is a rolling upgrade.
+//
+// network.ReleaseLease is new: its owner-scoped, PK-keyed `UPDATE
+// ip_allocations` is a statement fingerprint the previous release's ledgers do
+// not carry, and a receiver that cannot place a fingerprint does not fail those
+// rows — it BACK-PRESSURES, stalling the whole replication stream. Today that is
+// safe only because every caller is a NetBox path: the netbox allocator, and the
+// two claim-release sites that need a bound network. Bound networks require the
+// netbox_ipam_v1 latch, which cannot form while a peer is on the old build.
+//
+// builtinAllocator.Release calls it too, and builtinAllocator is what
+// allocatorFor hands back for a CONTAINER on an unbound network — every
+// container in every existing deployment. Nothing calls Release on it today: the
+// container delete cascade tombstones leases directly, through
+// network.ReleaseContainerLeases, whose bulk owner-scoped shape the previous
+// release already accepts. Wiring the allocator in here instead — which reads
+// like a tidy-up — would emit the new shape from a completely ungated path.
+//
+// So pin the shape the cascade actually emits. This is the same class of finding
+// as the startup cluster-record heal, which shipped a first-ever `cluster`
+// statement shape on an ungated path and would have stalled every
+// not-yet-upgraded peer.
+func TestDeleteContainer_ReleasesThroughTheOldLeaseShape(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+	mkManagedNetwork(t, s, "net1", "br-test", "10.9.0.0/24")
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "web", Template: "download", Distro: "alpine",
+		Networks: []*pb.ContainerNetwork{{Name: "eth0", NetworkName: "net1"}},
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	if _, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: "web", HostName: "test-host"}); err != nil {
+		t.Fatalf("DeleteContainer: %v", err)
+	}
+
+	// Precondition: the lease really was released, so the assertions below are
+	// about HOW and not about a cascade that did nothing.
+	if al, _ := network.GetAllocationFor(ctx, s.db, "net1", "ct", "test-host", "web"); al != nil {
+		t.Fatalf("precondition: the CT lease must be released, still held: %+v", al)
+	}
+
+	wal := replicatedStatementsFor(t, s, "ip_allocations")
+	// ReleaseContainerLeases: bulk, owner-scoped, a shape the previous release
+	// already accepts. Errorf, not Fatalf, so one wrong wiring reports against
+	// both halves of the rule rather than only the first.
+	//
+	// THE WHOLE STATEMENT, not the WHERE clause on its own.
+	// TransferContainerLeases keys on the identical `owner_kind = 'ct' AND
+	// owner_host = ? AND vm_name = ? AND deleted_at IS NULL`, so a fragment
+	// assertion is satisfied by a migrate's re-home as readily as by a delete's
+	// tombstone — and would go on passing if the cascade stopped tombstoning at
+	// all. `SET deleted_at` is what makes this statement a release.
+	const releaseShape = "UPDATE ip_allocations SET deleted_at = ?, updated_at = ? " +
+		"WHERE owner_kind = 'ct' AND owner_host = ? AND vm_name = ? AND deleted_at IS NULL"
+	if !strings.Contains(wal, releaseShape) {
+		t.Errorf("the container delete cascade must tombstone leases through the bulk "+
+			"owner-scoped shape the previous release accepts (%s); the ip_allocations statements "+
+			"it replicated were:\n%s", releaseShape, wal)
+	}
+	// ReleaseLease: PK-keyed, and NEW at this release.
+	if strings.Contains(wal, "AND ip = ? AND mac = ?") {
+		t.Errorf("the container delete cascade emitted network.ReleaseLease's shape. It is new at "+
+			"this release and the container path is UNGATED, so every peer still on the previous "+
+			"build would back-pressure its whole replication stream. Tombstone through "+
+			"network.ReleaseContainerLeases, or gate the path.\n%s", wal)
+	}
+}
+
+// replicatedStatementsFor is every statement this server logged for replication
+// that names table, with the WAL's JSON escaping undone and every run of
+// whitespace collapsed to one space, so an assertion can name a WHOLE statement
+// on one line however the builder wrapped it. Scoped to one table so a failure
+// names the writes in question instead of the whole log.
+//
+// Whole statements are the point: several ip_allocations builders share a WHERE
+// clause, so a fragment cannot tell a tombstone from a re-home.
+func replicatedStatementsFor(t *testing.T, s *Server, table string) string {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(), `SELECT stmts FROM mutation_log ORDER BY seq`)
+	if err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	var matched []string
+	for _, r := range rows {
+		stmts := r.String("stmts")
+		stmts = strings.ReplaceAll(stmts, `\n`, " ")
+		stmts = strings.ReplaceAll(stmts, `\t`, " ")
+		stmts = strings.Join(strings.Fields(stmts), " ")
+		if strings.Contains(stmts, table) {
+			matched = append(matched, stmts)
+		}
+	}
+	return strings.Join(matched, "\n")
 }
 
 // A VM and a CT of the same name on one network get DISTINCT leases, and

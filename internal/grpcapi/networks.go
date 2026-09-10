@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -70,13 +71,92 @@ func (s *Server) CreateNetwork(ctx context.Context, req *pb.CreateNetworkRequest
 		def.Interface = req.Name
 	}
 
+	// A NetBox bind is validated and CLAIMED before the network is persisted at
+	// all: the binding row and the network's config blob must agree, and a
+	// failed bind must abort the create rather than leave a network whose
+	// config names a prefix nothing actually reserved.
+	if req.NetboxPrefixId != 0 {
+		if err := s.validateAndBindPrefix(ctx, req.Name, int(req.NetboxPrefixId), def); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		def.NetBoxPrefixID = int(req.NetboxPrefixId)
+	}
+
 	ni, err := s.provisionAndPersistNetwork(ctx, req.Name, "", project, def)
 	if err != nil {
+		// The claim was taken before the network row existed. If the row never
+		// landed, release the prefix: a binding with no network behind it is
+		// invisible to every operator command, blocks the prefix against any
+		// future bind, and could previously only be cleared by hand in the DB.
+		// Past that stage the network DOES exist — its binding belongs to it
+		// until DeleteNetwork releases it, even though this create failed.
+		var np *networkNotPersistedError
+		heldPrefix := 0
+		if def.NetBoxPrefixID != 0 && errors.As(err, &np) {
+			if relErr := corrosion.DeleteBinding(ctx, s.db, def.NetBoxPrefixID); relErr != nil {
+				// Surface the create failure, not this one — but SAY the prefix
+				// is still held, in the error the operator actually sees. A log
+				// line on one node is not where they will look, and a prefix
+				// that stays claimed refuses every future bind of it with a
+				// message about a network that does not exist.
+				slog.Warn("failed to release NetBox binding after a failed network create",
+					"network", req.Name, "prefix_id", def.NetBoxPrefixID, "error", relErr)
+				heldPrefix = def.NetBoxPrefixID
+			}
+		}
+		if heldPrefix != 0 {
+			return nil, status.Errorf(codes.Internal,
+				"provision network: %v (NetBox prefix %d is STILL BOUND — its release also failed; clear it by hand before rebinding that prefix)",
+				err, heldPrefix)
+		}
 		return nil, status.Errorf(codes.Internal, "provision network: %v", err)
 	}
 
+	// The network row exists, so the event and the audit entry are facts
+	// whatever the adoption below does. Emitted BEFORE it, deliberately: an
+	// adoption that fails still leaves a created network, and a create with no
+	// trail is exactly the shape an operator cannot reconstruct afterwards.
 	s.publish("network.created", req.Name, fmt.Sprintf("type=%s", ntype))
 	s.audit(ctx, "network.create", req.Name, "project="+project, "ok")
+
+	// ADOPT the addresses guests already hold inside the newly-bound prefix, and
+	// resume the binding only if every one of them landed. validateAndBindPrefix
+	// left the binding SUSPENDED when there was anything to adopt, so until this
+	// finishes the network exists and serves no claim — which is the fail-closed
+	// half: an un-adopted address is one NetBox would hand to the next VM.
+	//
+	// It runs HERE, after the network row, rather than inside the bind: a
+	// refusal has to leave a binding an operator can finish with
+	// `lv netbox resume`, and a binding whose network never landed is invisible
+	// to every operator command while still blocking the prefix. The cost of
+	// that ordering is an RPC that reports failure over a network that exists,
+	// so the message has to say so.
+	if def.NetBoxPrefixID != 0 {
+		if aerr := s.finishAdoptionAndResume(ctx, req.Name, def.NetBoxPrefixID); aerr != nil {
+			if errors.Is(aerr, errAdoptionUncorroborated) {
+				// The one suspension with NO cause to repair: this node simply
+				// could not establish what its guests already hold, and a
+				// revalidation pass lifts it by itself. Reported rather than
+				// swallowed — a network that serves no claims is not a silent
+				// success — but without the "repair the cause" the other
+				// branch's message ends on, which would send an operator
+				// looking for a fault that does not exist.
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"network %q was created and its NetBox binding for prefix %d is SUSPENDED, so "+
+						"it serves no address claims yet: %v",
+					req.Name, def.NetBoxPrefixID, aerr)
+			}
+			code := codes.Internal
+			if adoptionRefused(aerr) {
+				code = codes.FailedPrecondition
+			}
+			return nil, status.Errorf(code,
+				"network %q was created and its NetBox binding for prefix %d is SUSPENDED, so it "+
+					"serves no address claims yet: %v. Repair the cause, then finish with "+
+					"`lv netbox resume %s` (or delete the network to release the prefix)",
+				req.Name, def.NetBoxPrefixID, aerr, req.Name)
+		}
+	}
 	return ni, nil
 }
 
@@ -153,7 +233,51 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 		return nil, status.Errorf(codes.Internal, "delete network: %v", err)
 	}
 
+	// Release the NetBox prefix. A network that no longer exists must not keep
+	// holding one: the binding is what refuses every future bind of that prefix,
+	// and nothing else in the system would ever release it.
+	//
+	// The network is ALREADY GONE by this point, so the event and the audit
+	// entry are facts whether or not the release succeeds — emitting them only
+	// on the happy path left the one failure an operator most needs a trail for
+	// (a deleted network whose prefix is still bound) as the one delete with no
+	// audit row at all. Emit both, then report the failure.
+	//
+	// And it is NOT retryable, which is the one thing these messages have to
+	// say. The soft delete above has already landed, so GetNetwork answers
+	// NotFound and re-running this command refuses before it reaches the release
+	// at all. What is left is a binding row naming a network that no longer
+	// exists, refusing every future bind of that prefix, and no command deletes
+	// one on its own — so the messages name the prefix and say the release has
+	// to be finished by hand rather than implying a second attempt would do it.
+	relErr := func() error {
+		b, err := corrosion.GetBindingByNetwork(ctx, s.db, req.Name)
+		if err != nil {
+			return status.Errorf(codes.Internal,
+				"network %q was deleted, but reading its NetBox binding failed, so the binding "+
+					"may still hold a prefix: %v. Re-running the delete cannot finish this — the "+
+					"network record is already gone and the command will answer NotFound. Check "+
+					"for a binding naming %q and release it by hand", req.Name, err, req.Name)
+		}
+		if b == nil {
+			return nil
+		}
+		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
+			return status.Errorf(codes.Internal,
+				"network %q was deleted, but releasing its NetBox prefix %d failed: %v. "+
+					"Re-running the delete cannot finish this — the network record is already "+
+					"gone and the command will answer NotFound. Prefix %d stays bound and will "+
+					"refuse every future bind until the binding is released by hand",
+				req.Name, b.PrefixID, err, b.PrefixID)
+		}
+		return nil
+	}()
+
 	s.publish("network.deleted", req.Name, "")
+	if relErr != nil {
+		s.audit(ctx, "network.delete", req.Name, "netbox binding release failed: "+relErr.Error(), "error")
+		return nil, relErr
+	}
 	s.audit(ctx, "network.delete", req.Name, "", "ok")
 	return &emptypb.Empty{}, nil
 }
@@ -227,6 +351,15 @@ func (s *Server) ListNetworks(ctx context.Context, _ *emptypb.Empty) (*pb.ListNe
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
+// networkNotPersistedError marks the ONE stage of provisionAndPersistNetwork
+// that runs before the network row lands. Callers that took a resource claim on
+// the network's behalf (a NetBox prefix binding) compensate on this error and
+// only this one: past it the network exists, and owns what was claimed for it.
+type networkNotPersistedError struct{ err error }
+
+func (e *networkNotPersistedError) Error() string { return "persist network: " + e.err.Error() }
+func (e *networkNotPersistedError) Unwrap() error { return e.err }
+
 // provisionAndPersistNetwork persists the network record to Corrosion first,
 // then provisions the infrastructure. Persisting first ensures that if the
 // config changes (e.g., bridge → direct), the new config is replicated to all
@@ -245,7 +378,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 		Config:    string(cfgJSON),
 		Project:   project, // "" = global/shared
 	}); err != nil {
-		return nil, fmt.Errorf("persist network: %w", err)
+		return nil, &networkNotPersistedError{err: err}
 	}
 
 	localIP := getLocalIP()
@@ -282,7 +415,29 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
-	return corrosion.DeleteNetwork(ctx, s.db, name)
+	if err := corrosion.DeleteNetwork(ctx, s.db, name); err != nil {
+		return err
+	}
+
+	// Release the NetBox prefix, exactly as DeleteNetwork does. A binding that
+	// outlives its network names something no operator command can see, and it
+	// refuses every future bind of that prefix forever — recoverable only by
+	// hand. Fail closed: report the leak rather than returning success.
+	b, err := corrosion.GetBindingByNetwork(ctx, s.db, name)
+	if err != nil {
+		return fmt.Errorf("network %q was deleted, but reading its NetBox binding failed, so the "+
+			"binding may still hold a prefix: %w. The network record is already gone, so a second "+
+			"deprovision cannot finish this — release any binding naming %q by hand", name, err, name)
+	}
+	if b != nil {
+		if err := corrosion.DeleteBinding(ctx, s.db, b.PrefixID); err != nil {
+			return fmt.Errorf("network %q was deleted, but releasing its NetBox prefix %d failed: %w. "+
+				"The network record is already gone, so a second deprovision cannot finish this — "+
+				"prefix %d stays bound and will refuse every future bind until the binding is "+
+				"released by hand", name, b.PrefixID, err, b.PrefixID)
+		}
+	}
+	return nil
 }
 
 // networkRecordToInfo converts a corrosion.NetworkRecord to a pb.NetworkInfo.

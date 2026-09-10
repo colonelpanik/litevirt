@@ -463,6 +463,18 @@ var capabilityMap = map[string]tableResolver{
 	// v47 cluster CRL. Append-only; the composite key includes the signed PEM, so
 	// a hash-squatting row cannot conflict with the genuine row.
 	"cluster_crl": {category: "content", chain: contentDefaultChain()},
+	// v51 NetBox IPAM. netbox_bindings (a bound prefix) and netbox_objects (the
+	// litevirt<->NetBox identity map) are plain scalar cluster facts, no opaque
+	// blob, tenancy, or runtime-ownership column — same treatment as
+	// ip_allocations/resource_mappings: tombstone-first, then content-max.
+	"netbox_bindings": {category: "content", chain: contentDefaultChain()},
+	"netbox_objects":  {category: "content", chain: contentDefaultChain()},
+	// netbox_host_config is one scalar per host, written only by that host, so a
+	// tie can only be that host racing itself — the default chain settles it.
+	// Deliberately NOT ruleAnyColUnresolved: a tie left unresolved would stop
+	// the mirror on a value the owning node is the only writer of, which is a
+	// worse answer than picking one of two values that node itself produced.
+	"netbox_host_config": {category: "content", chain: contentDefaultChain()},
 }
 
 // resolveTiePath labels which replication path observed a tie (for metrics).

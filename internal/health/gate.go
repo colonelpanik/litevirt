@@ -80,7 +80,7 @@ const (
 	ReasonWarmup                = "warmup"
 	ReasonSelfFenced            = "self_fenced"       // this node self-fenced; refuses decide/execute until it reboots
 	ReasonOwnershipDispute      = "ownership_dispute" // the workload has an active ownership condition; automated recovery must not add a holder
-	ReasonHardwareBlocked       = "hardware_blocked" // hardware_v2 pre-start refused an automated (re)start (blocked adoption / unacquirable passthrough)
+	ReasonHardwareBlocked       = "hardware_blocked"  // hardware_v2 pre-start refused an automated (re)start (blocked adoption / unacquirable passthrough)
 )
 
 // GateResult is the outcome of a gate check. Reason is set (from the closed
@@ -104,6 +104,19 @@ func votingEligible(state string) bool {
 	}
 	return true
 }
+
+// VotingEligible is votingEligible, exported for callers outside this package
+// that need "is this host live" and must not invent a fourth answer to it.
+//
+// The NetBox cluster-name uniformity check is one: it compares each live host's
+// published configuration, and a host that is down, in maintenance or fenced
+// must not be able to stop the inventory mirror forever by holding a stale
+// value. It deliberately does NOT use HealthyPeers for that, which additionally
+// requires a successful probe THIS run — that answer differs per node and is
+// empty on a freshly started daemon, so two nodes would disagree about who is
+// live and a restart would briefly count nobody. This predicate is cluster
+// STATE, so every node computes the same set.
+func VotingEligible(state string) bool { return votingEligible(state) }
 
 // QuorumProof computes whether this daemon currently sees a live voting majority,
 // using its OWN probe results. Returns the tri-state plus the live/needed counts

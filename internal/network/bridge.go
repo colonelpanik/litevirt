@@ -15,6 +15,50 @@ func BridgeExists(name string) bool {
 	return err == nil
 }
 
+// BridgeHasUplink reports whether bridge has anything enslaved that could carry
+// traffic OFF this host.
+//
+// It is the fact that separates the two bridges "the bridge exists here" cannot
+// tell apart:
+//
+//   - an INFRASTRUCTURE bridge an operator built — it enslaves a NIC, a bond, a
+//     VLAN sub-interface or another bridge, so a guest on it reaches the router
+//     that owns the subnet. This is the documented remedy for a bound network
+//     litevirt must not serve DHCP on, and it works;
+//   - a bridge LITEVIRT created because a placement asked for one. It holds
+//     nothing but guest taps. A guest on it has no gateway and no route off the
+//     host, while holding an address NetBox believes is routable — which is why
+//     the health finding must not clear just because such a bridge appeared.
+//
+// A member counts as an uplink if sysfs says it is attached to hardware
+// (`device/`), is a bond (`bonding/`), is stacked on another interface
+// (`lower_*` — a VLAN sub-interface, macvlan, or a tunnel with a link), or is
+// itself a bridge. A guest tap has none of those.
+//
+// FAIL CLOSED: a bridge that does not exist, or whose sysfs cannot be read, has
+// no uplink as far as this function is concerned. The caller's finding then
+// stays up, which is the direction that keeps a misconfiguration visible.
+//
+// THE FALSE-POSITIVE SET IS WIDER THAN THAT, and the extra case arrives through
+// sysfsParent: it answers only for a member with EXACTLY ONE `lower_*` link (see
+// there for why), so a member stacked on SEVERAL reads as no uplink here. A team
+// device is the ordinary example — it has no `device/`, no `bonding/` and no
+// `bridge/`, so nothing else in the disjunction above catches it either, and a
+// bridge whose only member is a team therefore reports no uplink while carrying
+// traffic off the host. The cost is a health finding that will not clear on a
+// correctly built host, whose named remedy (give the bridge an uplink) is
+// already done. Widening sysfsParent is not the fix — its other caller needs the
+// unambiguous answer — so closing this means a separate "is this member stacked
+// on anything at all" predicate.
+func BridgeHasUplink(bridge string) bool {
+	for _, m := range bridgeMembers(bridge) {
+		if isPhysicalNIC(m) || isBond(m) || isBridgeIface(m) || sysfsParent(m) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // EnsureBridge idempotently creates a Linux bridge and brings it up.
 // If the bridge already exists, this is a no-op.
 func EnsureBridge(name string) error {
@@ -45,10 +89,28 @@ func VLANInterfaceName(parent string, vlanID int) string {
 	return fmt.Sprintf("%s.%d", parent, vlanID)
 }
 
+// sysfsNet is where the interface topology below is read from. It is a variable
+// only so a test can point the five helpers at a temp tree: BridgeHasUplink's
+// answer decides a health finding, and letting the real host answer would make
+// the test depend on which interfaces the machine running it happens to carry.
+// Production never reassigns it.
+var sysfsNet = "/sys/class/net"
+
 // sysfsParent returns the parent interface name by reading
 // /sys/class/net/<iface>/lower_* entries. Returns "" if no parent.
+//
+// EXACTLY ONE `lower_*` or nothing, deliberately: resolveVLANParent walks this
+// upwards to find the single interface a VLAN should be created on, and a device
+// with several lowers has no single answer to give it — returning an arbitrary
+// leg would silently build the VLAN over the wrong one.
+//
+// BridgeHasUplink borrows the same call as a cheap "is this member stacked on
+// something", and inherits the restriction as a FALSE NEGATIVE: a team device,
+// or anything else carrying two or more lowers, answers "" and so reads as no
+// uplink. Fail-closed for that finding, but a finding that then cannot be
+// cleared — see BridgeHasUplink.
 func sysfsParent(iface string) string {
-	entries, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/lower_*", iface))
+	entries, _ := filepath.Glob(fmt.Sprintf("%s/%s/lower_*", sysfsNet, iface))
 	if len(entries) == 1 {
 		return strings.TrimPrefix(filepath.Base(entries[0]), "lower_")
 	}
@@ -57,25 +119,25 @@ func sysfsParent(iface string) string {
 
 // isBond returns true if the interface is a bond (has /sys/class/net/<iface>/bonding/).
 func isBond(iface string) bool {
-	_, err := os.Stat(fmt.Sprintf("/sys/class/net/%s/bonding", iface))
+	_, err := os.Stat(fmt.Sprintf("%s/%s/bonding", sysfsNet, iface))
 	return err == nil
 }
 
 // isPhysicalNIC returns true if the interface is a physical NIC (has /sys/class/net/<iface>/device/).
 func isPhysicalNIC(iface string) bool {
-	_, err := os.Stat(fmt.Sprintf("/sys/class/net/%s/device", iface))
+	_, err := os.Stat(fmt.Sprintf("%s/%s/device", sysfsNet, iface))
 	return err == nil
 }
 
 // isBridgeIface returns true if the interface is a bridge (has /sys/class/net/<iface>/bridge/).
 func isBridgeIface(iface string) bool {
-	_, err := os.Stat(fmt.Sprintf("/sys/class/net/%s/bridge", iface))
+	_, err := os.Stat(fmt.Sprintf("%s/%s/bridge", sysfsNet, iface))
 	return err == nil
 }
 
 // bridgeMembers returns the interfaces attached to a bridge via /sys/class/net/<bridge>/brif/.
 func bridgeMembers(bridge string) []string {
-	entries, _ := filepath.Glob(fmt.Sprintf("/sys/class/net/%s/brif/*", bridge))
+	entries, _ := filepath.Glob(fmt.Sprintf("%s/%s/brif/*", sysfsNet, bridge))
 	members := make([]string, 0, len(entries))
 	for _, e := range entries {
 		members = append(members, filepath.Base(e))

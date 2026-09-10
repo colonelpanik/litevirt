@@ -24,6 +24,8 @@ import (
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/netbox"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -51,6 +53,96 @@ type Server struct {
 	images     *image.Store
 	events     *events.Bus
 	webhookURL string // optional; fired on every publish() call
+
+	// netbox is the NetBox IPAM REST client, wired by the daemon from config
+	// once netbox_ipam_v1 is configured on this node. nil by default (every
+	// bare test server, and any node with no NetBox binding) — a claimSet with
+	// a non-zero NetBoxID and a nil client is a programming error, and
+	// releaseAll treats it as a failed release (logged + enqueued for the
+	// orphan sweep) rather than dereferencing a nil pointer.
+	netbox *netbox.Client
+
+	// netboxClusterName overrides the NetBox cluster this installation mirrors
+	// into (config `netbox.cluster_name`). Empty means "use the local cluster
+	// name" — see netboxsync.ClusterName, which is the single place that
+	// resolves it for both the mirror and the CA re-key.
+	netboxClusterName string
+
+	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
+	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
+	// claim or a sweep behaves differently.
+	nbMetricsSink netboxMetrics
+
+	// nbLeaseProbe replaces the lease READ the inventory mirror re-validates
+	// before each write batch. nil in production; see SetNetBoxLeaseProbe.
+	nbLeaseProbe func(context.Context) bool
+
+	// nicIPDiscovery replaces the ARP / dnsmasq-lease lookup every discovery
+	// path uses to find the address a MAC is answering on. nil in production;
+	// see SetNICIPDiscovery.
+	nicIPDiscovery func(mac string) string
+
+	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
+	// consecutive-blocked-pass state for the NetBox health evaluator, which
+	// cannot read a Prometheus counter in-process. Written only by the sweep,
+	// which runs under the `netbox` leader lease; the mutex is for the -race
+	// detector, since a test may drive a pass from another goroutine.
+	// See netbox_health.go for why the streak is deliberately per-process.
+	nbSweepMu           sync.Mutex
+	nbSweepUnreachable  bool
+	nbUnreachableStreak int
+
+	// nbDiscRefused is the set of VMs on THIS host whose discovered address
+	// NetBox would not grant, keyed by VM name, valued by the operator-facing
+	// detail. Written by the IP scanner's 30-second tick (refuseDiscovery) and
+	// cleared the moment the same address is claimed successfully; read by the
+	// revalidation pass, which folds it into a health condition.
+	//
+	// Per-process and in-memory for the reason the sweeper's streak is: the
+	// observation is a HOST-LOCAL runtime fact about a guest on this host, so no
+	// other node can make it and no row could be merged from one that tried. A
+	// restart forgets it, and the next scanner tick re-derives it within 30
+	// seconds — which is the safe direction for a warning, and much shorter than
+	// the pass that reports it.
+	nbDiscMu      sync.Mutex
+	nbDiscRefused map[string]string
+
+	// nbPassMu admits ONE NetBox write pass at a time on this node: a
+	// maintenance pass (revalidate + orphan sweep), an inventory mirror pass, or
+	// a CA re-key.
+	//
+	// The `netbox` leader lease is the CROSS-node half of that exclusion and was
+	// mistaken for the whole of it. It names the NODE, so on the node that holds
+	// it every one of those three passes reads "ours" — the re-key even RENEWS
+	// it under the same holder — and the mirror's 15-minute tick and 60-second
+	// queue poll can run straight through a re-key that is rewriting the very
+	// identities they filter actual state on. This is the intra-node half.
+	//
+	// A zero-value mutex, deliberately: several tests build a Server literal, and
+	// a gate that needed initialising would be nil on exactly those paths. Held
+	// with TryLock, never Lock — an operator's re-key must be told a pass is in
+	// flight, not hang behind one, and a background pass that finds the gate
+	// taken has a next tick.
+	nbPassMu sync.Mutex
+
+	// onProofCollected and onProofsGathered are ORPHAN-SWEEPER TEST SEAMS,
+	// documented at their setters. Both are nil in production and are the only
+	// way a test can reach the two windows the sweeper's safety rests on: a
+	// membership change landing between the two host samples, and a host that
+	// answers nothing at all without failing.
+	onProofCollected func()
+	onProofsGathered func(map[string]OrphanProof)
+
+	// onInventoryRead is an ADOPTION-PLAN TEST SEAM, run immediately after the
+	// local VM enumeration a plan is built from, so a scenario can land a
+	// replicated row inside the exact window the plan's snapshot binding
+	// defends. nil in production. See SetOnInventoryRead.
+	onInventoryRead func()
+
+	// onMaintenanceTick is a MAINTENANCE-LOOP TEST SEAM: it fires after each
+	// completed tick, so a test can observe the CADENCE the loop actually runs
+	// at without a database behind it. nil in production.
+	onMaintenanceTick func()
 
 	version   string // build version, reported via Ping and ListHosts
 	dnsDomain string // DNS domain for VM record names (e.g. "litevirt.local")
@@ -118,6 +210,31 @@ type Server struct {
 	// enfOperationProtocol is this node's kill-switch for relying on the v41 F1
 	// operation protocol; gated by this flag AND the OperationProtocolV1 latch.
 	enfOperationProtocol bool
+	// enfNetBoxIPAM gates ADVERTISEMENT of netbox_ipam_v1: the token is advertised
+	// only while this flag is set (like operation_protocol), so it can latch only
+	// once every node has opted in. An older binary does not parse the
+	// NetBoxPrefixID field on a network definition at all and would silently
+	// allocate from the builtin allocator across the whole prefix, so replicated
+	// state alone cannot make a bound prefix safe — the latch requires config
+	// uniformity, not just a uniform build. Default false; the flag is the
+	// reversible kill switch.
+	enfNetBoxIPAM bool
+	// enfNetBoxMirror gates ADVERTISEMENT of netbox_mirror_v1 AND the mirror's own
+	// decision to run. It is `netbox.mirror_inventory`, default false: NetBox is
+	// pure IPAM unless an operator asks for the inventory mirror as well.
+	//
+	// Advertised only while this flag is set, like netbox_ipam_v1, because "this
+	// installation mirrors its inventory" is a CLUSTER-WIDE fact: the sweep runs
+	// on whichever node holds the `netbox` leader lease, so a value set on some
+	// nodes only makes the inventory appear and disappear with leadership, and
+	// leaves every object the mirroring node created to a successor that never
+	// reaps it. Withholding advertisement is what makes the latch require config
+	// uniformity rather than merely a uniform build.
+	//
+	// It gates the DECISION too, not only the advertisement: a latch is monotone
+	// and durable, so if the flag stopped mattering once netbox_mirror_v1 formed
+	// the mirror could never be turned off again. See netboxMirrorAuthorized.
+	enfNetBoxMirror bool
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
@@ -199,6 +316,16 @@ type Server struct {
 	// Production leaves it nil, preserving the net.InterfaceByName +
 	// network.EnsureBridge validation path.
 	bridgeEnsure func(name string) error
+
+	// bridgeExists is a test seam for "does this bridge already exist on this
+	// host". Production leaves it nil, preserving network.BridgeExists.
+	bridgeExists func(name string) bool
+
+	// bridgeUplink is a test seam for "does this bridge carry anything off this
+	// host". Production leaves it nil, preserving network.BridgeHasUplink. Like
+	// bridgeExists it decides a health finding, so a test that let the real host
+	// answer would depend on which interfaces the test machine happens to have.
+	bridgeUplink func(name string) bool
 
 	// probeHolder is a test seam for the Phase-2 VIP takeover check: when non-nil it
 	// replaces the real fresh-probe of a peer holder's (reachable, supports, assigned)
@@ -482,6 +609,23 @@ func (s *Server) advertisedCapabilities() []string {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
+	// netbox_ipam_v1 is likewise advertised CONDITIONALLY on its config flag. An
+	// older binary does not parse the NetBoxPrefixID field on a network
+	// definition at all, and would silently allocate from the builtin allocator
+	// across the whole prefix — every node observing the same replicated binding
+	// is not the same thing as every node INTERPRETING it, so the latch requires
+	// CONFIG uniformity, not just a uniform build.
+	if !s.enfNetBoxIPAM {
+		caps = withoutCapability(caps, capabilities.NetBoxIPAMV1)
+	}
+	// netbox_mirror_v1 is conditional on the SEPARATE mirror opt-in, so the two
+	// halves of the integration latch independently: a pure-IPAM cluster
+	// advertises netbox_ipam_v1 and never this one. A cluster that latched this
+	// token across a node whose flag is off would have its inventory rewritten
+	// only while that node was not the `netbox` lease holder.
+	if !s.enfNetBoxMirror {
+		caps = withoutCapability(caps, capabilities.NetBoxMirrorV1)
+	}
 	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
 	// a peer outright, and a node that isn't enforcing would keep accepting the
 	// isolated node's state and re-inject it — so the latch requires CONFIG
@@ -563,6 +707,13 @@ type serverGate interface {
 	// Ping). The HA monitor's bounded latch-driver uses it to skip already-latched
 	// tokens so it drives at most one unlatched token per cycle.
 	Latched(token string) bool
+	// DurablyLatched is the STRONGER form of Latched: the latch must be active
+	// in memory AND persisted to its durable marker. A contract whose safety
+	// must survive a restart — like binding a network to a NetBox prefix, where
+	// a node that latched only in memory would, after a reboot that reloads no
+	// marker, revert to allocating from the builtin allocator across an
+	// already-bound prefix — gates on this, not Latched.
+	DurablyLatched(token string) bool
 	// PeerSupportsFresh fresh-Pings peer (UNcached) and reports whether it advertises
 	// token — used before stamping/forwarding a proof-bearing action, so a
 	// regressed/replaced target that can't honor the proof is never sent one.
@@ -599,6 +750,47 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
+// enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node
+// changes nothing until every node has opted in and the token has latched.
+func (s *Server) SetNetBoxIPAM(on bool) { s.enfNetBoxIPAM = on }
+
+// SetNetBoxMirrorInventory sets this node's `netbox.mirror_inventory` opt-in
+// (see enfNetBoxMirror). Default false — NetBox is pure IPAM. It must be set
+// before StartNetBoxMirror, which declines outright on a node that has not
+// opted in, and it stays the reversible kill switch after netbox_mirror_v1 has
+// latched.
+func (s *Server) SetNetBoxMirrorInventory(on bool) { s.enfNetBoxMirror = on }
+
+// SetBridgeEnsure injects the host-bridge test seam (see bridgeEnsure): a
+// rootless harness cannot create a real bridge, so it substitutes a no-op.
+func (s *Server) SetBridgeEnsure(fn func(name string) error) { s.bridgeEnsure = fn }
+
+// SetBridgeExists injects the "does this bridge already exist here" seam (see
+// bridgeExists). It is the host-local fact the NetBox bind-time DHCP refusal
+// reads, so a test that exercises that refusal must fix it rather than inherit
+// whatever interfaces the machine running the test happens to have.
+func (s *Server) SetBridgeExists(fn func(name string) bool) { s.bridgeExists = fn }
+
+// SetBridgeHasUplink injects the "does this bridge carry anything off the host"
+// seam (see bridgeUplink). It is the fact that tells an operator's
+// infrastructure bridge from one litevirt auto-created for a placement, and it
+// decides whether the netbox_dhcp_would_race finding may clear.
+func (s *Server) SetBridgeHasUplink(fn func(name string) bool) { s.bridgeUplink = fn }
+
+// SetNetBoxClient wires the NetBox REST client the daemon builds from config.
+// nil (the default) means every NetBox-dependent path refuses: binding a
+// network to a prefix, and claiming from a bound one. The kill-switch above and
+// this client are set together — a node whose config enables the integration
+// but whose client failed to construct must not advertise the token.
+func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
+
+// SetNetBoxClusterName sets the NetBox cluster override (see
+// netboxClusterName). It must be set before the mirror starts: the name decides
+// which cluster object every mirrored VM hangs off, and changing it later
+// strands everything written under the previous one.
+func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name }
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
@@ -760,6 +952,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfOwnerEpoch
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
+	case capabilities.NetBoxIPAMV1:
+		return s.enfNetBoxIPAM
+	case capabilities.NetBoxMirrorV1:
+		return s.enfNetBoxMirror
 	default:
 		return false
 	}
@@ -1379,3 +1575,158 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 // SetContainersRoot tells the runtime-inventory collector where per-container
 // owner-epoch markers live (the same root the container checker converges).
 func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }
+
+// netboxMetrics is every counter the NetBox IPAM paths emit. It is one
+// interface rather than several because the sink is one object; a caller that
+// only needs IncAPIError still passes the whole thing (the allocator's own
+// narrower interface is satisfied structurally).
+//
+// IncSweepSkipped takes a BOUNDED reason label, never a raw error string: the
+// error text carries addresses and host names, and a Prometheus label with
+// unbounded cardinality is a cluster-wide memory bug, not a diagnostic. The
+// full error is logged instead.
+type netboxMetrics interface {
+	IncAPIError(netbox.ErrClass)
+	IncSweepSkipped(reason string)
+	IncOrphansReclaimed()
+	IncStuckLease()
+	// IncBindingSuspended counts one binding taken out of service AND LEFT
+	// THERE — by revalidation drift, or by a bind-time adoption that could not
+	// finish. Suspension is otherwise silent to anything but a log line: it
+	// produces no error, no deletion, and no change a running workload can feel
+	// — the first symptom is a create refusing, long after the fact.
+	//
+	// The suspension a SUCCESSFUL bind takes while it adopts existing addresses
+	// is deliberately not counted here; it is lifted inside the same RPC, and
+	// this counter is one operators alert on the rate of.
+	IncBindingSuspended()
+	// IncAmbiguousClaim counts one claim resolved by lookup because the POST's
+	// outcome could not be read off the response. Emitted by the allocator, not
+	// by this package — it is declared here because the whole sink is passed to
+	// it (network.apiErrorCounter is the narrower structural view).
+	IncAmbiguousClaim()
+	// IncUnclaimableDiscovery counts one address a guest was discovered USING
+	// that litevirt declined to record, because NetBox would not grant it on a
+	// bound network. Takes a BOUNDED reason, for the same cardinality reason as
+	// IncSweepSkipped.
+	//
+	// It is the only outward sign of the one collision litevirt cannot prevent:
+	// an external DHCP server handing a guest an address NetBox has already
+	// given to something else. Nothing repairs it automatically, and the address
+	// stays absent from the NIC row rather than being recorded as one litevirt
+	// holds — so without this counter the state is a log line and nothing else.
+	IncUnclaimableDiscovery(reason string)
+	// IncDuplicateObject counts one NetBox object found duplicated for a single
+	// litevirt identity, and deleted by the mirror. Emitted by
+	// internal/netboxsync, not by this package — declared here for the same
+	// reason as IncAmbiguousClaim: the whole sink is what gets passed on, and a
+	// second sink would be a second thing the daemon could forget to wire.
+	IncDuplicateObject()
+	// The inventory mirror's own observability, emitted by internal/netboxsync
+	// and declared here for the same reason: this whole sink is what gets passed
+	// to it. IncMirrorObject counts one NetBox object the mirror wrote, by object
+	// kind and operation; IncMirrorSweep counts one sweep by result; and
+	// SetMirrorLastSuccess records when a sweep last SUCCEEDED, which is the
+	// staleness signal an operator alerts on.
+	IncMirrorObject(kind, op string)
+	IncMirrorSweep(result string)
+	SetMirrorLastSuccess(t time.Time)
+}
+
+// noopNetBoxMetrics is what an UNWIRED sink resolves to — every bare test
+// server, and any node with no NetBox configuration. The real sink is
+// metrics.NewNetBoxMetrics(), wired by the daemon.
+//
+// Classification is used for metrics ONLY — never to decide whether a remote
+// write happened — so discarding it changes no outcome.
+type noopNetBoxMetrics struct{}
+
+func (noopNetBoxMetrics) IncAPIError(netbox.ErrClass) {}
+func (noopNetBoxMetrics) IncSweepSkipped(string)      {}
+func (noopNetBoxMetrics) IncOrphansReclaimed()        {}
+func (noopNetBoxMetrics) IncStuckLease()              {}
+func (noopNetBoxMetrics) IncBindingSuspended()        {}
+func (noopNetBoxMetrics) IncAmbiguousClaim()          {}
+func (noopNetBoxMetrics) IncDuplicateObject()         {}
+
+func (noopNetBoxMetrics) IncUnclaimableDiscovery(string) {}
+
+func (noopNetBoxMetrics) IncMirrorObject(_, _ string)    {}
+func (noopNetBoxMetrics) IncMirrorSweep(string)          {}
+func (noopNetBoxMetrics) SetMirrorLastSuccess(time.Time) {}
+
+// SetNetBoxMetrics wires the NetBox counter sink (nil restores the noop).
+func (s *Server) SetNetBoxMetrics(m netboxMetrics) { s.nbMetricsSink = m }
+
+// nbMetrics is the nil-safe accessor. Every emit site goes through it so an
+// unwired sink can never panic a sweep midway through — the point at which a
+// panic would leave a half-finished reclamation.
+func (s *Server) nbMetrics() netboxMetrics {
+	if s.nbMetricsSink == nil {
+		return noopNetBoxMetrics{}
+	}
+	return s.nbMetricsSink
+}
+
+// allocatorFor picks the allocator for one workload on one network, and hands
+// back the binding the claim request needs.
+//
+// Selection is by workload kind AND binding together, never by binding alone:
+//
+//	VM        + unbound  -> nil, nil, nil  (NO allocation — today's behaviour)
+//	VM        + bound    -> netbox
+//	Container + unbound  -> builtin
+//	Container + bound    -> refused
+//
+// A nil allocator with a nil error is not "nothing to do here" by omission: VMs
+// have never allocated (network.AllocateIP had no non-test callers), so handing
+// an unbound VM NIC the builtin allocator would newly address every VM on every
+// existing network and push static cloud-init config to guests that DHCP today.
+func (s *Server) allocatorFor(ctx context.Context, ownerKind, netName string) (network.Allocator, *corrosion.BindingRecord, error) {
+	b, err := corrosion.GetBindingByNetwork(ctx, s.db, netName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read binding for network %q: %w", netName, err)
+	}
+	if b == nil {
+		// A network whose CONFIG names a prefix while no binding row exists is a
+		// disagreement, not an unbound network: nothing validated that prefix
+		// against NetBox and nothing holds a claim on it. Allocating from the
+		// builtin allocator across an address space someone believes is
+		// externally managed is exactly the silent double-allocation this design
+		// exists to prevent, so it is loud. (Reachable through a compose file
+		// written before the refusal in provisionComposeNetworks, or a binding
+		// released while its network survived.)
+		// The read itself must fail CLOSED. This guard is the only thing standing
+		// between a network whose config names a prefix and the builtin allocator
+		// handing out addresses across it, and a swallowed read error made it a
+		// fail-OPEN guard: "could not read the record" became "the record names
+		// no prefix" and the allocation went ahead.
+		def, derr := lookupNetworkDef(ctx, s.db, netName)
+		if derr != nil {
+			return nil, nil, fmt.Errorf(
+				"cannot determine whether network %q names a NetBox prefix: %w", netName, derr)
+		}
+		if def != nil && def.NetBoxPrefixID != 0 {
+			return nil, nil, fmt.Errorf(
+				"network %q config names NetBox prefix %d but no binding exists; rebind with `lv network create --netbox-prefix-id`",
+				netName, def.NetBoxPrefixID)
+		}
+		if ownerKind == "vm" {
+			return nil, nil, nil // VMs do not allocate on unbound networks
+		}
+		return network.NewBuiltinAllocator(s.db), nil, nil
+	}
+	if ownerKind != "vm" {
+		return nil, nil, fmt.Errorf(
+			"network %q is bound to NetBox prefix %d; containers are not supported on bound networks",
+			netName, b.PrefixID)
+	}
+	if b.Suspended {
+		return nil, nil, fmt.Errorf("network %q binding is suspended: %s", netName, b.SuspendReason)
+	}
+	if s.netbox == nil {
+		return nil, nil, fmt.Errorf(
+			"network %q is bound to a NetBox prefix but this node has no netbox configuration", netName)
+	}
+	return network.NewNetBoxAllocator(s.db, s.netbox, s.nbMetrics()), b, nil
+}

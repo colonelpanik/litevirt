@@ -55,6 +55,8 @@ const (
 	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
 	LiteVirt_GetRuntimeInventory_FullMethodName        = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
+	LiteVirt_CollectOrphanProof_FullMethodName         = "/litevirt.v1.LiteVirt/CollectOrphanProof"
+	LiteVirt_GetMembershipView_FullMethodName          = "/litevirt.v1.LiteVirt/GetMembershipView"
 	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -100,6 +102,8 @@ const (
 	LiteVirt_GetNetwork_FullMethodName                 = "/litevirt.v1.LiteVirt/GetNetwork"
 	LiteVirt_DeleteNetwork_FullMethodName              = "/litevirt.v1.LiteVirt/DeleteNetwork"
 	LiteVirt_ListNetworks_FullMethodName               = "/litevirt.v1.LiteVirt/ListNetworks"
+	LiteVirt_RekeyBinding_FullMethodName               = "/litevirt.v1.LiteVirt/RekeyBinding"
+	LiteVirt_ResumeBinding_FullMethodName              = "/litevirt.v1.LiteVirt/ResumeBinding"
 	LiteVirt_ListLoadBalancers_FullMethodName          = "/litevirt.v1.LiteVirt/ListLoadBalancers"
 	LiteVirt_InspectLoadBalancer_FullMethodName        = "/litevirt.v1.LiteVirt/InspectLoadBalancer"
 	LiteVirt_CreateLoadBalancer_FullMethodName         = "/litevirt.v1.LiteVirt/CreateLoadBalancer"
@@ -321,6 +325,20 @@ type LiteVirtClient interface {
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
 	GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error)
+	// CollectOrphanProof answers, for THIS host, "does anything here still claim
+	// this address" — every defined domain in every state plus this host's local
+	// rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
+	// from every host before reclaiming an address in NetBox.
+	CollectOrphanProof(ctx context.Context, in *OrphanProofRequest, opts ...grpc.CallOption) (*OrphanProofResponse, error)
+	// GetMembershipView answers, for THIS host, "which hosts could be running
+	// anything at all" — every `hosts` row it holds, TOMBSTONES INCLUDED, plus
+	// its own gossip membership, which is the only source that can name a host
+	// with no row anywhere. Peer-only, like CollectOrphanProof, and gathered by
+	// the same caller: one membership closure gates both reclaiming an address
+	// and binding a prefix. An older peer answers Unimplemented, which is a
+	// definite failure the closure treats as "cannot corroborate" — that, not a
+	// capability latch, is what makes this safe on a mixed-version cluster.
+	GetMembershipView(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*MembershipViewResponse, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -376,6 +394,16 @@ type LiteVirtClient interface {
 	GetNetwork(ctx context.Context, in *GetNetworkRequest, opts ...grpc.CallOption) (*NetworkInfo, error)
 	DeleteNetwork(ctx context.Context, in *DeleteNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListNetworks(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListNetworksResponse, error)
+	// RekeyBinding recovers a NetBox binding suspended by a MOVED cluster
+	// identity fingerprint: it rewrites every owned object's identity under the
+	// new fingerprint and resumes allocation. Idempotent and resumable — a
+	// partial rewrite leaves the binding suspended for the next run to finish.
+	RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+	// It re-runs the bind-time checks against the binding's pinned prefix facts
+	// and refuses while any of them still disagree; it never accepts a changed
+	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
+	ResumeBinding(ctx context.Context, in *ResumeBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ListLBResponse, error)
 	InspectLoadBalancer(ctx context.Context, in *InspectLBRequest, opts ...grpc.CallOption) (*LoadBalancer, error)
@@ -1045,6 +1073,26 @@ func (c *liteVirtClient) GetRuntimeInventory(ctx context.Context, in *GetRuntime
 	return out, nil
 }
 
+func (c *liteVirtClient) CollectOrphanProof(ctx context.Context, in *OrphanProofRequest, opts ...grpc.CallOption) (*OrphanProofResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(OrphanProofResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CollectOrphanProof_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetMembershipView(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*MembershipViewResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MembershipViewResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetMembershipView_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckVIPParticipantResponse)
@@ -1594,6 +1642,26 @@ func (c *liteVirtClient) ListNetworks(ctx context.Context, in *emptypb.Empty, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListNetworksResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RekeyBinding(ctx context.Context, in *RekeyBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_RekeyBinding_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ResumeBinding(ctx context.Context, in *ResumeBindingRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ResumeBinding_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3322,6 +3390,20 @@ type LiteVirtServer interface {
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
 	GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error)
+	// CollectOrphanProof answers, for THIS host, "does anything here still claim
+	// this address" — every defined domain in every state plus this host's local
+	// rows. Peer-only, like GetRuntimeInventory: the sweeper leader gathers it
+	// from every host before reclaiming an address in NetBox.
+	CollectOrphanProof(context.Context, *OrphanProofRequest) (*OrphanProofResponse, error)
+	// GetMembershipView answers, for THIS host, "which hosts could be running
+	// anything at all" — every `hosts` row it holds, TOMBSTONES INCLUDED, plus
+	// its own gossip membership, which is the only source that can name a host
+	// with no row anywhere. Peer-only, like CollectOrphanProof, and gathered by
+	// the same caller: one membership closure gates both reclaiming an address
+	// and binding a prefix. An older peer answers Unimplemented, which is a
+	// definite failure the closure treats as "cannot corroborate" — that, not a
+	// capability latch, is what makes this safe on a mixed-version cluster.
+	GetMembershipView(context.Context, *emptypb.Empty) (*MembershipViewResponse, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3377,6 +3459,16 @@ type LiteVirtServer interface {
 	GetNetwork(context.Context, *GetNetworkRequest) (*NetworkInfo, error)
 	DeleteNetwork(context.Context, *DeleteNetworkRequest) (*emptypb.Empty, error)
 	ListNetworks(context.Context, *emptypb.Empty) (*ListNetworksResponse, error)
+	// RekeyBinding recovers a NetBox binding suspended by a MOVED cluster
+	// identity fingerprint: it rewrites every owned object's identity under the
+	// new fingerprint and resumes allocation. Idempotent and resumable — a
+	// partial rewrite leaves the binding suspended for the next run to finish.
+	RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error)
+	// ResumeBinding lifts a suspension whose cause has been repaired in NetBox.
+	// It re-runs the bind-time checks against the binding's pinned prefix facts
+	// and refuses while any of them still disagree; it never accepts a changed
+	// CIDR. A fingerprint mismatch is the re-key's job, not this one.
+	ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error)
 	// ── Load Balancers ──
 	ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error)
 	InspectLoadBalancer(context.Context, *InspectLBRequest) (*LoadBalancer, error)
@@ -3768,6 +3860,12 @@ func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwner
 func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRuntimeInventory not implemented")
 }
+func (UnimplementedLiteVirtServer) CollectOrphanProof(context.Context, *OrphanProofRequest) (*OrphanProofResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CollectOrphanProof not implemented")
+}
+func (UnimplementedLiteVirtServer) GetMembershipView(context.Context, *emptypb.Empty) (*MembershipViewResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMembershipView not implemented")
+}
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
 }
@@ -3902,6 +4000,12 @@ func (UnimplementedLiteVirtServer) DeleteNetwork(context.Context, *DeleteNetwork
 }
 func (UnimplementedLiteVirtServer) ListNetworks(context.Context, *emptypb.Empty) (*ListNetworksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListNetworks not implemented")
+}
+func (UnimplementedLiteVirtServer) RekeyBinding(context.Context, *RekeyBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RekeyBinding not implemented")
+}
+func (UnimplementedLiteVirtServer) ResumeBinding(context.Context, *ResumeBindingRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeBinding not implemented")
 }
 func (UnimplementedLiteVirtServer) ListLoadBalancers(context.Context, *emptypb.Empty) (*ListLBResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListLoadBalancers not implemented")
@@ -4976,6 +5080,42 @@ func _LiteVirt_GetRuntimeInventory_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_CollectOrphanProof_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(OrphanProofRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CollectOrphanProof(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CollectOrphanProof_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CollectOrphanProof(ctx, req.(*OrphanProofRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetMembershipView_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetMembershipView(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetMembershipView_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetMembershipView(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CheckVIPParticipant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckVIPParticipantRequest)
 	if err := dec(in); err != nil {
@@ -5657,6 +5797,42 @@ func _LiteVirt_ListNetworks_Handler(srv interface{}, ctx context.Context, dec fu
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListNetworks(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RekeyBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RekeyBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RekeyBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RekeyBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RekeyBinding(ctx, req.(*RekeyBindingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ResumeBinding_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeBindingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ResumeBinding(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ResumeBinding_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ResumeBinding(ctx, req.(*ResumeBindingRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8469,6 +8645,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_GetRuntimeInventory_Handler,
 		},
 		{
+			MethodName: "CollectOrphanProof",
+			Handler:    _LiteVirt_CollectOrphanProof_Handler,
+		},
+		{
+			MethodName: "GetMembershipView",
+			Handler:    _LiteVirt_GetMembershipView_Handler,
+		},
+		{
 			MethodName: "CheckVIPParticipant",
 			Handler:    _LiteVirt_CheckVIPParticipant_Handler,
 		},
@@ -8587,6 +8771,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListNetworks",
 			Handler:    _LiteVirt_ListNetworks_Handler,
+		},
+		{
+			MethodName: "RekeyBinding",
+			Handler:    _LiteVirt_RekeyBinding_Handler,
+		},
+		{
+			MethodName: "ResumeBinding",
+			Handler:    _LiteVirt_ResumeBinding_Handler,
 		},
 		{
 			MethodName: "ListLoadBalancers",

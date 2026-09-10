@@ -40,6 +40,7 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/metrics"
+	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/obs"
 	"github.com/litevirt/litevirt/internal/opjournal"
@@ -294,6 +295,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := corrosion.InitSchema(ctx, d.db); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
+
+	// Derive the cluster record from this node's CA if the cluster has none.
+	// Presence-gated and idempotent — see corrosion.EnsureClusterRecord for why
+	// it is derived rather than minted, and why it never rewrites a row.
+	d.ensureClusterRecord(ctx)
 
 	// Migrate legacy unscoped network names to stack-scoped names.
 	if err := corrosion.MigrateLegacyNetworkNames(ctx, d.db); err != nil {
@@ -753,6 +759,51 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cfg.Enforcement.VIPProofReclaim,
 		d.cfg.Enforcement.SharedStorageFence,
 	)
+	// netbox_ipam_v1 is advertised only while this node's config enables the
+	// NetBox integration, so the cluster-wide latch requires config uniformity,
+	// not just a uniform build (see capabilities.NetBoxIPAMV1).
+	svc.SetNetBoxIPAM(d.cfg.NetBox.Enabled)
+	// The INVENTORY MIRROR is a second, narrower opt-in, driving its own token
+	// (netbox_mirror_v1) the same conditional-advertisement way. Default off:
+	// NetBox is pure IPAM unless this node asks for inventory too, and the latch
+	// requires every node to ask — the sweep runs on one lease holder, so a
+	// non-uniform flag makes the inventory follow leadership. Set BEFORE
+	// StartNetBoxMirror, which declines outright when it is off.
+	svc.SetNetBoxMirrorInventory(d.cfg.NetBox.MirrorInventory)
+	// BEFORE the mirror starts. The name decides which NetBox cluster object
+	// every mirrored VM hangs off, and the CA re-key resolves the same one.
+	svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)
+	// The client itself. A node whose config ENABLES the integration but whose
+	// client cannot be built (missing/empty token file, no URL) must not start:
+	// it would advertise netbox_ipam_v1 — helping the cluster latch — while
+	// every bind and claim on it refused for want of a client. Failing startup
+	// keeps the "config uniformity" the latch depends on honest.
+	if d.cfg.NetBox.Enabled {
+		nbClient, err := netbox.New(netbox.Config{
+			BaseURL:   d.cfg.NetBox.URL,
+			TokenPath: d.cfg.NetBox.TokenPath,
+			Timeout:   time.Duration(d.cfg.NetBox.TimeoutSec) * time.Second,
+		})
+		if err != nil {
+			return fmt.Errorf("netbox client: %w", err)
+		}
+		svc.SetNetBoxClient(nbClient)
+		// The real counter sink, replacing the noop. Registered on the default
+		// registry, so it is served wherever /metrics is.
+		svc.SetNetBoxMetrics(metrics.NewNetBoxMetrics())
+		// Binding revalidation + the orphan sweep, on the configured cadence.
+		// Started ONLY here: a node with no NetBox configuration creates no
+		// goroutine and never enters the `netbox` leader-lease race. The sweep
+		// itself is leader-gated, so every configured node running this loop
+		// still means exactly one reclaiming node cluster-wide.
+		svc.StartNetBoxMaintenance(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
+		// The inventory mirror, on the SAME cadence and the SAME leader lease.
+		// One key, not two: the sweeper reclaims addresses and the mirror
+		// rewrites the objects that name them, so a cluster where two different
+		// nodes led the two would have each acting on state the other was
+		// changing underneath it.
+		svc.StartNetBoxMirror(ctx, time.Duration(d.cfg.NetBox.SweepIntervalSec)*time.Second)
+	}
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
@@ -1410,6 +1461,34 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 		FenceStrategy: "best-effort",
 		Version:       d.cfg.Version,
 	})
+}
+
+// ensureClusterRecord derives the `cluster` row from this node's CA certificate
+// when the cluster does not have one yet.
+//
+// Nothing else ever wrote that row: `lv host init` mints the PKI, the daemon
+// applies the schema and registers a host, and no path anywhere inserted it. So
+// every reader of it — the cluster fingerprint that is the first component of
+// every NetBox identity litevirt mints, and the cluster name — found nothing on
+// a real installation, and the whole NetBox integration was inert outside tests
+// that seeded the row by hand.
+//
+// The WRITE is local-only, because this call is unconditional and reaches every
+// installation on the first start after an upgrade: a replicated first-ever
+// `cluster` statement shape would stall the replication stream of every peer
+// still on the previous build. The ROW is still replicated — anti-entropy
+// carries the table, and every node derives the same value from the shared CA.
+// See corrosion.EnsureClusterRecord.
+//
+// A failure is LOGGED, not fatal. This is a heal, not a precondition: a node
+// with no CA on disk yet, or a database that refused one read, must still boot —
+// the paths that need the row already refuse fail-closed without it, and the
+// next start heals again.
+func (d *Daemon) ensureClusterRecord(ctx context.Context) {
+	if err := corrosion.EnsureClusterRecord(ctx, d.db, d.cfg.PKIDir); err != nil {
+		slog.Warn("could not derive the cluster record from this node's CA; "+
+			"NetBox identities cannot be minted until it exists", "error", err)
+	}
 }
 
 // reconcileHostAddress rewrites this host's address when the row disagrees with

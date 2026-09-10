@@ -18,6 +18,7 @@ func buildRootCmd() *cobra.Command {
 	root.AddCommand(
 		newHostCmd(),
 		newNetworkCmd(),
+		newNetboxCmd(),
 		newComposeCmd(),
 		newLBCmd(),
 		newRunCmd(),
@@ -83,7 +84,7 @@ func TestRootCommandHasSubcommands(t *testing.T) {
 	root := buildRootCmd()
 
 	required := []string{
-		"host", "network", "compose", "lb",
+		"host", "network", "netbox", "compose", "lb",
 		"run", "ls", "inspect", "start", "stop", "restart", "rm",
 		"console", "vnc", "exec", "ssh",
 		"ansible-inventory", "migrate",
@@ -296,6 +297,29 @@ func TestClusterHasSubcommands(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Argument validation tests
 // ---------------------------------------------------------------------------
+
+// TestNetboxRekeyAcceptsZeroOrOneArg pins the two forms of `lv netbox rekey`.
+//
+// The network-less form is the ONLY re-key path a cluster that mirrors NetBox
+// inventory without binding a prefix has. An ExactArgs(1) here would make it
+// unreachable from the CLI with every server-side test still green, because the
+// fleet scenarios drive the RPC directly.
+func TestNetboxRekeyAcceptsZeroOrOneArg(t *testing.T) {
+	cmd := newNetboxRekeyCmd()
+	if cmd.Args == nil {
+		t.Fatal("netbox rekey: Args is nil")
+	}
+	if err := cmd.Args(cmd, nil); err != nil {
+		t.Errorf("netbox rekey with no argument must be accepted — it is the "+
+			"cluster-scoped, inventory-only form: %v", err)
+	}
+	if err := cmd.Args(cmd, []string{"net"}); err != nil {
+		t.Errorf("netbox rekey <network>: unexpected error: %v", err)
+	}
+	if err := cmd.Args(cmd, []string{"net", "extra"}); err == nil {
+		t.Error("netbox rekey: expected an error with two args")
+	}
+}
 
 func TestExactArgs1Commands(t *testing.T) {
 	// Commands that require exactly 1 argument.

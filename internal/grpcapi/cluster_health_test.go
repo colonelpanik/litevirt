@@ -290,7 +290,7 @@ func TestOverallHealth_InfoConditionsAreAdvisoriesNotFaults(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := overallHealth(tc.conditions, fresh, nil, now); got != tc.want {
+			if got := overallHealth(tc.conditions, fresh, nil, nil, now); got != tc.want {
 				t.Fatalf("overall = %q, want %q — %s", got, tc.want, tc.why)
 			}
 		})
@@ -320,14 +320,14 @@ func TestOverallHealth_TheInfoPolicyResolvesNothing(t *testing.T) {
 		}
 	}
 	if got := overallHealth([]corrosion.HealthCondition{orphan(corrosion.SeverityWarning)},
-		fresh, nil, now); got != HealthDegraded {
+		fresh, nil, nil, now); got != HealthDegraded {
 		t.Fatalf("a stale WARNING nothing owns any more = %q, want DEGRADED. The info policy "+
 			"is not a garbage collector: an unresolved warning keeps degrading, and "+
 			"presenting the policy as if it cleared one would hide exactly the row an "+
 			"operator has to go and deal with", got)
 	}
 	if got := overallHealth([]corrosion.HealthCondition{orphan(corrosion.SeverityInfo)},
-		fresh, nil, now); got != HealthHealthy {
+		fresh, nil, nil, now); got != HealthHealthy {
 		t.Fatalf("a stale INFO row = %q, want HEALTHY — it stops degrading because of what "+
 			"its severity MEANS, not because anything resolved it; the row is still there",
 			got)

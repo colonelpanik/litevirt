@@ -41,8 +41,21 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		return nil, status.Errorf(codes.Internal, "query connectivity: %v", err)
 	}
 
+	// Parse the mesh once: the same edges feed both the response body and the
+	// roll-up, which counts a link that is not proven good as a coverage gap.
+	mesh := make([]connectivityEdge, 0, len(edges))
+	for _, r := range edges {
+		mesh = append(mesh, connectivityEdge{
+			Observer:            r.String("observer"),
+			Target:              r.String("target"),
+			Status:              r.String("status"),
+			ConsecutiveFailures: r.Int("consecutive_failures"),
+			LastSeen:            r.String("last_seen"),
+		})
+	}
+
 	resp := &pb.ClusterHealth{
-		Overall:     overallHealth(conditions, evaluators, capacity, time.Now().UTC()),
+		Overall:     overallHealth(conditions, evaluators, capacity, mesh, time.Now().UTC()),
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
@@ -63,12 +76,12 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			Coverage: e.Coverage, Reporter: e.Reporter, Detail: e.Detail,
 		})
 	}
-	for _, r := range edges {
+	for _, e := range mesh {
 		resp.Connectivity = append(resp.Connectivity, &pb.ConnectivityEdge{
-			Observer: r.String("observer"), Target: r.String("target"),
-			Status:              r.String("status"),
-			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            r.String("last_seen"),
+			Observer: e.Observer, Target: e.Target,
+			Status:              e.Status,
+			ConsecutiveFailures: int32(e.ConsecutiveFailures),
+			LastSeen:            e.LastSeen,
 		})
 	}
 	for _, c := range capacity {
@@ -81,6 +94,29 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		})
 	}
 	return resp, nil
+}
+
+// connectivityEdge is one observer→target peer-probe result from host_health,
+// as both the response body and the roll-up read it. It is the typed shape of
+// the row, not a new storage concept: internal/health's checker owns the column.
+type connectivityEdge struct {
+	Observer            string
+	Target              string
+	Status              string // healthy | suspect | failing
+	ConsecutiveFailures int
+	LastSeen            string
+}
+
+// connectivityDegrades reports whether an edge's status means the link is not
+// proven good. The checker (internal/health) writes "healthy" and "suspect"
+// today; "failing" is accepted as the same class so a future terminal state
+// degrades rather than reading as silently fine.
+//
+// An UNRECOGNISED status is deliberately NOT treated as a problem: guessing
+// would turn any new status value the checker starts writing into an immediate
+// cluster-wide DEGRADED on every node that has not been upgraded yet.
+func connectivityDegrades(status string) bool {
+	return status == "failing" || status == "suspect"
 }
 
 // Overall cluster-health states.
@@ -107,9 +143,10 @@ const evaluatorScanTTL = 5 * time.Minute
 //	CRITICAL — any ACTIVE critical condition (an observed one included: the
 //	           operator should be looking before the confirm lands);
 //	DEGRADED — active warning conditions, an evaluator without complete
-//	           coverage, a STALE evaluator (last scan past evaluatorScanTTL),
-//	           or an incomplete capacity observation. Active INFO conditions do
-//	           NOT degrade: they are advisories, not faults (see the severity
+//	           coverage, a STALE evaluator (last scan past evaluatorScanTTL, or
+//	           dated in the FUTURE), an incomplete capacity observation, or a
+//	           connectivity edge that is not proven good. Active INFO conditions
+//	           do NOT degrade: they are advisories, not faults (see the severity
 //	           branch below);
 //	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
 //	           last scan is stale (nothing is watching NOW, which is not the
@@ -124,7 +161,7 @@ const evaluatorScanTTL = 5 * time.Minute
 // would make that detector a cluster-wide availability SPOF, which is a worse
 // trade than a loudly-degraded health state; an operator who wants a hard stop
 // on a blind cluster has the DEGRADED/UNKNOWN exit codes to wire it from.
-func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, now time.Time) string {
+func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, capacity []corrosion.HostCapacityObservation, mesh []connectivityEdge, now time.Time) string {
 	if len(evaluators) == 0 {
 		return HealthUnknown
 	}
@@ -166,9 +203,16 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 	allStale := true
 	for _, e := range evaluators {
 		stale := true
-		if at, err := time.Parse(time.RFC3339, e.LastScan); err == nil && now.Sub(at) <= evaluatorScanTTL {
-			stale = false
-			allStale = false
+		// A scan dated in the FUTURE is not fresh — it is a clock-skewed or
+		// forged row, and now.Sub(at) <= TTL is trivially true for any negative
+		// age, so an unbounded check reads the most suspect row in the table as
+		// the most current one. Requiring d >= 0 makes a future timestamp stale,
+		// which is the honest reading: nothing has been proven scanned by now.
+		if at, err := time.Parse(time.RFC3339, e.LastScan); err == nil {
+			if d := now.Sub(at); d >= 0 && d <= evaluatorScanTTL {
+				stale = false
+				allStale = false
+			}
 		}
 		if stale || e.Coverage != corrosion.CoverageComplete {
 			degraded = true
@@ -179,6 +223,15 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 	}
 	for _, c := range capacity {
 		if !c.Complete {
+			degraded = true
+		}
+	}
+	// A peer-probe mesh full of failing links used to roll up as HEALTHY: the
+	// edges were reported in the response body but never read by the state.
+	// Connectivity is exactly the kind of cross-host fact this endpoint is the
+	// single surface for, so a link the checker cannot prove good degrades.
+	for _, e := range mesh {
+		if connectivityDegrades(e.Status) {
 			degraded = true
 		}
 	}

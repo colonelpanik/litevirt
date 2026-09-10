@@ -36,6 +36,19 @@ const (
 	// leaseRenewBefore is how much head-room the leader has to renew before
 	// the lease expires. Failover renews when remaining time drops below this.
 	leaseRenewBefore = 10 * time.Second
+	// minFenceLease is the lease head-room required before a fence may START.
+	// leaseRenewBefore (10 s) is NOT enough: an IPMI fence spends up to
+	// fence.PowerOffVerifyTimeout (15 s) on verification alone, so a fence begun
+	// with only the renewal margin left outlives the lease that authorised it —
+	// the row expires mid-call, a second coordinator takes it, and two nodes
+	// fence and reschedule the same host concurrently. This is a floor, not a
+	// budget: the actual deadline comes from the lease time this node really
+	// holds, which is usually the full leaseDuration.
+	minFenceLease = 20 * time.Second
+	// leaseFenceMargin is withheld from the fence deadline so the call returns
+	// while this node is still demonstrably the leader, leaving room for the
+	// post-fence re-check to read the lease row before it expires.
+	leaseFenceMargin = 5 * time.Second
 	// healthFreshness is the maximum age of a host_health row that may count
 	// toward fencing quorum. Stale rows from dead observers must not fence
 	// hosts they last saw failing days ago.
@@ -645,23 +658,54 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 // remaining TTL is at least leaseRenewBefore. Renews if low. Returns false if
 // the lease is lost or read fails.
 func (c *Coordinator) holdLease(ctx context.Context) bool {
+	_, ok := c.holdLeaseAtLeast(ctx, leaseRenewBefore)
+	return ok
+}
+
+// holdLeaseAtLeast re-validates the failover lease and guarantees strictly more
+// than `need` remaining on it, renewing when the margin is short. It returns
+// the remaining TTL so a caller can bound a long operation by the authority it
+// actually holds rather than by a hardcoded guess.
+//
+// A renewal that still cannot reach `need` is a refusal, not a success: it
+// means this node no longer holds enough of the lease to finish the work
+// safely, and proceeding would be acting past its own authority.
+func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) (time.Duration, bool) {
+	left, ok := c.leaseRemaining(ctx)
+	if !ok {
+		return 0, false
+	}
+	if left > need {
+		return left, true
+	}
+	if !c.acquireLease(ctx) {
+		return 0, false
+	}
+	left, ok = c.leaseRemaining(ctx)
+	if !ok || left <= need {
+		return 0, false
+	}
+	return left, true
+}
+
+// leaseRemaining reports how much of the failover lease this node still holds.
+// It returns ok=false when the row is missing or unreadable, when the holder is
+// someone else, or when expires_at cannot be parsed — every case in which this
+// node cannot prove it is the leader.
+func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) {
 	rows, err := c.db.Query(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
 	if err != nil || len(rows) == 0 {
-		return false
+		return 0, false
 	}
 	if rows[0].String("holder") != c.hostName {
-		return false
+		return 0, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
-		return false
+		return 0, false
 	}
-	if expiresAt.Sub(c.now()) > leaseRenewBefore {
-		return true
-	}
-	// Renew.
-	return c.acquireLease(ctx)
+	return expiresAt.Sub(c.now()), true
 }
 
 // leaseSnapshot returns the current failover-lease holder + expiry to record in a
@@ -845,17 +889,29 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// split-brain. See recoverHosts.
 	c.fenceRelocated[h.Name] = false
 
-	// Re-validate lease immediately before the destructive fence call. Fence
-	// runs (especially IPMI verify) can take ~15 s; a second coordinator must
-	// not begin fencing the same host concurrently.
-	if !c.holdLease(ctx) {
-		slog.Warn("failover: lease lost before fence, aborting", "host", h.Name)
+	// Re-validate the lease immediately before the destructive fence call, and
+	// require enough of it left to FINISH that call. Checking only that the
+	// lease is currently held is not sufficient: a fence run (IPMI verify alone
+	// is up to 15 s) can outlast the remaining TTL, and once the row expires a
+	// second coordinator can take the lease and start fencing the same host
+	// while this call is still in flight.
+	leaseLeft, ok := c.holdLeaseAtLeast(ctx, minFenceLease)
+	if !ok {
+		slog.Warn("failover: lease lost or too short to fence, aborting",
+			"host", h.Name, "required", minFenceLease)
 		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 		return
 	}
 
+	// Bound the fence by the lease that authorises it. The deadline is derived
+	// from the time this node actually holds, less a margin so the call returns
+	// while it is still the leader — not from a constant that could quietly
+	// exceed the lease if either value is ever retuned.
+	fenceCtx, cancelFence := context.WithTimeout(ctx, leaseLeft-leaseFenceMargin)
+	defer cancelFence()
+
 	// Step 1: Fence the host.
-	fr := c.fencer(ctx, fence.HostConfig{
+	fr := c.fencer(fenceCtx, fence.HostConfig{
 		Name:          h.Name,
 		Address:       h.Address,
 		SSHUser:       h.SSHUser,
@@ -892,6 +948,20 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 	if c.OnFence != nil {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
+	}
+
+	// The fence is recorded; confirm this node is still the leader before acting
+	// on it. If the lease expired while the fence ran, another coordinator may
+	// already be driving this host's recovery, and continuing would mean two
+	// coordinators rescheduling the same VMs. Deliberately placed AFTER the
+	// fence log and OnFence: those record a physical act that did happen and
+	// must survive regardless of who holds the lease now. What stops here is
+	// everything that ASSERTS authority — the host state write and the
+	// reschedule below.
+	if !c.holdLease(ctx) {
+		slog.Warn("failover: lease lost during fence, not rescheduling", "host", h.Name)
+		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
+		return
 	}
 
 	// Step 2: Mark host as fenced (fr.Success) or offline (best-effort/manual

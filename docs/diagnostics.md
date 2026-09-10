@@ -193,7 +193,11 @@ table.
      table-remediation procedure above or a table-specific restamp — `repair-owner`
      cannot repair them, and `lv cluster converge` labels them accordingly.
    - **In-memory unresolved-tie records do not auto-clear** just because a table's
-     v2 digest now matches; they clear on the next daemon restart.
+     v2 digest now matches; they clear on the next daemon restart. The one
+     exception is `leader_lease_terms`, whose rows are immutable: a restart
+     empties the register but the next anti-entropy pass re-registers the same
+     tie, so that one needs `lv cluster acknowledge-lease-term` — see
+     [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
 v1-only emission (peers then compare v1 against it). Because negotiation is by

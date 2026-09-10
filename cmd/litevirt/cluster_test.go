@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"strings"
 	"testing"
+
+	"google.golang.org/grpc"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -114,5 +117,95 @@ func TestPrintConvergence_SafetyFaultRemediation(t *testing.T) {
 	}
 	if !strings.Contains(vmLine, "repair-owner") {
 		t.Fatalf("vms should suggest repair-owner: %q", vmLine)
+	}
+}
+
+// captureAckLeaseTerm records the AcknowledgeLeaseTermTie request the CLI put on
+// the wire and returns a canned answer. The assertion that matters is that --key
+// and --term REACH the request: a parsed-but-unwired flag would silently
+// acknowledge term 0 for the empty key, which the server rejects as
+// InvalidArgument and an operator would read as "the tie is not real".
+type captureAckLeaseTerm struct {
+	pb.LiteVirtClient
+	req  *pb.AcknowledgeLeaseTermTieRequest
+	resp bool
+}
+
+func (c *captureAckLeaseTerm) AcknowledgeLeaseTermTie(_ context.Context, in *pb.AcknowledgeLeaseTermTieRequest, _ ...grpc.CallOption) (*pb.AcknowledgeLeaseTermTieResponse, error) {
+	c.req = in
+	return &pb.AcknowledgeLeaseTermTieResponse{Acknowledged: c.resp}, nil
+}
+
+func runAckLeaseTermCLI(t *testing.T, spy *captureAckLeaseTerm, args ...string) (string, error) {
+	t.Helper()
+	orig := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	t.Cleanup(func() { withClient = orig })
+
+	cmd := newClusterAckLeaseTermCmd()
+	cmd.SetArgs(args)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	var err error
+	out := captureStdout(t, func() { err = cmd.Execute() })
+	return out, err
+}
+
+// TestClusterAckLeaseTerm_FlagsReachTheRequest.
+func TestClusterAckLeaseTerm_FlagsReachTheRequest(t *testing.T) {
+	spy := &captureAckLeaseTerm{resp: true}
+	out, err := runAckLeaseTermCLI(t, spy, "--key", "rebalancer", "--term", "7")
+	if err != nil {
+		t.Fatalf("acknowledge-lease-term: %v", err)
+	}
+	if spy.req.GetKey() != "rebalancer" {
+		t.Errorf("key = %q, want rebalancer", spy.req.GetKey())
+	}
+	if spy.req.GetTerm() != 7 {
+		t.Errorf("term = %d, want 7", spy.req.GetTerm())
+	}
+	if !strings.Contains(out, "Acknowledged rebalancer term 7") {
+		t.Errorf("output does not confirm the acknowledgement:\n%s", out)
+	}
+}
+
+// TestClusterAckLeaseTerm_UntrackedTieIsNotReportedAsDone: acknowledged=false is
+// a legitimate answer (already acknowledged, or this host never contested), and
+// must not print the same line as a real clear — the operator uses that
+// distinction to decide whether the remaining hosts still need visiting.
+func TestClusterAckLeaseTerm_UntrackedTieIsNotReportedAsDone(t *testing.T) {
+	spy := &captureAckLeaseTerm{resp: false}
+	out, err := runAckLeaseTermCLI(t, spy, "--key", "failover", "--term", "3")
+	if err != nil {
+		t.Fatalf("acknowledge-lease-term: %v", err)
+	}
+	if strings.Contains(out, "Acknowledged failover term 3") {
+		t.Errorf("an untracked tie was reported as acknowledged:\n%s", out)
+	}
+	if !strings.Contains(out, "No tracked tie") {
+		t.Errorf("output does not say the tie was untracked:\n%s", out)
+	}
+}
+
+// TestClusterAckLeaseTerm_RefusesIncompleteInputWithoutDialling. A missing
+// --term must not reach the wire as term 0: the server would answer
+// InvalidArgument, and the operator would be debugging the wrong end.
+func TestClusterAckLeaseTerm_RefusesIncompleteInputWithoutDialling(t *testing.T) {
+	for _, args := range [][]string{
+		{"--key", "failover"},
+		{"--term", "1"},
+		{"--key", "failover", "--term", "0"},
+		{"--key", "failover", "--term", "-1"},
+	} {
+		spy := &captureAckLeaseTerm{resp: true}
+		if _, err := runAckLeaseTermCLI(t, spy, args...); err == nil {
+			t.Errorf("lv cluster acknowledge-lease-term %v was accepted", args)
+		}
+		if spy.req != nil {
+			t.Errorf("lv cluster acknowledge-lease-term %v reached the wire as %+v", args, spy.req)
+		}
 	}
 }

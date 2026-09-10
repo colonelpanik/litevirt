@@ -7,6 +7,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -197,6 +198,87 @@ func TestAcknowledgeLeaseTermTie_IsNotPeerCallable(t *testing.T) {
 	}
 	if c := status.Code(err); c != codes.Unauthenticated && c != codes.PermissionDenied {
 		t.Errorf("code = %v, want Unauthenticated or PermissionDenied", c)
+	}
+}
+
+// boundCtx returns a context for a principal actually BOUND to role at "/",
+// with the auth engine loaded — the only shape in which RequirePerm consults
+// RBAC at all.
+//
+// The existing positive tests here use adminCtx(), whose principal holds no
+// bindings, so HasAnyBinding is false and RequirePerm silently takes its
+// legacy RequireRole("operator") fallback. Every one of them passed while the
+// handler was gated on a verb no builtin role below Admin held: the RBAC path
+// they are meant to cover was never entered. A bound principal is what makes
+// the grant load-bearing.
+func boundCtx(t *testing.T, s *Server, user, legacyRole, role string) context.Context {
+	t.Helper()
+	ctx := context.Background()
+	if err := corrosion.InsertUser(ctx, s.db, user, legacyRole, "x"); err != nil {
+		t.Fatalf("InsertUser: %v", err)
+	}
+	if err := auth.SeedBuiltinRoles(ctx, s.db); err != nil {
+		t.Fatalf("SeedBuiltinRoles: %v", err)
+	}
+	if err := corrosion.InsertRoleBinding(ctx, s.db, corrosion.RoleBindingRecord{
+		ID: user + "-root", Path: "/", Role: role,
+		Principal: "user:" + user + "@local", Propagate: true,
+	}); err != nil {
+		t.Fatalf("InsertRoleBinding: %v", err)
+	}
+	engine := auth.NewEngine(s.db)
+	if err := engine.Reload(ctx); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	s.SetAuthEngine(engine)
+
+	out := context.WithValue(context.Background(), ctxKeyUsername, user)
+	return context.WithValue(out, ctxKeyRole, legacyRole)
+}
+
+// TestAcknowledgeLeaseTermTie_ABoundOperatorMayAcknowledge is the test the
+// handler's doc comment has been claiming since Task 0c: "an operator
+// acknowledges on each host".
+//
+// It is the whole reason cluster.lww.acknowledge exists. Drop that verb from
+// Operator and this fails with PermissionDenied — which is precisely what
+// every RBAC cluster did while the gate read cluster.update, leaving the
+// ha.lww.unresolved condition with a documented remedy no operator could run.
+func TestAcknowledgeLeaseTermTie_ABoundOperatorMayAcknowledge(t *testing.T) {
+	s := contestedTermNode(t)
+	ctx := boundCtx(t, s, "olive", "operator", "Operator")
+
+	resp, err := s.AcknowledgeLeaseTermTie(ctx, &pb.AcknowledgeLeaseTermTieRequest{
+		Key: corrosion.LeaseKeyFailover, Term: 1,
+	})
+	if err != nil {
+		t.Fatalf("a bound Operator could not acknowledge the tie the health condition "+
+			"tells them to acknowledge: %v", err)
+	}
+	if !resp.GetAcknowledged() {
+		t.Error("acknowledged = false; the fixture holds a real tracked tie")
+	}
+	if n := s.db.UnresolvedTieCount(); n != 0 {
+		t.Errorf("unresolved ties = %d, want 0 — the register did not clear", n)
+	}
+}
+
+// TestAcknowledgeLeaseTermTie_ABoundViewerMayNot keeps the new verb narrow in
+// the direction that matters: read-only roles carry "*.read", which matches by
+// suffix, so a verb named e.g. cluster.lww.read would have handed silencing
+// power to every Viewer and Auditor in the cluster.
+func TestAcknowledgeLeaseTermTie_ABoundViewerMayNot(t *testing.T) {
+	s := contestedTermNode(t)
+	ctx := boundCtx(t, s, "vera", "viewer", "Viewer")
+
+	_, err := s.AcknowledgeLeaseTermTie(ctx, &pb.AcknowledgeLeaseTermTieRequest{
+		Key: corrosion.LeaseKeyFailover, Term: 1,
+	})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("code = %v, want PermissionDenied", status.Code(err))
+	}
+	if n := s.db.UnresolvedTieCount(); n != 1 {
+		t.Errorf("unresolved ties = %d, want 1 — a denied call cleared the register", n)
 	}
 }
 

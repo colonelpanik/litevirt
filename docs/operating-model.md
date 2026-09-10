@@ -373,6 +373,39 @@ answer to a question the cluster never agreed on. Instead both claims persist on
 their own nodes and the conflict is flagged, which is why the alert above is the
 access path rather than a query.
 
+#### Clearing the condition once you have seen it
+
+Because a contested term is never resolved into a winner, there is no
+remediating write for the `ha.lww.unresolved` condition to wait for.
+`leader_lease_terms` rows are immutable, the two rows disagree forever, and the
+condition therefore stays dirty forever. Waiting it out does not work, and
+neither does a restart: the register is in memory, so a restart empties it and
+the next anti-entropy pass re-registers the same tie within seconds.
+
+What clears it is a human saying they have seen it:
+
+```
+lv cluster acknowledge-lease-term --key failover --term 7
+```
+
+Three things about that command:
+
+- **It clears evidence tracking, not the conflict.** Both claims stay in the
+  ledger, no winner is elected, and the acknowledgement is written to the audit
+  log with your principal, the key and the term.
+- **It is node-local.** The register belongs to one daemon, and the RPC refuses
+  peer certificates so that no node can silence its own split-brain evidence.
+  Point `LV_HOST` at each host `lv health` names and run it there; verify with
+  `lv cluster digest`.
+- **It needs the `cluster.lww.acknowledge` verb**, held by Operator and Admin.
+  That verb grants this and nothing else.
+
+Investigate before acknowledging. Two nodes recording the same term means the
+fencing token did its job — enforcement will refuse proofs from the losing
+tenure — but something upstream let both nodes believe they held the lease.
+`litevirt_leader_lease_term` around the event tells you whether this was
+leadership churn or a partition.
+
 ### Even-N clusters cannot fence in a 2/2 partition
 - A 4-node cluster split exactly 2/2 has no majority. Both sides compute
   quorum=3 with 2 observers each → neither side can fence.

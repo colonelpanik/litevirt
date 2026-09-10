@@ -90,8 +90,14 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 // operator acknowledges on each host the health condition names; and a node
 // must never be able to acknowledge its own contest, which is exactly what a
 // peer-callable path would allow.
+//
+// Gated on cluster.lww.acknowledge, a verb that grants this and nothing else.
+// It was cluster.update, which no builtin role below Admin holds — so the
+// doc above was false on any RBAC cluster: the operator the condition tells
+// to acknowledge got PermissionDenied. Widening cluster.update instead would
+// have pre-granted Operator every cluster verb added after this one.
 func (s *Server) AcknowledgeLeaseTermTie(ctx context.Context, req *pb.AcknowledgeLeaseTermTieRequest) (*pb.AcknowledgeLeaseTermTieResponse, error) {
-	if err := s.RequirePerm(ctx, "/", "cluster.update", "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "cluster.lww.acknowledge", "operator"); err != nil {
 		return nil, err
 	}
 	key := req.GetKey()

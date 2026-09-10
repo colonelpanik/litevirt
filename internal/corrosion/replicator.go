@@ -1195,6 +1195,19 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		if s.Guard == nil || s.Guard.Protocol != workloadReplaceGuardV1 {
 			return invalidf("guarded replace statement missing workload_replace_v1 guard")
 		}
+		// Applied verbatim, but with updated_at clamped to max(incoming, local)
+		// wherever the shape names a single row. Verbatim is what stops a receiver
+		// skipping one statement of the batch on its own clock; the clamp is what
+		// stops applying it from REGRESSING that clock, which would leave the row
+		// losing a later comparison to a stale copy of itself. Every statement in
+		// the batch is row-scoped except the cleanup authorization, which is
+		// append-only and has no updated_at to preserve.
+		if sh.HasFullPKIdentity && sh.UpdatedAtParamIdx >= 0 {
+			s, err = retainSemanticMaxUpdatedAt(ctx, tx, s, sh, tableName, pkCols)
+			if err != nil {
+				return err
+			}
+		}
 		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if execErr == nil && rowsChanged(res) {
 			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
@@ -1855,21 +1868,27 @@ func validateGuardedVMReplaceEntry(stmts []Statement) error {
 	// and the five retirements are not, so they are counted rather than merely
 	// permitted — a batch that silently dropped one would leave the replacement's
 	// rows live under its temporary name.
+	// Everything the replacement brings to the new name, and everything of its own
+	// it retires, is row-scoped — so the count is data-dependent and only the SET
+	// of shapes can be pinned here.
 	optional := map[string]bool{
-		mustStatementFingerprint(vmReplaceInterfaceSQL):      true,
-		mustStatementFingerprint(vmReplaceDiskSQL):           true,
-		mustStatementFingerprint(vmReplaceNICSQL):            true,
-		mustStatementFingerprint(vmReplacePCIIntentSQL):      true,
-		mustStatementFingerprint(vmReplacePCIRealizationSQL): true,
+		mustStatementFingerprint(vmReplaceInterfaceSQL):       true,
+		mustStatementFingerprint(vmReplaceDiskSQL):            true,
+		mustStatementFingerprint(vmReplaceNICSQL):             true,
+		mustStatementFingerprint(vmReplacePCIIntentSQL):       true,
+		mustStatementFingerprint(vmReplacePCIRealizationSQL):  true,
+		mustStatementFingerprint(vmReplaceRetireInterfaceSQL): true,
+		mustStatementFingerprint(vmReplaceRetireDiskSQL):      true,
+		mustStatementFingerprint(vmReplaceRetireNICSQL):       true,
+		mustStatementFingerprint(vmReplaceRetirePCIIntentSQL): true,
+		mustStatementFingerprint(vmReplaceRetirePCIRealSQL):   true,
+		mustStatementFingerprint(vmReplaceLeaseSQL):           true,
 	}
+	// The cleanup authorization is the one statement whose absence is a protocol
+	// error rather than an empty set: a transition that committed without it
+	// displaces the manifest's rows leaving nothing to say what to free.
 	required := map[string]int{
-		mustStatementFingerprint(vmReplaceCleanupAuthSQL):      0,
-		mustStatementFingerprint(vmReplaceLeaseSQL):            0,
-		mustStatementFingerprint(vmInterfacesCreateCleanupSQL): 0,
-		mustStatementFingerprint(vmDisksCreateCleanupSQL):      0,
-		mustStatementFingerprint(vmNICsCreateCleanupSQL):       0,
-		mustStatementFingerprint(vmPCIIntentCreateCleanupSQL):  0,
-		mustStatementFingerprint(vmPCIRealCreateCleanupSQL):    0,
+		mustStatementFingerprint(vmReplaceCleanupAuthSQL): 0,
 	}
 	for i := 1; i < len(stmts)-1; i++ {
 		fp, table, fErr := fingerprintAt(i)
@@ -2204,7 +2223,6 @@ func validateReplaceStatementBinding(s Statement, sh StmtShape, g *MutationGuard
 	if g.ResourceKind != "vm" || g.ResourceID == "" || g.TargetResourceID == "" {
 		return invalidf("guarded replace statement carries an incomplete guard identity")
 	}
-	bound := func(name string) bool { return name == g.ResourceID || name == g.TargetResourceID }
 	switch sh.Table {
 	case "vms":
 		// The target upsert binds the new name; the final tombstone binds the
@@ -2222,21 +2240,25 @@ func validateReplaceStatementBinding(s Statement, sh StmtShape, g *MutationGuard
 		return nil
 	case "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations":
 		if sh.Kind == KindInsert {
+			// What the replacement brings TO the contested name.
 			name, ok := guardedInsertField(sh, s, "vm_name")
 			if !ok || coerceString(name) != g.TargetResourceID {
 				return invalidf("guarded replace child row is not under the guard's target name")
 			}
 			return nil
 		}
-		// The create-cleanup tombstones retire the replacement's own children.
-		if _, ok := createCleanupFingerprints[stmtFingerprint(sh)]; !ok ||
-			len(s.Params) != 3 || coerceString(s.Params[2]) != g.ResourceID {
-			return invalidf("guarded replace child cleanup is not the guard's replacement")
+		// Retiring one of the replacement's OWN keys. Each retirement shape binds
+		// (deleted_at, updated_at, vm_name, …pk), so the name sits at index 2.
+		if !vmReplaceRetirementFingerprints[stmtFingerprint(sh)] ||
+			len(s.Params) < 4 || coerceString(s.Params[2]) != g.ResourceID {
+			return invalidf("guarded replace child retirement is not one of the guard's replacement keys")
 		}
 		return nil
 	case "ip_allocations":
-		if len(s.Params) != 3 || !bound(coerceString(s.Params[0])) || !bound(coerceString(s.Params[2])) {
-			return invalidf("guarded replace lease transfer is not between the guard's two names")
+		// One lease, moved onto the contested name by its own primary key.
+		if stmtFingerprint(sh) != mustStatementFingerprint(vmReplaceLeaseSQL) ||
+			len(s.Params) != 4 || coerceString(s.Params[0]) != g.TargetResourceID {
+			return invalidf("guarded replace lease transfer does not move one lease onto the guard's target name")
 		}
 		return nil
 	case "operation_steps":

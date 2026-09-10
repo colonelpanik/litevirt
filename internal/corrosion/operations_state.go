@@ -103,9 +103,18 @@ var opHappyPath = map[OperationKind][]string{
 	//                     batch as that transition, so it cannot be observed
 	//                     without it, and it is what authorizes the destruction.
 	//
-	// OpStepCompleted is appended only after the cleanup has actually run, so a
-	// crash between the two leaves work a restart can find and finish.
-	OpVMReplace: {OpStepPlanned, OpStepDesiredPersisted},
+	//   config_applied    the replaced VM's resources are freed. It also CLOSES the
+	//                     cleanup phase: past this point the replacement's own
+	//                     firmware has moved onto the contested name, so re-running
+	//                     a name-keyed wipe would destroy the replacement's state.
+	//   redefined         the replacement's libvirt domain and firmware answer to
+	//                     the new name. The transition alone does not do this, and
+	//                     a restart that only finished the cleanup would leave a
+	//                     committed cutover with no domain at the name.
+	//
+	// OpStepCompleted is appended only after BOTH later phases have run, so a crash
+	// anywhere between them leaves work a restart can find and finish.
+	OpVMReplace: {OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied, OpStepRedefined},
 }
 
 var opTerminalStates = map[string]bool{

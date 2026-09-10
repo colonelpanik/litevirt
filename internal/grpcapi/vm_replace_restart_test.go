@@ -250,3 +250,171 @@ func TestCutoverCleanupKeepsAVolumeTheReplacementShares(t *testing.T) {
 		t.Fatalf("the shared volume is no longer recorded at the contested name: %+v", disks)
 	}
 }
+
+// A committed cutover is not finished when its cleanup is. The replacement's
+// libvirt domain and its name-keyed firmware still answer to the temporary name,
+// and moving them is the other half of the operation — so a restart has to
+// resume that too, or a crash straight after the DB commit becomes a "completed"
+// journal with no domain at the name at all. An ordinary retry cannot rescue it:
+// the replacement's row is tombstoned, so the handler reports NotFound.
+func TestCutoverRestart_AfterCommitFinishesTheRuntimeHandoff(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+
+	// A UEFI replacement, so the firmware half is real: the reconciler explicitly
+	// cannot heal one of these.
+	nvram := lv.NvramPath(s.dataDir, "app-next")
+	if err := os.MkdirAll(filepath.Dir(nvram), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, nvram)
+	if err := s.db.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = ?`,
+		`{"name":"app-next","firmware":"uefi","secure_boot":true,"uuid":"next-uuid"}`,
+		s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.DefineDomain(
+		`<domain><name>app-next</name><uuid>next-uuid</uuid><os><nvram>` + nvram + `</nvram></os></domain>`); err != nil {
+		t.Fatal(err)
+	}
+
+	crashAt(s, "after-commit")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+	// A direct retry cannot recover it — the replacement is tombstoned.
+	s.SetCutoverCrashHook(nil)
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("a retry claimed to redo a committed cutover")
+	}
+
+	// The restart must finish BOTH phases.
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Errorf("resume left no domain at the contested name: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app-next"); err == nil {
+		t.Error("resume left the replacement's domain under its temporary name")
+	}
+	if !exists(lv.NvramPath(s.dataDir, "app")) {
+		t.Error("resume left the replacement's firmware at its temporary path")
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("the operation is not finished: %+v", left)
+	}
+}
+
+// The runtime handoff moves the REPLACEMENT's firmware onto the contested name.
+// A cleanup pass that ran again after that would wipe it, so the phase has to be
+// recorded and never repeated.
+func TestCutoverRestart_ResumeDoesNotWipeTheReplacementsFirmware(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+
+	nvram := lv.NvramPath(s.dataDir, "app-next")
+	if err := os.MkdirAll(filepath.Dir(nvram), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, nvram)
+	if err := s.db.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = ?`,
+		`{"name":"app-next","firmware":"uefi","uuid":"next-uuid"}`, s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.DefineDomain(
+		`<domain><name>app-next</name><uuid>next-uuid</uuid><os><nvram>` + nvram + `</nvram></os></domain>`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	moved := lv.NvramPath(s.dataDir, "app")
+	if !exists(moved) {
+		t.Fatal("the cutover did not move the replacement's firmware onto the name")
+	}
+	// Resuming again must not re-run the name-keyed wipe.
+	for i := 0; i < 2; i++ {
+		if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+			t.Fatalf("resume %d: %v", i, err)
+		}
+	}
+	if !exists(moved) {
+		t.Error("a repeated resume wiped the REPLACEMENT's firmware from the contested name")
+	}
+}
+
+// The temporary name is free after the transition, and free means reusable. A
+// cleanup that exempted it from the shared-reference check would exempt whatever
+// VM holds it when a delayed cleanup finally runs — including one created after
+// the crash that legitimately references the captured volume.
+func TestCutoverCleanupHonorsAReusedTemporaryName(t *testing.T) {
+	s, original, _, _ := restartFixture(t)
+	ctx := adminCtx()
+
+	crashAt(s, "after-commit")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+
+	// The name is free now; something else takes it and references the volume the
+	// pending cleanup is holding.
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "app-next", HostName: s.hostName, Spec: `{"name":"app-next"}`, State: "stopped"},
+		nil, []corrosion.DiskRecord{{
+			VMName: "app-next", DiskName: "root", HostName: s.hostName,
+			Path: original, StorageType: "local",
+		}}); err != nil {
+		t.Fatalf("re-create the temporary name: %v", err)
+	}
+
+	s.SetCutoverCrashHook(nil)
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !exists(original) {
+		t.Fatal("the cleanup deleted a volume a live VM references, because it exempted the reused name")
+	}
+}
+
+// BOUNDARY 4 — the process dies after the destruction is recorded but before the
+// runtime handoff starts.
+//
+// This is the boundary the two phases exist to separate. The cleanup must NOT run
+// again (the handoff is about to put the replacement's firmware where the wipe
+// would look), and the handoff must still happen.
+func TestCutoverRestart_BeforeRuntimeFinishesTheHandoff(t *testing.T) {
+	s, original, replacement, iso := restartFixture(t)
+	ctx := adminCtx()
+
+	crashAt(s, "before-runtime")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon before the runtime handoff")
+	}
+	// The destruction ran and is recorded; the handoff has not.
+	if exists(original) || exists(iso) {
+		t.Fatal("the destruction phase did not complete before this boundary")
+	}
+	pending := pendingCleanups(t, s)
+	if len(pending) != 1 || !pending[0].CleanupDone || pending[0].RuntimeDone {
+		t.Fatalf("journal state = %+v, want the destruction done and the handoff owed", pending)
+	}
+	if _, err := s.virt.DumpXML("app"); err == nil {
+		t.Fatal("the handoff already ran")
+	}
+
+	s.SetCutoverCrashHook(nil)
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Errorf("resume did not finish the handoff: %v", err)
+	}
+	if !exists(replacement) {
+		t.Error("resume destroyed the replacement's disk")
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("the operation is not finished: %+v", left)
+	}
+}

@@ -60,6 +60,9 @@ func prepareCutover(t *testing.T, c *Client, replaced, replacement string) VMRep
 	}
 	prepared, err := PrepareVMReplace(ctx, c, VMReplaceManifest{
 		ReplacedVM: replaced, Replacement: replacement, HostName: src.HostName, Disks: disks,
+		ReplacementIncarnation: src.CreatedAt,
+		ReplacementSpec:        src.Spec,
+		ReplacementState:       src.State,
 	}, src.OwnerEpoch)
 	if err != nil {
 		t.Fatalf("PrepareVMReplace: %v", err)

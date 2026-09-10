@@ -151,6 +151,29 @@ const (
 			   updated_at = excluded.updated_at,
 			   deleted_at = excluded.deleted_at`
 
+	// The replacement's OWN rows, retired one key at a time.
+	//
+	// Row-scoped, not bulk by vm_name, and applied under the shared guard rather
+	// than per-row last-writer-wins. Bulk-by-name statements are dispatched through
+	// ordinary per-row LWW on a receiver, so a peer with a newer clock on one of
+	// them could commit the parent transition and leave that child live — the
+	// replacement still owning disks under a name the transition retired. Full-PK
+	// identity is also what lets the receiver clamp updated_at to max(incoming,
+	// local), so applying verbatim cannot REGRESS its clock on the row.
+	//
+	// `deleted_at IS NULL` makes each one naturally idempotent: a re-apply leaves
+	// an existing tombstone's own stamp alone.
+	vmReplaceRetireInterfaceSQL = `UPDATE vm_interfaces SET deleted_at = ?, updated_at = ?
+		 WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`
+	vmReplaceRetireDiskSQL = `UPDATE vm_disks SET deleted_at = ?, updated_at = ?
+		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`
+	vmReplaceRetireNICSQL = `UPDATE vm_nics SET deleted_at = ?, updated_at = ?
+		 WHERE vm_name = ? AND id = ? AND deleted_at IS NULL`
+	vmReplaceRetirePCIIntentSQL = `UPDATE vm_pci_intent SET deleted_at = ?, updated_at = ?
+		 WHERE vm_name = ? AND device_id = ? AND deleted_at IS NULL`
+	vmReplaceRetirePCIRealSQL = `UPDATE vm_pci_realizations SET deleted_at = ?, updated_at = ?
+		 WHERE vm_name = ? AND device_id = ? AND member_id = ? AND deleted_at IS NULL`
+
 	// vmReplaceCleanupAuthSQL is the operation_steps insert that authorizes the
 	// destruction — the same shape every other journaled operation appends with,
 	// so it carries no new wire liability of its own. It is named here because the
@@ -159,10 +182,12 @@ const (
 		     (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
 		     VALUES (?, ?, ?, ?, ?, ?, NULL)`
 
-	// vmReplaceLeaseSQL moves the replacement's IPAM leases onto the new name.
-	// ip_allocations keys on (network, ip), so vm_name is a plain column here and
-	// this shape is shared with the ordinary rename rather than replace-specific.
-	vmReplaceLeaseSQL = `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`
+	// vmReplaceLeaseSQL moves ONE of the replacement's IPAM leases onto the new
+	// name, keyed on the allocation's own primary key. The bulk-by-vm_name form
+	// would be dispatched through per-row LWW on a receiver, which is how a lease
+	// ends up still owned by a name the transition retired.
+	vmReplaceLeaseSQL = `UPDATE ip_allocations SET vm_name = ?, updated_at = ?
+		 WHERE network = ? AND ip = ? AND deleted_at IS NULL`
 
 	vmReplacePCIRealizationSQL = `INSERT INTO vm_pci_realizations
 			 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
@@ -175,6 +200,20 @@ const (
 			   updated_at = excluded.updated_at,
 			   deleted_at = excluded.deleted_at`
 )
+
+// vmReplaceRetirementFingerprints is the closed set of shapes that may retire one
+// of the replacement's own keys inside a guarded replace envelope.
+var vmReplaceRetirementFingerprints = map[string]bool{
+	mustStatementFingerprint(vmReplaceRetireInterfaceSQL): true,
+	mustStatementFingerprint(vmReplaceRetireDiskSQL):      true,
+	mustStatementFingerprint(vmReplaceRetireNICSQL):       true,
+	mustStatementFingerprint(vmReplaceRetirePCIIntentSQL): true,
+	mustStatementFingerprint(vmReplaceRetirePCIRealSQL):   true,
+}
+
+// replaceInterleaveHook is the seam described in ReplaceVM. Set it only from a
+// test, and clear it afterwards.
+var replaceInterleaveHook func()
 
 // ErrVMReplaceSourceUnsafe means the replacement is not in a state that may be
 // handed a new name — it is missing, already tombstoned, or has an operation in
@@ -288,7 +327,62 @@ func ReplaceVM(ctx context.Context, c *Client, replacement, name string, prepare
 	if err != nil {
 		return err
 	}
-	return c.ExecuteBatch(ctx, stmts)
+	// A TEST-ONLY seam, run after the batch is built and before it is written.
+	// Producing that interleaving is the only way to exercise what the
+	// write-transaction guard exists to catch, and it cannot be arranged from
+	// outside: the reads, the build and the write are adjacent here. Production
+	// leaves it nil.
+	if replaceInterleaveHook != nil {
+		replaceInterleaveHook()
+	}
+	// GUARDED, not a plain batch. ExecuteBatch executes each statement and
+	// evaluates no guard at all, so the reads above would be a bare
+	// time-of-check-to-time-of-use window: an ownership transfer landing between
+	// them and the write would let a stale target upsert — and the cleanup
+	// authorization travelling with it — commit while the source retirement CAS
+	// changed no rows, leaving both names live and destruction authorized.
+	//
+	// ExecuteBatchGuarded re-evaluates the SAME predicate inside the write
+	// transaction, for every statement, so the local writer reaches the identical
+	// decision a receiver does.
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return workloadReplaceGuardMatches(ctx, tx, guard)
+	}, stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("%w: %q or %q moved while the transition was being built",
+			ErrVMReplaceSourceUnsafe, replacement, name)
+	}
+	// The transition and the retirement are the two statements that must actually
+	// have taken effect. A matched guard implies both, so this is a post-condition
+	// rather than a race check — and cheap insurance against a future statement
+	// reordering that would otherwise authorize a cleanup for a transition that
+	// never happened.
+	return verifyVMReplaceApplied(ctx, c, replacement, name, authority)
+}
+
+// verifyVMReplaceApplied re-reads both names and refuses to call the transition
+// done unless the contested name holds the replacement at the authority the batch
+// wrote and the temporary name is retired.
+func verifyVMReplaceApplied(
+	ctx context.Context, c *Client, replacement, name string, a vmReplaceAuthority,
+) error {
+	took, err := GetVM(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	if took == nil || took.OwnerEpoch != a.epoch || took.SpecGeneration != a.generation {
+		return fmt.Errorf("corrosion: replacement did not take %q (row=%+v, want epoch %d generation %d)",
+			name, took, a.epoch, a.generation)
+	}
+	if stillLive, lErr := GetVM(ctx, c, replacement); lErr != nil {
+		return lErr
+	} else if stillLive != nil {
+		return fmt.Errorf("corrosion: %q is still live after it took the name %q", replacement, name)
+	}
+	return nil
 }
 
 // vmReplaceStatements builds the batch. Every statement carries the same guard.
@@ -312,6 +406,14 @@ func vmReplaceStatements(
 	adoptionState, _, adoptionErr := GetHardwareAdoptionState(ctx, c, source.Name)
 	if adoptionErr != nil {
 		return nil, adoptionErr
+	}
+	// Every key the replacement holds, so each can be retired by its own primary
+	// key below. Tombstoned keys are included and harmless: the retirement
+	// statements carry `deleted_at IS NULL`, so re-retiring one is a no-op that
+	// leaves its existing stamp alone.
+	sourceChildren, err := vmChildKeys(ctx, c, source.Name)
+	if err != nil {
+		return nil, err
 	}
 	if adoptionState == "" {
 		adoptionState = "pending"
@@ -430,27 +532,52 @@ func vmReplaceStatements(
 		})
 	}
 
-	// ip_allocations keys on (network, ip); vm_name is a NON-PK column, so this is a
-	// bulk update whose per-row LWW expansion is safe on apply.
-	stmts = append(stmts, Statement{
-		SQL:    vmReplaceLeaseSQL,
-		Params: []interface{}{name, now, source.Name},
-		Guard:  guard,
-	})
+	// Move each of the replacement's IPAM leases by its OWN primary key. The
+	// bulk-by-vm_name form is dispatched through per-row LWW on a receiver, which
+	// is how a lease ends up still assigned to the name the transition retired.
+	leases, err := c.Query(ctx,
+		`SELECT network, ip FROM ip_allocations WHERE vm_name = ? AND deleted_at IS NULL`, source.Name)
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range leases {
+		stmts = append(stmts, Statement{
+			SQL:    vmReplaceLeaseSQL,
+			Params: []interface{}{name, now, l.String("network"), l.String("ip")},
+			Guard:  guard,
+		})
+	}
 
 	// Retire the replacement's own rows. Children first, then the parent — which is
 	// deliberately the LAST statement in the batch: it is the semantic commit
 	// barrier, and keeping the source row live until then is what lets every
 	// preceding statement re-evaluate the SAME guard and reach the same answer.
-	// Written out rather than looped: every replicated statement has to be finite
-	// static SQL at its own emission site, or the compatibility ledger cannot see it.
+	//
+	// Row-scoped for the same reason as the leases, and written out per table
+	// because every replicated statement has to be finite static SQL at its own
+	// emission site or the compatibility ledger cannot see it.
 	wall := nowRFC3339()
-	retire := []interface{}{wall, now, source.Name}
-	stmts = append(stmts, Statement{SQL: vmInterfacesCreateCleanupSQL, Params: retire, Guard: guard})
-	stmts = append(stmts, Statement{SQL: vmDisksCreateCleanupSQL, Params: retire, Guard: guard})
-	stmts = append(stmts, Statement{SQL: vmNICsCreateCleanupSQL, Params: retire, Guard: guard})
-	stmts = append(stmts, Statement{SQL: vmPCIIntentCreateCleanupSQL, Params: retire, Guard: guard})
-	stmts = append(stmts, Statement{SQL: vmPCIRealCreateCleanupSQL, Params: retire, Guard: guard})
+	for _, k := range sourceChildren {
+		switch k.table {
+		case "vm_interfaces":
+			stmts = append(stmts, Statement{SQL: vmReplaceRetireInterfaceSQL,
+				Params: []interface{}{wall, now, source.Name, k.key}, Guard: guard})
+		case "vm_disks":
+			stmts = append(stmts, Statement{SQL: vmReplaceRetireDiskSQL,
+				Params: []interface{}{wall, now, source.Name, k.key}, Guard: guard})
+		case "vm_nics":
+			stmts = append(stmts, Statement{SQL: vmReplaceRetireNICSQL,
+				Params: []interface{}{wall, now, source.Name, k.key}, Guard: guard})
+		case "vm_pci_intent":
+			stmts = append(stmts, Statement{SQL: vmReplaceRetirePCIIntentSQL,
+				Params: []interface{}{wall, now, source.Name, k.key}, Guard: guard})
+		case "vm_pci_realizations":
+			stmts = append(stmts, Statement{SQL: vmReplaceRetirePCIRealSQL,
+				Params: []interface{}{wall, now, source.Name, k.deviceID, k.memberID}, Guard: guard})
+		default:
+			return nil, fmt.Errorf("corrosion: replace has no retirement for child table %q", k.table)
+		}
+	}
 	// The step that AUTHORIZES the destruction, in the same batch as the
 	// transition that makes it necessary. Atomic with it by construction: a
 	// receiver — or a crashed sender's own database — can never hold this step
@@ -604,6 +731,12 @@ type VMReplaceManifest struct {
 	// afterwards, which makes every live reference count as another VM's.
 	Replacement string `json:"replacement"`
 	HostName    string `json:"host_name"`
+	// ReplacementIncarnation is the replacement's created_at. It is in the
+	// operation's deterministic identity because the NAMES are not unique over
+	// time: a second deployment reuses both of them, and an id built from names
+	// alone collides with the first deployment's completed header — which is a
+	// hash conflict raised after the current VM has already been torn down.
+	ReplacementIncarnation string `json:"replacement_incarnation"`
 	// FirmwareUUID keys the replaced VM's swtpm tree. Its NVRAM is name-keyed and
 	// so is covered by ReplacedVM.
 	FirmwareUUID string `json:"firmware_uuid,omitempty"`
@@ -613,6 +746,14 @@ type VMReplaceManifest struct {
 	// Paths are whole-file artifacts keyed by the replaced VM's name (its
 	// cloud-init ISO), which the transition does not describe.
 	Paths []string `json:"paths,omitempty"`
+	// ReplacementSpec and ReplacementState are the runtime-handoff inputs: the
+	// libvirt domain and firmware still answer to the temporary name after the
+	// transition commits, and moving them is the other half of a cutover. A
+	// restart cannot re-derive them from the database — the replacement's row is
+	// tombstoned under its temporary name and the reused name now holds the
+	// transitioned record — so they are captured here alongside the manifest.
+	ReplacementSpec  string `json:"replacement_spec,omitempty"`
+	ReplacementState string `json:"replacement_state,omitempty"`
 }
 
 // VMReplacePrepared is the handle PrepareVMReplace returns: the journaled
@@ -625,13 +766,22 @@ type VMReplacePrepared struct {
 	OwnerEpoch  int64
 }
 
-// VMReplaceCleanup is a committed replace whose destruction has not been
-// recorded as done.
+// VMReplaceCleanup is a committed replace with phases still outstanding.
+//
+// CleanupDone says the destruction has already run, which is not merely an
+// optimisation: after it, the replacement's own firmware has moved onto the
+// contested name, so re-running the name-keyed wipe would destroy the
+// replacement's state instead of the replaced VM's.
 type VMReplaceCleanup struct {
 	OperationID string
 	OwnerEpoch  int64
 	Manifest    VMReplaceManifest
+	CleanupDone bool
+	RuntimeDone bool
 }
+
+// Outstanding reports whether either phase still has to run.
+func (c VMReplaceCleanup) Outstanding() bool { return !c.CleanupDone || !c.RuntimeDone }
 
 // vmReplaceMethod names the operation in its deterministic id.
 const vmReplaceMethod = "CutoverVM"
@@ -655,7 +805,15 @@ func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, owner
 	if err != nil {
 		return none, err
 	}
-	id := DeterministicOperationID(vmReplaceMethod, m.HostName, "", m.ReplacedVM, m.Replacement)
+	if m.ReplacementIncarnation == "" {
+		return none, fmt.Errorf("corrosion: VM replace manifest has no replacement incarnation")
+	}
+	// The incarnation, not just the names: both names are reused by the next
+	// deployment, and a completed header sticks around until the retention sweep.
+	// Two deployments of the same pair must be two operations; two ATTEMPTS at one
+	// deployment must be the same one.
+	id := DeterministicOperationID(vmReplaceMethod, m.HostName, "", m.ReplacedVM,
+		m.Replacement+"@"+m.ReplacementIncarnation)
 	op := OperationRecord{
 		ID: id, Method: vmReplaceMethod, Principal: m.HostName,
 		ResourceKind: "vm", ResourceID: m.ReplacedVM,
@@ -663,7 +821,8 @@ func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, owner
 		// The manifest IS the request: a retry that produced a different one would
 		// be describing different resources, which ClaimOrFindOperation refuses
 		// rather than silently adopting.
-		RequestHash: hashIdentity(string(body)), IdempotencyKey: m.Replacement,
+		RequestHash:     hashIdentity(string(body)),
+		IdempotencyKey:  m.Replacement + "@" + m.ReplacementIncarnation,
 		ReservationJSON: string(body), DesiredRef: m.ReplacedVM, VMOwnerEpoch: ownerEpoch,
 	}
 	if _, _, err := ClaimOrFindOperation(ctx, c, op); err != nil {
@@ -698,23 +857,48 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 		if sErr != nil {
 			return nil, sErr
 		}
-		if state != OpStepDesiredPersisted {
-			continue // planned (authorizes nothing) or already terminal
+		// planned authorizes nothing — its transition never landed, so the
+		// resources its manifest names are still owned by a live VM. A terminal
+		// operation is finished.
+		if state == OpStepPlanned || IsOperationTerminal(state) {
+			continue
 		}
 		var m VMReplaceManifest
 		if json.Unmarshal([]byte(op.ReservationJSON), &m) != nil || m.HostName != hostName {
 			continue
 		}
-		out = append(out, VMReplaceCleanup{OperationID: op.ID, OwnerEpoch: op.VMOwnerEpoch, Manifest: m})
+		steps, stErr := ListOperationSteps(ctx, c, op.ID, op.VMOwnerEpoch)
+		if stErr != nil {
+			return nil, stErr
+		}
+		pending := VMReplaceCleanup{OperationID: op.ID, OwnerEpoch: op.VMOwnerEpoch, Manifest: m}
+		for _, st := range steps {
+			switch st.StepName {
+			case OpStepConfigApplied:
+				pending.CleanupDone = true
+			case OpStepRedefined:
+				pending.RuntimeDone = true
+			}
+		}
+		if !pending.Outstanding() {
+			continue
+		}
+		out = append(out, pending)
 	}
 	return out, nil
 }
 
-// CompleteVMReplace records that the cleanup ran. Appended ONLY after it
-// succeeded: the step is what stops a restart from trying again, so writing it
-// early would strand exactly the resources the journal exists to free.
-func CompleteVMReplace(ctx context.Context, c *Client, operationID string, ownerEpoch int64) error {
+// RecordVMReplacePhase records that one phase of a committed replace has run.
+//
+// Appended ONLY after that phase actually succeeded: the step is what stops a
+// restart from doing it again, so writing it early would either strand the
+// resources the journal exists to free, or — for the cleanup phase — let a later
+// resume wipe firmware that by then belongs to the replacement.
+func RecordVMReplacePhase(ctx context.Context, c *Client, operationID string, ownerEpoch int64, step string) error {
+	if step != OpStepConfigApplied && step != OpStepRedefined && step != OpStepCompleted {
+		return fmt.Errorf("corrosion: %q is not a VM replace phase", step)
+	}
 	return AppendOperationStep(ctx, c, OperationStepRecord{
-		OperationID: operationID, OwnerEpoch: ownerEpoch, StepName: OpStepCompleted,
+		OperationID: operationID, OwnerEpoch: ownerEpoch, StepName: step,
 	})
 }

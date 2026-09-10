@@ -293,14 +293,26 @@ replaced VM's parent row, and any child row whose key the replacement claims. A 
 between would leak its volumes with nothing left in the database naming them.
 
 So a `vm_replace` operation records an immutable manifest — the replaced VM's disk records,
-its firmware UUID, its cloud-init ISO path — while those rows are still intact, and the
-step that AUTHORIZES the destruction (`desired_persisted`) is written in the same batch as
-the transition. A `planned` operation authorizes nothing, which is what makes a crash before
-the commit safe: the resources it names are still owned by a VM that still exists.
-`completed` is appended only after the destruction has actually run, so a crash in the
-middle leaves work a restart finds and finishes — from the manifest, never by reading the
-reused name, which now belongs to the replacement. Cleanup is idempotent and keeps the
-shared-reference check, so a volume the replacement also uses is skipped rather than freed.
+its firmware UUID and cloud-init ISO path, plus the replacement's spec and state — while
+those rows are still intact, and the step that AUTHORIZES the destruction is written in the
+same batch as the transition. Its phases are:
+
+| step | meaning |
+|---|---|
+| `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
+| `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
+| `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
+| `redefined` | the replacement's libvirt domain and firmware answer to the new name. The database transition does not do this, and a restart that finished only the destruction would leave a committed cutover with no domain at the name. |
+| `completed` | appended only after **both** later phases have run. |
+
+A restart resumes whichever phases are outstanding, from the manifest — never by
+re-running the transition, and never by reading the reused name, which now belongs to the
+replacement. The operation's identity includes the replacement's **incarnation**, not just
+the two names: both are reused by the next deployment, and an identity built from names
+alone collides with the previous cutover's header. Destruction exempts **no** VM from the
+shared-reference check, because the temporary name is free and reusable — a VM created
+after a crash can legitimately reference a captured volume.
+
 That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
 
 That is new receiver behaviour, which nothing in the historical ledger can retrofit onto an

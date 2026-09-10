@@ -208,6 +208,12 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: vmReplaceNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
 	{SQL: vmReplacePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
 	{SQL: vmReplacePCIRealizationSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireInterfaceSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireDiskSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIRealSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceLeaseSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()

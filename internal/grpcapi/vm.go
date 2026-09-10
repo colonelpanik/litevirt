@@ -2823,6 +2823,17 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			oldVM, resumed = tombstoned, true
 		}
 	}
+	// Journalled FIRST, before anything is stopped or written. Two reasons it has
+	// to be here and not after the teardown: the manifest can only be taken while
+	// the replaced VM's rows are intact, and CLAIMING the operation is what detects
+	// a conflicting one — a conflict discovered after the current VM has been
+	// undefined and tombstoned would leave no live VM at the name at all.
+	manifest := corrosion.VMReplaceManifest{
+		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
+		ReplacementIncarnation: nextVM.CreatedAt,
+		ReplacementSpec:        nextVM.Spec,
+		ReplacementState:       nextVM.State,
+	}
 	if oldVM != nil {
 		// Captured HERE, before any DB write: the transition DISPLACES the replaced
 		// VM's parent row and every child row whose key the replacement claims, so
@@ -2840,7 +2851,17 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 				return nil, status.Errorf(codes.Internal,
 					"cutover: read the replaced VM's disk records: %v", derr)
 			}
+			manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
+			manifest.Disks = replacedDisks
+			manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
 		}
+	}
+	prepared, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover: journal the cleanup manifest: %v (nothing was changed)", err)
+	}
+	if oldVM != nil {
 		if oldVM.HostName == s.hostName && oldVM.State == "running" {
 			s.virt.DestroyDomain(req.VmName)
 		}
@@ -2873,25 +2894,6 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			}
 		}
 	}
-
-	// Journal what the replaced VM owned, while the rows describing it are still
-	// intact. The transition below displaces them, so this is the last moment the
-	// manifest can be taken — and after it commits, this journal is the ONLY thing
-	// that still knows which volumes belong to a VM whose name now belongs to
-	// something else. A planned operation authorizes nothing; the transition
-	// writes the step that does, in the same batch.
-	manifest := corrosion.VMReplaceManifest{
-		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
-	}
-	if oldVM != nil && oldVM.HostName == s.hostName {
-		manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
-		manifest.Disks = replacedDisks
-		manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
-	}
-	prepared, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "cutover: journal the cleanup manifest: %v", err)
-	}
 	if hErr := s.fireCutoverCrashHook("before-commit"); hErr != nil {
 		return nil, status.Errorf(codes.Internal, "cutover: %v", hErr)
 	}
@@ -2917,73 +2919,17 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
-	// Only now free what cannot be put back, and only from the journal. This must
-	// stay AHEAD of the NVRAM rename below, which moves the -next vars file into
-	// the replaced VM's name-keyed path.
+	// The destruction of what the replaced VM owned, then the runtime handoff that
+	// moves the replacement's domain and firmware onto the name — both driven from
+	// the journal, in that order (the handoff puts the replacement's vars file at
+	// the path the destruction wipes), each recorded only once it has run.
+	// A crash between them leaves the rest journaled for a restart to finish.
 	if err := s.finishVMReplaceCleanup(ctx, corrosion.VMReplaceCleanup{
 		OperationID: prepared.OperationID, OwnerEpoch: prepared.OwnerEpoch, Manifest: manifest,
 	}); err != nil {
 		return nil, status.Errorf(codes.Internal,
-			"cutover: free the replaced VM's resources: %v (the transition is committed; "+
-				"the journaled cleanup will be retried)", err)
-	}
-
-	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
-	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal
-	// a firmware VM (a fresh redefine would mint new firmware) — so mark it errored
-	// and return rather than reporting a successful cutover. For a plain VM the
-	// reconciler rebuilds, so log + continue (G1).
-	fwVM := usesFirmwareState(nextVM.Spec)
-	if nextVM.HostName == s.hostName {
-		cutoverFail := func(step string, e error) error {
-			slog.Error("cutover: "+step+" failed", "vm", req.VmName, "error", e, "firmware_vm", fwVM)
-			s.recordVMEvent(ctx, req.VmName, "vm.cutover", "error", step+" failed: "+e.Error())
-			if fwVM {
-				if werr := corrosion.UpdateVMState(ctx, s.db, req.VmName, "error", "cutover "+step+" failed: "+e.Error()); werr != nil {
-					s.noteStateWriteFail(corrosion.OpVMState, werr)
-				}
-				return status.Errorf(codes.Internal, "cutover %s for %q: %v", step, req.VmName, e)
-			}
-			return nil // plain VM — reconciler will rebuild
-		}
-		// Libvirt doesn't support rename directly — dump XML, undefine, redefine.
-		xml, derr := s.virt.DumpXML(nextName)
-		if derr != nil {
-			if e := cutoverFail("dump XML", derr); e != nil {
-				return nil, e
-			}
-		} else {
-			// KEEP NVRAM/vTPM — the dumped XML retains the stable <uuid> so the
-			// UUID-keyed swtpm follows it automatically; only the name-keyed NVRAM
-			// file needs renaming. Undefine MUST succeed before we rename NVRAM —
-			// renaming the vars file out from under a still-defined -next domain
-			// would leave a dangling <nvram> path (G1), so treat failure as hard.
-			if e := s.virt.UndefineDomainPreservingState(nextName); e != nil {
-				if e := cutoverFail("undefine -next", e); e != nil {
-					return nil, e
-				}
-			}
-			xml = replaceDomainName(xml, nextName, req.VmName)
-			oldNvram, newNvram := lv.NvramPath(s.dataDir, nextName), lv.NvramPath(s.dataDir, req.VmName)
-			if _, e := os.Stat(oldNvram); e == nil {
-				if e := os.Rename(oldNvram, newNvram); e == nil {
-					xml = strings.ReplaceAll(xml, oldNvram, newNvram)
-				} else if e := cutoverFail("nvram rename", e); e != nil {
-					return nil, e
-				}
-			}
-			if e := s.virt.DefineDomain(xml); e != nil {
-				if e := cutoverFail("redefine", e); e != nil {
-					return nil, e
-				}
-			} else if nextVM.State == "running" {
-				if e := s.virt.StartDomain(req.VmName); e != nil {
-					if e := cutoverFail("start", e); e != nil {
-						return nil, e
-					}
-				}
-			}
-		}
+			"cutover: finish the replacement: %v (the transition is committed; the journaled "+
+				"phases will be retried)", err)
 	}
 
 	slog.Info("cutover complete", "vm", req.VmName, "replaced_from", nextName)

@@ -38,6 +38,11 @@ var sanctionedSpecWriters = map[string]string{
 		"it does not execute a write",
 	"HistoricalShapes": "enumerates retained SQL strings for compatibility-ledger generation; " +
 		"it does not execute a write",
+	"vmReplaceStatements": "guarded VM-name replacement — writes the replacement's spec AT the " +
+		"contested name under a single receiver decision; there is no name-keyed CAS to use " +
+		"because the row being written is not the row being read",
+	"validateGuardedVMReplaceEntry": "fingerprints the exact guarded-replace batch envelope; " +
+		"it does not execute a write",
 }
 
 // TestSpecWritersAreSanctioned fails if any function in the corrosion package

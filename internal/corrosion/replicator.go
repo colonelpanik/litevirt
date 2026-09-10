@@ -1185,6 +1185,22 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
 		return execErr
 
+	case DispGuardedReplace:
+		// One statement of a guarded VM-name replacement. The shared
+		// workload_replace_v1 guard has already matched (mutationGuardMatches ran
+		// above and skipped the statement otherwise), and that single decision is
+		// what orders the whole batch — so apply verbatim. LWW-gating on top would
+		// let this receiver take the parent transition and drop a child on its own
+		// clock, which is the partial application the guard exists to prevent.
+		if s.Guard == nil || s.Guard.Protocol != workloadReplaceGuardV1 {
+			return invalidf("guarded replace statement missing workload_replace_v1 guard")
+		}
+		res, execErr := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if execErr == nil && rowsChanged(res) {
+			r.client.deferAfterCommit(tx, func() { r.client.clearUnresolvedFromShape(sh, s) })
+		}
+		return execErr
+
 	case DispCreateBegin:
 		if s.Guard == nil || s.Guard.Protocol != workloadCreateBeginGuardV1 {
 			return invalidf("create-begin statement missing workload_create_begin_v1 guard")
@@ -1667,6 +1683,9 @@ func validateGuardedMutationEntry(stmts []Statement) error {
 		if s.Guard != nil && s.Guard.Protocol == workloadRekeyGuardV1 {
 			return validateGuardedContainerRekeyEntry(stmts)
 		}
+		if s.Guard != nil && s.Guard.Protocol == workloadReplaceGuardV1 {
+			return validateGuardedVMReplaceEntry(stmts)
+		}
 	}
 	barrierIndex, barrierCount := -1, 0
 	needsCreateBarrier, needsDeleteBarrier := false, false
@@ -1779,6 +1798,94 @@ func validateGuardedMutationEntry(stmts []Statement) error {
 			if !hasExactGuardedRoles(roleCounts, "container_interfaces") {
 				return invalidf("guarded container delete is missing its exact child cleanup sequence")
 			}
+		}
+	}
+	return nil
+}
+
+// validateGuardedVMReplaceEntry pins the EXACT envelope of a guarded VM-name
+// replacement, so a matched guard authorizes only the transition it was built
+// for. A guard that admitted an arbitrary statement list would be a much weaker
+// thing than it looks: the single receiver decision is only meaningful if the
+// set of statements it decides for is fixed.
+//
+// The order is load-bearing. The target row comes FIRST, because the guard's
+// target-side check has to accept the row this batch itself writes, and the
+// replacement's tombstone comes LAST, because the guard requires the source to
+// still be live — which is what lets every statement in between re-evaluate the
+// same guard and reach the same answer.
+func validateGuardedVMReplaceEntry(stmts []Statement) error {
+	base := stmts[0].Guard
+	if base == nil || base.Protocol != workloadReplaceGuardV1 ||
+		base.ResourceKind != "vm" || base.ResourceID == "" || base.TargetResourceID == "" ||
+		base.ResourceID == base.TargetResourceID || base.Incarnation == "" ||
+		base.IdentityHash == "" || !base.CheckSpecGeneration ||
+		base.NewOwnerEpoch <= base.OwnerEpoch || base.NewOwnerEpoch <= base.TargetOwnerEpoch ||
+		base.NewSpecGeneration <= base.SpecGeneration ||
+		base.NewSpecGeneration <= base.TargetSpecGeneration {
+		return invalidf("guarded VM replace has an invalid authority guard")
+	}
+	for _, s := range stmts {
+		if s.Guard == nil || *s.Guard != *base {
+			return invalidf("guarded VM replace mixes or omits authority guards")
+		}
+	}
+	fingerprintAt := func(i int) (string, string, error) {
+		sh, _, err := parseResolved(stmts[i].SQL)
+		if err != nil {
+			return "", "", err
+		}
+		return stmtFingerprint(sh), sh.Table, nil
+	}
+	firstFP, _, err := fingerprintAt(0)
+	if err != nil {
+		return err
+	}
+	if firstFP != mustStatementFingerprint(vmReplaceTargetSQL) {
+		return invalidf("guarded VM replace does not open with its target row")
+	}
+	lastFP, _, err := fingerprintAt(len(stmts) - 1)
+	if err != nil {
+		return err
+	}
+	if lastFP != mustStatementFingerprint(vmDeleteSQL) {
+		return invalidf("guarded VM replace does not close with the replacement's tombstone")
+	}
+	// Every child upsert is optional (a VM need not have disks); the lease transfer
+	// and the five retirements are not, so they are counted rather than merely
+	// permitted — a batch that silently dropped one would leave the replacement's
+	// rows live under its temporary name.
+	optional := map[string]bool{
+		mustStatementFingerprint(vmReplaceInterfaceSQL):      true,
+		mustStatementFingerprint(vmReplaceDiskSQL):           true,
+		mustStatementFingerprint(vmReplaceNICSQL):            true,
+		mustStatementFingerprint(vmReplacePCIIntentSQL):      true,
+		mustStatementFingerprint(vmReplacePCIRealizationSQL): true,
+	}
+	required := map[string]int{
+		mustStatementFingerprint(vmReplaceLeaseSQL):            0,
+		mustStatementFingerprint(vmInterfacesCreateCleanupSQL): 0,
+		mustStatementFingerprint(vmDisksCreateCleanupSQL):      0,
+		mustStatementFingerprint(vmNICsCreateCleanupSQL):       0,
+		mustStatementFingerprint(vmPCIIntentCreateCleanupSQL):  0,
+		mustStatementFingerprint(vmPCIRealCreateCleanupSQL):    0,
+	}
+	for i := 1; i < len(stmts)-1; i++ {
+		fp, table, fErr := fingerprintAt(i)
+		if fErr != nil {
+			return fErr
+		}
+		if optional[fp] {
+			continue
+		}
+		if _, ok := required[fp]; !ok {
+			return invalidf("guarded VM replace carries an unauthorized statement on %s", table)
+		}
+		required[fp]++
+	}
+	for fp, n := range required {
+		if n != 1 {
+			return invalidf("guarded VM replace has %d of a mandatory statement (%s), want exactly 1", n, fp)
 		}
 	}
 	return nil
@@ -2089,6 +2196,53 @@ func hasExactGuardedRoles(got map[string]int, expected ...string) bool {
 	return true
 }
 
+// validateReplaceStatementBinding proves a guarded-replace statement actually
+// addresses one of the two VMs its guard names, so a matched guard cannot be
+// reused to smuggle a write at some third name into the batch.
+func validateReplaceStatementBinding(s Statement, sh StmtShape, g *MutationGuard) error {
+	if g.ResourceKind != "vm" || g.ResourceID == "" || g.TargetResourceID == "" {
+		return invalidf("guarded replace statement carries an incomplete guard identity")
+	}
+	bound := func(name string) bool { return name == g.ResourceID || name == g.TargetResourceID }
+	switch sh.Table {
+	case "vms":
+		// The target upsert binds the new name; the final tombstone binds the
+		// replacement. Both are the guard's own names, in their own parameter slots.
+		if sh.Kind == KindInsert {
+			name, ok := guardedInsertField(sh, s, "name")
+			if !ok || coerceString(name) != g.TargetResourceID {
+				return invalidf("guarded replace target row is not the guard's target name")
+			}
+			return nil
+		}
+		if len(s.Params) < 3 || coerceString(s.Params[2]) != g.ResourceID {
+			return invalidf("guarded replace source tombstone is not the guard's replacement")
+		}
+		return nil
+	case "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations":
+		if sh.Kind == KindInsert {
+			name, ok := guardedInsertField(sh, s, "vm_name")
+			if !ok || coerceString(name) != g.TargetResourceID {
+				return invalidf("guarded replace child row is not under the guard's target name")
+			}
+			return nil
+		}
+		// The create-cleanup tombstones retire the replacement's own children.
+		if _, ok := createCleanupFingerprints[stmtFingerprint(sh)]; !ok ||
+			len(s.Params) != 3 || coerceString(s.Params[2]) != g.ResourceID {
+			return invalidf("guarded replace child cleanup is not the guard's replacement")
+		}
+		return nil
+	case "ip_allocations":
+		if len(s.Params) != 3 || !bound(coerceString(s.Params[0])) || !bound(coerceString(s.Params[2])) {
+			return invalidf("guarded replace lease transfer is not between the guard's two names")
+		}
+		return nil
+	default:
+		return invalidf("guarded replace statement targets an unexpected table %q", sh.Table)
+	}
+}
+
 func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	g := s.Guard
 	if g == nil {
@@ -2097,6 +2251,13 @@ func validateGuardedStatementBinding(s Statement, sh StmtShape) error {
 	field := func(name string) (string, bool) {
 		v, ok := guardedInsertField(sh, s, name)
 		return coerceString(v), ok
+	}
+	// workload_replace_v1 binds TWO names: the replacement (g.ResourceID, whose rows
+	// the batch retires) and the name it is taking (g.TargetResourceID, where the
+	// batch writes). Every other protocol binds one, so this is checked first rather
+	// than bent into the per-table branches below.
+	if g.Protocol == workloadReplaceGuardV1 {
+		return validateReplaceStatementBinding(s, sh, g)
 	}
 	switch sh.Table {
 	case "operations":
@@ -2288,8 +2449,15 @@ func guardedInsertField(sh StmtShape, s Statement, name string) (interface{}, bo
 
 func validateWorkloadDeleteStatement(s Statement, sh StmtShape) error {
 	g := s.Guard
+	// workload_replace_v1 is accepted here because a guarded VM-name replacement
+	// closes with exactly this tombstone, on the replacement it just moved. That is
+	// not a widening of what the shape can reach: the envelope validator pins this
+	// statement to the LAST position of a validated replace batch under the same
+	// guard, and the identity checks below still bind it to the guard's own
+	// resource and authority.
 	if g == nil ||
-		(g.Protocol != workloadDeleteGuardV1 && g.Protocol != workloadRekeyGuardV1) ||
+		(g.Protocol != workloadDeleteGuardV1 && g.Protocol != workloadRekeyGuardV1 &&
+			g.Protocol != workloadReplaceGuardV1) ||
 		g.ResourceID == "" ||
 		g.IdentityHash == "" || !g.CheckSpecGeneration {
 		return invalidf("workload delete missing workload_delete_v1 authority guard")

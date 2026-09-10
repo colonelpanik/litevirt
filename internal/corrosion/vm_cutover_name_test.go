@@ -20,22 +20,26 @@ import (
 // The tests here also pin the three ways the obvious fix — purging the tombstone
 // in the same batch as the rekey — is wrong. See ErrRenameTargetOccupied.
 
-// cutover drives what CutoverVM drives at the database layer and returns the
-// name the replaced VM's tombstone was moved to.
-func cutover(t *testing.T, c *Client, replaced, replacement string) string {
+// testClientVMReplace is a client that has latched vm_replace_v1, so it will APPLY
+// a replicated guarded replace instead of rejecting the shape. A receiver without
+// it refuses — which is the rollout guarantee, and has its own test.
+func testClientVMReplace(t *testing.T) *Client {
+	t.Helper()
+	c := testClient(t)
+	c.SetVMReplaceAccept(func() bool { return true })
+	return c
+}
+
+// cutover drives what CutoverVM drives at the database layer.
+func cutover(t *testing.T, c *Client, replaced, replacement string) {
 	t.Helper()
 	ctx := context.Background()
 	if err := DeleteVM(ctx, c, replaced); err != nil {
 		t.Fatalf("DeleteVM %q: %v", replaced, err)
 	}
-	retired, err := ReplaceVMName(ctx, c, replacement, replaced)
-	if err != nil {
-		t.Fatalf("ReplaceVMName %q → %q: %v", replacement, replaced, err)
+	if err := ReplaceVM(ctx, c, replacement, replaced); err != nil {
+		t.Fatalf("ReplaceVM %q → %q: %v", replacement, replaced, err)
 	}
-	if retired == "" {
-		t.Fatalf("ReplaceVMName reported no retired name, but %q was tombstoned", replaced)
-	}
-	return retired
 }
 
 // walEntries returns every mutation the client has logged, oldest first, as
@@ -79,7 +83,18 @@ func TestCutoverGivesTheReplacementATombstonedName(t *testing.T) {
 		t.Fatalf("InsertVM replacement: %v", err)
 	}
 
-	retired := cutover(t, c, "app", "app-next")
+	before := func(name string) (created string, epoch, gen int64) {
+		t.Helper()
+		vm, err := GetVM(ctx, c, name)
+		if err != nil || vm == nil {
+			t.Fatalf("read %q before the cutover: %+v err=%v", name, vm, err)
+		}
+		return vm.CreatedAt, vm.OwnerEpoch, vm.SpecGeneration
+	}
+	replacedCreated, replacedEpoch, replacedGen := before("app")
+	replacementCreated, replacementEpoch, replacementGen := before("app-next")
+
+	cutover(t, c, "app", "app-next")
 
 	got, err := GetVM(ctx, c, "app")
 	if err != nil {
@@ -115,28 +130,40 @@ func TestCutoverGivesTheReplacementATombstonedName(t *testing.T) {
 		t.Fatalf(`disks on "app" = %+v, want exactly the replacement's path`, disks)
 	}
 
-	// The replaced VM's tombstone must still EXIST, under the retired name. It is
-	// the only evidence that its incarnation was deleted; destroying it is what
-	// lets a stale pre-delete copy come back (TestStaleFullStateCannotUndoACutover).
-	rows, err := c.Query(ctx, `SELECT deleted_at FROM vms WHERE name = ?`, retired)
+	// The two invariants the whole transition rests on.
+	//
+	// The row at the contested name carries the REPLACEMENT's incarnation, not the
+	// replaced VM's. created_at IS the incarnation identity the anti-entropy merge
+	// decides from, and a delete is terminal for its own incarnation — so inheriting
+	// the replaced VM's stamp would let a delayed replay of its tombstone kill the
+	// replacement as "the same incarnation, already deleted".
+	if got.CreatedAt != replacementCreated {
+		t.Errorf("VM \"app\" carries created_at %q, want the replacement's %q — a delayed "+
+			"tombstone of the replaced VM would read as the same incarnation and kill it",
+			got.CreatedAt, replacementCreated)
+	}
+	if got.CreatedAt == replacedCreated {
+		t.Errorf("VM \"app\" inherited the REPLACED VM's incarnation %q", replacedCreated)
+	}
+	// And its authority exceeds BOTH inputs, because a both-live conflict at this
+	// name is decided on owner/generation alone: a stale copy of either VM that
+	// still outranked it would simply overwrite the replacement.
+	if got.OwnerEpoch <= replacedEpoch || got.OwnerEpoch <= replacementEpoch {
+		t.Errorf("owner epoch = %d, want above both inputs (replaced %d, replacement %d)",
+			got.OwnerEpoch, replacedEpoch, replacementEpoch)
+	}
+	if got.SpecGeneration <= replacedGen || got.SpecGeneration <= replacementGen {
+		t.Errorf("spec generation = %d, want above both inputs (replaced %d, replacement %d)",
+			got.SpecGeneration, replacedGen, replacementGen)
+	}
+	// The replacement's own rows are TOMBSTONED, not deleted — the tombstone is what
+	// tells a lagging peer the temporary name is retired rather than merely unseen.
+	rows, err := c.Query(ctx, `SELECT deleted_at FROM vms WHERE name = 'app-next'`)
 	if err != nil {
-		t.Fatalf("read retired row: %v", err)
+		t.Fatalf("read the replacement's old row: %v", err)
 	}
 	if len(rows) != 1 || rows[0].String("deleted_at") == "" {
-		t.Fatalf("retired row %q = %+v, want one row still tombstoned", retired, rows)
-	}
-	// …and so must the children that were in the replacement's way.
-	for _, q := range []struct{ label, query string }{
-		{"vm_interfaces", `SELECT deleted_at FROM vm_interfaces WHERE vm_name = ?`},
-		{"vm_disks", `SELECT deleted_at FROM vm_disks WHERE vm_name = ?`},
-	} {
-		rows, err := c.Query(ctx, q.query, retired)
-		if err != nil {
-			t.Fatalf("read retired %s: %v", q.label, err)
-		}
-		if len(rows) != 1 || rows[0].String("deleted_at") == "" {
-			t.Fatalf("retired %s = %+v, want one row still tombstoned", q.label, rows)
-		}
+		t.Fatalf(`row at "app-next" = %+v, want one row tombstoned`, rows)
 	}
 }
 
@@ -161,7 +188,7 @@ func TestCutoverWithTheSameMAC(t *testing.T) {
 		}
 	}
 
-	retired := cutover(t, c, "app", "app-next")
+	cutover(t, c, "app", "app-next")
 
 	nics, err := c.Query(ctx, `SELECT id, deleted_at FROM vm_nics WHERE vm_name = ?`, "app")
 	if err != nil {
@@ -173,10 +200,13 @@ func TestCutoverWithTheSameMAC(t *testing.T) {
 	if want := DeterministicNICID("app", mac); nics[0].String("id") != want {
 		t.Fatalf("NIC id = %q, want the re-derived %q", nics[0].String("id"), want)
 	}
-	if got, err := c.Query(ctx, `SELECT id FROM vm_nics WHERE vm_name = ?`, retired); err != nil {
-		t.Fatalf("read retired nics: %v", err)
-	} else if len(got) != 1 {
-		t.Fatalf("retired NIC rows = %d, want the tombstone moved aside, not deleted", len(got))
+	// The replaced VM's tombstoned NIC sat on exactly this key — the id mixes the
+	// name with the MAC, and the MAC is shared — so the upsert displaced it at that
+	// one key rather than colliding with it.
+	if rows, err := c.Query(ctx, `SELECT deleted_at FROM vm_nics WHERE vm_name = 'app-next'`); err != nil {
+		t.Fatalf("read the replacement's old NIC: %v", err)
+	} else if len(rows) != 1 || rows[0].String("deleted_at") == "" {
+		t.Fatalf(`vm_nics on "app-next" = %+v, want one row tombstoned`, rows)
 	}
 }
 
@@ -227,7 +257,7 @@ func TestCutoverKeepsTheTombstonesItIsNotReplacing(t *testing.T) {
 // no replacement written, the batch still commits, and the next stale full-state
 // merge resurrects the VM.
 func TestDelayedRenameReplayKeepsANewerDeletion(t *testing.T) {
-	src, dst := testClient(t), testClient(t)
+	src, dst := testClient(t), testClientVMReplace(t)
 	ctx := context.Background()
 
 	if err := InsertVM(ctx, src,
@@ -431,31 +461,31 @@ func TestRenameVMRefusesAnOccupiedTargetKey(t *testing.T) {
 				}
 			}
 
-			// ReplaceVMName resolves the very same collision, by moving that
+			// ReplaceVM resolves the very same collision, by moving that
 			// tombstone aside — this is the case the fix exists for.
-			if _, err := ReplaceVMName(ctx, c, "app-next", "app"); err != nil {
-				t.Fatalf("ReplaceVMName over a %s collision: %v", tc.table, err)
+			if err := ReplaceVM(ctx, c, "app-next", "app"); err != nil {
+				t.Fatalf("ReplaceVM over a %s collision: %v", tc.table, err)
 			}
 			if vm, err := GetVM(ctx, c, "app"); err != nil || vm == nil {
-				t.Fatalf(`no live VM named "app" after ReplaceVMName: %+v err=%v`, vm, err)
+				t.Fatalf(`no live VM named "app" after ReplaceVM: %+v err=%v`, vm, err)
 			}
 		})
 	}
 }
 
 // A LIVE occupant is not a cutover — only DeleteVM may decide a workload can be
-// tombstoned, so ReplaceVMName must not do it implicitly.
-func TestReplaceVMNameRefusesALiveOccupant(t *testing.T) {
+// tombstoned, so ReplaceVM must not do it implicitly.
+func TestReplaceVMRefusesALiveOccupant(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()
 	mustInsertVM(t, c, VMRecord{Name: "app", HostName: "h1", Spec: `{}`, State: "running"}, nil, nil)
 	mustInsertVM(t, c, VMRecord{Name: "app-next", HostName: "h1", Spec: `{}`, State: "running"}, nil, nil)
 	before := vmTableSnapshot(t, c)
-	if _, err := ReplaceVMName(ctx, c, "app-next", "app"); err == nil {
-		t.Fatal("ReplaceVMName took the name of a live VM")
+	if err := ReplaceVM(ctx, c, "app-next", "app"); err == nil {
+		t.Fatal("ReplaceVM took the name of a live VM")
 	}
 	if after := vmTableSnapshot(t, c); after != before {
-		t.Fatalf("a refused ReplaceVMName wrote to the database:\nbefore=%s\nafter =%s", before, after)
+		t.Fatalf("a refused ReplaceVM wrote to the database:\nbefore=%s\nafter =%s", before, after)
 	}
 }
 

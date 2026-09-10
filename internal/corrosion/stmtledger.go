@@ -39,6 +39,17 @@ const (
 	// so the guard is a no-op for everything it was ever meant to reach) while
 	// making a signed row unreachable by any reseal, local or replicated.
 	DispAuditReseal Disposition = "audit_reseal"
+	// DispGuardedReplace applies one statement of a guarded VM-name replacement
+	// (`lv cutover`) VERBATIM, once its workload_replace_v1 guard has matched.
+	//
+	// Verbatim is the point. Every statement in the batch carries the SAME guard, so
+	// the guard's single decision is what orders the transition; LWW-gating the
+	// individual writes on top of it would let a receiver apply the parent and skip
+	// a child on its own clock, leaving the contested name holding some of the
+	// replacement's devices and not others. The target-row shape re-states its own
+	// incarnation/authority ordering in SQL, so it still fails closed if it is ever
+	// reached without the guard.
+	DispGuardedReplace Disposition = "guarded_replace"
 	// DispCreateBegin applies one of the exact, audited workload-create
 	// resurrection UPSERTs verbatim after workload_create_begin_v1 matches.
 	// Their owner/generation WHERE is the ordering rule; an unrelated receiver

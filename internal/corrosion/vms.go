@@ -6,10 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-
-	"github.com/litevirt/litevirt/internal/randid"
-	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -1281,100 +1277,15 @@ func execVMRekey(ctx context.Context, c *Client, now string, passes ...vmRekeyPa
 }
 
 // RenameVM changes a VM's name across all tables. The new name must be entirely
-// free — see ErrRenameTargetOccupied, and ReplaceVMName for the cutover case
-// where it is not.
+// FREE — see ErrRenameTargetOccupied.
+//
+// `lv cutover` does NOT use this: taking a name a tombstone still holds needs a
+// single receiver decision over both VMs, which a rekey by UPDATE cannot give
+// (ReplaceVM). This is the plain free-target primitive, and it has no caller in
+// the tree today — it is kept because the transition it performs is correct and
+// its statement shapes are the ones a supported prior release still emits.
 func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
 	return execVMRekey(ctx, c, c.NowTS(), vmRekeyPass{oldName: oldName, newName: newName})
-}
-
-// retiredVMNameInfix marks a name that exists only to hold a retired tombstone.
-const retiredVMNameInfix = ".retired."
-
-// ReplaceVMName gives `replacement` the name `name`, which an ALREADY-TOMBSTONED
-// VM may still hold — the `lv cutover` shape. It returns the reserved name that
-// tombstone was moved to, or "" if `name` was free to begin with.
-//
-// `vms.name` is the PRIMARY KEY and DeleteVM soft-deletes, so the replaced VM's
-// tombstone still occupies the key its replacement needs, and every child table
-// DeleteVM tombstones collides the same way on its own composite PK. This MOVES
-// those tombstones aside rather than deleting them, and moves ONLY the ones the
-// replacement actually collides with. Both halves matter:
-//
-//   - Moving rather than deleting, because a receiver applies a hard delete of a
-//     full-state row unconditionally while the write meant to replace it is not
-//     (see ErrRenameTargetOccupied), and because the tombstone carries the
-//     incarnation identity that keeps a stale pre-delete copy from resurrecting.
-//   - Only where it collides, because relocating a tombstone VACATES its key, and
-//     a vacated child key has nothing left to reject a stale full-state row with:
-//     the anti-entropy child-authority check admits that row whenever the incoming
-//     payload's parent identity-hashes equal to the local one. A disk the replaced
-//     VM had and the replacement does not would come back on top of it.
-//
-// It is ONE batch, so the name is never held by neither VM.
-func ReplaceVMName(ctx context.Context, c *Client, replacement, name string) (string, error) {
-	occupant, err := c.Query(ctx, `SELECT deleted_at FROM vms WHERE name = ?`, name)
-	if err != nil {
-		return "", err
-	}
-	if len(occupant) == 0 {
-		// Nothing holds the parent key, so there is no occupant to retire. Any
-		// child tombstone still under the name is reported by the ordinary refusal.
-		return "", RenameVM(ctx, c, replacement, name)
-	}
-	if occupant[0].String("deleted_at") == "" {
-		return "", fmt.Errorf("corrosion: %q is a live VM — it must be tombstoned before %q can take its name",
-			name, replacement)
-	}
-
-	// The keys the replacement will claim at `name`. Only these may be vacated.
-	claimed, err := vmChildKeys(ctx, c, replacement)
-	if err != nil {
-		return "", err
-	}
-	claim := vmChildKeySet{}
-	for _, k := range claimed {
-		claim.add(k.table, k.targetKey(name))
-	}
-
-	// A random suffix rather than a counter: the retired name is a primary key in
-	// a replicated table, so two nodes retiring the same name concurrently must
-	// not pick the same one. It is still verified free — nothing stops an operator
-	// from having created that exact name.
-	now := c.NowTS()
-	for attempt := 0; attempt < 4; attempt++ {
-		retired, nameErr := retiredVMName(name)
-		if nameErr != nil {
-			return "", nameErr
-		}
-		err = execVMRekey(ctx, c, now,
-			vmRekeyPass{oldName: name, newName: retired, keep: claim.has},
-			vmRekeyPass{oldName: replacement, newName: name, parentVacated: true},
-		)
-		if errors.Is(err, ErrRenameTargetOccupied) &&
-			strings.Contains(err.Error(), retired) && attempt < 3 {
-			continue // the drawn retired name is taken; draw another
-		}
-		if err != nil {
-			return "", err
-		}
-		return retired, nil
-	}
-	return "", err
-}
-
-// retiredVMName builds the reserved name, trimming the base so the result still
-// satisfies the cluster-wide name rule (safename owns that rule).
-func retiredVMName(name string) (string, error) {
-	suffix := retiredVMNameInfix + randid.New()
-	base := name
-	if budget := safename.MaxNameLen - len(suffix); budget > 0 && len(base) > budget {
-		base = base[:budget]
-	}
-	retired := base + suffix
-	if err := safename.ValidateVMName(retired); err != nil {
-		return "", err
-	}
-	return retired, nil
 }
 
 // UpdateVMInterfaceIP sets the IP of a VM interface.

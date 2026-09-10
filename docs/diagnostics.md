@@ -261,6 +261,49 @@ pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) �
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
 
+### `vm_replace` — `lv cutover`
+
+`lv cutover` gives the `<vm>-next` replacement the name of the VM it replaces. That VM is
+deleted first, and the delete is a **soft** delete, so its tombstone still occupies the
+`vms.name` PRIMARY KEY — and every child table it tombstones holds its own composite key
+the same way.
+
+No pre-existing replicated statement shape makes that handover safe on a **receiver**.
+Clearing the tombstone with a retention DELETE is applied unconditionally there, while the
+write meant to replace the row is only last-writer-wins gated — so a delayed replay erases
+a tombstone and puts nothing in its place. Moving it aside instead splits the handover into
+two independently gated statements, and a receiver can commit one and skip the other,
+leaving no row at the name, or moving a still-live VM aside when its own newer ownership
+made the sender's delete decline there. Neither addresses the merge rules, which decide a
+both-live conflict at the contested name on owner/generation authority alone: the replaced
+VM has usually been running longer than its replacement, so its stale copy simply
+overwrites it.
+
+The transition therefore ships as **one receiver decision**: every statement in the batch
+carries the same `workload_replace_v1` guard over both VMs' incarnations and authority, and
+a receiver applies all of them or none. The row installed at the contested name keeps the
+**replacement's** `created_at` — a delete is terminal only for its own incarnation, so a
+delayed tombstone of the replaced VM must read as an older one — and carries authority
+above **both** inputs.
+
+That is new receiver behaviour, which nothing in the historical ledger can retrofit onto an
+older peer, so it is gated:
+
+- **`enforcement.vm_replace`** (config flag, default false) gates **advertisement** of
+  `vm_replace_v1`, so the cluster-wide latch requires config uniformity rather than just a
+  uniform build — the same rule as `operation_protocol`.
+- **`lv cutover` REFUSES** while the flag is off or the token has not latched, and it
+  refuses as its first act, before stopping a domain or writing to either VM. A cluster
+  that has not opted in has a cutover that declines, not one that half-applies.
+- A receiver that has not latched **rejects** the batch's statements rather than applying
+  them under a disposition never designed for them, which is why the sender is gated too.
+
+Rollout: upgrade every node (flag off, behavior-neutral — cutover simply refuses), then set
+`enforcement.vm_replace: true` everywhere and rolling-restart; the latch closes once every
+voting-eligible member advertises the token. Kill switch: set it `false` and restart;
+cutover goes back to refusing. Acceptance of an already-emitted batch is NOT revoked by the flag — it reads the
+durable latch, because a batch in flight must not become unacceptable across a restart.
+
 ### `canonical_registry` — registry-credential migration
 
 Registry logins mint a **new random `id` per login** and write via a tombstone+insert

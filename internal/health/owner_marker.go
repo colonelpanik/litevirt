@@ -51,6 +51,12 @@ func WriteContainerOwnerEpochMarker(containersRoot, name string, epoch int64) er
 }
 
 func writeOwnerEpochMarker(root, name string, epoch int64) error {
+	// Refused rather than clamped: a caller asking to record a pre-epoch value
+	// has a bug, and writing 1 on its behalf would hide it while making the row
+	// and the marker disagree.
+	if epoch < 1 {
+		return fmt.Errorf("refusing to write owner-epoch marker %d for %q: a generation starts at 1", epoch, name)
+	}
 	if err := safename.ValidateContainerName(name); err != nil {
 		return err
 	}
@@ -100,6 +106,17 @@ func readOwnerEpochMarker(root, name string) (int64, bool, error) {
 	epoch, perr := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
 	if perr != nil {
 		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: %w", name, perr)
+	}
+	// A parseable number is not automatically a generation. Epoch allocation
+	// starts at 1 (BackfillOwnerEpochs assigns 1; ownership transfer increments),
+	// so 0 is the "no epoch assigned" sentinel of the DB COLUMN and never a
+	// marker value, and a negative is garbage. Returning either as a reading is
+	// what let a zero marker satisfy the detector's equality test against a row
+	// still at the column default and suppress the check with no finding. This
+	// is the rule this function's doc comment and the libvirt twin's
+	// (SetDomainOwnerEpoch/GetDomainOwnerEpoch) have both always stated.
+	if epoch < 1 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch %d is not a generation", name, epoch)
 	}
 	return epoch, true, nil
 }

@@ -70,3 +70,81 @@ func TestContainerOwnerEpochMarker_AbsentAndCorrupt(t *testing.T) {
 		t.Fatal("traversal name accepted")
 	}
 }
+
+// TestOwnerEpochMarker_AZeroOnDiskIsCorruptNotValid: a marker file containing
+// "0" must not read back as a valid generation.
+//
+// The reader used to accept any parseable integer, so a zero read as
+// (0, true, nil) -> classifyMarker's default arm -> MarkerValid. Against a DB
+// row also at epoch 0 that satisfies the detector's equality test and condition
+// 7 is suppressed silently — no grace, no finding, nothing to notice. Both this
+// function's doc comment and the libvirt twin's already say epoch 0 is never a
+// valid marker; this pins it.
+func TestOwnerEpochMarker_AZeroOnDiskIsCorruptNotValid(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "vm1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ownerEpochMarkerFile), []byte("0\n"), 0o600); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	epoch, found, err := readOwnerEpochMarker(root, "vm1")
+	if err == nil {
+		t.Fatalf("a zero marker read back cleanly as (%d, %v) — it must be an error, "+
+			"because a zero that reads as valid suppresses the owner-epoch check "+
+			"against any row still at the pre-epoch default", epoch, found)
+	}
+	if found {
+		t.Error("found = true for a zero marker; a value that cannot mean anything is not a reading")
+	}
+}
+
+// TestOwnerEpochMarker_ANegativeOnDiskIsCorrupt: same rule, other side of zero.
+func TestOwnerEpochMarker_ANegativeOnDiskIsCorrupt(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "vm1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ownerEpochMarkerFile), []byte("-5\n"), 0o600); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	if _, _, err := readOwnerEpochMarker(root, "vm1"); err == nil {
+		t.Error("a negative marker read back cleanly; allocation starts at 1, so it is garbage")
+	}
+}
+
+// TestWriteOwnerEpochMarker_RefusesAPreEpochValue: the writer must not create
+// the file this reader now rejects.
+//
+// internal/health/reconciler.go's failover start path writes fresh.OwnerEpoch
+// unconditionally, and that value can still be 0 today. Refusing at the writer
+// means a zero marker cannot be produced in the first place; rejecting at the
+// reader handles the ones already on disk.
+func TestWriteOwnerEpochMarker_RefusesAPreEpochValue(t *testing.T) {
+	root := t.TempDir()
+	for _, epoch := range []int64{0, -1} {
+		if err := writeOwnerEpochMarker(root, "vm1", epoch); err == nil {
+			t.Errorf("writeOwnerEpochMarker accepted epoch %d; a marker that cannot name a "+
+				"generation must never reach disk", epoch)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "vm1", ownerEpochMarkerFile)); err == nil {
+		t.Error("a refused write still left a marker file behind")
+	}
+}
+
+// TestOwnerEpochMarker_RoundTripsAValidEpoch guards against the refusals above
+// being too broad — 1 is the first legal generation and must survive.
+func TestOwnerEpochMarker_RoundTripsAValidEpoch(t *testing.T) {
+	root := t.TempDir()
+	if err := writeOwnerEpochMarker(root, "vm1", 1); err != nil {
+		t.Fatalf("write epoch 1: %v", err)
+	}
+	epoch, found, err := readOwnerEpochMarker(root, "vm1")
+	if err != nil || !found || epoch != 1 {
+		t.Fatalf("round trip = (%d, %v, %v), want (1, true, nil)", epoch, found, err)
+	}
+}

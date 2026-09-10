@@ -946,7 +946,7 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL
 	)`,
 
-	// Leader-lease TERM ledger (v51). APPEND-ONLY, with term in the primary key.
+	// Leader-lease TERM ledger (v52). APPEND-ONLY, with term in the primary key.
 	//
 	// leader_election says who holds a lease right now; it cannot say which
 	// INCARNATION of that lease, so a stale leader's writes are
@@ -1053,17 +1053,17 @@ var schemaDDL = []string{
 		created_at        TEXT NOT NULL,
 		updated_at        TEXT NOT NULL,
 		deleted_at        TEXT,
-		-- lease_term (v52) is LAST deliberately, after deleted_at, so this DDL
+		-- lease_term (v53) is LAST deliberately, after deleted_at, so this DDL
 		-- produces the SAME physical column order as the ALTER in
 		-- schemaMigrations. The v1 state digest hashes SELECT * positionally
 		-- (sync.go digestTableRows → encodeRowCells) and anti-entropy only prefers
 		-- the order-invariant v2 hash when BOTH peers emit one
 		-- (antientropy.go:181). A mid-DDL column would therefore make a
-		-- freshly-initialised v52 node and a v51→v52 upgraded node disagree
+		-- freshly-initialised v53 node and a v52→v53 upgraded node disagree
 		-- about this table's digest forever with identical rows, wherever
 		-- digest_v2 is off. Put every future additive column here, not above.
 		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
-		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v53); '' = minted without one
+		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -1815,11 +1815,20 @@ var schemaDDL = []string{
 		vm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind
 		owner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)
 		owner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)
-		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
-		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		allocated_at TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
+		-- The two NetBox join keys stay LAST, where their ALTERs append them.
+		-- The v1 state digest hashes SELECT * POSITIONALLY (digestTableRows ->
+		-- encodeRowCells), so a fresh node that CREATEs them mid-table and an
+		-- upgraded node that appends them after deleted_at produce different
+		-- digests for identical rows — permanently. digestMismatches then
+		-- reports ip_allocations as drifted on EVERY anti-entropy cycle, and
+		-- each one pulls a full cluster-state dump, while genuine divergence on
+		-- this table is masked because it is always already "drifted". Only
+		-- enforcement.digest_v2 on BOTH peers avoids it, and it defaults false.
+		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
+		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		PRIMARY KEY (network, ip)
 	)`,
 
@@ -2280,19 +2289,29 @@ var schemaDDL = []string{
 		observed_cidr       TEXT NOT NULL,
 		vrf_id              INTEGER NOT NULL,
 		cluster_fingerprint TEXT NOT NULL,
+		suspended           INTEGER NOT NULL DEFAULT 0,
+		suspend_reason      TEXT NOT NULL DEFAULT '',
+		validated_at        TEXT NOT NULL,
+		created_at          TEXT NOT NULL,
+		updated_at          TEXT NOT NULL,
+		deleted_at          TEXT,
 		-- The NetBox virtualization.cluster name the FIRST bind resolved, pinned
 		-- so a node whose netbox.cluster_name resolves to something else can
 		-- discover the disagreement and refuse to mirror. It has to be uniform
 		-- cluster-wide and, unlike an enforcement.* flag, has no latch to make it
 		-- so: a capability token cannot express a string. Defaulted rather than
 		-- NOT NULL-without-default so an older peer's writes still land.
-		netbox_cluster      TEXT NOT NULL DEFAULT '',
-		suspended           INTEGER NOT NULL DEFAULT 0,
-		suspend_reason      TEXT NOT NULL DEFAULT '',
-		validated_at        TEXT NOT NULL,
-		created_at          TEXT NOT NULL,
-		updated_at          TEXT NOT NULL,
-		deleted_at          TEXT
+		--
+		-- LAST, where its heal ALTER appends it. That ALTER exists precisely to
+		-- run on a real database — one created by an earlier v51 build, whose
+		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — and
+		-- refusePrereleaseTrustDatabase does not refuse such a database, so it
+		-- boots and gets the column appended after deleted_at. netbox_bindings is
+		-- in sync.go's tableNames, so it is digested every anti-entropy tick, and
+		-- the v1 digest hashes SELECT * positionally: declaring this column 6th
+		-- while the ALTER appends it 12th made a freshly-created node and a healed
+		-- one disagree forever on identical rows.
+		netbox_cluster      TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// Identity map: litevirt object -> NetBox object. Interfaces key on MAC, NOT
@@ -2743,7 +2762,7 @@ var schemaMigrations = []string{
 	// row reads as "minted without a term" — the sentinel the executor refuses
 	// once lease_term_v1 is enforced, never a valid term.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_term INTEGER NOT NULL DEFAULT 0`,
-	// v53: which lease the term belongs to. lease_term alone is ambiguous —
+	// v54: which lease the term belongs to. lease_term alone is ambiguous —
 	// three subsystems share leader_lease_terms and their term numbers collide
 	// by design — so a term is only interpretable together with its key.
 	// Additive with a '' default, which pairs with lease_term 0.

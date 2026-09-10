@@ -327,7 +327,7 @@ func TestActionProof_LeaseTermRoundTrips(t *testing.T) {
 // test, not a plumbing one. It inserts through the pre-v53 22-column proof shape
 // — the one a not-yet-upgraded peer still emits, retained as
 // proof_insert_pre_lease_term_v51 in HistoricalShapes() — and requires it to
-// (a) still apply against the v53 schema and (b) yield the termless sentinel.
+// (a) still apply against the v52 schema and (b) yield the termless sentinel.
 //
 // READ THIS BEFORE COUNTING IT AS COVERAGE. The 0 assertion is UNFALSIFIABLE by
 // any mutation of the lease_term plumbing, and an earlier version of this test

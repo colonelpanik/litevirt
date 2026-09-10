@@ -218,7 +218,7 @@ func HistoricalShapes() []HistoricalShape {
 
 	// The failover coordinator's lease upsert with the key as a LITERAL. Every
 	// release on this line emitted it unchanged from the initial commit through
-	// schema v50; at v51 all three lease consumers moved to the shared
+	// schema v50; at v52 all three lease consumers moved to the shared
 	// corrosion.AcquireLeaseWithTerm, which BINDS the key, so the literal form
 	// now has no emitter in this tree — but a prior-release coordinator still
 	// emits it on every poll cycle, and a receiver that stopped recognising it
@@ -246,12 +246,20 @@ func HistoricalShapes() []HistoricalShape {
 	// This shape is retained receive-only because a peer on the first
 	// term-ledger build still emits it, and dropping it would back-pressure that
 	// peer's stream. It applies identically to the new form.
+	//
+	// The `_v51`/`_v52` suffixes on the three lease-term family names below are
+	// FROZEN IDENTITIES, not schema versions. They were minted when this work
+	// sat at schema v51-v53; integrating upstream's NetBox IPAM PR took v51, so
+	// the lease-term versions moved up by one and the surrounding comments name
+	// the current numbers. The family names are deliberately NOT renumbered with
+	// them: a family name is part of the compatibility digest, and renaming one
+	// for cosmetics would spend a frozen identity on nothing.
 	add(`INSERT OR IGNORE INTO leader_lease_terms
 		   (key, term, holder, acquired_at, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`, "lease_term_mint_or_ignore_v51")
 
-	// The proof INSERT before the fencing term (v51 and earlier). A peer on a
-	// pre-v52 build emits this shape for every proof it mints, and a receiver
+	// The proof INSERT before the fencing term (v52 and earlier). A peer on a
+	// pre-v53 build emits this shape for every proof it mints, and a receiver
 	// that stopped recognising it would back-pressure that peer's entire
 	// replication stream mid-rolling-upgrade. It applies identically to the new
 	// form: the missing column takes its DEFAULT 0, which is exactly the
@@ -264,14 +272,14 @@ func HistoricalShapes() []HistoricalShape {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
 		"proof_insert_pre_lease_term_v51")
 
-	// The proof INSERT at v52: lease_term present, lease_key not yet (v53). A
-	// peer on a v52 build emits this for every proof it mints, and a receiver
+	// The proof INSERT at v53: lease_term present, lease_key not yet (v54). A
+	// peer on a v53 build emits this for every proof it mints, and a receiver
 	// that stopped recognising it would back-pressure that peer's entire
 	// replication stream mid-rolling-upgrade. It applies identically to the new
 	// form — the missing column takes its DEFAULT '', the "minted without a
 	// lease" sentinel that pairs with lease_term 0.
 	//
-	// Note there are now TWO retained proof-insert shapes, v51's and v52's, and
+	// Note there are now TWO retained proof-insert shapes, v52's and v53's, and
 	// both must stay while their emitters are supported. That is the cost of a
 	// second additive column on a replicated table in consecutive versions, not
 	// a sign either entry is redundant.

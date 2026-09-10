@@ -107,6 +107,17 @@ func gateNo(r string) GateResult { return GateResult{OK: false, Reason: r} }
 // live voting member iff its state is not offline/maintenance/fenced (witnesses
 // included, since countLiveHosts counts them in the denominator). The self-count
 // predicate and the quorum denominator MUST be identical or quorum skews.
+//
+// Exported because callers outside this package need "is this host live" and
+// must not invent a fourth answer to it. The NetBox cluster-name uniformity
+// check is one: it compares each live host's published configuration, and a
+// host that is down, in maintenance or fenced must not be able to stop the
+// inventory mirror forever by holding a stale value. It deliberately does NOT
+// use HealthyPeers for that, which additionally requires a successful probe
+// THIS run — that answer differs per node and is empty on a freshly started
+// daemon, so two nodes would disagree about who is live and a restart would
+// briefly count nobody. This predicate is cluster STATE, so every node
+// computes the same set.
 func VotingEligible(state string) bool {
 	switch state {
 	case "offline", "maintenance", "fenced":
@@ -114,19 +125,6 @@ func VotingEligible(state string) bool {
 	}
 	return true
 }
-
-// VotingEligible is votingEligible, exported for callers outside this package
-// that need "is this host live" and must not invent a fourth answer to it.
-//
-// The NetBox cluster-name uniformity check is one: it compares each live host's
-// published configuration, and a host that is down, in maintenance or fenced
-// must not be able to stop the inventory mirror forever by holding a stale
-// value. It deliberately does NOT use HealthyPeers for that, which additionally
-// requires a successful probe THIS run — that answer differs per node and is
-// empty on a freshly started daemon, so two nodes would disagree about who is
-// live and a restart would briefly count nobody. This predicate is cluster
-// STATE, so every node computes the same set.
-func VotingEligible(state string) bool { return votingEligible(state) }
 
 // QuorumProof computes whether this daemon currently sees a live voting majority,
 // using its OWN probe results. Returns the tri-state plus the live/needed counts

@@ -136,6 +136,10 @@ type Reconciler struct {
 	// Only the sweep acquires — see Run.
 	interval     time.Duration
 	pollInterval time.Duration
+	// sweepPhase delays the first sweep tick, holding this loop's schedule away
+	// from the maintenance loop it shares a per-node gate with. See
+	// Options.SweepPhase.
+	sweepPhase time.Duration
 
 	// acquireLease takes or renews the leader lease; holdsLease is the READ
 	// alone, re-run before every write batch.

@@ -107,6 +107,26 @@ type Options struct {
 	// Interval is clamped to it — a poll slower than the sweep it exists to
 	// anticipate would never be the thing that noticed a change.
 	PollInterval time.Duration
+	// SweepPhase delays the FIRST sweep tick, shifting this loop's whole
+	// schedule away from another periodic loop it shares an exclusion with.
+	//
+	// It exists because the mirror and the orphan sweeper's maintenance loop run
+	// on the SAME configured cadence and serialise on the SAME per-node gate,
+	// and both are started from the same function microseconds apart. Two
+	// tickers of equal period created together stay in lockstep for the life of
+	// the process, so whichever loop reaches the gate second finds it held and
+	// declines — every interval, indefinitely.
+	//
+	// That is not a lost tick. The mirror's sweep is the ONLY thing that
+	// acquires the leader lease, and the queue poll acts solely on a lease
+	// already held, so a sweep that never wins the gate means no node ever
+	// leads, the poll can never pull work forward either, and the inventory
+	// mirror does not run at all. Half an interval of skew leaves the two
+	// schedules maximally far apart, and a pass slower than that hits the gate
+	// on the merits — which is what declining is for.
+	//
+	// <= 0 means no delay, and the first sweep lands one interval in as before.
+	SweepPhase time.Duration
 	// ClusterName overrides the NetBox cluster this mirror writes into. Empty
 	// means "the local cluster name", which is the default every
 	// single-installation deployment runs.
@@ -198,6 +218,7 @@ func New(o Options) *Reconciler {
 		metrics:      o.Metrics,
 		interval:     interval,
 		pollInterval: poll,
+		sweepPhase:   o.SweepPhase,
 		clusterName:  o.ClusterName,
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
@@ -222,7 +243,29 @@ func New(o Options) *Reconciler {
 // cluster mid-rolling-upgrade — is not writing inventory while its own view of
 // the fleet is still assembling. The poll cannot pull that forward either: it
 // takes no lease, so before the first sweep tick there is none to hold.
+// SweepPhase is the skew this reconciler was built with.
+//
+// It exists so the WIRING can be asserted where the value is decided. The skew
+// is the only thing keeping the mirror's sweep off the maintenance loop's tick,
+// and a mirror built with a zero one is starved completely rather than visibly
+// broken — nothing errors, no inventory is written, and the loop that would have
+// reported it never acquires a lease. Run's own behaviour under a phase is
+// testable in this package; that the daemon PASSES one is not.
+func (r *Reconciler) SweepPhase() time.Duration { return r.sweepPhase }
+
 func (r *Reconciler) Run(ctx context.Context) {
+	// The phase delay is taken BEFORE the sweep ticker is created, because a
+	// ticker's schedule is fixed from the moment it is made: creating it now and
+	// dropping its first tick would leave it in the very lockstep the delay
+	// exists to break. Waiting first puts every later tick half an interval off
+	// the maintenance loop's, for the life of the process.
+	if r.sweepPhase > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.sweepPhase):
+		}
+	}
 	sweep := time.NewTicker(r.interval)
 	defer sweep.Stop()
 	poll := time.NewTicker(r.pollInterval)

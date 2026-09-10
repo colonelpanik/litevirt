@@ -30,10 +30,18 @@ import (
 func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 	interval = effectiveNetBoxSweepInterval(interval)
 	return netboxsync.New(netboxsync.Options{
-		NetBox:      s.netbox,
-		DB:          s.db,
-		Metrics:     s.nbMetrics(),
-		Interval:    interval,
+		NetBox:   s.netbox,
+		DB:       s.db,
+		Metrics:  s.nbMetrics(),
+		Interval: interval,
+		// HALF an interval behind the maintenance loop. Both run on this same
+		// cadence and serialise on this same node's nbPassMu, and the daemon
+		// starts them microseconds apart — so without the skew the mirror's
+		// sweep reaches the gate second every time and is declined for the life
+		// of the process. That starves the whole mirror rather than one tick:
+		// the sweep is the only caller that ACQUIRES the leader lease, and the
+		// queue poll acts only on a lease already held. See Options.SweepPhase.
+		SweepPhase:  interval / 2,
 		ClusterName: s.netboxClusterName,
 		// The TTL is sized from the cadence this node actually runs at, exactly
 		// as the sweeper's is, so a cluster on a slower cadence does not hand

@@ -1064,6 +1064,17 @@ and sweeps early when a VM lifecycle operation has left something in it. The
 queue is latency only — a VM whose enqueue never happened, because the node died
 mid-operation, is converged by the next full sweep just the same.
 
+The mirror's sweep runs **half an interval offset** from the orphan sweeper's
+maintenance pass. They share that cadence and are serialised on each node, so
+running them in phase means one of them finds the other still going and skips
+its turn — every interval, for as long as the process lives. For the mirror that
+is not one lost pass: its sweep is the only thing that takes the leader lease,
+and the queue poll only accelerates a lease already held, so a sweep that always
+skips leaves the whole inventory unwritten with nothing reporting an error. The
+offset is derived from the configured interval and needs no tuning; a pass that
+genuinely runs longer than half an interval still yields, which is what yielding
+is for.
+
 #### The queue during a NetBox outage
 
 Queued items are acked only after a sweep has **succeeded**. While NetBox is

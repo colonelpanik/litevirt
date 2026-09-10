@@ -228,11 +228,18 @@ func ipmitoolCmd(ctx context.Context, h HostConfig, ipmiArgs ...string) (*exec.C
 // chassis off, the budget expires, or ctx is done.
 //
 // It returns (true, nil) ONLY on a positive, anchored power-off reading. Any
-// other outcome returns false plus the last thing that went wrong, so the
-// caller can record WHY it could not confirm — "the BMC said the chassis is
-// still on" and "the BMC never answered" are very different facts about a host
-// that may still be writing to shared storage, and the old bool return
-// collapsed them into one indistinguishable false.
+// other outcome returns false plus the last substantive READING — the BMC said
+// the chassis is still on, or the BMC refused, or it never answered — so the
+// caller can record WHY it could not confirm. Those are very different facts
+// about a host that may still be writing to shared storage, and the old bool
+// return collapsed them into one indistinguishable false.
+//
+// "Substantive" excludes a call this function's own budget killed: that error is
+// "signal: terminated", which describes our timeout rather than the BMC, and
+// letting it win would erase the reading it interrupted. Reporting the earlier
+// reading is deliberate, so a caller must not read the returned error as
+// describing the FINAL attempt. When no reading landed at all, the error says
+// exactly that.
 func verifyIPMIPowerOff(ctx context.Context, h HostConfig) (bool, error) {
 	vctx, cancel := context.WithTimeout(ctx, PowerOffVerifyTimeout)
 	defer cancel()
@@ -252,6 +259,21 @@ func verifyIPMIPowerOff(ctx context.Context, h HostConfig) (bool, error) {
 
 		switch {
 		case err != nil:
+			// A call OUR OWN budget killed is not a reading, and must not
+			// overwrite one. cmd.Output() reports the SIGTERM as "signal:
+			// terminated", which carries neither the exit status nor the BMC's
+			// stderr — so letting it win replaces the operator's only
+			// explanation of why the power-off was unconfirmed with a
+			// description of our timeout. fencing_log.detail is where that
+			// explanation is read, when deciding whether to run
+			// `lv host fence-confirm` on a host that may still be running.
+			//
+			// Whichever substantive reading came before is the one worth
+			// keeping. If none did, lastErr still says no reading was taken,
+			// which is both true and more use than the signal name.
+			if vctx.Err() != nil {
+				return false, lastErr
+			}
 			lastErr = ipmitoolError(err)
 		case isChassisOff(out):
 			return true, nil

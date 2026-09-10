@@ -36,6 +36,33 @@ func fakeIpmitool(t *testing.T, stdout string, delay time.Duration, exitCode int
 	return fakeIpmitoolStreams(t, stdout, "", delay, exitCode)
 }
 
+// fakeIpmitoolFailThenHang fails the FIRST invocation with the BMC's reason and
+// then hangs every later one, so the verify budget is guaranteed to interrupt a
+// call that has already been preceded by a real reading. A counter file keeps
+// the state, since each invocation is a fresh process.
+func fakeIpmitoolFailThenHang(t *testing.T, stderr string) {
+	t.Helper()
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "n")
+
+	script := fmt.Sprintf(`#!/bin/sh
+n=0
+[ -f %[1]q ] && n=$(cat %[1]q)
+echo $((n+1)) > %[1]q
+if [ "$n" -eq 0 ]; then
+  printf '%%s\n' %[2]q >&2
+  exit 1
+fi
+sleep 30
+`, counter, stderr)
+
+	path := filepath.Join(dir, "ipmitool")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake ipmitool: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // fakeIpmitoolStreams is fakeIpmitool with control over stderr as well.
 // ipmitool reports failures on stderr, and cmd.Output() captures ONLY stderr
 // into ExitError.Stderr — a fake that writes its message to stdout cannot
@@ -291,5 +318,45 @@ func TestFenceIPMI_UnconfirmedDetailNamesTheBudgetAndCause(t *testing.T) {
 	}
 	if strings.Contains(r.Detail, testBMCPassword) {
 		t.Errorf("fence detail leaks the BMC password into fencing_log: %q", r.Detail)
+	}
+}
+
+// TestVerifyIPMIPowerOff_ABudgetTimeoutDoesNotEraseTheBMCsReason pins the
+// reason the loop keeps its previous reading instead of the last error it saw.
+//
+// The verify budget kills an in-flight ipmitool with SIGTERM, and cmd.Output()
+// reports that as "signal: terminated" — no exit status, no stderr. Letting it
+// overwrite lastErr replaced the BMC's own complaint with a description of our
+// own timeout, in the one field an operator reads before deciding whether to
+// run `lv host fence-confirm` against a host that may still be writing.
+//
+// This is also why TestVerifyIPMIPowerOff_ReportsWhyItFailed failed under
+// parallel-package load while passing in isolation: with a 2s budget and 50ms
+// polls the final attempt is often still running when the deadline lands, so
+// on a busy machine the diagnostic was replaced by the signal name.
+//
+// The interval here is longer than the budget, so the FIRST attempt is the one
+// the deadline interrupts — after an earlier attempt has already recorded a
+// real reading, which is the state worth protecting.
+func TestVerifyIPMIPowerOff_ABudgetTimeoutDoesNotEraseTheBMCsReason(t *testing.T) {
+	const bmcError = "Error: Unable to establish IPMI v2 / RMCP+ session"
+	// First call fails fast with the BMC's reason; later calls hang until the
+	// budget kills them.
+	fakeIpmitoolFailThenHang(t, bmcError)
+	shrinkVerifyKnobs(t, 3*time.Second, 10*time.Millisecond)
+
+	verified, err := verifyIPMIPowerOff(context.Background(), testIPMIHost())
+	if verified {
+		t.Fatal("a hanging ipmitool must not verify as off")
+	}
+	if err == nil {
+		t.Fatal("no error reported")
+	}
+	if strings.Contains(err.Error(), "signal:") {
+		t.Errorf("the budget's own SIGTERM became the reported reason (%v); the operator needs "+
+			"the BMC's explanation, not the name of our timeout", err)
+	}
+	if !strings.Contains(err.Error(), bmcError) {
+		t.Errorf("the BMC's stderr was lost: %v", err)
 	}
 }

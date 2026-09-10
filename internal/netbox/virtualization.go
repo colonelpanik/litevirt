@@ -16,6 +16,10 @@ const (
 	clusterTypesPath = "/api/virtualization/cluster-types/"
 	clustersPath     = "/api/virtualization/clusters/"
 	devicesPath      = "/api/dcim/devices/"
+	// macAddressesPath exists only on NetBox 4.2+, where a MAC became an object
+	// of its own. Reached only when a write shows the server is on that shape —
+	// see repairDroppedMAC.
+	macAddressesPath = "/api/dcim/mac-addresses/"
 )
 
 // VirtualMachine is one virtualization.virtual_machine.
@@ -330,7 +334,14 @@ func (c *Client) CreateInterface(ctx context.Context, i VMInterface) (VMInterfac
 	if err := c.do(ctx, http.MethodPost, vmInterfacesPath, body, &out); err != nil {
 		return VMInterface{}, err
 	}
-	return out.toIface(), nil
+	got := out.toIface()
+	if err := c.repairDroppedMAC(ctx, got.ID, i.MAC, got.MAC); err != nil {
+		return VMInterface{}, err
+	}
+	if i.MAC != "" {
+		got.MAC = i.MAC
+	}
+	return got, nil
 }
 
 // UpdateInterface patches one VM interface. Diff before calling — an
@@ -344,7 +355,88 @@ func (c *Client) UpdateInterface(ctx context.Context, id int, i VMInterface) err
 		"name":        i.Name,
 		"mac_address": i.MAC,
 	}
-	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", id), body, nil)
+	// The response is decoded rather than discarded so a dropped MAC is visible
+	// here: this is the call the mirror makes once a diff has noticed the MAC
+	// missing, so it is the call that has to be able to put it back.
+	var out ifaceJSON
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", id), body, &out); err != nil {
+		return err
+	}
+	return c.repairDroppedMAC(ctx, id, i.MAC, out.toIface().MAC)
+}
+
+// repairDroppedMAC records `want` on the interface when the server answered a
+// write with `got` — that is, did not honour the `mac_address` field.
+//
+// NetBox 4.2 moved the MAC off the interface: `vminterface.mac_address` is
+// READ-ONLY there, and a MAC is a `dcim.MACAddress` object assigned to the
+// interface which the interface points at with `primary_mac_address`. Such a
+// server accepts an interface write carrying `mac_address` with a 2xx and
+// SILENTLY DROPS the field, so a caller that does not compare what came back
+// cannot tell the shapes apart. That silence is the whole hazard: nothing fails,
+// and the mirror's NIC diff then sees the MAC missing on every single sweep,
+// emits an update, and has that update dropped in turn — one write per NIC per
+// sweep against a mirror that can never converge.
+//
+// Comparing the response, rather than the server's version string, is what keeps
+// this correct in both directions: a pre-4.2 server echoes the MAC back and
+// never has its (nonexistent) MACAddress collection touched.
+//
+// An interface's MAC never changes — a NIC's identity is (fingerprint, uuid,
+// MAC), so a changed MAC is a different identity and therefore a different
+// object — which makes this a create-once repair, not a value to reconcile.
+func (c *Client) repairDroppedMAC(ctx context.Context, ifaceID int, want, got string) error {
+	if want == "" || ifaceID == 0 || strings.EqualFold(want, got) {
+		return nil
+	}
+	macID, err := c.findAssignedMACAddress(ctx, ifaceID, want)
+	if err != nil {
+		return err
+	}
+	if macID == 0 {
+		// NetBox permits SEVERAL MACAddress objects carrying the same MAC, so a
+		// repair that only ever created would add one more on every retry after
+		// a failed PATCH below. Hence the lookup above: adopt, then create.
+		var created struct {
+			ID int `json:"id"`
+		}
+		body := map[string]any{
+			"mac_address":          want,
+			"assigned_object_type": "virtualization.vminterface",
+			"assigned_object_id":   ifaceID,
+		}
+		if err := c.do(ctx, http.MethodPost, macAddressesPath, body, &created); err != nil {
+			return fmt.Errorf("netbox: record MAC %s for interface %d: %w", want, ifaceID, err)
+		}
+		macID = created.ID
+	}
+	patch := map[string]any{"primary_mac_address": macID}
+	if err := c.do(ctx, http.MethodPatch, fmt.Sprintf(vmInterfacesPath+"%d/", ifaceID), patch, nil); err != nil {
+		return fmt.Errorf("netbox: set primary MAC of interface %d to %s: %w", ifaceID, want, err)
+	}
+	return nil
+}
+
+// findAssignedMACAddress returns the id of the MACAddress object carrying mac
+// and already assigned to this interface, or 0. NetBox matches the address
+// case-insensitively, so the lower-cased form litevirt holds is the right query.
+func (c *Client) findAssignedMACAddress(ctx context.Context, ifaceID int, mac string) (int, error) {
+	q := url.Values{}
+	q.Set("mac_address", mac)
+	q.Set("assigned_object_type", "virtualization.vminterface")
+	q.Set("assigned_object_id", strconv.Itoa(ifaceID))
+	var page struct {
+		Results []struct {
+			ID int `json:"id"`
+		} `json:"results"`
+	}
+	if err := c.do(ctx, http.MethodGet, macAddressesPath+"?"+q.Encode(), nil, &page); err != nil {
+		return 0, fmt.Errorf("netbox: look up MAC %s of interface %d: %w", mac, ifaceID, err)
+	}
+	if len(page.Results) == 0 {
+		return 0, nil
+	}
+	return page.Results[0].ID, nil
 }
 
 // SetVMIdentity rewrites ONE virtual machine's litevirt identity custom field.

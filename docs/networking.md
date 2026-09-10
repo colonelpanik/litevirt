@@ -204,6 +204,32 @@ How a VM gets its address depends on when and how you set it:
 lv config my-vm --ip 10.0.1.50 --network lan
 ```
 
+### What to set up in NetBox first
+
+Two things have to exist in NetBox before litevirt can use it, and neither is
+created for you.
+
+**An API token.** `netbox.token_path` points at a file holding it. On NetBox 4.5
+and later a deployment cannot issue any token at all until its configuration
+defines `API_TOKEN_PEPPERS` — a dict of id to secret, each secret at least 50
+characters — so an otherwise healthy new install answers every token creation
+with `API_TOKEN_PEPPERS is not defined`. That is NetBox's own prerequisite, not
+litevirt's, but it is the first thing to hit. Either token scheme works: 4.5
+issues `nbt_`-prefixed tokens by default and litevirt authenticates with those
+and with the older 40-character form, as long as the file holds the whole value
+the UI showed.
+
+**A custom field named `litevirt_identity`,** of type text, on all three of
+`ipam.ipaddress`, `virtualization.virtualmachine` and
+`virtualization.vminterface`. This is the field that makes an object litevirt's:
+the orphan sweeper proves an address unclaimed by matching on it, and re-keying
+rewrites it. NetBox rejects a write naming a custom field it does not have, so
+without it every address claim fails with
+`Custom field 'litevirt_identity' does not exist for this object type` — a 400,
+which litevirt reports as NetBox refusing the write rather than as a
+misconfiguration. Create it before the first bind. Only the three object types
+above need it; the field's label, description and default may be anything.
+
 ### Binding a network to NetBox
 
 `lv network create <name> --netbox-prefix-id <id>` binds a network to a NetBox
@@ -218,7 +244,8 @@ Binding requires:
 - the prefix to live in a VRF with `enforce_unique` set — global-table prefixes
   are refused, because NetBox does not expose the global uniqueness setting;
 - the prefix not to be bound to another litevirt network already;
-- litevirt's own DHCP server not to serve the network's subnet — see below.
+- litevirt's own DHCP server not to serve the network's subnet — see below;
+- the `litevirt_identity` custom field to exist — see above.
 
 While NetBox is unreachable, creating a VM on a bound network fails. Existing
 VMs are unaffected, and unbound networks are unaffected.
@@ -754,7 +781,15 @@ named after the local cluster or after `netbox.cluster_name`) and mirrors:
   **up**, so a recorded size never understates the provisioned disk. It is not
   the gibibyte figure project quota charges against, which rounds each disk up
   to a whole GiB;
-- each VM NIC as a `vminterface`, keyed by its MAC;
+- each VM NIC as a `vminterface`, keyed by its MAC. Where the MAC is recorded
+  depends on the NetBox version and litevirt handles both: up to 4.1 it is the
+  interface's own `mac_address` field, while 4.2 made that field read-only and
+  moved the value to a `dcim.MACAddress` object the interface points at with
+  `primary_mac_address`. A 4.2+ server answers a write of the old field with a
+  success and silently drops it, so litevirt checks what came back rather than
+  trusting the status code, and records the MAC the other way when it finds the
+  field ignored. NetBox stores a MAC upper-cased; comparisons are
+  case-insensitive, so that is not drift;
 - each address litevirt claimed from NetBox as an `ip_address` assigned to the
   interface that holds it.
 

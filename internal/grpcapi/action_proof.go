@@ -52,6 +52,86 @@ func proofToPB(p corrosion.ActionProof) *pb.RuntimeActionProof {
 	}
 }
 
+// proofLeaseKeyProducible reports whether key is one a PROOF PRODUCER actually
+// holds — a strictly narrower question than ValidLeaseKey's "is this one of the
+// three leases".
+//
+// Membership in the three-key set is not authorization. The key SELECTS which
+// ledger judgeProofLeaseTerm computes its threshold against, so a proof naming
+// a different lease than the one its producer holds is judged against an
+// unrelated high-water. The three ledgers advance independently, so the other
+// two are routinely lower — and on a cluster whose rebalancer has never been
+// elected, at 0, where any term >= 1 clears. That turns the term check into a
+// formality for anything able to choose the name.
+//
+// The set is derived from what the tree EMITS, not from what exists: the only
+// code that sets LeaseKey on a proof is the failover coordinator, at three
+// sites, all corrosion.LeaseKeyFailover. The rebalancer and the dual-run
+// detector hold leases but produce no proofs — the rebalancer's LeaseKey field
+// configures its OWN acquisition, not a proof — so a proof naming either of
+// their keys was produced by nothing in this tree.
+//
+// "" is handled by the caller: it is the "minted without a lease" form the
+// lease-less producers emit.
+//
+// Widening this is deliberate, and the direction is known: container cold
+// migration has producers of both kinds, so if a lease-holding producer other
+// than the coordinator starts stamping, its key belongs here — and the
+// equal-term holder check then becomes what distinguishes two legitimate
+// producers of one action. Until then, failing closed costs nothing real.
+func proofLeaseKeyProducible(key string) bool {
+	return key == corrosion.LeaseKeyFailover
+}
+
+// validateProofTermStamp refuses a malformed lease-term stamp on a proof that is
+// about to be PERSISTED, before it is persisted.
+//
+// It has to run before the write rather than at enforcement time because the
+// stamp is BOUND: WriteActionProofValidated seeds these fields from the
+// presented proof and relays the batch, so a forged value becomes that row's
+// permanent authorization record on every peer. Enforcement afterwards reads
+// whatever ledger the row now names.
+//
+// Factored out of claimCarriedProof because that is NOT the only path that
+// persists a caller-supplied proof. promoteResolved seeds the row itself, from
+// req.Proof, before the promote is relayed or executed — deliberately, so
+// ErrProofDiverges can fire on the most destructive action in the tree — and
+// that seed used to run with no stamp validation at all, committing and
+// replicating a peer-supplied key that claimCarriedProof only rejected several
+// hundred lines later, after the row had already shipped.
+//
+//   - A NEGATIVE term is malformed input. proofFromPB forwards a peer-supplied
+//     int64 straight into the DB, and -5 marshals cleanly. nextLeaseTerm returns
+//     COALESCE(MAX(term),0)+1, which is >= 1, so a term below zero is neither the
+//     0 "minted without a term" sentinel nor a real tenure, and has no defined
+//     behaviour in either enforcement arm. Refused PRE-LATCH, unlike the term
+//     comparison, because this is not a legacy proof that predates stamping — it
+//     is a broken one.
+//   - A key NO PRODUCER HOLDS is refused rather than merely checked for
+//     membership in the three leases. The key selects which ledger the threshold
+//     is computed against; naming a quieter one moves the bar to 0 on a cluster
+//     that never elected that lease. "failover " with a trailing space is enough
+//     to miss the set, deliberately — the match neither trims nor folds.
+//
+// "" stays valid: it is the documented "minted without a lease" form the three
+// lease-less producers emit, and refusing it would fail closed on LB apply,
+// container relocation and automated promotion.
+func validateProofTermStamp(p *pb.RuntimeActionProof) error {
+	if p.GetLeaseTerm() < 0 {
+		return status.Errorf(codes.InvalidArgument,
+			"runtime-action proof %s carries lease term %d; a lease term is never negative "+
+				"(allocation starts at 1, and 0 means the proof was minted without one)",
+			p.GetId(), p.GetLeaseTerm())
+	}
+	if k := p.GetLeaseKey(); k != "" && !proofLeaseKeyProducible(k) {
+		return status.Errorf(codes.InvalidArgument,
+			"runtime-action proof %s names lease key %q, which no producer of a proof holds; "+
+				"refusing to persist it (naming a quieter ledger would move the term "+
+				"threshold this proof is judged against)", p.GetId(), k)
+	}
+	return nil
+}
+
 // claimCarriedProof validates a coordinator-minted proof carried in a direct-RPC
 // request and claims it single-use on THIS host. It (1) validates the
 // coordinator's assertions — exact action/target and dest_host == this host — so
@@ -79,49 +159,11 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 			p.GetId(), action, targetKind, targetName, s.hostName,
 			p.GetAction(), p.GetTargetKind(), p.GetTargetName(), p.GetDestHost())
 	}
-	// A NEGATIVE lease term is malformed input, refused here and not only where
-	// enforcement compares terms.
-	//
-	// proofFromPB forwards a peer-supplied int64 straight into the DB, and
-	// -5 marshals and unmarshals over the wire cleanly. nextLeaseTerm returns
-	// COALESCE(MAX(term),0)+1, which is >= 1, so a term below zero is not
-	// something allocation can produce: it is neither the 0 "minted without a
-	// term" sentinel nor a real tenure, and it has no defined behaviour in
-	// either enforcement arm. Contrast OwnerEpoch, which is parsed and compared
-	// against the live row a few lines below.
-	//
-	// Refused PRE-LATCH, unlike the term comparison, because this is not a
-	// legacy proof that predates stamping — it is a broken one, and accepting
-	// it until a capability latches would persist a value no reader can
-	// interpret. (The post-latch `term <= 0` refusal belongs to Task 6, which
-	// also decides which actions it applies to.)
-	if p.GetLeaseTerm() < 0 {
-		return "", status.Errorf(codes.InvalidArgument,
-			"runtime-action proof %s carries lease term %d; a lease term is never negative "+
-				"(allocation starts at 1, and 0 means the proof was minted without one)",
-			p.GetId(), p.GetLeaseTerm())
-	}
-	// The lease KEY is validated against the closed set on RECEIPT, before it is
-	// persisted — which is what service.proto and the schema's v53 history block
-	// have claimed in the present tense since Task 2c, while nothing actually
-	// did it (ValidLeaseKey's only non-test caller was the operator ack RPC).
-	//
-	// It has to happen here rather than at enforcement time, because the key is
-	// BOUND: WriteActionProofValidated seeds a peer-supplied key and replicates
-	// it, so a forged value becomes that row's permanent authorization record on
-	// every peer. Enforcement would then read a nonexistent ledger for it,
-	// MAX(term) = 0, and pass every proof naming it. "failover " with a trailing
-	// space is enough — ValidLeaseKey matches exactly and neither trims nor
-	// folds, deliberately.
-	//
-	// "" stays valid: it is the documented "minted without a lease" form that
-	// the three lease-less producers emit, and refusing it here would fail
-	// closed on LB apply, container relocation and automated promotion.
-	if k := p.GetLeaseKey(); k != "" && !corrosion.ValidLeaseKey(k) {
-		return "", status.Errorf(codes.InvalidArgument,
-			"runtime-action proof %s names lease key %q, which is not a lease; refusing to "+
-				"persist it (an unknown key reads an empty ledger, so enforcement would pass "+
-				"every proof naming it)", p.GetId(), k)
+	// The term STAMP is validated before anything persists it. Factored out
+	// because this is not the only caller that persists a caller-supplied proof:
+	// see validateProofTermStamp.
+	if err := validateProofTermStamp(p); err != nil {
+		return "", err
 	}
 	// Seed the row from the carried proof AND check it against any row already
 	// present, in ONE guarded transaction.
@@ -292,7 +334,18 @@ func (s *Server) judgeProofLeaseTerm(ctx context.Context, p *pb.RuntimeActionPro
 	// A HALF-stamped proof is malformed however it got that way: a term without
 	// a key cannot be judged against any ledger, and a key without a term names
 	// a ledger with nothing to compare. Neither is something a producer emits.
-	if term <= 0 || !corrosion.ValidLeaseKey(key) {
+	//
+	// The key is checked for PRODUCIBILITY, not mere membership, and it has to be
+	// checked HERE rather than only where a carried proof is received. This is
+	// the boundary VM reschedule crosses — the action the whole phase exists for
+	// — and it never sees a carried proto: internal/health's reconciler picks the
+	// row off replication and calls in through LeaseTermGateForPendingProof. So
+	// the row IS the authorization record, and a row can carry a key this node's
+	// receipt check never saw: a peer still on a pre-narrowing binary seeds one
+	// from a proof it accepted, and it replicates from there. Judging such a row
+	// against the ledger it names is the whole hole — the rebalancer's high-water
+	// is 0 on a cluster that never rebalanced, so any term clears it.
+	if term <= 0 || !proofLeaseKeyProducible(key) {
 		return health.ReasonStaleLeaseTerm, status.Errorf(codes.FailedPrecondition,
 			"runtime-action proof %s carries lease term %d for key %q, which is not a judgeable "+
 				"pair; refusing %s of %s", p.GetId(), term, key, action, targetName)

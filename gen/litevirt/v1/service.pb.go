@@ -17775,6 +17775,14 @@ type RuntimeActionProof struct {
 	// ledger yields MAX(term) = 0, which would pass every proof naming it.
 	// "" = minted by a pre-v53 node, and pairs with lease_term = 0.
 	// Additive/wire-compatible.
+	//
+	// Validation is NOT mere membership in those three. The key selects the
+	// ledger the threshold is computed from, so naming a quieter lease would
+	// move the bar; the executor accepts only a key a proof PRODUCER holds,
+	// which today is the failover lease alone. It is enforced both where a proof
+	// is received and where a term is judged — the reschedule path reads the
+	// replicated ROW rather than a carried proof, so the row cannot be trusted
+	// on the strength of some other node having checked it.
 	LeaseKey      string `protobuf:"bytes,15,opt,name=lease_key,json=leaseKey,proto3" json:"lease_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -372,9 +372,14 @@ import (
 //	     A term is meaningless without it: leader_lease_terms is shared by the
 //	     failover coordinator, the rebalancer and the dual-run detector, and
 //	     their term numbers collide by design, so an executor holding only a
-//	     term cannot tell which ledger to judge it against. Validated against a
-//	     closed set on receipt — an unknown key would read an empty ledger,
-//	     find MAX(term) = 0, and make anything naming it look current.
+//	     term cannot tell which ledger to judge it against. Validated against
+//	     the keys a proof PRODUCER holds — not merely against the three names —
+//	     both on receipt and where a term is judged, since the reschedule path
+//	     reads this row rather than a carried proof and the row may come from a
+//	     peer that never narrowed it. An unknown key would read an empty ledger, find
+//	     MAX(term) = 0, and make anything naming it look current; a known but
+//	     unproduced key does the same thing against a real ledger that happens
+//	     to be idle.
 //	     One additive column, appended LAST for the same digest reason as v53.
 const CurrentSchemaVersion = 54
 

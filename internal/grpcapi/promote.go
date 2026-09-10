@@ -183,6 +183,20 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	// correct dest) — before relaying/executing — so the replicated row and the
 	// carried proof agree on the exact action/target/dest binding.
 	if req.Proof != nil {
+		// The lease-term stamp is validated FIRST: before the destination probes,
+		// and above all before the seed below.
+		//
+		// claimCarriedProof also validates it, but that call is several hundred
+		// lines later, inside doPromoteLocal. The seed below commits the presented
+		// proof and relays the batch, so a key that fails validation down there has
+		// already become the row every peer holds — and the row, not the proto, is
+		// what enforcement reads afterwards. A malformed stamp is also malformed
+		// regardless of what the destination advertises, so it costs nothing to
+		// refuse it before spending a Fresh-Ping on it.
+		if err := validateProofTermStamp(req.Proof); err != nil {
+			s.noteGateRefused(corrosion.ActionPromote, health.ReasonProofConflict)
+			return err
+		}
 		// Fresh-Ping the resolved destination: never stamp a proof for a target that
 		// no longer advertises the gate (a regressed/replaced replica host that
 		// couldn't honor it). Fail closed — refuse rather than promote there ungated.

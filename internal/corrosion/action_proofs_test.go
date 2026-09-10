@@ -803,6 +803,60 @@ func TestClaimActionProofFenced_AnotherExecutorsClaimDoesNotFenceThisOne(t *test
 	}
 }
 
+// TestClaimActionProofFenced_IsScopedToItsLeaseKey: a claim at one lease's term
+// must not fence a proof minted under a different lease at the same number.
+//
+// The three leases allocate terms independently, so their numbers COLLIDE by
+// design — that is what TestLeaseTermHolder_IsScopedToItsKey pins one layer
+// down. claimProofFencedSQL therefore scopes its NOT EXISTS by (lease_term,
+// lease_key), and the key half is the half with nothing else backing it: drop it
+// and the conflict subquery still reads perfectly plausibly, still passes every
+// other fenced-claim test, and quietly refuses a legitimate rebalancer proof at
+// term 7 because an unrelated failover proof at term 7 was claimed on this host.
+// The operator-facing failure is the worst kind: ErrTermClaimantConflict names a
+// split-brain that never happened.
+//
+// Both claims land on ONE executor deliberately. A different executor is already
+// covered by _AnotherExecutorsClaimDoesNotFenceThisOne, and using two here would
+// let the per-executor half of the binding carry the test on its own.
+func TestClaimActionProofFenced_IsScopedToItsLeaseKey(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+
+	for _, tc := range []struct{ id, coordinator, key string }{
+		{"p-failover", "node-a", LeaseKeyFailover},
+		{"p-rebalance", "node-z", LeaseKeyRebalancer},
+	} {
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: tc.id, Action: ActionReschedule, TargetKind: "vm", TargetName: tc.id,
+			DestHost: "node-b", Coordinator: tc.coordinator,
+			LeaseTerm: 7, LeaseKey: tc.key,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", tc.id, err)
+		}
+	}
+
+	// This executor binds itself to node-a for (failover, 7).
+	if err := ClaimActionProofFenced(ctx, c, "p-failover", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-a"}); err != nil {
+		t.Fatalf("the failover claim at term 7: %v", err)
+	}
+
+	// The rebalancer's term 7 is a different tenure of a different lease, so the
+	// binding above says nothing about it.
+	err := ClaimActionProofFenced(ctx, c, "p-rebalance", "node-b",
+		&TermFence{Key: LeaseKeyRebalancer, Term: 7, Coordinator: "node-z"})
+	if errors.Is(err, ErrTermClaimantConflict) {
+		t.Fatalf("a rebalancer proof at term 7 was refused as a claimant conflict because an "+
+			"unrelated FAILOVER proof at term 7 was claimed on this executor: %v — the "+
+			"three ledgers advance independently, so this reports a split-brain that "+
+			"never happened and strands legitimate work", err)
+	}
+	if err != nil {
+		t.Fatalf("the rebalancer claim at term 7: %v", err)
+	}
+}
+
 // TestWriteActionProof_PreLatchEmitsTheReleasedShape: mid-roll, a proof must go
 // on the wire in the shape a previous-release peer can resolve.
 //

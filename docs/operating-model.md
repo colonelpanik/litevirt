@@ -262,12 +262,30 @@ definition of that set. A mismatch refuses the action ungated, exactly as a
 mismatched relocation token already did. That catches a DIVERGENT PROOF ROW,
 which is a different question from whether the term is current.
 
-A carried proof's term and key are persisted on receipt and replicate from
-there, so the executor validates the key against the closed set of lease names
-before storing it, and refuses a negative term outright. An unknown key would
-otherwise become that row's permanent authorization record — and enforcement
-reading a nonexistent ledger for it would find `MAX(term) = 0` and pass every
-proof naming it.
+A proof's term and key are validated at every point where they could otherwise
+become authoritative, which is more than one point. A carried proof is validated
+on receipt, before it is persisted, because persisting it replicates it: an
+unvalidated key would become that row's permanent authorization record on every
+peer, and enforcement reading a nonexistent ledger for it would find
+`MAX(term) = 0` and pass every proof naming it. Promotion validates the proof it
+was handed before it seeds the row itself. And the key is checked again where a
+term is JUDGED, because the reschedule path — the action this regime exists for
+— never sees a carried proof at all: the destination reads the replicated row.
+A row can therefore carry a key this node's own receipt check never saw, from a
+peer still running a binary that did not narrow it, so the row is not trusted on
+the strength of where it came from. A negative term is refused outright at the
+same places.
+
+Membership in the three lease names is **not** sufficient, and treating it as
+sufficient was a real hole. The key SELECTS which ledger the threshold is
+computed against, and the three advance independently, so naming a quieter
+lease moves the bar — on a cluster that has never rebalanced, to 0, where any
+term clears. So the accepted set is narrowed to the keys a proof PRODUCER
+actually holds, which today is `failover` alone: the failover coordinator is
+the only thing in the tree that stamps a key on a proof. The rebalancer and the
+dual-run detector hold leases but produce no proofs. Widening that set is a
+deliberate act, and the case that will force it is container cold migration,
+which has producers of both kinds.
 
 To read the current terms:
 

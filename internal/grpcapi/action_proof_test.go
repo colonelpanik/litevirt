@@ -11,6 +11,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -769,25 +770,134 @@ func TestClaimCarriedProof_TheSameClaimantMayActRepeatedly(t *testing.T) {
 	}
 }
 
-// TestClaimCarriedProof_TheFenceIsScopedToItsLeaseKey: the three leases
-// allocate terms independently, so their numbers collide by design. A
-// rebalancer proof at term 7 must not be fenced by a failover proof at term 7
-// already claimed on this host — that would refuse a legitimate action and
-// report a split-brain conflict that never happened.
-func TestClaimCarriedProof_TheFenceIsScopedToItsLeaseKey(t *testing.T) {
+// perKeyPeer answers a DIFFERENT high water per lease key, which is what makes
+// the ledger-redirection hazard reproducible: the three ledgers advance
+// independently, so a cluster busy with failovers and idle on rebalancing has a
+// high failover water and a rebalancer water of 0.
+type perKeyPeer struct {
+	pb.LiteVirtClient
+	terms map[string]int64 // lease key → newest term this peer has seen
+}
+
+func (f *perKeyPeer) GetLeaseTermHighWater(_ context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption) (*pb.GetLeaseTermHighWaterResponse, error) {
+	k := req.GetKey()
+	return &pb.GetLeaseTermHighWaterResponse{Key: k, Term: f.terms[k], Holder: "node-x"}, nil
+}
+
+// enforcingServerPerKey is enforcingServer with per-key peer answers.
+func enforcingServerPerKey(t *testing.T, peers []string, perKey map[string]int64) *Server {
+	t.Helper()
+	s := apServer(t)
+	s.SetLeaseTermEnforce(true)
+	s.SetGate(fakeServerGate{
+		enforcedTok: map[string]bool{capabilities.LeaseTermV1: true},
+		quorum:      health.QuorumYes,
+		needed:      2,
+		healthy:     peers,
+	})
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		for _, p := range peers {
+			if p == host {
+				return &perKeyPeer{terms: perKey}, func() {}, nil
+			}
+		}
+		return nil, nil, context.DeadlineExceeded
+	}
+	return s
+}
+
+// TestClaimCarriedProof_RefusesALeaseKeyNoProducerHolds closes the redirection
+// that membership-only validation left open.
+//
+// ValidLeaseKey answers "is this one of the three leases", and the receipt check
+// used to stop there. But the key SELECTS the ledger the threshold is computed
+// from, and the three ledgers advance independently — so naming a quieter one
+// moves the bar. Here the quorum answers term 7 for failover while the named
+// rebalancer ledger is untouched at 0, which is exactly the shape that made the
+// term check a formality: a proof at term 1 would clear a 0 high-water.
+//
+// Nothing in the tree produces such a proof — all three stamp sites are
+// failover — so refusing it costs no real path.
+func TestClaimCarriedProof_RefusesALeaseKeyNoProducerHolds(t *testing.T) {
+	ctx := context.Background()
+	// Failover is busy at term 7; the other two ledgers have never elected, so
+	// their quorum-observed water is 0. Judged against those, ANY term clears.
+	s := enforcingServerPerKey(t, []string{"node-c"}, map[string]int64{
+		corrosion.LeaseKeyFailover: 7,
+	})
+
+	for _, key := range []string{corrosion.LeaseKeyRebalancer, corrosion.LeaseKeyDualRun} {
+		p := carriedProof("p-"+key, "node-z", "vm-"+key, 1)
+		p.LeaseKey = key
+		_, err := s.claimCarriedProof(ctx, p, corrosion.ActionReschedule, "vm", "vm-"+key)
+		if err == nil {
+			t.Errorf("a proof naming %q at term 1 was accepted while the failover quorum stood "+
+				"at 7; the term threshold can be moved by choosing which ledger to be judged "+
+				"against, which makes enforcement a formality", key)
+			continue
+		}
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("key %q: code = %v, want InvalidArgument — this is a malformed proof, not "+
+				"a stale one, and it must not be counted as a lease-term refusal", key, status.Code(err))
+		}
+	}
+}
+
+// TestClaimCarriedProof_AcceptsTheKeyItsProducerHolds is the other half: the
+// narrowing must not refuse the one key that IS produced.
+func TestClaimCarriedProof_AcceptsTheKeyItsProducerHolds(t *testing.T) {
 	ctx := context.Background()
 	s := enforcingServer(t, map[string]int64{"node-c": 7})
 
-	failover := carriedProof("p-failover", "node-a", "vm1", 7)
-	if _, err := s.claimCarriedProof(ctx, failover, corrosion.ActionReschedule, "vm", "vm1"); err != nil {
-		t.Fatalf("failover term 7: %v", err)
+	p := carriedProof("p-failover", "node-a", "vm1", 7)
+	p.LeaseKey = corrosion.LeaseKeyFailover
+	if _, err := s.claimCarriedProof(ctx, p, corrosion.ActionReschedule, "vm", "vm1"); err != nil {
+		t.Fatalf("the coordinator's own key was refused: %v", err)
+	}
+}
+
+// TestLeaseTermGateForPendingProof_RefusesARowWhoseKeyNoProducerHolds: the
+// narrowing has to hold at the boundary VM RESCHEDULE crosses, which is not the
+// one a carried proof crosses.
+//
+// A reschedule proof never travels over an RPC. The coordinator writes the row,
+// internal/health's reconciler picks it up off replication and calls in through
+// LeaseTermGateForPendingProof, and the ROW is therefore the authorization
+// record. A check placed only in claimCarriedProof runs on every proof path
+// except the one this phase exists for — and a row can carry a key this node's
+// receipt check never saw, because a peer still on a pre-narrowing binary seeds
+// one from a proof it accepted and it replicates from there.
+//
+// So this test starts from a persisted ProofRecord, not from a carried proto.
+// The rebalancer ledger is left untouched at 0 while failover sits at 7: if the
+// key were merely checked for membership, term 1 would clear a threshold of 0
+// and the gate would return a fence.
+func TestLeaseTermGateForPendingProof_RefusesARowWhoseKeyNoProducerHolds(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServerPerKey(t, []string{"node-b", "node-c"}, map[string]int64{
+		corrosion.LeaseKeyFailover: 7,
+	})
+
+	pr := corrosion.ProofRecord{
+		ActionProof: corrosion.ActionProof{
+			ID: "p-row", Action: corrosion.ActionReschedule,
+			TargetKind: "vm", TargetName: "vm1",
+			DestHost: s.hostName, Coordinator: "node-a",
+			LeaseTerm: 1, LeaseKey: corrosion.LeaseKeyRebalancer,
+		},
+		Status: corrosion.ProofPrepared,
 	}
 
-	// A DIFFERENT lease, same term number, different coordinator.
-	rebalancer := carriedProof("p-rebalancer", "node-z", "vm2", 7)
-	rebalancer.LeaseKey = corrosion.LeaseKeyRebalancer
-	if _, err := s.claimCarriedProof(ctx, rebalancer, corrosion.ActionReschedule, "vm", "vm2"); err != nil {
-		t.Errorf("a rebalancer proof at term 7 was fenced by an unrelated failover claim at "+
-			"term 7: %v — term numbers collide across the three leases by design", err)
+	fence, reason, err := s.LeaseTermGateForPendingProof(ctx, pr)
+	if err == nil {
+		t.Fatalf("a persisted row naming the rebalancer lease was judged and admitted "+
+			"(fence=%+v): the reschedule boundary reads the ROW, so a key no producer "+
+			"holds selects an idle ledger whose high-water is 0 and every term clears it", fence)
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition: %v", got, err)
+	}
+	if reason == "" {
+		t.Error("refusal returned no countable reason, so the reconciler cannot record it")
 	}
 }

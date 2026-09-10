@@ -141,6 +141,18 @@ type Config struct {
 	// and falling back to image-recreate. Default 600s (10m) — comfortably longer
 	// than a real rootfs restore.
 	ContainerRestoreTimeoutSec int `yaml:"container_restore_timeout_sec"`
+	// StrandedRecovery opts the failover coordinator into finishing recovery for
+	// hosts it already fenced whose workloads a post-fence refusal left behind.
+	//
+	// Every proof stamp site is reached AFTER the fence, and a fenced host is
+	// otherwise processed only once, so a refusal there — a lost quorum, an
+	// ungated target, a transient DB error — leaves the workload on a powered-off
+	// machine until an operator notices. With this on, a later cycle retries,
+	// gated on quorum still reporting the host down.
+	//
+	// Default false; reversible kill switch. Recovery moves workloads, so it
+	// ships behind a switch like the rest of this family.
+	StrandedRecovery bool `yaml:"stranded_recovery,omitempty"`
 
 	// Split-brain Phase 2 — minority VIP self-demotion. Both are seconds, consumed as
 	// time.Duration. An isolated (quorum-lost) LB host drops its own VIP so keepalived

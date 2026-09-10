@@ -1225,6 +1225,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// executor half, and both read this one flag so the source and the enforcer
 	// can never disagree about whether enforcement is on.
 	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
+	// Stranded-workload recovery: retries recovery for hosts already fenced whose
+	// workloads a post-fence refusal abandoned. Off by default (see the field).
+	fc.StrandedRecovery = d.cfg.StrandedRecovery
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

@@ -323,19 +323,53 @@ executor's barrier still guards the stale case. So this counter is the one place
 enforcement is permissive rather than fail-closed, and a persistent nonzero rate
 means the coordinator has effectively stopped prechecking.
 
-`litevirt_failover_attempts_total{phase="stranded-recovery",result="recovered"}`
-is the stranded-workload sweep finishing work an earlier refusal left behind.
-Any nonzero value is worth reading, because it does not mean the sweep is broken
-— it means something upstream refused AFTER the host was already fenced, and the
-workloads sat on a powered-off machine until this sweep came back for them.
+The stranded-workload sweep is off by default (`failover.stranded_recovery`) and
+reports on `phase="stranded-recovery"`, with the two results meaning different
+things:
+
+`result="recovered"` is the sweep having actually MOVED workloads an earlier
+refusal left behind. Any nonzero value is worth reading — not because the sweep
+is broken, but because something upstream refused AFTER the host was fenced, and
+those workloads sat on a powered-off machine until the sweep came back for them.
 Alert on it and go find the refusal that preceded it; the sweep is the safety
 net, not the fix.
 
-Note the phase label. `phase="recovery"` with `result="recovered"` is a HOST
+`result="skipped"` is the sweep having tried and moved nothing: every remaining
+workload was refused again. That is a different condition and usually a worse
+one — a blocker nobody has cleared, typically an ownership dispute, no placement
+that satisfies the workload's constraints, or a shared-disk VM whose proof-grade
+fence evidence has aged out. It is reported separately precisely so it cannot
+drown the signal above. A steady `skipped` rate with no `recovered` means the
+sweep is spinning on something only an operator can resolve.
+
+Note the phase label too. `phase="recovery"` with `result="recovered"` is a HOST
 returning to active, which is routine and which you do not want to alert on;
 `phase="stranded-recovery"` is workloads being evacuated from a host that never
-came back. The two are deliberately separate labels because alerting on the
-first would drown the second.
+came back.
+
+#### Holding a fenced host
+
+The sweep admits a host only while quorum still reports it down, so it will not
+fight a host that has come back. But it does not ask permission either: once a
+blocker clears it evacuates within a poll interval.
+
+**The only hold is the flag.** Clear `failover.stranded_recovery` on the leader
+and the sweep stands down cluster-wide, immediately and without stopping the
+coordinator (which would also stop fencing). There is deliberately no per-host
+hold, and no way to fake one: the sweep keys on `hosts.state == "fenced"`, and
+the only ways out of that state are `lv host undrain <host>`, which marks the
+host `active` and hands it back to placement and to the fence loop, or a genuine
+recovery. `maintenance` reads like a parking state in the fence loop's skip list
+but nothing in the tree ever writes it, so it is not one.
+
+If you need a single host held while you investigate, clear the flag for the
+duration. That is a real gap rather than a recommendation.
+
+What the sweep cannot recover, by construction: a host whose fence succeeded but
+whose `hosts.state` write did NOT (that write is deliberately non-fatal, so the
+fence is not lost to a store blip) never reaches `fenced`, so the sweep never
+admits it. Those workloads still need an operator. The guarantee is "a refusal
+after a recorded fence is retried", not "no workload is ever stranded".
 
 `litevirt_ha_degraded{reason="capability_rollout_pending"}` says a mandatory
 token has not latched yet. During an upgrade that is expected and should not

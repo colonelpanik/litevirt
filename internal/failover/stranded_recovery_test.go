@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -41,7 +42,7 @@ func TestVMNeedsFailover(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			db := newTestDB(t)
 			c := newTestCoordinator("coord", db)
-			got := c.vmNeedsFailover(context.Background(), corrosion.VMRecord{Name: "vm1", Spec: tc.spec})
+			got := c.vmNeedsFailover(corrosion.VMRecord{Name: "vm1", Spec: tc.spec}, nil)
 			if got != tc.want {
 				t.Errorf("vmNeedsFailover = %v, want %v", got, tc.want)
 			}
@@ -64,17 +65,10 @@ func TestVMNeedsFailover_AutoPromoteOverridesPolicyNone(t *testing.T) {
 
 	vm := corrosion.VMRecord{Name: "vm1", Spec: `{"on_host_failure":"none"}`}
 
-	// No promoter wired: nothing can promote, so there is nothing to wait for.
-	if c.vmNeedsFailover(ctx, vm) {
-		t.Error("policy=none with no Promoter wired is not recoverable work")
-	}
-
-	c.Promoter = stubPromoter{}
-	if c.vmNeedsFailover(ctx, vm) {
-		t.Error("policy=none with a Promoter but no replication schedule is not recoverable work")
-	}
-
-	// Enrol it in replication with auto-promote.
+	// Enrol FIRST, so the no-Promoter assertion below is actually about the
+	// Promoter. Asserting it against an empty schedule set proved nothing: the
+	// predicate would have answered false either way, so deleting the
+	// `c.Promoter == nil` guard survived.
 	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
 		VMName: "vm1", Repo: "dr", Scope: "vm", Cron: "* * * * *", Enabled: true,
 		Type: "replication", TargetPool: "dr", TargetHost: "live", KeepReplicas: 3,
@@ -82,7 +76,22 @@ func TestVMNeedsFailover_AutoPromoteOverridesPolicyNone(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertBackupSchedule: %v", err)
 	}
-	if !c.vmNeedsFailover(ctx, vm) {
+	enrolled, err := c.autoPromoteSet(ctx)
+	if err != nil {
+		t.Fatalf("autoPromoteSet: %v", err)
+	}
+	if !enrolled["vm1"] {
+		t.Fatal("premise check: vm1 must be enrolled for the rest of this test to mean anything")
+	}
+
+	// Enrolled, but nothing can promote it.
+	if c.vmNeedsFailover(vm, enrolled) {
+		t.Error("an enrolled VM with no Promoter wired is not recoverable work — nothing can " +
+			"act on it, so reporting work keeps the sweep awake forever")
+	}
+
+	c.Promoter = stubPromoter{}
+	if !c.vmNeedsFailover(vm, enrolled) {
 		t.Error("a VM enrolled in replication with auto_promote is recoverable by PROMOTION " +
 			"regardless of on_host_failure, and the reschedule loop reaches promotion first. " +
 			"Reporting no work here retires its host from the sweep for good")
@@ -109,19 +118,26 @@ func TestVMNeedsFailover_UnreadableSchedulesAssumeWork(t *testing.T) {
 	c.Promoter = stubPromoter{}
 
 	// policy=none, so the answer hinges entirely on the schedule read.
-	vm := corrosion.VMRecord{Name: "vm1", Spec: `{"on_host_failure":"none"}`}
-	if c.vmNeedsFailover(ctx, vm) {
-		t.Fatal("premise check: with readable schedules and no enrolment there is no work")
-	}
-
 	if err := db.Execute(ctx, `DROP TABLE backup_schedules`); err != nil {
 		t.Fatalf("drop backup_schedules: %v", err)
 	}
-	if _, err := c.autoPromoteEnabled(ctx, "vm1"); err == nil {
+	if _, err := c.autoPromoteSet(ctx); err == nil {
 		t.Fatal("schedule read still succeeds; this test is not injecting the error it claims to")
 	}
 
-	if !c.vmNeedsFailover(ctx, vm) {
+	// The fail-open lives in hostHasRecoverableWorkloads, which owns the read.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "dead", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "dead", State: "running", Spec: `{"on_host_failure":"none"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if !c.hostHasRecoverableWorkloads(ctx, "dead") {
 		t.Error("an unreadable schedule was read as 'no work'. The sweep is the only thing " +
 			"that returns to a fenced host, so this retires it permanently and strands any " +
 			"auto-promote VM on it — a transient DB error turned into the stranding this " +
@@ -186,6 +202,7 @@ func TestRecoverStrandedWorkloads_RetriesAfterARefusal(t *testing.T) {
 	fenceQuorum(t, ctx, db, []string{"coord", "live"}, "dead")
 
 	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
 	fm := newFakeMetrics()
 	c.Metrics = fm
 	// Enforce lease terms, then supersede this coordinator's term so the stamp
@@ -239,7 +256,7 @@ func TestRecoverStrandedWorkloads_RetriesAfterARefusal(t *testing.T) {
 
 	// A later cycle. run() would skip the offline host entirely, so the sweep is
 	// the only thing that can still recover this VM.
-	c.recoverStrandedWorkloads(ctx)
+	sweepFor(ctx, c, "dead")
 
 	vm, err = corrosion.GetVM(ctx, db, "vm1")
 	if err != nil || vm == nil {
@@ -276,7 +293,7 @@ func TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay(t *testing.T) {
 
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "dead", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "offline", FenceStrategy: "best-effort",
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
 	}
@@ -296,6 +313,7 @@ func TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay(t *testing.T) {
 	recordFence(t, ctx, db, "dead")
 
 	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
 	fm := newFakeMetrics()
 	c.Metrics = fm
 	if !c.acquireLease(ctx) {
@@ -306,14 +324,21 @@ func TestRecoverStrandedWorkloads_QuiescesOnWorkloadsThatStay(t *testing.T) {
 	// just as well with the sweep's call to it deleted, which is the mutation this
 	// has to catch.
 	for i := 0; i < 3; i++ {
-		c.recoverStrandedWorkloads(ctx)
+		sweepFor(ctx, c, "dead")
 	}
 
-	if n := fm.attempts[foKey(PhaseStranded, ResultRecovered, "")]; n != 0 {
-		t.Errorf("the sweep ran recovery %d time(s) for a host whose only workloads are a "+
-			"policy=none VM and a Secure Boot VM. Both stay by design and the host stays "+
-			"offline, so that condition never goes false and the sweep would re-run every "+
-			"cycle for the life of the cluster", n)
+	// Assert on BOTH outcomes, not just "recovered". Once the sweep reports
+	// ResultSkipped when a pass moves nothing, a quiesced host that is wrongly
+	// ADMITTED still shows recovered==0 — so that assertion alone stopped being
+	// able to see the eligibility check disappear. A quiesced host must produce no
+	// stranded-phase metric at all, because it must never be admitted.
+	for _, result := range []string{ResultRecovered, ResultSkipped} {
+		if n := fm.attempts[foKey(PhaseStranded, result, "")]; n != 0 {
+			t.Errorf("the sweep entered recovery %d time(s) (result=%q) for a host whose only "+
+				"workloads are a policy=none VM and a Secure Boot VM. Both stay by design and "+
+				"a fenced host stays fenced, so that condition never goes false and the sweep "+
+				"would re-run every cycle for the life of the cluster", n, result)
+		}
 	}
 }
 
@@ -368,12 +393,13 @@ func TestRecoverStrandedWorkloads_OfflineIsNotAuthorityToEvacuate(t *testing.T) 
 			}
 
 			c := newTestCoordinator("coord", db)
+			c.StrandedRecovery = true
 			c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
 			if !c.acquireLease(ctx) {
 				t.Fatal("must acquire an unheld lease")
 			}
 
-			c.recoverStrandedWorkloads(ctx)
+			sweepFor(ctx, c, "dead")
 
 			vm, err := corrosion.GetVM(ctx, db, "vm1")
 			if err != nil || vm == nil {
@@ -439,6 +465,7 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 	recordFence(t, ctx, db, "dead")
 
 	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
 	// Safe-fence policy enforced, and no operator has confirmed the power-off.
 	c.SafeFenceEnforce = true
 	c.Gate = fakeFailoverGate{
@@ -449,7 +476,7 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 		t.Fatal("must acquire an unheld lease")
 	}
 
-	c.recoverStrandedWorkloads(ctx)
+	sweepFor(ctx, c, "dead")
 
 	vm, err := corrosion.GetVM(ctx, db, "vm1")
 	if err != nil || vm == nil {
@@ -500,6 +527,17 @@ func TestRecoverStrandedWorkloads_HonoursTheSplitBrainAuthorization(t *testing.T
 // authority to evacuate, and the sweep would have invented an eviction nobody
 // ordered.
 
+// sweepFor drives the sweep as run() would, with quorum corroborating that each
+// named host is down. Admission needs BOTH state=="fenced" and this live
+// evidence, so a test that omits the evidence is testing the refusal path.
+func sweepFor(ctx context.Context, c *Coordinator, hosts ...string) {
+	failing := map[string]int{}
+	for _, h := range hosts {
+		failing[h] = 1
+	}
+	c.recoverStrandedWorkloads(ctx, failing, 1)
+}
+
 // stubPromoter satisfies ReplicaPromoter without doing anything. The predicate
 // only asks whether a promoter EXISTS, so nothing here needs to work.
 type stubPromoter struct{}
@@ -540,3 +578,283 @@ func (stubPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch s
 // host returning to active and fires routinely, so an operator alerting on it
 // would drown the one event that means workloads were abandoned on a
 // powered-off machine.
+
+// TestRecoverStrandedWorkloads_RequiresQuorumCorroboration is the safety test
+// for what state=="fenced" is and is not.
+//
+// It is a record that somebody decided a host was down. It is NOT evidence the
+// host IS down, and `lv host fence-confirm` writes it with no precondition on
+// the host's current state, runs no fence, and logs a "manual-confirmed" result
+// that FenceProofGrade accepts. So an operator who mistypes a hostname marks a
+// LIVE machine fenced. The fence loop shrugs — it skips terminal states, which is
+// why that RPC's own comment says it "does NOT make an operator-initiated fence
+// reschedule anything" — but a sweep admitting on state alone evacuates a running
+// host within one poll, shared disks included, because the proof-grade row
+// satisfies the storage gate too.
+func TestRecoverStrandedWorkloads_RequiresQuorumCorroboration(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	// The mistyped host: alive, healthy, running its VM — and marked fenced.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "alive", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost alive: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost live: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "alive", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// The operator's confirmation, exactly as FenceHost(ConfirmManualOnly) writes
+	// it — and FenceProofGrade accepts this as proof of power-off.
+	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
+		ID: "f-alive", HostName: "alive", Method: "manual",
+		Result: "manual-confirmed", Detail: "operator confirmation",
+	}); err != nil {
+		t.Fatalf("InsertFenceLog: %v", err)
+	}
+
+	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
+	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+	if !c.acquireLease(ctx) {
+		t.Fatal("must acquire an unheld lease")
+	}
+
+	// No quorum evidence: nobody observes "alive" as failing, because it isn't.
+	c.recoverStrandedWorkloads(ctx, map[string]int{}, 1)
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "alive" {
+		t.Errorf("the sweep evacuated vm1 to %q off a host that is up and running it. Only a "+
+			"state row said otherwise, and an operator can write that row on any host by "+
+			"mistyping a name — nothing power-cycled this machine, so vm1 is now started on "+
+			"the target while it is still running here. On shared storage that is two writers "+
+			"to one disk", vm.HostName)
+	}
+
+	// With quorum corroborating, the same host IS evacuated.
+	sweepFor(ctx, c, "alive")
+	vm, err = corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM after corroborated sweep: %v", err)
+	}
+	if vm.HostName == "alive" {
+		t.Error("positive control failed: with quorum reporting the host down the sweep must " +
+			"recover, or the test above passes for the wrong reason")
+	}
+}
+
+// TestRecoverStrandedWorkloads_OffByDefault: the sweep moves workloads, so it
+// ships behind a reversible switch like every other post-fence behaviour here.
+func TestRecoverStrandedWorkloads_OffByDefault(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "dead", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost dead: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost live: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "dead", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	recordFence(t, ctx, db, "dead")
+
+	c := newTestCoordinator("coord", db) // StrandedRecovery not set
+	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+	if !c.acquireLease(ctx) {
+		t.Fatal("must acquire an unheld lease")
+	}
+
+	sweepFor(ctx, c, "dead")
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "dead" {
+		t.Errorf("the sweep ran with StrandedRecovery unset and moved vm1 to %q. A behaviour "+
+			"that relocates workloads must be switchable off mid-incident without stopping "+
+			"the coordinator, which would also stop fencing", vm.HostName)
+	}
+}
+
+// TestRun_DrivesTheStrandedSweep pins the production wiring.
+//
+// Every other test in this file calls recoverStrandedWorkloads directly, so
+// deleting its one call site in run() left the whole suite green while the
+// feature was dead — which is precisely the "nothing ever comes back for the VM"
+// failure it exists to prevent.
+func TestRun_DrivesTheStrandedSweep(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	// A host already fenced on an earlier cycle, still holding its VM, plus two
+	// live hosts so a fresh quorum can observe the fenced one as down.
+	for _, h := range []struct{ name, state string }{
+		{"dead", "fenced"}, {"live", "active"}, {"coord", "active"},
+	} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h.name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: h.state, FenceStrategy: "best-effort",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "dead", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	recordFence(t, ctx, db, "dead")
+	// Quorum of fresh observers reporting "dead" past the failure threshold —
+	// the same evidence the fence loop requires.
+	fenceQuorum(t, ctx, db, []string{"coord", "live"}, "dead")
+
+	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
+	fm := newFakeMetrics()
+	c.Metrics = fm
+	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+
+	c.run(ctx)
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName == "dead" {
+		t.Errorf("a full run() cycle left vm1 on the already-fenced host. run()'s fence loop "+
+			"skips terminal states, so the sweep is the only thing that can recover it — if "+
+			"run() does not call it, the feature does not exist in production: state=%q",
+			vm.State)
+	}
+	if n := fm.attempts[foKey(PhaseStranded, ResultRecovered, "")]; n != 1 {
+		t.Errorf("stranded-recovery/recovered = %d, want 1 — the recovery must be attributable "+
+			"to the sweep, not indistinguishable from the fence path's own work", n)
+	}
+}
+
+// TestRecoverStrandedWorkloads_RevalidatesTheLease: the sweep does destructive
+// ownership writes, so it must re-check the lease per host like the fence loop.
+//
+// It runs LAST in the cycle, after the fence loop, recoverHosts and
+// resolvePendingRelocations, so the lease is at its oldest here — and a single
+// restore-from-backup can outlive a whole lease term while the sweep works
+// through an earlier host.
+func TestRecoverStrandedWorkloads_RevalidatesTheLease(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "dead", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost dead: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost live: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "dead", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	recordFence(t, ctx, db, "dead")
+
+	c := newTestCoordinator("coord", db)
+	c.StrandedRecovery = true
+	c.Now = func() time.Time { return now }
+	c.Gate = fakeFailoverGate{supports: map[string]bool{"live": true}}
+	if !c.acquireLease(ctx) {
+		t.Fatal("must acquire an unheld lease")
+	}
+
+	// A peer takes the lease after this coordinator acquired it — the displacement
+	// the sweep would otherwise not notice until its first proof mint.
+	valid := now.Add(time.Hour).UTC().Format(time.RFC3339)
+	if err := db.Execute(ctx,
+		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
+		 VALUES ('failover', 'other', ?, ?)
+		 ON CONFLICT(key) DO UPDATE
+		   SET holder = excluded.holder,
+		       expires_at = excluded.expires_at,
+		       updated_at = excluded.updated_at`, valid, valid); err != nil {
+		t.Fatalf("hand the lease to another host: %v", err)
+	}
+
+	sweepFor(ctx, c, "dead")
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "dead" {
+		t.Errorf("a displaced coordinator moved vm1 to %q. It no longer holds the failover "+
+			"lease, so another coordinator is entitled to recover this host, and two of them "+
+			"re-homing the same rows is the split the lease exists to prevent", vm.HostName)
+	}
+}
+
+//
+// ROUND 1 REVIEW (2026-09-09). A /code-review across five angles plus an
+// afriend crossexam produced ~20 verified findings against the commits above.
+// Mutations 11-15 cover the fixes.
+//
+//	 # | mutation                                        | outcome
+//	---+-------------------------------------------------+------------------------------
+//	11 | sweep drops the quorum-corroboration check      | KILLED RequiresQuorum-
+//	   |                                                 |   Corroboration
+//	12 | sweep ignores StrandedRecovery                  | KILLED OffByDefault
+//	13 | run() no longer calls the sweep                 | KILLED Run_DrivesThe-
+//	   |                                                 |   StrandedSweep
+//	14 | sweep drops per-host holdLease revalidation     | KILLED RevalidatesTheLease
+//	15 | sweep drops the fresh GetHost re-read           | SURVIVED — un-isolatable,
+//	   |                                                 |   see below
+//	 3 | (re-run) drop the eligibility check             | SURVIVED TWICE, then KILLED
+//
+// Mutation 15 has no unit-tier test and cannot get one honestly. The window it
+// closes exists only between the sweep's ListHosts snapshot and its GetHost
+// re-read, inside a single call, and nothing a unit test controls can change a
+// row in that gap. It is real — an earlier host's restore-from-backup runs
+// synchronously for minutes, and an operator can undrain a later host in that
+// time — but pinning it needs either a production test seam or a fleet scenario
+// with a controllable clock. Recorded as uncovered rather than claimed.
+//
+// Mutation 3 is the cautionary one, having now survived twice for two DIFFERENT
+// reasons. First its host was inserted "offline" while admission had narrowed to
+// "fenced", so the host was never admitted and the assertion compared 0 against
+// 0. Fixing the state exposed the second cause: once the sweep began reporting
+// ResultSkipped for a pass that moves nothing, "recovered == 0" was again true
+// whether or not the eligibility check existed. It now asserts on BOTH results,
+// because the property is "a quiesced host is never admitted", not "a quiesced
+// host recovers nothing". Two rounds of review to notice that an assertion had
+// been re-broken by an unrelated fix in the same file.

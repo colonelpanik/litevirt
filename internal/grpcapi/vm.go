@@ -2787,30 +2787,35 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 	}
 
-	// Stop and delete the old VM (re-fetch in case state changed).
+	// Stop and delete the old VM (re-fetch in case state changed). The DB re-key
+	// runs FIRST and the irreversible frees follow it, so a failure anywhere in
+	// here leaves the replaced VM's disks and firmware intact and the whole
+	// cutover retryable. It used to be the other way round, which is what made
+	// the rename's UNIQUE-constraint failure destroy the VM it was replacing.
 	oldVM, _ = corrosion.GetVM(ctx, s.db, req.VmName)
+	var retiredName string
+	var replacedDisks []corrosion.DiskRecord
 	if oldVM != nil {
+		// Captured HERE, before any DB write: the re-key moves these rows to the
+		// retired name (tombstoned, so GetVMDisks stops returning them) and hands
+		// req.VmName to the replacement, so reading them afterwards would give
+		// the deleter the REPLACEMENT's disks.
+		if oldVM.HostName == s.hostName {
+			var derr error
+			if replacedDisks, derr = corrosion.GetVMDisks(ctx, s.db, req.VmName); derr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cutover: read the replaced VM's disk records: %v", derr)
+			}
+		}
 		if oldVM.HostName == s.hostName && oldVM.State == "running" {
 			s.virt.DestroyDomain(req.VmName)
 		}
+		// The old domain has to go before the -next domain can be redefined under
+		// its name. A plain VM's definition is rebuildable from its row, so this
+		// is not yet a point of no return.
 		if oldVM.HostName == s.hostName {
 			s.virt.UndefineDomain(req.VmName, false)
 		}
-		// Free the replaced VM's disks at their recorded locations (driver-
-		// dispatched) before the tombstone, then glob the default dir.
-		if oldVM.HostName == s.hostName {
-			s.deleteRecordedVMDiskVolumes(ctx, req.VmName)
-			// Wipe the replaced VM's firmware state (its old UUID-keyed swtpm +
-			// name-keyed NVRAM) so cutover doesn't orphan it (G1).
-			lv.WipeFirmwareState(s.dataDir, req.VmName, parseFirmwareSpec(oldVM.Spec).UUID)
-		}
-		s.images.DeleteVMDisks(req.VmName)
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
-		// A declined tombstone must abort BEFORE the rename below: proceeding
-		// would leave the replaced VM's row live (a duplicate identity) while
-		// its disks and firmware are already gone. Everything up to here is
-		// idempotent teardown, so the cutover can simply be retried.
-		//
 		// The replaced VM's addresses go back BEFORE its row does: the lease
 		// survives the row otherwise, and the sweeper's live-lease veto then
 		// makes it unreclaimable for good. Best-effort — the -next VM is about
@@ -2818,13 +2823,21 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		// two rows claiming one identity — but a failure is logged at ERROR and
 		// every NIC handed to the orphan sweep rather than passing silently.
 		s.releaseNICLeasesBestEffort(ctx, oldVM, "cutover")
+		// A declined tombstone must abort BEFORE the re-key: proceeding would
+		// leave the replaced VM's row live (a duplicate identity) under a name
+		// the replacement is taking.
 		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
 			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
 		}
 	}
 
-	// Rename the -next VM to the original name.
-	if err := corrosion.RenameVM(ctx, s.db, nextName, req.VmName); err != nil {
+	// Give the -next VM the original name. DeleteVM SOFT-deletes, so the replaced
+	// VM's tombstone still holds vms.name and every child primary key this has to
+	// write; ReplaceVMName moves those tombstones aside — never purges them — and
+	// only the ones actually in the way. One batch, so the name is never held by
+	// neither VM.
+	retiredName, err = corrosion.ReplaceVMName(ctx, s.db, nextName, req.VmName)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
 	}
 	// The SURVIVING name, once. A cutover leaves NetBox two things to do — retire
@@ -2835,6 +2848,26 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// enqueue a name that answers to nothing — the rename above just moved it —
 	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
+
+	// Only now free what cannot be put back.
+	if oldVM != nil && oldVM.HostName == s.hostName {
+		// Owner = the RETIRED name. req.VmName now belongs to the replacement, and
+		// passing it would make diskPathReferencedByOtherVM read the replacement's
+		// own rows as this VM's and delete a path they share.
+		//
+		// There is deliberately no images.DeleteVMDisks default-dir sweep here.
+		// That globs "<name>-*.qcow2", which matches the replacement's own flat-
+		// named disks ("<name>-next-*.qcow2") — the sweep would delete the disks
+		// the cutover exists to keep. The recorded rows above are authoritative
+		// and driver-dispatched, and they skip paths another VM still references.
+		s.deleteRecordedVMDiskVolumeRecords(ctx, retiredName, replacedDisks)
+		// Wipe the replaced VM's firmware state (its old UUID-keyed swtpm +
+		// name-keyed NVRAM) so cutover doesn't orphan it (G1). This must stay
+		// AHEAD of the NVRAM rename below, which moves the -next vars file into
+		// this same name-keyed path.
+		lv.WipeFirmwareState(s.dataDir, req.VmName, parseFirmwareSpec(oldVM.Spec).UUID)
+		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
+	}
 
 	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
 	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal

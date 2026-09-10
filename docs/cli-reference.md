@@ -146,6 +146,20 @@ lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
 lv stats <vm>                                # VM resource statistics
 ```
 
+`lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The
+replaced VM is deleted first, and a delete is a SOFT delete, so its rows still
+hold the primary keys the replacement needs. Cutover therefore moves the replaced
+VM's tombstone — and only the child rows the replacement actually collides with —
+onto a reserved `<vm>.retired.<id>` name, rather than hard-deleting it. Those
+tombstones are what keep a lagging peer's pre-delete copy of the replaced VM from
+reappearing on top of its replacement, so expect to see retired rows in
+`state.db` after a cutover; the retention sweep reaps them like any other
+tombstone.
+
+The database re-key runs before the replaced VM's disks and firmware state are
+freed, so a cutover that fails partway leaves the original intact and can simply
+be retried.
+
 ## Secure Boot + vTPM (Windows 11)
 
 ```bash

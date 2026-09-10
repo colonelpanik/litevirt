@@ -472,6 +472,16 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 			"vm", vmName, "error", err)
 		return
 	}
+	s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+}
+
+// deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
+// Split out for cutover, which has to capture the replaced VM's rows before the
+// rekey moves them to its retired name and hands the name itself to the
+// replacement — reading them afterwards returns the REPLACEMENT's disks.
+func (s *Server) deleteRecordedVMDiskVolumeRecords(
+	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
+) {
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {

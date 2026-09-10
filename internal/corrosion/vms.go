@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+
+	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -995,106 +999,340 @@ func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOut
 	return deleteApplied, nil
 }
 
-// RenameVM changes a VM's name across all tables, including the name embedded in
-// the stored spec JSON — otherwise spec.name keeps the old name and later XML +
-// firmware-path derivation (which use spec.Name) target the wrong VM (G1).
-func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
-	now := c.NowTS()
-	// Patch the spec JSON's "name" via a generic map (keeps this layer pb-free).
-	vmsUpdate := Statement{SQL: `UPDATE vms SET name = ?, updated_at = ? WHERE name = ?`,
-		Params: []interface{}{newName, now, oldName}}
-	if vm, err := GetVM(ctx, c, oldName); err == nil && vm != nil && vm.Spec != "" {
-		var m map[string]interface{}
-		if json.Unmarshal([]byte(vm.Spec), &m) == nil {
-			m["name"] = newName
-			if b, mErr := json.Marshal(m); mErr == nil {
-				vmsUpdate = Statement{SQL: `UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?`,
-					Params: []interface{}{newName, string(b), now, oldName}}
-			}
+// ErrRenameTargetOccupied means some row — LIVE OR TOMBSTONED — already holds a
+// primary key a rekey would write. It is returned while the batch is still being
+// built, so a caller that hits it has changed nothing.
+//
+// The obstruction is deliberately never PURGED. On a receiver a retention DELETE
+// executes unconditionally, while the rekey UPDATE meant to replace the row is
+// LWW-gated on the OLD name and matches nothing at all on a peer that never saw
+// it — so a delayed replay erases the target's tombstone and writes nothing in
+// its place, and the batch still commits. That tombstone is also the only thing
+// standing between a stale pre-delete full-state copy and a resurrection:
+// created_at is the incarnation identity the anti-entropy merge decides from,
+// and a hard delete throws it away. Callers that need an occupied key MOVE the
+// obstruction instead — see ReplaceVMName.
+var ErrRenameTargetOccupied = errors.New("corrosion: rename target key already occupied")
+
+// vmChildKey is one child row's identity under a VM name: the table it is in and
+// the primary-key remainder (everything but vm_name) it holds, as one comparable
+// key plus whichever raw components a rekey statement has to bind.
+type vmChildKey struct {
+	table string
+	key   string
+	// vm_nics only. Its id is DeterministicNICID(vm_name, mac) — DERIVED from the
+	// name — so a rekey must RE-DERIVE it rather than carry the old id forward.
+	// Re-deriving does not make a collision impossible: two VMs can hold the same
+	// MAC (CreateVM accepts a supplied one, and two stopped VMs can share an
+	// address), and then the re-derived id is exactly the target's.
+	mac string
+	// vm_pci_realizations only: key is the joined pair, these are the bound halves.
+	deviceID, memberID string
+}
+
+// targetKey is the remainder this row would hold under vmName.
+func (k vmChildKey) targetKey(vmName string) string {
+	if k.mac != "" {
+		return DeterministicNICID(vmName, k.mac)
+	}
+	return k.key
+}
+
+// vmChildKeySet is table name → the primary-key remainders held in it.
+type vmChildKeySet map[string]map[string]bool
+
+func (s vmChildKeySet) add(table, key string) {
+	if s[table] == nil {
+		s[table] = map[string]bool{}
+	}
+	s[table][key] = true
+}
+
+func (s vmChildKeySet) has(table, key string) bool { return s[table][key] }
+
+func (s vmChildKeySet) merge(other vmChildKeySet) {
+	for table, keys := range other {
+		for key := range keys {
+			s.add(table, key)
 		}
 	}
-	// Purge any TOMBSTONED rows already holding newName before the rekey takes
-	// it. `vms.name` is the PRIMARY KEY and DeleteVM soft-deletes, so a replaced
-	// VM's tombstone still occupies the key its replacement is about to take —
-	// which is exactly what `lv cutover` does, and every child table DeleteVM
-	// tombstones collides the same way on its own composite PK.
+}
+
+// pciRealizationKey joins the two non-vm_name PK components of
+// vm_pci_realizations into one key, on a separator neither can contain.
+func pciRealizationKey(deviceID, memberID string) string {
+	return deviceID + "\x00" + memberID
+}
+
+// vmChildKeys reads every child row held under vmName, across all five tables
+// DeleteVM tombstones.
+//
+// Nothing here filters deleted_at, in either direction: a tombstone holds its
+// primary key just as firmly as a live row — which is why a rekey can collide at
+// all — and moving a tombstone out of a replacement's way is exactly what
+// ReplaceVMName does.
+func vmChildKeys(ctx context.Context, c *Client, vmName string) ([]vmChildKey, error) {
+	var out []vmChildKey
+	// vm_interfaces and vm_disks key on a COMPOSITE PK (vm_name + X) whose vm_name
+	// component is being rekeyed; the rekey is row-scoped to full-PK statements so
+	// each is per-row LWW-gated on apply (a bulk WHERE vm_name = ? can't be), which
+	// is why the other PK component is enumerated locally here.
 	//
-	// full-state-delete-ok: this only drops ALREADY-tombstoned rows immediately
-	// before the rekey writes the live row under the same name, in ONE batch and
-	// with a newer updated_at, so the surviving row wins LWW and there is no
-	// cross-node resurrection window. Same rule and same reasoning as the
-	// same-name re-create purge in InsertVMWithHardware.
-	stmts := []Statement{
-		{SQL: `DELETE FROM vm_interfaces WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}}, // full-state-delete-ok
-		{SQL: `DELETE FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},      // full-state-delete-ok
-		// vm_nics needs no purge: its id is DeterministicNICID(vmName, mac), so
-		// after the rekey the surviving row and any tombstone sit under the same
-		// vm_name but different MACs — hence different ids, no PK collision. (And
-		// UpsertNIC is INSERT OR REPLACE regardless.) Every new replicated shape
-		// is a mixed-version liability, so this one is deliberately not added.
-		{SQL: `DELETE FROM vm_pci_intent WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},       // full-state-delete-ok
-		{SQL: `DELETE FROM vm_pci_realizations WHERE vm_name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}}, // full-state-delete-ok
-		{SQL: `DELETE FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, Params: []interface{}{newName}},                    // full-state-delete-ok
-		vmsUpdate,
+	// vm_pci_intent's device_id and vm_pci_realizations' device_id/member_id are
+	// name-INDEPENDENT by design (DeterministicPCIIntentID takes no vmName), so they
+	// are PRESERVED across a rekey — only vm_name changes. That is what lets the
+	// hardware-adoption audit's unconditional re-derive converge onto the same row
+	// after a rename instead of forking a duplicate.
+	for _, q := range []struct{ table, query string }{
+		{"vm_interfaces", `SELECT network_name AS pk FROM vm_interfaces WHERE vm_name = ?`},
+		{"vm_disks", `SELECT disk_name AS pk FROM vm_disks WHERE vm_name = ?`},
+		{"vm_pci_intent", `SELECT device_id AS pk FROM vm_pci_intent WHERE vm_name = ?`},
+	} {
+		rows, err := c.Query(ctx, q.query, vmName)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rows {
+			out = append(out, vmChildKey{table: q.table, key: r.String("pk")})
+		}
 	}
-	// vm_interfaces and vm_disks key on a COMPOSITE PK (vm_name + X) whose vm_name component
-	// is being rekeyed; row-scope them to full-PK statements so each is per-row LWW-gated on
-	// apply (a bulk WHERE vm_name = ? can't be). Enumerate the other PK component locally.
-	ifaces, err := c.Query(ctx, `SELECT network_name AS pk FROM vm_interfaces WHERE vm_name = ?`, oldName)
+	nics, err := c.Query(ctx, `SELECT id AS pk, mac FROM vm_nics WHERE vm_name = ?`, vmName)
 	if err != nil {
-		return err
-	}
-	for _, r := range ifaces {
-		stmts = append(stmts, Statement{SQL: `UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
-			Params: []interface{}{newName, now, oldName, r.String("pk")}})
-	}
-	disks, err := c.Query(ctx, `SELECT disk_name AS pk FROM vm_disks WHERE vm_name = ?`, oldName)
-	if err != nil {
-		return err
-	}
-	for _, r := range disks {
-		stmts = append(stmts, Statement{SQL: `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
-			Params: []interface{}{newName, now, oldName, r.String("pk")}})
-	}
-	// vm_nics keys on (vm_name, id), but unlike vm_interfaces/vm_disks its id is itself
-	// DERIVED from vm_name (DeterministicNICID(vmName, mac)) — a rename must therefore
-	// RE-DERIVE id too, not just carry the row's old id forward under the new vm_name.
-	nics, err := c.Query(ctx, `SELECT id AS pk, mac FROM vm_nics WHERE vm_name = ?`, oldName)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, r := range nics {
-		newID := DeterministicNICID(newName, r.String("mac"))
-		stmts = append(stmts, Statement{SQL: `UPDATE vm_nics SET vm_name = ?, id = ?, updated_at = ? WHERE vm_name = ? AND id = ?`,
-			Params: []interface{}{newName, newID, now, oldName, r.String("pk")}})
+		out = append(out, vmChildKey{table: "vm_nics", key: r.String("pk"), mac: r.String("mac")})
 	}
-	// vm_pci_intent keys on (vm_name, device_id); device_id is name-INDEPENDENT by design
-	// (DeterministicPCIIntentID takes no vmName) so it is PRESERVED here — only vm_name is
-	// rekeyed. This is what lets the hardware-adoption audit's unconditional re-derive
-	// converge onto this same row after a rename instead of forking a duplicate.
-	pciIntents, err := c.Query(ctx, `SELECT device_id AS pk FROM vm_pci_intent WHERE vm_name = ?`, oldName)
+	reals, err := c.Query(ctx, `SELECT device_id, member_id FROM vm_pci_realizations WHERE vm_name = ?`, vmName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, r := range pciIntents {
-		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_intent SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
-			Params: []interface{}{newName, now, oldName, r.String("pk")}})
+	for _, r := range reals {
+		dev, mem := r.String("device_id"), r.String("member_id")
+		out = append(out, vmChildKey{
+			table: "vm_pci_realizations", key: pciRealizationKey(dev, mem),
+			deviceID: dev, memberID: mem,
+		})
 	}
-	// vm_pci_realizations keys on (vm_name, device_id, member_id); device_id/member_id are
-	// likewise name-independent, so both are PRESERVED — only vm_name is rekeyed.
-	pciRealizations, err := c.Query(ctx, `SELECT device_id, member_id FROM vm_pci_realizations WHERE vm_name = ?`, oldName)
+	return out, nil
+}
+
+// vmChildKeysHeld is vmChildKeys as a lookup set.
+func vmChildKeysHeld(ctx context.Context, c *Client, vmName string) (vmChildKeySet, error) {
+	keys, err := vmChildKeys(ctx, c, vmName)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, r := range pciRealizations {
-		stmts = append(stmts, Statement{SQL: `UPDATE vm_pci_realizations SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ? AND member_id = ?`,
-			Params: []interface{}{newName, now, oldName, r.String("device_id"), r.String("member_id")}})
+	held := vmChildKeySet{}
+	for _, k := range keys {
+		held.add(k.table, k.key)
 	}
-	// ip_allocations keys on (network, ip); vm_name is a NON-PK column here, so this stays a
-	// bulk update — per-row LWW expansion handles it safely on apply.
-	stmts = append(stmts, Statement{SQL: `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
-		Params: []interface{}{newName, now, oldName}})
+	return held, nil
+}
+
+// vmRekeyPass is one leg of a rekey: move every row of oldName onto newName.
+//
+// keep, when non-nil, restricts the leg to the child rows it selects by their
+// CURRENT key; the rest stay where they are, still holding their keys.
+// parentVacated says an earlier leg in the same batch already freed the parent
+// key, so the occupancy check must not trip on a row that is on its way out.
+type vmRekeyPass struct {
+	oldName, newName string
+	parentVacated    bool
+	keep             func(table, key string) bool
+}
+
+// execVMRekey builds every leg's statements into ONE batch and executes it, so a
+// two-leg rekey is atomic and lands as a single replicated mutation — there is no
+// window, locally or on a receiver, in which a name is held by neither VM.
+//
+// It refuses (ErrRenameTargetOccupied) before executing anything if a leg would
+// write a key that is already held and no earlier leg frees it.
+func execVMRekey(ctx context.Context, c *Client, now string, passes ...vmRekeyPass) error {
+	var stmts []Statement
+	freed := vmChildKeySet{} // child keys an EARLIER leg vacates
+	for _, p := range passes {
+		if !p.parentVacated {
+			held, err := c.Query(ctx, `SELECT name FROM vms WHERE name = ?`, p.newName)
+			if err != nil {
+				return err
+			}
+			if len(held) > 0 {
+				return fmt.Errorf("%w: vms.name = %q", ErrRenameTargetOccupied, p.newName)
+			}
+		}
+		source, err := vmChildKeys(ctx, c, p.oldName)
+		if err != nil {
+			return err
+		}
+		held, err := vmChildKeysHeld(ctx, c, p.newName)
+		if err != nil {
+			return err
+		}
+		// The vms rekey patches the name embedded in the stored spec JSON —
+		// otherwise spec.name keeps the old name and later XML + firmware-path
+		// derivation (which use spec.Name) target the wrong VM (G1). A tombstoned
+		// row has no readable spec and moves with the narrower shape; nothing reads
+		// a tombstone's spec.
+		parent := Statement{SQL: `UPDATE vms SET name = ?, updated_at = ? WHERE name = ?`,
+			Params: []interface{}{p.newName, now, p.oldName}}
+		if vm, gErr := GetVM(ctx, c, p.oldName); gErr == nil && vm != nil && vm.Spec != "" {
+			var spec map[string]interface{}
+			if json.Unmarshal([]byte(vm.Spec), &spec) == nil {
+				spec["name"] = p.newName
+				if b, mErr := json.Marshal(spec); mErr == nil {
+					parent = Statement{SQL: `UPDATE vms SET name = ?, spec = ?, updated_at = ? WHERE name = ?`,
+						Params: []interface{}{p.newName, string(b), now, p.oldName}}
+				}
+			}
+		}
+		stmts = append(stmts, parent)
+		vacates := vmChildKeySet{}
+		for _, k := range source {
+			if p.keep != nil && !p.keep(k.table, k.key) {
+				continue
+			}
+			target := k.targetKey(p.newName)
+			if held.has(k.table, target) && !freed.has(k.table, target) {
+				return fmt.Errorf("%w: %s (%q, %q)", ErrRenameTargetOccupied, k.table, p.newName, target)
+			}
+			switch k.table {
+			case "vm_interfaces":
+				stmts = append(stmts, Statement{
+					SQL:    `UPDATE vm_interfaces SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND network_name = ?`,
+					Params: []interface{}{p.newName, now, p.oldName, k.key},
+				})
+			case "vm_disks":
+				stmts = append(stmts, Statement{
+					SQL:    `UPDATE vm_disks SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND disk_name = ?`,
+					Params: []interface{}{p.newName, now, p.oldName, k.key},
+				})
+			case "vm_nics":
+				stmts = append(stmts, Statement{
+					SQL:    `UPDATE vm_nics SET vm_name = ?, id = ?, updated_at = ? WHERE vm_name = ? AND id = ?`,
+					Params: []interface{}{p.newName, target, now, p.oldName, k.key},
+				})
+			case "vm_pci_intent":
+				stmts = append(stmts, Statement{
+					SQL:    `UPDATE vm_pci_intent SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ?`,
+					Params: []interface{}{p.newName, now, p.oldName, k.key},
+				})
+			case "vm_pci_realizations":
+				stmts = append(stmts, Statement{
+					SQL:    `UPDATE vm_pci_realizations SET vm_name = ?, updated_at = ? WHERE vm_name = ? AND device_id = ? AND member_id = ?`,
+					Params: []interface{}{p.newName, now, p.oldName, k.deviceID, k.memberID},
+				})
+			default:
+				return fmt.Errorf("corrosion: rekey has no statement for child table %q", k.table)
+			}
+			vacates.add(k.table, k.key)
+		}
+		// ip_allocations keys on (network, ip); vm_name is a NON-PK column here, so this stays a
+		// bulk update — per-row LWW expansion handles it safely on apply.
+		stmts = append(stmts, Statement{
+			SQL:    `UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE vm_name = ?`,
+			Params: []interface{}{p.newName, now, p.oldName},
+		})
+		freed.merge(vacates)
+	}
 	return c.ExecuteBatch(ctx, stmts)
+}
+
+// RenameVM changes a VM's name across all tables. The new name must be entirely
+// free — see ErrRenameTargetOccupied, and ReplaceVMName for the cutover case
+// where it is not.
+func RenameVM(ctx context.Context, c *Client, oldName, newName string) error {
+	return execVMRekey(ctx, c, c.NowTS(), vmRekeyPass{oldName: oldName, newName: newName})
+}
+
+// retiredVMNameInfix marks a name that exists only to hold a retired tombstone.
+const retiredVMNameInfix = ".retired."
+
+// ReplaceVMName gives `replacement` the name `name`, which an ALREADY-TOMBSTONED
+// VM may still hold — the `lv cutover` shape. It returns the reserved name that
+// tombstone was moved to, or "" if `name` was free to begin with.
+//
+// `vms.name` is the PRIMARY KEY and DeleteVM soft-deletes, so the replaced VM's
+// tombstone still occupies the key its replacement needs, and every child table
+// DeleteVM tombstones collides the same way on its own composite PK. This MOVES
+// those tombstones aside rather than deleting them, and moves ONLY the ones the
+// replacement actually collides with. Both halves matter:
+//
+//   - Moving rather than deleting, because a receiver applies a hard delete of a
+//     full-state row unconditionally while the write meant to replace it is not
+//     (see ErrRenameTargetOccupied), and because the tombstone carries the
+//     incarnation identity that keeps a stale pre-delete copy from resurrecting.
+//   - Only where it collides, because relocating a tombstone VACATES its key, and
+//     a vacated child key has nothing left to reject a stale full-state row with:
+//     the anti-entropy child-authority check admits that row whenever the incoming
+//     payload's parent identity-hashes equal to the local one. A disk the replaced
+//     VM had and the replacement does not would come back on top of it.
+//
+// It is ONE batch, so the name is never held by neither VM.
+func ReplaceVMName(ctx context.Context, c *Client, replacement, name string) (string, error) {
+	occupant, err := c.Query(ctx, `SELECT deleted_at FROM vms WHERE name = ?`, name)
+	if err != nil {
+		return "", err
+	}
+	if len(occupant) == 0 {
+		// Nothing holds the parent key, so there is no occupant to retire. Any
+		// child tombstone still under the name is reported by the ordinary refusal.
+		return "", RenameVM(ctx, c, replacement, name)
+	}
+	if occupant[0].String("deleted_at") == "" {
+		return "", fmt.Errorf("corrosion: %q is a live VM — it must be tombstoned before %q can take its name",
+			name, replacement)
+	}
+
+	// The keys the replacement will claim at `name`. Only these may be vacated.
+	claimed, err := vmChildKeys(ctx, c, replacement)
+	if err != nil {
+		return "", err
+	}
+	claim := vmChildKeySet{}
+	for _, k := range claimed {
+		claim.add(k.table, k.targetKey(name))
+	}
+
+	// A random suffix rather than a counter: the retired name is a primary key in
+	// a replicated table, so two nodes retiring the same name concurrently must
+	// not pick the same one. It is still verified free — nothing stops an operator
+	// from having created that exact name.
+	now := c.NowTS()
+	for attempt := 0; attempt < 4; attempt++ {
+		retired, nameErr := retiredVMName(name)
+		if nameErr != nil {
+			return "", nameErr
+		}
+		err = execVMRekey(ctx, c, now,
+			vmRekeyPass{oldName: name, newName: retired, keep: claim.has},
+			vmRekeyPass{oldName: replacement, newName: name, parentVacated: true},
+		)
+		if errors.Is(err, ErrRenameTargetOccupied) &&
+			strings.Contains(err.Error(), retired) && attempt < 3 {
+			continue // the drawn retired name is taken; draw another
+		}
+		if err != nil {
+			return "", err
+		}
+		return retired, nil
+	}
+	return "", err
+}
+
+// retiredVMName builds the reserved name, trimming the base so the result still
+// satisfies the cluster-wide name rule (safename owns that rule).
+func retiredVMName(name string) (string, error) {
+	suffix := retiredVMNameInfix + randid.New()
+	base := name
+	if budget := safename.MaxNameLen - len(suffix); budget > 0 && len(base) > budget {
+		base = base[:budget]
+	}
+	retired := base + suffix
+	if err := safename.ValidateVMName(retired); err != nil {
+		return "", err
+	}
+	return retired, nil
 }
 
 // UpdateVMInterfaceIP sets the IP of a VM interface.

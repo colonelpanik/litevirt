@@ -110,6 +110,7 @@ message ClusterHealth {
     repeated HostCapacityAssessment capacity = 5;
     string generated_at = 6;   // RFC3339
 }
+
 message RescanHostRequest  { string name = 1; }
 message RescanHostResponse { int32 added = 1; int32 removed = 2;
     int32 total = 3; repeated PCIDevice devices = 4; }
@@ -1686,6 +1687,46 @@ message PingResponse {
   // recording the isolation (§A), because the quarantined node may not record
   // its own.
   bool wal_quarantined = 6;
+  // not_enforcing names capability tokens this node ADVERTISES but does not act
+  // on, because their `enforcement.*` / `auth.*` kill-switch is false locally.
+  //
+  // It exists because `capabilities` deliberately cannot answer this. A node
+  // advertises a token so the cluster can LATCH it while its own kill-switch is
+  // off, so a cluster can have a token fully latched while any subset of members
+  // silently does not enforce it — a state no peer and no operator could observe
+  // before this field. For the shared-storage fence that means a cross-host
+  // transfer of a shared-disk VM proceeding without the proof-grade fence anyone
+  // reading the latch would assume was in force.
+  //
+  // Like wal_quarantined, this is a SELF-REPORT OF DEGRADATION: the one
+  // direction worth trusting, since a node lying about its posture claims to
+  // enforce, not to skip. And like wal_quarantined it is DIAGNOSTIC ONLY —
+  // consumed by `lv doctor fence` to tell an operator what is not switched on.
+  //
+  // NOTHING in an enforcement decision path may read this field. The rule in
+  // advertisedCapabilities still stands in both directions: a peer's
+  // advertisement is not proof it enforces, and this list is not proof it does
+  // not. An empty list from a peer that predates the field means "unknown", NOT
+  // "everything is enforced" — a caller that cannot tell must say so rather than
+  // report all-clear.
+  repeated string not_enforcing = 7;
+  // posture_reported disambiguates an empty not_enforcing list, which otherwise
+  // has two very different meanings: "this node enforces everything it
+  // advertises" and "nothing was said". False means UNKNOWN, and a consumer must
+  // never read it as all-clear.
+  //
+  // False has TWO causes and they are not distinguishable on the wire, which is
+  // deliberate: the peer predates this field, or it declined to answer THIS
+  // caller. Posture is served only to a caller presenting a host certificate,
+  // because Ping bypasses the identity interceptor (skipAuth) and this list
+  // names which security kill-switches are off — the distributable lv-cli
+  // certificate would otherwise read it with no session and no role. Report the
+  // ambiguity rather than guessing: naming version skew would send an operator
+  // to upgrade a fleet over a credential property of the node they asked from.
+  //
+  // wall_clock got away without a companion flag because its zero value is not
+  // a legal reading; an empty token list is, so it needs one.
+  bool posture_reported = 8;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -2056,6 +2097,7 @@ service LiteVirt {
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
+    rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -2996,4 +3038,64 @@ message ReserveHostCapacityResponse {
 }
 message ReleaseHostCapacityRequest {
     string lease_id = 1;
+}
+
+// ── Shared-storage fence readiness (diagnostic) ──
+//
+// Declared at the END of this file deliberately: protoc-gen-go indexes messages
+// by declaration order, so inserting these beside ClusterHealth renumbered every
+// message after them and turned a two-message addition into a 4,300-line
+// generated diff. Appending keeps every existing index stable.
+// One host's shared-storage-fence posture, as it reported for itself.
+message FenceHostPosture {
+    string host = 1;
+    // reachable=false means the host did not answer a fresh Ping, so its posture
+    // is UNKNOWN and must not be read as either enforcing or not.
+    bool   reachable = 2;
+    // enforcing is meaningful only when reachable AND posture_known. A host
+    // running a binary that predates PingResponse.not_enforcing cannot report
+    // its kill-switch at all.
+    bool   enforcing = 3;
+    bool   posture_known = 4;
+    string detail = 5;
+}
+
+// FenceReadiness answers one question: if a shared-disk VM had to move hosts
+// right now, would the proof-grade fence actually run?
+//
+// It is a DIAGNOSTIC, never an input to a fencing decision. The reason it must
+// exist as its own read is that neither half of the answer was observable:
+// capability_latched is visible in the mesh, but the per-node kill-switch is
+// local config, so a cluster could show a fully latched token while members
+// silently skipped the fence.
+message FenceReadiness {
+    // capability_latched: shared_storage_fence_v1 is latched ON THE RESPONDING
+    // NODE. The latch is per-node state (internal/health.Checker's activated map
+    // plus its marker files), so this is NOT proof every peer has latched: during
+    // a rollout one node can latch before another finishes its own sweep. A peer
+    // that has not latched will take the legacy path however its config flag
+    // reads, and that is not visible from here — see FenceReadiness's
+    // known-limits note.
+    bool capability_latched = 1;
+    // enforced_everywhere: every host is reachable, reported its posture, and has
+    // its enforcement.shared_storage_fence flag ON. False when ANY host is not
+    // enforcing OR its posture is unknown — "we cannot tell" is never reported as
+    // all-clear.
+    //
+    // It covers the per-host CONFIG half only. The other half of
+    // sharedStorageFenceActive — each peer's own latch — has no wire
+    // representation, so true here means "nothing is switched off", not "every
+    // node will fence".
+    bool enforced_everywhere = 2;
+    // Workloads that would be exposed: a VM with a disk on shared storage
+    // (nfs/ceph/rbd/iscsi), which a second host can open and write.
+    //
+    // Counted from the RESPONDING NODE'S replicated vm_disks rows. A VM created
+    // on a peer whose disk rows have not replicated here yet is not counted, so
+    // a zero is "none that this node knows of", not "none exist".
+    int32 vms_with_shared_disk = 3;
+    // A few affected VM names, for the operator to recognise. Not exhaustive.
+    repeated string sample_vms = 4;
+    repeated FenceHostPosture hosts = 5;
+    string generated_at = 6;   // RFC3339
 }

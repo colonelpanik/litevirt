@@ -363,6 +363,11 @@ var supported = []string{
 	VIPReleaseProbeV1,
 	StrictMTLSIdentityV1,
 	ForwardedIdentityV1,
+	// SharedStorageFenceV1 stays UNCONDITIONAL despite gating a corruption
+	// hazard, which is not the contradiction it looks like: the guarantee is
+	// enforced where the transfer is CREATED, so no node relies on a peer
+	// enforcing it. The grpcapi advertisement filter carries the full reasoning
+	// and what withholding it would cost.
 	SharedStorageFenceV1,
 	RBACRealmV1,
 	OperationProtocolV1,

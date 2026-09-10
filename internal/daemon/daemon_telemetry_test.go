@@ -44,9 +44,7 @@ func TestArmWatchdogThenSetupTelemetry_PropagatesError(t *testing.T) {
 	wantErr := errors.New("boom")
 	_, err := armWatchdogThenSetupTelemetry(
 		func() {},
-		func() (func(context.Context) error, error) {
-			return func(context.Context) error { return nil }, wantErr
-		},
+		func() (func(context.Context) error, error) { return func(context.Context) error { return nil }, wantErr },
 	)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("err = %v; want %v", err, wantErr)

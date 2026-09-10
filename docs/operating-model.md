@@ -300,76 +300,44 @@ enforcement firing. Expect a burst around a genuine failover; a steady trickle
 in calm conditions means a producer is minting proofs from a tenure it no longer
 holds, and that producer is worth finding.
 
+`litevirt_failover_stranded_workloads` is the one to alert on, and it is a
+GAUGE rather than a rate: it counts workloads sitting on a host this cluster
+fenced that failover would have moved and did not.
+
+Zero is the normal value. Non-zero means a refusal landed AFTER the fence — a
+lost quorum, an ungated target, a superseded lease term, a transient store error
+on the proof write — and because a fenced host is processed at most once per
+outage, nothing will revisit it. Those workloads stay assigned to a powered-off
+machine until you act.
+
+That window cannot be closed. The checks that can refuse sit as late as they do
+deliberately, because they close races against the writes they guard, and moving
+them before the fence would make them staler than the thing they protect. So the
+coordinator reports the condition instead of retrying it.
+
+**Recovering by hand.** Confirm the host really is down, then `lv host undrain
+<host>` to return it to `active`. Its workloads become eligible again: if the
+host is genuinely dead, quorum re-fences it and the ordinary failover path runs
+from the start, this time without the refusal. If it has come back, its own
+reconciler picks the workloads up. Either way the gauge returns to zero, which is
+how you confirm the fix.
+
+Automatic recovery was built, reviewed and withdrawn, and the reason is worth
+knowing before anyone proposes it again. Acting unattended requires proving the
+host was POWERED OFF, and nothing available to a coordinator proves that.
+`hosts.state` records only that somebody decided it — `lv host fence-confirm`
+writes `fenced` on any host with no precondition, so a mistyped hostname marks a
+live one. Health quorum proves unreachability, which is equally true of a
+partitioned host still running its VMs. Evacuating on either gives you two hosts
+writing one shared disk, which is worse than the stranding it fixes. Doing it
+safely needs a fence proof bound to the current outage, and the schema does not
+carry one yet.
+
 `litevirt_runtime_action_refused_total{reason="lease_term_unconfirmed"}` is
 enforcement UNABLE to fire. It says actions are being refused for lack of
 quorum evidence, so alert on it separately and treat it as an availability
 signal rather than a safety one — this is the reason that appears when a
 partition, not a stale leader, is the problem.
-
-The three signals above are the EXECUTOR refusing. The coordinator has its own
-precheck, and its counters answer a different question — not "was a bad proof
-stopped" but "did a producer notice it had gone stale before writing one".
-
-`litevirt_failover_attempts_total{phase="lease",result="skipped",error_class="stale_lease_term"}`
-is that precheck firing. Read it against the executor's refusals: the
-coordinator catching it means the producer stood down at the source, and the
-executor catching it means one did not. A steady executor count with a flat
-coordinator count says some producer is not running the precheck at all.
-
-`litevirt_failover_attempts_total{phase="lease",result="error",error_class="db_error"}`
-is the precheck's threshold read failing. It stamps ANYWAY when this happens —
-deliberately, because refusing after the fence abandons the workload and the
-executor's barrier still guards the stale case. So this counter is the one place
-enforcement is permissive rather than fail-closed, and a persistent nonzero rate
-means the coordinator has effectively stopped prechecking.
-
-The stranded-workload sweep is off by default (`failover.stranded_recovery`) and
-reports on `phase="stranded-recovery"`, with the two results meaning different
-things:
-
-`result="recovered"` is the sweep having actually MOVED workloads an earlier
-refusal left behind. Any nonzero value is worth reading — not because the sweep
-is broken, but because something upstream refused AFTER the host was fenced, and
-those workloads sat on a powered-off machine until the sweep came back for them.
-Alert on it and go find the refusal that preceded it; the sweep is the safety
-net, not the fix.
-
-`result="skipped"` is the sweep having tried and moved nothing: every remaining
-workload was refused again. That is a different condition and usually a worse
-one — a blocker nobody has cleared, typically an ownership dispute, no placement
-that satisfies the workload's constraints, or a shared-disk VM whose proof-grade
-fence evidence has aged out. It is reported separately precisely so it cannot
-drown the signal above. A steady `skipped` rate with no `recovered` means the
-sweep is spinning on something only an operator can resolve.
-
-Note the phase label too. `phase="recovery"` with `result="recovered"` is a HOST
-returning to active, which is routine and which you do not want to alert on;
-`phase="stranded-recovery"` is workloads being evacuated from a host that never
-came back.
-
-#### Holding a fenced host
-
-The sweep admits a host only while quorum still reports it down, so it will not
-fight a host that has come back. But it does not ask permission either: once a
-blocker clears it evacuates within a poll interval.
-
-**The only hold is the flag.** Clear `failover.stranded_recovery` on the leader
-and the sweep stands down cluster-wide, immediately and without stopping the
-coordinator (which would also stop fencing). There is deliberately no per-host
-hold, and no way to fake one: the sweep keys on `hosts.state == "fenced"`, and
-the only ways out of that state are `lv host undrain <host>`, which marks the
-host `active` and hands it back to placement and to the fence loop, or a genuine
-recovery. `maintenance` reads like a parking state in the fence loop's skip list
-but nothing in the tree ever writes it, so it is not one.
-
-If you need a single host held while you investigate, clear the flag for the
-duration. That is a real gap rather than a recommendation.
-
-What the sweep cannot recover, by construction: a host whose fence succeeded but
-whose `hosts.state` write did NOT (that write is deliberately non-fatal, so the
-fence is not lost to a store blip) never reaches `fenced`, so the sweep never
-admits it. Those workloads still need an operator. The guarantee is "a refusal
-after a recorded fence is retried", not "no workload is ever stranded".
 
 `litevirt_ha_degraded{reason="capability_rollout_pending"}` says a mandatory
 token has not latched yet. During an upgrade that is expected and should not

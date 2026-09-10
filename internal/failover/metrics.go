@@ -12,6 +12,11 @@ type Metrics interface {
 	VMAction(action, result, errorClass string)
 	// ContainerAction records a per-container failover action outcome (relocate).
 	ContainerAction(action, result, errorClass string)
+	// StrandedWorkloads reports how many workloads are sitting on hosts this
+	// cluster fenced that the coordinator would have moved and did not. A GAUGE,
+	// not a counter: it is a current condition an operator resolves, not an event
+	// rate. Zero is the normal value and any sustained non-zero needs a human.
+	StrandedWorkloads(n int)
 }
 
 // Phases, results, actions, and error classes are a CLOSED vocabulary kept as
@@ -25,12 +30,6 @@ const (
 	PhaseFence      = "fence"
 	PhaseSplitBrain = "split-brain-guard"
 	PhaseRecovery   = "recovery"
-	// PhaseStranded is the stranded-workload sweep, kept distinct from
-	// PhaseRecovery on purpose. PhaseRecovery+recovered fires when a HOST comes
-	// back to active, which is routine; this fires when WORKLOADS are recovered
-	// off a host an earlier refusal abandoned, which never is. Sharing a label
-	// would bury the second signal under the first.
-	PhaseStranded = "stranded-recovery"
 
 	ResultOK        = "ok"
 	ResultSkipped   = "skipped"
@@ -91,5 +90,12 @@ func (c *Coordinator) mVM(action, result, errClass string) {
 func (c *Coordinator) mCt(action, result, errClass string) {
 	if c.Metrics != nil {
 		c.Metrics.ContainerAction(action, result, errClass)
+	}
+}
+
+// mStranded reports the stranded-workload gauge (nil-safe, like the rest).
+func (c *Coordinator) mStranded(n int) {
+	if c.Metrics != nil {
+		c.Metrics.StrandedWorkloads(n)
 	}
 }

@@ -12,6 +12,7 @@ type FailoverMetrics struct {
 	attempts         *prometheus.CounterVec
 	vmActions        *prometheus.CounterVec
 	containerActions *prometheus.CounterVec
+	stranded         prometheus.Gauge
 }
 
 // NewFailoverMetrics registers the failover counters on the default registry
@@ -36,10 +37,18 @@ func newFailoverMetrics(reg prometheus.Registerer) *FailoverMetrics {
 			Name: "litevirt_failover_container_actions_total",
 			Help: "Per-container failover actions (relocate), by result and error class.",
 		}, []string{"action", "result", "error_class"}),
+		stranded: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "litevirt_failover_stranded_workloads",
+			Help: "Workloads left on a fenced host that failover would have moved and did not " +
+				"(a post-fence refusal). Zero is normal; sustained non-zero needs an operator.",
+		}),
 	}
-	reg.MustRegister(m.attempts, m.vmActions, m.containerActions)
+	reg.MustRegister(m.attempts, m.vmActions, m.containerActions, m.stranded)
 	return m
 }
+
+// StrandedWorkloads sets the stranded-workload gauge. (Satisfies failover.Metrics.)
+func (m *FailoverMetrics) StrandedWorkloads(n int) { m.stranded.Set(float64(n)) }
 
 // Attempt records a failover decision point. (Satisfies failover.Metrics.)
 func (m *FailoverMetrics) Attempt(phase, result, errorClass string) {

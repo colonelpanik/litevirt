@@ -13,6 +13,7 @@ type fakeMetrics struct {
 	attempts map[string]int
 	vm       map[string]int
 	ct       map[string]int
+	stranded int
 }
 
 func newFakeMetrics() *fakeMetrics {
@@ -24,6 +25,7 @@ func foKey(a, b, c string) string { return a + "|" + b + "|" + c }
 func (f *fakeMetrics) Attempt(p, r, e string)         { f.attempts[foKey(p, r, e)]++ }
 func (f *fakeMetrics) VMAction(a, r, e string)        { f.vm[foKey(a, r, e)]++ }
 func (f *fakeMetrics) ContainerAction(a, r, e string) { f.ct[foKey(a, r, e)]++ }
+func (f *fakeMetrics) StrandedWorkloads(n int)        { f.stranded = n }
 
 // TestFailoverMetrics_SkipUpgrading: a recently-'upgrading' host is skipped, and
 // that skip is observable.

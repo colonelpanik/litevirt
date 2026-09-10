@@ -2,6 +2,7 @@ package libvirt
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,6 +16,12 @@ import (
 // own — possibly stale — replica. Written through the executor when a claimed
 // transition lands; the reconciler converges a missing/stale marker toward the
 // DB row. Enforcement gates on owner_epoch_v1.
+
+// ErrPreEpochOwnerEpoch is the domain-metadata twin of health.ErrPreEpochMarker:
+// the content parsed but named a value that cannot be a generation. Callers that
+// must distinguish "no readable marker" from "a marker asserting no generation"
+// key off this rather than on the message.
+var ErrPreEpochOwnerEpoch = errors.New("owner-epoch metadata does not name a generation")
 
 const (
 	// ownerEpochMetadataURI namespaces the element; the key is the libvirt
@@ -103,7 +110,7 @@ func parseOwnerEpochMetadata(name, raw string) (int64, bool, error) {
 	// finding. Same hole, same rule, as the host-local file marker in
 	// internal/health.
 	if epoch < 1 {
-		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch %d is not a generation", name, epoch)
+		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch %d: %w", name, epoch, ErrPreEpochOwnerEpoch)
 	}
 	return epoch, true, nil
 }

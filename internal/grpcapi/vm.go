@@ -974,30 +974,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// backfill is still the backstop, and it is exactly the state that existed
 		// before this call was added. Guarded on the insert having landed, because
 		// with no row the UPDATE is a replicated no-op and a misleading log line.
-		if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, spec.Name); gerr != nil {
-			slog.Warn("vm create: could not assign the first owner epoch — the reconciler's "+
-				"backfill remains the backstop",
-				"name", spec.Name, "error", gerr)
-		}
-		// Stamp both runtime markers now, at the epoch just assigned.
-		//
-		// Neither failure is fatal. The row is already at a positive epoch, which is
-		// the precondition convergeOwnerEpochMarker needs, so the reconciler repairs
-		// a missing marker on its next sweep — the state this create would otherwise
-		// have left permanently. That is also why the epoch is assigned BEFORE these
-		// writes and not after: the reverse order fails into marker-present against
-		// an epoch-0 row, which convergence returns early on and never repairs.
-		//
-		// The literal 1 rather than a re-read: GraduateVMOwnerEpoch assigns exactly
-		// that, and a fresh read here would race the backfill for no gain.
-		if merr := s.virt.SetDomainOwnerEpoch(spec.Name, 1, true); merr != nil {
-			slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
-				"name", spec.Name, "error", merr)
-		}
-		if merr := health.WriteVMOwnerEpochMarker(s.dataDir, spec.Name, 1); merr != nil {
-			slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
-				"name", spec.Name, "error", merr)
-		}
+		s.assignOwnerEpochAtCreate(ctx, spec.Name)
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -1030,6 +1007,58 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 // alone (it is the contract the VM was created under), and an unreadable domain
 // or an alias-only answer leaves the spec exactly as it was rather than blanking
 // it. Nil-safe, because the callers are best-effort paths.
+// assignOwnerEpochAtCreate moves a freshly inserted VM row off the pre-epoch
+// default and stamps both runtime markers at the generation it assigned, so the
+// VM is provable before CreateVM returns instead of at the reconciler's next
+// sweep.
+//
+// Split out of the create path so the graduation failure is reachable in a test
+// without also failing the insert: the two share one *corrosion.Client, and a
+// test that breaks the client to fail the graduation breaks the insert too,
+// which skips this whole block and proves nothing.
+//
+// Nothing here is fatal. The VM is already running, and every outcome is one an
+// existing repair path handles — which is the whole reason for the ordering.
+func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
+	if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
+		// Leave the row pre-epoch AND unmarked. That is exactly the state a create
+		// left behind before any of this existed, and the only one the repair paths
+		// can act on: convergeOwnerEpochMarker returns early for an epoch-0 row, so
+		// stamping a marker here would produce marker-1 against row-0 — a mismatch
+		// nothing converges, which assertRuntimeOwnership reads as
+		// marker_epoch_mismatch and which would refuse this VM's legitimate
+		// sole-holder re-key for good. It would also hold the row at 0, so
+		// OwnerEpochBackfillComplete keeps reporting this host unready and the
+		// fleet's owner_epoch_v1 latch never closes. The backfill sweep is the
+		// backstop, though only where enforcement.owner_epoch is on.
+		slog.Warn("vm create: could not assign the first owner epoch — leaving the VM "+
+			"unmarked for the backfill rather than stamping a marker the row cannot match",
+			"name", name, "error", gerr)
+		return
+	}
+	// Stamp both runtime markers now, at the epoch just assigned.
+	//
+	// A marker failure is not fatal. The row is already at a positive epoch, which
+	// is the precondition convergeOwnerEpochMarker needs, and its call site fires
+	// for any confirmed-running VM regardless of the enforcement flag — so the
+	// reconciler repairs a missing marker on its next sweep. That is also why the
+	// epoch is assigned BEFORE these writes and not after: the reverse order fails
+	// into marker-present against an epoch-0 row, which convergence returns early
+	// on and never repairs.
+	//
+	// The literal 1 rather than a re-read: the guarded UPDATE just applied to a row
+	// inserted at the column default, and a fresh read here would race the backfill
+	// for no gain.
+	if merr := s.virt.SetDomainOwnerEpoch(name, 1, true); merr != nil {
+		slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
+			"name", name, "error", merr)
+	}
+	if merr := health.WriteVMOwnerEpochMarker(s.dataDir, name, 1); merr != nil {
+		slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
+			"name", name, "error", merr)
+	}
+}
+
 func (s *Server) pinMachineFromDomain(spec *pb.VMSpec) {
 	if spec == nil || lv.IsPinnedMachineType(spec.Machine) {
 		return

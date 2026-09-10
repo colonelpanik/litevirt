@@ -1,6 +1,7 @@
 package health
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,16 @@ import (
 
 // ownerEpochMarkerFile is the per-container marker filename.
 const ownerEpochMarkerFile = "owner_epoch"
+
+// ErrPreEpochMarker reports a marker whose content parsed but named a value that
+// cannot be a generation (0 or negative). Distinguished from unparseable garbage
+// because the two must be treated DIFFERENTLY by runtimeSuperseded: an
+// unreadable marker deliberately does not fail closed there (it would strand a
+// legitimately-owned VM), but a marker that says "generation 0" is a positive
+// statement that this runtime belongs to no generation the DB can have moved
+// past — so a row at any real generation HAS superseded it, and resurrecting
+// from local state is the dual-run this check exists to stop.
+var ErrPreEpochMarker = errors.New("owner-epoch marker does not name a generation")
 
 // WriteVMOwnerEpochMarker is the VM twin of the container marker, stored under
 // <dataDir>/vms/<name>/owner_epoch.
@@ -116,7 +127,7 @@ func readOwnerEpochMarker(root, name string) (int64, bool, error) {
 	// is the rule this function's doc comment and the libvirt twin's
 	// (SetDomainOwnerEpoch/GetDomainOwnerEpoch) have both always stated.
 	if epoch < 1 {
-		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch %d is not a generation", name, epoch)
+		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch %d: %w", name, epoch, ErrPreEpochMarker)
 	}
 	return epoch, true, nil
 }

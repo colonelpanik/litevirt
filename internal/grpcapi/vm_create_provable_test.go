@@ -89,34 +89,126 @@ func TestCreateVM_IsProvableBeforeItReturns(t *testing.T) {
 // graduate-then-mark leaves epoch 1 with no marker, which
 // convergeOwnerEpochMarker fixes on its next sweep. The reverse order would
 // leave marker 1 against epoch 0, which convergence returns early on and never
-// repairs. This pins the order by asserting the epoch survives a marker failure.
+// repairs — and assertRuntimeOwnership reads as marker_epoch_mismatch, refusing
+// that VM's sole-holder re-key for good.
+//
+// The order is pinned by observing the row AT THE MOMENT the marker is written,
+// not by the final state. Checking only the end state does not pin anything: a
+// pure reorder still runs the graduation afterwards, so the row still finishes
+// at 1 and every end-state assertion passes. That was the original defect in
+// this test.
 func TestCreateVM_AMarkerFailureLeavesAStateConvergenceRepairs(t *testing.T) {
 	s, fake := provableCreateServer(t)
-	// A backend whose marker write always fails, wrapping the fake so every other
-	// call behaves normally.
-	s.virt = markerHostileVirt{Fake: fake}
 	ctx := adminCtx()
+	virt := &epochObservingVirt{
+		Fake: fake,
+		fail: true,
+		epochAtCall: func() int64 {
+			row, err := corrosion.GetVM(ctx, s.db, "vm1")
+			if err != nil || row == nil {
+				return -1
+			}
+			return row.OwnerEpoch
+		},
+	}
+	s.virt = virt
 
 	if _, err := s.CreateVM(ctx, disklessCreateRequest("vm1")); err != nil {
 		t.Fatalf("CreateVM must not fail on a marker write: %v", err)
+	}
+	if !virt.called {
+		t.Fatal("the marker write was never attempted, so this test proves nothing about ordering")
+	}
+	if virt.seen < 1 {
+		t.Errorf("the row was at epoch %d when the marker was written; the epoch must be "+
+			"assigned FIRST, or the marker names a generation the row does not have and "+
+			"convergeOwnerEpochMarker (which requires a positive epoch) can never repair it",
+			virt.seen)
 	}
 	row, err := corrosion.GetVM(ctx, s.db, "vm1")
 	if err != nil || row == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
 	if row.OwnerEpoch < 1 {
-		t.Errorf("row epoch = %d after a failed marker write; the epoch must be assigned FIRST "+
-			"so convergeOwnerEpochMarker (which requires a positive epoch) can repair the "+
-			"marker on its next sweep", row.OwnerEpoch)
+		t.Errorf("row epoch = %d after a failed marker write; a marker failure must not cost "+
+			"the row its generation", row.OwnerEpoch)
 	}
 }
 
-// markerHostileVirt fails only SetDomainOwnerEpoch. Injected as a wrapper rather
-// than a flag on the fake so the fake's contract stays the real client's.
-type markerHostileVirt struct {
-	*libvirtfake.Fake
+// TestAssignOwnerEpochAtCreate_AFailedGraduationStampsNothing: if the row cannot
+// be moved off the pre-epoch default, NOTHING may be stamped.
+//
+// Stamping anyway produces marker-1 against row-0, and every consequence of that
+// is permanent: convergeOwnerEpochMarker returns early for an epoch-0 row so it
+// never repairs the marker; assertRuntimeOwnership reads the disagreement as
+// marker_epoch_mismatch and refuses that VM's legitimate sole-holder re-key for
+// good; and the row sitting at 0 keeps OwnerEpochBackfillComplete reporting this
+// host unready, so the fleet's owner_epoch_v1 latch never closes. The backfill
+// sweep is not a backstop either — it runs only under enforcement.owner_epoch,
+// which is off by default.
+//
+// Called at the seam rather than through CreateVM on purpose. The graduation is
+// failed by closing the database, and through CreateVM that fails the INSERT
+// too, which skips the whole block — a test that looked like it covered this and
+// did not. Verified: reverting the fix must fail THIS test.
+func TestAssignOwnerEpochAtCreate_AFailedGraduationStampsNothing(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	ctx := adminCtx()
+	// A running domain exists, so a stamp would succeed if one were attempted —
+	// otherwise the fake would refuse it for an unrelated reason.
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	s.db.Close()
+
+	s.assignOwnerEpochAtCreate(ctx, "vm1")
+
+	if epoch, ok, _ := fake.GetDomainOwnerEpoch("vm1"); ok {
+		t.Errorf("a domain marker of %d was stamped although no row was graduated; a marker "+
+			"the row cannot match is never repaired and blocks that VM's re-key", epoch)
+	}
+	if epoch, ok, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "vm1"); ok {
+		t.Errorf("a file marker of %d was written although no row was graduated", epoch)
+	}
 }
 
-func (markerHostileVirt) SetDomainOwnerEpoch(string, int64, bool) error {
-	return context.DeadlineExceeded
+// TestAssignOwnerEpochAtCreate_StampsBothOnSuccess is the control: the refusal
+// above must not be a blanket refusal to ever stamp anything.
+func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	ctx := adminCtx()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	s.assignOwnerEpochAtCreate(ctx, "vm1")
+
+	if epoch, ok, err := fake.GetDomainOwnerEpoch("vm1"); err != nil || !ok || epoch != 1 {
+		t.Errorf("domain marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
+	}
+	if epoch, ok, err := health.ReadVMOwnerEpochMarker(s.dataDir, "vm1"); err != nil || !ok || epoch != 1 {
+		t.Errorf("file marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
+	}
+}
+
+// epochObservingVirt records the persisted owner epoch at the instant the domain
+// marker is written, so the ordering can be asserted rather than inferred from
+// the end state. Injected as a wrapper rather than a flag on the fake, so the
+// fake's contract stays the real client's.
+type epochObservingVirt struct {
+	*libvirtfake.Fake
+	epochAtCall func() int64
+	fail        bool
+	called      bool
+	seen        int64
+}
+
+func (v *epochObservingVirt) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	v.called = true
+	v.seen = v.epochAtCall()
+	if v.fail {
+		return context.DeadlineExceeded
+	}
+	return v.Fake.SetDomainOwnerEpoch(name, epoch, running)
 }

@@ -54,12 +54,21 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.
-- **A freshly created VM is provable immediately.** The create path assigns its
-  first ownership generation and stamps both runtime markers (libvirt domain
-  metadata and the host-local marker file) before `CreateVM` returns.
-  Previously the row was born at the pre-epoch default and carried no marker
-  until the reconciler's next backfill sweep, so for up to that interval a
-  running VM could not prove which generation it belonged to.
+- **A VM created through `CreateVM` is normally provable immediately.** It is
+  assigned its first ownership generation and both runtime markers (libvirt
+  domain metadata and the host-local marker file) are stamped before the call
+  returns. Previously the row was born at the pre-epoch default and carried no
+  marker until the reconciler's next backfill sweep, so for up to that interval
+  a running VM could not prove which generation it belonged to.
+  **This narrows that window; it does not close it**, and it covers only that
+  one path. The row is still published as `running` before the markers are
+  written, so a crash or a failure in between still leaves a running VM that
+  cannot prove its generation — now for the width of a few calls inside one RPC
+  rather than a sweep interval. The dual-run detector's newborn grace remains
+  the backstop for that residue, and closing it needs the create path reordered
+  to record the row before the runtime exists. VMs that arrive by template
+  instantiation, import, restore or promote, and all containers, are unchanged:
+  they graduate on the backfill sweep as before.
 - **A marker value of `0` is not a generation.** It is treated as corrupt
   wherever it is read — the marker file and the domain metadata alike — and
   refused wherever it would be written. One consequence is visible on upgrade:

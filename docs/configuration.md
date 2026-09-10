@@ -281,10 +281,13 @@ enforcement:
                               # backfill every workload this host owns from the pre-epoch 0
                               # to a real generation, stamping its runtime marker (libvirt
                               # domain metadata / the container marker file) in the same
-                              # pass. Freshly created VMs never need that sweep: the create
-                              # path assigns the first generation and stamps both VM markers
-                              # before returning, REGARDLESS of this flag, so the backfill
-                              # is left with pre-existing workloads only.
+                              # pass. A VM created through CreateVM does not normally need
+                              # that sweep: it is assigned the first generation and both its
+                              # markers are stamped before the call returns, REGARDLESS of
+                              # this flag. Nothing else is: a VM created by template
+                              # instantiation, import, restore or promote still lands at
+                              # epoch 0, as does every container and any VM whose graduation
+                              # failed, so this sweep remains what graduates them.
                               # The token is advertised only once this node is READY —
                               # flag on and no owned workload left at epoch 0 — so the fleet
                               # can never latch across a node whose workloads are still

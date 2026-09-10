@@ -499,9 +499,15 @@ func TestRun_StrandedGaugeClearsOnMidCycleLeaseLoss(t *testing.T) {
 
 	c.run(ctx)
 
-	if got := fm.attempts[foKey(PhaseFence, ResultRefused, ErrLeaseLost)]; got != 1 {
-		t.Fatalf("premise: lease-lost counter = %d, want 1 — the run did not take the "+
-			"mid-cycle abort path, so this test is not exercising it (attempts=%v)",
+	// At least one, not exactly one: a fence candidate is now checked against
+	// the lease TWICE — holdLeaseAtLeast(minFenceLease) before the fence, and
+	// holdLease at the top of the next candidate — so one steal is reported by
+	// both call sites. The premise this guards is that the abort path ran at
+	// all; pinning the exact count would just re-break the day a third check is
+	// added, and the gauge assertion below is the real one.
+	if got := fm.attempts[foKey(PhaseFence, ResultRefused, ErrLeaseLost)]; got < 1 {
+		t.Fatalf("premise: lease-lost counter = %d, want at least 1 — the run did not take "+
+			"the mid-cycle abort path, so this test is not exercising it (attempts=%v)",
 			got, fm.attempts)
 	}
 	if fm.stranded != 0 {

@@ -236,7 +236,7 @@ func TestEvaluateHADegraded_AnUnrolledMandatoryTokenIsNotUnsupportedMember(t *te
 	s := inventoryServer(t)
 	s.SetGate(&recordingGate{})
 
-	cur := s.evaluateHADegraded(context.Background())
+	cur, _ := s.evaluateHADegraded(context.Background())
 
 	if cur[haUnsupportedMember] {
 		t.Errorf("%q raised while a mandatory token is merely un-rolled. That is the ordinary "+
@@ -262,7 +262,7 @@ func TestEvaluateHADegraded_AMandatoryTokenThatRegressedStillAlarms(t *testing.T
 	s.capHealthLast = map[string]bool{capabilities.SplitBrainGateV1: false}
 	s.capHealthMu.Unlock()
 
-	cur := s.evaluateHADegraded(context.Background())
+	cur, _ := s.evaluateHADegraded(context.Background())
 
 	if !cur[haUnsupportedMember] {
 		t.Errorf("%q not raised for a latched mandatory token whose support regressed — that "+

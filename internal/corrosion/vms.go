@@ -1274,6 +1274,30 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 		nowRFC3339(), now, vmName, mac)
 }
 
+// graduateVMOwnerEpochSQL moves a vms row off the pre-epoch default. It is the
+// ONE statement for that intent, shared by BackfillOwnerEpochs and
+// GraduateVMOwnerEpoch, because two texts for one operation would be two
+// replicated fingerprints — and a peer registered for only one of them cannot
+// resolve the other, which fails its apply closed and head-of-line blocks its
+// whole stream.
+//
+// Guarded on vm_owner_epoch = 0 so it is idempotent on its own and cannot walk a
+// live generation backwards: a retry, or a race with the per-sweep backfill, is
+// a no-op rather than a reset.
+const graduateVMOwnerEpochSQL = `UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`
+
+// GraduateVMOwnerEpoch assigns the first ownership generation to one named VM.
+//
+// The create path calls this immediately after inserting the row, because
+// INSERT INTO vms does not name vm_owner_epoch (12 columns, and widening it
+// would move the insert's fingerprint) so a fresh row takes the column default
+// of 0 — and a running VM at epoch 0 has no marker, since
+// convergeOwnerEpochMarker returns early for one, which is the window
+// colonelpanik/litevirt#157 is about.
+func GraduateVMOwnerEpoch(ctx context.Context, c *Client, name string) error {
+	return c.Execute(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+}
+
 // BackfillOwnerEpochs graduates every workload THIS host owns out of the
 // pre-epoch 0 (0→1) — the Phase 4 one-time backfill, run by the health sweeps
 // while enforcement.owner_epoch is on. Only owned, live rows are touched:
@@ -1292,8 +1316,7 @@ func BackfillOwnerEpochs(ctx context.Context, c *Client, hostName string) error 
 		return err
 	}
 	for _, r := range vms {
-		if err := c.Execute(ctx,
-			`UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		if err := c.Execute(ctx, graduateVMOwnerEpochSQL,
 			int64(1), c.NowTS(), r.String("name")); err != nil {
 			return err
 		}

@@ -963,6 +963,21 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
+	} else {
+		// Graduate the row off the pre-epoch default at once, rather than waiting
+		// for the reconciler's next backfill sweep.
+		//
+		// A VM at epoch 0 has no marker at all — convergeOwnerEpochMarker returns
+		// early for one — so between here and that sweep a running VM cannot prove
+		// which ownership generation it belongs to. Not fatal if it fails: the
+		// backfill is still the backstop, and it is exactly the state that existed
+		// before this call was added. Guarded on the insert having landed, because
+		// with no row the UPDATE is a replicated no-op and a misleading log line.
+		if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, spec.Name); gerr != nil {
+			slog.Warn("vm create: could not assign the first owner epoch — the reconciler's "+
+				"backfill remains the backstop",
+				"name", spec.Name, "error", gerr)
+		}
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)

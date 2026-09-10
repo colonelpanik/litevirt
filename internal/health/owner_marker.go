@@ -24,14 +24,20 @@ import (
 // ownerEpochMarkerFile is the per-container marker filename.
 const ownerEpochMarkerFile = "owner_epoch"
 
-// ErrPreEpochMarker reports a marker whose content parsed but named a value that
-// cannot be a generation (0 or negative). Distinguished from unparseable garbage
-// because the two must be treated DIFFERENTLY by runtimeSuperseded: an
-// unreadable marker deliberately does not fail closed there (it would strand a
-// legitimately-owned VM), but a marker that says "generation 0" is a positive
-// statement that this runtime belongs to no generation the DB can have moved
-// past — so a row at any real generation HAS superseded it, and resurrecting
-// from local state is the dual-run this check exists to stop.
+// ErrPreEpochMarker reports a marker whose content parsed as EXACTLY 0.
+// Distinguished from every other corrupt marker because the two must be treated
+// differently by runtimeSuperseded: an unreadable marker deliberately does not
+// fail closed there (it would strand a legitimately-owned VM), but a marker that
+// says "generation 0" is a positive statement that this runtime belongs to no
+// generation the DB can have moved past — so a row at any real generation HAS
+// superseded it, and resurrecting from local state is the dual-run that check
+// exists to stop.
+//
+// A NEGATIVE marker is deliberately NOT this error. It is garbage, and this
+// file's own rule is that garbage never authorizes: reading -5 as "generation 0"
+// would derive a decision from content the code calls meaningless, and against
+// a row also at 0 it would report NOT superseded and permit the very restart a
+// plain corrupt reading refuses.
 var ErrPreEpochMarker = errors.New("owner-epoch marker does not name a generation")
 
 // WriteVMOwnerEpochMarker is the VM twin of the container marker, stored under
@@ -126,8 +132,11 @@ func readOwnerEpochMarker(root, name string) (int64, bool, error) {
 	// still at the column default and suppress the check with no finding. This
 	// is the rule this function's doc comment and the libvirt twin's
 	// (SetDomainOwnerEpoch/GetDomainOwnerEpoch) have both always stated.
-	if epoch < 1 {
-		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch %d: %w", name, epoch, ErrPreEpochMarker)
+	if epoch == 0 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch 0: %w", name, ErrPreEpochMarker)
+	}
+	if epoch < 0 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch marker for %q: epoch %d is garbage, not a generation", name, epoch)
 	}
 	return epoch, true, nil
 }

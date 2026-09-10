@@ -1294,8 +1294,30 @@ const graduateVMOwnerEpochSQL = `UPDATE vms SET vm_owner_epoch = ?, updated_at =
 // of 0 — and a running VM at epoch 0 has no marker, since
 // convergeOwnerEpochMarker returns early for one, which is the window
 // colonelpanik/litevirt#157 is about.
+//
+// Returns ErrNoRowsAffected when the guarded UPDATE matched nothing, via
+// ExecuteRows rather than Execute. This is the difference between "the row is
+// now at generation 1" and "some other row state exists that this statement
+// declined to touch" — a soft-deleted row (a DeleteVM racing the create) or one
+// a replicated write already moved off 0. A caller that stamps a runtime marker
+// on the strength of this call MUST distinguish them: Execute discards the row
+// count, so a no-op would read as success and the marker would name a
+// generation the row does not hold, which is the one mismatch nothing
+// converges. On a nil return the row is at 1, which is what makes stamping the
+// literal 1 sound.
+//
+// BackfillOwnerEpochs deliberately does NOT use this: it is idempotent by
+// predicate across many rows, and a row a concurrent graduation already moved
+// is a success for it, not a fault.
 func GraduateVMOwnerEpoch(ctx context.Context, c *Client, name string) error {
-	return c.Execute(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+	n, err := c.ExecuteRows(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
 }
 
 // BackfillOwnerEpochs graduates every workload THIS host owns out of the

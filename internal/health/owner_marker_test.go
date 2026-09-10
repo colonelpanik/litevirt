@@ -1,6 +1,7 @@
 package health
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -146,5 +147,44 @@ func TestOwnerEpochMarker_RoundTripsAValidEpoch(t *testing.T) {
 	epoch, found, err := readOwnerEpochMarker(root, "vm1")
 	if err != nil || !found || epoch != 1 {
 		t.Fatalf("round trip = (%d, %v, %v), want (1, true, nil)", epoch, found, err)
+	}
+}
+
+// TestOwnerEpochMarker_ZeroAndNegativeAreDifferentKindsOfCorrupt pins the
+// distinction runtimeSuperseded decides on.
+//
+// A marker of exactly 0 is a positive statement — "this runtime belongs to no
+// generation" — and carries ErrPreEpochMarker so that check can treat it as
+// generation 0 and refuse a self-heal restart when the row has moved on. A
+// NEGATIVE is not a statement about anything: no allocator emits one, and
+// deriving a decision from it would be computing with content this package
+// calls garbage. Both are corrupt; only one is actionable.
+func TestOwnerEpochMarker_ZeroAndNegativeAreDifferentKindsOfCorrupt(t *testing.T) {
+	seed := func(t *testing.T, content string) error {
+		t.Helper()
+		root := t.TempDir()
+		dir := filepath.Join(root, "vm1")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ownerEpochMarkerFile), []byte(content), 0o600); err != nil {
+			t.Fatalf("seed marker: %v", err)
+		}
+		_, _, err := readOwnerEpochMarker(root, "vm1")
+		return err
+	}
+
+	zeroErr := seed(t, "0\n")
+	if !errors.Is(zeroErr, ErrPreEpochMarker) {
+		t.Errorf("a zero marker must carry ErrPreEpochMarker so runtimeSuperseded can act on "+
+			"it; got %v", zeroErr)
+	}
+	negErr := seed(t, "-5\n")
+	if negErr == nil {
+		t.Fatal("a negative marker must still be corrupt")
+	}
+	if errors.Is(negErr, ErrPreEpochMarker) {
+		t.Error("a negative marker must NOT carry ErrPreEpochMarker: it is garbage, and " +
+			"coercing it to generation 0 would derive a decision from meaningless content")
 	}
 }

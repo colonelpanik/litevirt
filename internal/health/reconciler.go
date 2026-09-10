@@ -1363,10 +1363,13 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 		marker, ok, err = 0, true, nil
 	}
 	if err != nil || !ok {
+		// No pre-epoch coercion on this fallback: it cannot fire. This function is
+		// reached only from the !DomainExists branch, and DomainExists IS a
+		// DomainLookupByName — the same lookup GetDomainOwnerEpoch does first — so
+		// here it can only ever return a lookup error, never a parse result. The
+		// fallback is retained as written because that is pre-existing behaviour,
+		// but nothing decides anything from it.
 		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
-		if errors.Is(err, lv.ErrPreEpochOwnerEpoch) {
-			marker, ok, err = 0, true, nil
-		}
 	}
 	if err != nil || !ok {
 		return false

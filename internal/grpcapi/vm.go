@@ -965,15 +965,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	} else {
-		// Graduate the row off the pre-epoch default at once, rather than waiting
-		// for the reconciler's next backfill sweep.
-		//
-		// A VM at epoch 0 has no marker at all — convergeOwnerEpochMarker returns
-		// early for one — so between here and that sweep a running VM cannot prove
-		// which ownership generation it belongs to. Not fatal if it fails: the
-		// backfill is still the backstop, and it is exactly the state that existed
-		// before this call was added. Guarded on the insert having landed, because
-		// with no row the UPDATE is a replicated no-op and a misleading log line.
+		// Guarded on the insert having landed: with no row the graduation is a
+		// replicated no-op and a misleading log line. The invariant it maintains
+		// lives on assignOwnerEpochAtCreate; do not restate it here, or the two
+		// copies drift.
 		s.assignOwnerEpochAtCreate(ctx, spec.Name)
 	}
 
@@ -996,17 +991,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	return s.vmToProto(ctx, spec.Name)
 }
 
-// pinMachineFromDomain upgrades a spec's machine ALIAS to the concrete
-// versioned type libvirt bound the (already-defined) domain to. Every path that
-// defines a domain and then persists its spec must call this before marshalling:
-// libvirt resolves an alias against the LOCAL qemu at define time, so persisting
-// the alias lets a later migration or failover re-resolve it on a host with a
-// different qemu and silently shift the guest ABI.
-//
-// Best-effort and strictly non-destructive: an already-concrete value is left
-// alone (it is the contract the VM was created under), and an unreadable domain
-// or an alias-only answer leaves the spec exactly as it was rather than blanking
-// it. Nil-safe, because the callers are best-effort paths.
 // assignOwnerEpochAtCreate moves a freshly inserted VM row off the pre-epoch
 // default and stamps both runtime markers at the generation it assigned, so the
 // VM is provable before CreateVM returns instead of at the reconciler's next
@@ -1020,6 +1004,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 // Nothing here is fatal. The VM is already running, and every outcome is one an
 // existing repair path handles — which is the whole reason for the ordering.
 func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
+	// Detached from the RPC context. The row is already committed and the guest is
+	// already running by the time this runs, so a client ^C or an RPC deadline that
+	// expired during the preceding image and disk work must not decide whether the
+	// VM is provable. With the failure path below correctly stamping nothing, an
+	// inherited cancellation would reliably leave a running VM at epoch 0 with no
+	// marker and no backstop unless enforcement.owner_epoch happens to be on. The
+	// same function already detaches its post-commit LB work for this reason.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
 	if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
 		// Leave the row pre-epoch AND unmarked. That is exactly the state a create
 		// left behind before any of this existed, and the only one the repair paths
@@ -1053,12 +1046,33 @@ func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
 		slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
 			"name", name, "error", merr)
 	}
+	// Skipped rather than written to a relative path when dataDir is unset:
+	// readVMMarker treats an empty dataDir as MarkerMissing, so writing anyway
+	// would create a marker tree under the daemon's cwd that no reader in this
+	// package will ever look at — a marker on disk while the inventory reports
+	// none.
+	if s.dataDir == "" {
+		slog.Warn("vm create: no data directory, so no owner-epoch file marker",
+			"name", name)
+		return
+	}
 	if merr := health.WriteVMOwnerEpochMarker(s.dataDir, name, 1); merr != nil {
 		slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
 			"name", name, "error", merr)
 	}
 }
 
+// pinMachineFromDomain upgrades a spec's machine ALIAS to the concrete
+// versioned type libvirt bound the (already-defined) domain to. Every path that
+// defines a domain and then persists its spec must call this before marshalling:
+// libvirt resolves an alias against the LOCAL qemu at define time, so persisting
+// the alias lets a later migration or failover re-resolve it on a host with a
+// different qemu and silently shift the guest ABI.
+//
+// Best-effort and strictly non-destructive: an already-concrete value is left
+// alone (it is the contract the VM was created under), and an unreadable domain
+// or an alias-only answer leaves the spec exactly as it was rather than blanking
+// it. Nil-safe, because the callers are best-effort paths.
 func (s *Server) pinMachineFromDomain(spec *pb.VMSpec) {
 	if spec == nil || lv.IsPinnedMachineType(spec.Machine) {
 		return

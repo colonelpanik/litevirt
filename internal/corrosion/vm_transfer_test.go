@@ -363,7 +363,15 @@ func TestGraduateVMOwnerEpoch_MovesOneRowOffTheDefault(t *testing.T) {
 
 // TestGraduateVMOwnerEpoch_DoesNotDisturbAnAlreadyGraduatedRow: the statement is
 // guarded on vm_owner_epoch = 0, so a retry or a race with the backfill cannot
-// walk a live generation backwards.
+// walk a live generation backwards — AND it says so rather than returning nil.
+//
+// Both halves matter. The guard is what protects the row; the ErrNoRowsAffected
+// is what protects the caller. A create path that stamps a runtime marker on the
+// strength of this call cannot tell "the row is now at generation 1" from "this
+// statement declined to touch whatever state exists" if a no-op returns nil —
+// and stamping 1 over a live generation 7 produces the one marker/row mismatch
+// nothing converges. Idempotent here means "changes nothing", not "reports
+// success".
 func TestGraduateVMOwnerEpoch_DoesNotDisturbAnAlreadyGraduatedRow(t *testing.T) {
 	ctx := context.Background()
 	c := newGraduationTestClient(t)
@@ -375,12 +383,31 @@ func TestGraduateVMOwnerEpoch_DoesNotDisturbAnAlreadyGraduatedRow(t *testing.T) 
 		`UPDATE vms SET vm_owner_epoch = 7, updated_at = ? WHERE name = ?`, c.NowTS(), "vm1"); err != nil {
 		t.Fatalf("bump: %v", err)
 	}
-	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); err != nil {
-		t.Fatalf("second graduate: %v", err)
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Errorf("second graduate: err = %v, want ErrNoRowsAffected — a caller that stamps a "+
+			"marker must be able to tell a no-op from an applied graduation", err)
 	}
 	if got := vmEpochOf(t, ctx, c, "vm1"); got != 7 {
 		t.Errorf("epoch = %d, want 7 — graduation must be guarded on the pre-epoch "+
 			"default so it cannot reset a live generation", got)
+	}
+}
+
+// TestGraduateVMOwnerEpoch_ReportsASoftDeletedRowAsUnapplied: the reachable
+// production shape of the no-op.
+//
+// A DeleteVM racing the create path soft-deletes the row between its INSERT and
+// this UPDATE. The statement is guarded on deleted_at IS NULL, so it matches
+// nothing — and the create path must learn that, or it stamps both runtime
+// markers for a generation no row holds.
+func TestGraduateVMOwnerEpoch_ReportsASoftDeletedRowAsUnapplied(t *testing.T) {
+	ctx := context.Background()
+	c := newGraduationTestClient(t)
+	if err := DeleteVM(ctx, c, "vm1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Errorf("graduate against a tombstoned row: err = %v, want ErrNoRowsAffected", err)
 	}
 }
 

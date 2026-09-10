@@ -1,6 +1,9 @@
 package libvirt
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // The parse contract for the domain owner-epoch marker: corrupt content is an
 // ERROR, never epoch 0 — garbage read as the zero generation would authorize
@@ -59,5 +62,22 @@ func TestSetDomainOwnerEpoch_RefusesAPreEpochValue(t *testing.T) {
 			t.Errorf("SetDomainOwnerEpoch accepted epoch %d; a marker that cannot name a "+
 				"generation must never reach domain metadata", epoch)
 		}
+	}
+}
+
+// TestParseOwnerEpochMetadata_ZeroAndNegativeAreDifferentKindsOfCorrupt is the
+// metadata twin of the file marker's rule: exactly 0 carries the sentinel, a
+// negative is plain garbage.
+func TestParseOwnerEpochMetadata_ZeroAndNegativeAreDifferentKindsOfCorrupt(t *testing.T) {
+	_, _, zeroErr := parseOwnerEpochMetadata("vm1", "<owner-epoch>0</owner-epoch>")
+	if !errors.Is(zeroErr, ErrPreEpochOwnerEpoch) {
+		t.Errorf("a zero must carry ErrPreEpochOwnerEpoch; got %v", zeroErr)
+	}
+	_, _, negErr := parseOwnerEpochMetadata("vm1", "<owner-epoch>-5</owner-epoch>")
+	if negErr == nil {
+		t.Fatal("a negative must still be corrupt")
+	}
+	if errors.Is(negErr, ErrPreEpochOwnerEpoch) {
+		t.Error("a negative must NOT carry the pre-epoch sentinel; it is garbage")
 	}
 }

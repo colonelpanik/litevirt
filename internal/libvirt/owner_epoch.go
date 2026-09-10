@@ -109,8 +109,11 @@ func parseOwnerEpochMetadata(name, raw string) (int64, bool, error) {
 	// against a row still at the column default and suppress condition 7 with no
 	// finding. Same hole, same rule, as the host-local file marker in
 	// internal/health.
-	if epoch < 1 {
-		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch %d: %w", name, epoch, ErrPreEpochOwnerEpoch)
+	if epoch == 0 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch 0: %w", name, ErrPreEpochOwnerEpoch)
+	}
+	if epoch < 0 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch %d is garbage, not a generation", name, epoch)
 	}
 	return epoch, true, nil
 }

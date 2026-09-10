@@ -69,11 +69,18 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   to record the row before the runtime exists. VMs that arrive by template
   instantiation, import, restore or promote, and all containers, are unchanged:
   they graduate on the backfill sweep as before.
-- **A marker value of `0` is not a generation.** It is treated as corrupt
-  wherever it is read — the marker file and the domain metadata alike — and
-  refused wherever it would be written. One consequence is visible on upgrade:
-  a VM already running with a `0` marker was never provable, and now reports as
-  such rather than passing silently.
+- **A marker value of `0` is not a generation.** It is refused wherever it would
+  be written — the marker file and the domain metadata alike — and reported as a
+  corrupt marker wherever it is read, with one deliberate exception: the
+  superseded-runtime check that decides whether a rejoined host may restart a VM
+  from local state reads it as generation `0` rather than as unreadable. That
+  check does not fail closed on an unreadable marker (which would strand a
+  legitimately-owned VM), so treating a `0` as unreadable there would turn its
+  refusal into a permission — the dual-run the marker exists to prevent. A
+  NEGATIVE marker gets no such treatment: it is garbage, and no decision is
+  derived from it. One consequence is visible on upgrade: a VM already running
+  with a `0` marker was never provable, and now reports as such rather than
+  passing silently.
 
 ### Time
 - HLC rejects remote timestamps more than **5 minutes ahead** of local wall

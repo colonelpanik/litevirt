@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -101,8 +104,8 @@ func TestCreateVM_AMarkerFailureLeavesAStateConvergenceRepairs(t *testing.T) {
 	s, fake := provableCreateServer(t)
 	ctx := adminCtx()
 	virt := &epochObservingVirt{
-		Fake: fake,
-		fail: true,
+		Fake:     fake,
+		failWith: context.DeadlineExceeded,
 		epochAtCall: func() int64 {
 			row, err := corrosion.GetVM(ctx, s.db, "vm1")
 			if err != nil || row == nil {
@@ -184,6 +187,17 @@ func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
 
 	s.assignOwnerEpochAtCreate(ctx, "vm1")
 
+	// The postcondition FIRST: without it the two marker assertions below pass in
+	// exactly the case the sibling test forbids — a graduation that silently
+	// matched no row, leaving marker 1 against a row that is not at 1.
+	row, err := corrosion.GetVM(ctx, s.db, "vm1")
+	if err != nil || row == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if row.OwnerEpoch != 1 {
+		t.Fatalf("row epoch = %d, want 1 — the markers below are only meaningful if the row "+
+			"actually reached the generation they name", row.OwnerEpoch)
+	}
 	if epoch, ok, err := fake.GetDomainOwnerEpoch("vm1"); err != nil || !ok || epoch != 1 {
 		t.Errorf("domain marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
 	}
@@ -198,17 +212,123 @@ func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
 // fake's contract stays the real client's.
 type epochObservingVirt struct {
 	*libvirtfake.Fake
+	// epochAtCall is optional: a reuse that only needs the injected failure, or
+	// only the call record, must not have to supply one.
 	epochAtCall func() int64
-	fail        bool
-	called      bool
-	seen        int64
+	// failWith, when set, is returned instead of delegating to the fake.
+	failWith error
+	called   bool
+	seen     int64
 }
 
 func (v *epochObservingVirt) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
 	v.called = true
-	v.seen = v.epochAtCall()
-	if v.fail {
-		return context.DeadlineExceeded
+	if v.epochAtCall != nil {
+		v.seen = v.epochAtCall()
+	}
+	if v.failWith != nil {
+		return v.failWith
 	}
 	return v.Fake.SetDomainOwnerEpoch(name, epoch, running)
+}
+
+// TestClassifyMarker_KeysOffTheSentinelNotTheMessage: a pre-epoch marker must
+// classify as CORRUPT even when the error text does not contain "corrupt".
+//
+// Today it does contain it, so the sentinel branch and the string match agree
+// and no end-to-end test can tell them apart. This calls the classifier directly
+// with the coupling broken, which is the only way to pin the decoupling — and it
+// matters because the two answers are not equally bad. MarkerCorrupt pages
+// condition 7 for the one VM; MarkerUnreadable makes collectRuntimeInventory
+// fail the whole host's inventory as not-decision-complete, which suppresses
+// owner-assert for every workload on that host. One VM's bad marker must not
+// silence the checks fleet-wide.
+func TestClassifyMarker_KeysOffTheSentinelNotTheMessage(t *testing.T) {
+	err := fmt.Errorf("marker for %q names no generation: %w", "vm1", health.ErrPreEpochMarker)
+	if got := fmt.Sprint(err); got == "" {
+		t.Fatal("unreachable")
+	}
+	epoch, status := classifyMarker(0, false, err)
+	if status != MarkerCorrupt {
+		t.Errorf("classifyMarker(pre-epoch sentinel, no \"corrupt\" in the text) = %q, want %q — "+
+			"keyed off the message it falls to MarkerUnreadable, which fails the whole host's "+
+			"inventory instead of paging one VM", status, MarkerCorrupt)
+	}
+	if epoch != 0 {
+		t.Errorf("epoch = %d, want 0", epoch)
+	}
+}
+
+// TestAssignOwnerEpochAtCreate_SkipsTheFileMarkerWithoutADataDir: with no data
+// directory, no file marker may be written to a RELATIVE path.
+//
+// readVMMarker treats an empty dataDir as MarkerMissing, so a marker written
+// anyway lands under the daemon's working directory where no reader in this
+// package looks — a marker on disk while the inventory reports none. The domain
+// marker is unaffected and must still be stamped.
+func TestAssignOwnerEpochAtCreate_SkipsTheFileMarkerWithoutADataDir(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	ctx := adminCtx()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// A clean cwd, so a relative write is detectable rather than lost among the
+	// package's own files.
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	s.dataDir = ""
+
+	s.assignOwnerEpochAtCreate(ctx, "vm1")
+
+	if _, err := os.Stat(filepath.Join(cwd, "vms", "vm1", "owner_epoch")); err == nil {
+		t.Error("a file marker was written to a relative path with no dataDir set; no reader " +
+			"in this package resolves that path, so it is a marker the inventory cannot see")
+	}
+	if epoch, ok, err := fake.GetDomainOwnerEpoch("vm1"); err != nil || !ok || epoch != 1 {
+		t.Errorf("domain marker = (%d,%v,%v), want (1,true,nil) — the file marker being "+
+			"skipped must not cost the domain marker", epoch, ok, err)
+	}
+}
+
+// TestAssignOwnerEpochAtCreate_SurvivesACancelledRPCContext: a client hang-up
+// must not decide whether the VM is provable.
+//
+// By the time this runs the row is committed and the guest is running, so the
+// work is post-commit. Inheriting the RPC context means a ^C, or a deadline that
+// expired during the preceding image and disk work, fails the graduation — and
+// with the failure path correctly stamping nothing, that reliably leaves a
+// running VM at epoch 0 with no marker and no backstop unless
+// enforcement.owner_epoch happens to be on. The create path already detaches its
+// post-commit load-balancer work for the same reason.
+func TestAssignOwnerEpochAtCreate_SurvivesACancelledRPCContext(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(adminCtx())
+	cancel() // the client is already gone
+
+	s.assignOwnerEpochAtCreate(ctx, "vm1")
+
+	row, err := corrosion.GetVM(adminCtx(), s.db, "vm1")
+	if err != nil || row == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if row.OwnerEpoch != 1 {
+		t.Errorf("row epoch = %d, want 1 — post-commit provability must not be cancellable by "+
+			"the caller that has already been told the VM exists", row.OwnerEpoch)
+	}
+	if epoch, ok, err := fake.GetDomainOwnerEpoch("vm1"); err != nil || !ok || epoch != 1 {
+		t.Errorf("domain marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
+	}
+	if epoch, ok, err := health.ReadVMOwnerEpochMarker(s.dataDir, "vm1"); err != nil || !ok || epoch != 1 {
+		t.Errorf("file marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
+	}
 }

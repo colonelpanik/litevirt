@@ -104,3 +104,23 @@ func TestFake_FireEvent_CallbackMayReenterTheFake(t *testing.T) {
 		t.Errorf("callback's SetState did not take effect: state=%q err=%v", got, err)
 	}
 }
+
+// TestFakeSetDomainOwnerEpoch_RefusesAPreEpochValue keeps the fake's marker
+// contract identical to the real client's. A generation starts at 1, so 0 and
+// negatives are refused — without this, a test could pass against a marker state
+// internal/libvirt would never write.
+func TestFakeSetDomainOwnerEpoch_RefusesAPreEpochValue(t *testing.T) {
+	f := New()
+	f.SetState("vm1", StateRunning)
+	for _, epoch := range []int64{0, -1} {
+		if err := f.SetDomainOwnerEpoch("vm1", epoch, true); err == nil {
+			t.Errorf("the fake accepted epoch %d; the real client refuses it", epoch)
+		}
+	}
+	if _, ok, _ := f.GetDomainOwnerEpoch("vm1"); ok {
+		t.Error("a refused write still recorded a marker")
+	}
+	if err := f.SetDomainOwnerEpoch("vm1", 1, true); err != nil {
+		t.Fatalf("epoch 1 is the first legal generation and must be accepted: %v", err)
+	}
+}

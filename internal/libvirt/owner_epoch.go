@@ -31,6 +31,14 @@ const (
 // survives both the live domain and its persisted definition; a stopped one
 // takes CONFIG only (LIVE on an inactive domain is a libvirt error).
 func (c *Client) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	// Refused before the connection is touched, and refused rather than clamped:
+	// a caller asking to record a pre-epoch value has a bug, and writing 1 on its
+	// behalf would hide it while making the row and the marker disagree. This is
+	// the write side of the rule GetDomainOwnerEpoch states — a marker value of 0
+	// is never a generation.
+	if epoch < 1 {
+		return fmt.Errorf("refusing to set owner-epoch metadata %d on %q: a generation starts at 1", epoch, name)
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	dom, err := c.virt.DomainLookupByName(name)
@@ -86,6 +94,16 @@ func parseOwnerEpochMetadata(name, raw string) (int64, bool, error) {
 	epoch, err := strconv.ParseInt(strings.TrimSpace(el.Value), 10, 64)
 	if err != nil {
 		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: %w", name, err)
+	}
+	// A parseable number is not automatically a generation. Epoch allocation
+	// starts at 1, so 0 is the vms column's "no epoch assigned" sentinel and never
+	// a marker value; a negative is garbage. Returning either as a reading is what
+	// let a zero marker satisfy the dual-run detector's marker/epoch equality test
+	// against a row still at the column default and suppress condition 7 with no
+	// finding. Same hole, same rule, as the host-local file marker in
+	// internal/health.
+	if epoch < 1 {
+		return 0, false, fmt.Errorf("corrupt owner-epoch metadata on %q: epoch %d is not a generation", name, epoch)
 	}
 	return epoch, true, nil
 }

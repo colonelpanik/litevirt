@@ -821,8 +821,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
-	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
-	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
+	// Finish any cutover cleanup a previous process left committed-but-unfinished.
+	// The replacement transition displaced the rows describing what the replaced VM
+	// owned, so its journaled manifest is the only surviving record of the volumes
+	// to free — and nothing else will ever look at it.
+	if err := svc.ResumeVMReplaceCleanups(ctx); err != nil {
+		slog.Warn("cutover: resuming journaled cleanups at startup", "error", err)
+	}
+	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
+	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
 	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
 	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
 	// the fleet can never latch across a node whose generations do not exist yet.

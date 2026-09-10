@@ -21,7 +21,13 @@ import (
 // that drives a real cutover has to say so explicitly.
 func enableVMReplace(s *Server) {
 	s.SetVMReplaceEnforce(true)
-	s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}}
+	// operation_protocol_v1 too: the cleanup manifest lives in the operation
+	// journal, and cutover treats a missing journal as not-active.
+	s.SetOperationProtocol(true)
+	s.gate = fakeServerGate{enforcedTok: map[string]bool{
+		capabilities.VMReplaceV1:         true,
+		capabilities.OperationProtocolV1: true,
+	}}
 }
 
 // A cutover on a cluster that has not latched vm_replace_v1 must refuse, and must
@@ -42,6 +48,15 @@ func TestCutoverRefusedWithoutVMReplaceCapability(t *testing.T) {
 			s.gate = fakeServerGate{enforcedTok: map[string]bool{}}
 		}},
 		{"latched, flag off", func(s *Server) {
+			s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}}
+		}},
+		// The operation journal is a HARD dependency, not an additional safety
+		// check: it is what carries the cleanup manifest across the gap between the
+		// transition and the destruction it makes necessary. Without it a crash in
+		// between leaks the replaced VM's volumes with nothing left in the database
+		// naming them, so a missing journal means cutover is not available at all.
+		{"vm_replace latched, no operation journal", func(s *Server) {
+			s.SetVMReplaceEnforce(true)
 			s.gate = fakeServerGate{enforcedTok: map[string]bool{capabilities.VMReplaceV1: true}}
 		}},
 	} {
@@ -89,7 +104,10 @@ func TestCutoverRefusalNamesTheEnforcementFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("cutover did not refuse")
 	}
-	for _, want := range []string{"enforcement.vm_replace", "vm_replace_v1"} {
+	for _, want := range []string{
+		"enforcement.vm_replace", "vm_replace_v1",
+		"enforcement.operation_protocol", "operation_protocol_v1",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal %q does not mention %q", err, want)
 		}

@@ -151,6 +151,14 @@ const (
 			   updated_at = excluded.updated_at,
 			   deleted_at = excluded.deleted_at`
 
+	// vmReplaceCleanupAuthSQL is the operation_steps insert that authorizes the
+	// destruction — the same shape every other journaled operation appends with,
+	// so it carries no new wire liability of its own. It is named here because the
+	// batch envelope validator requires exactly one of it.
+	vmReplaceCleanupAuthSQL = `INSERT INTO operation_steps
+		     (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
+		     VALUES (?, ?, ?, ?, ?, ?, NULL)`
+
 	// vmReplaceLeaseSQL moves the replacement's IPAM leases onto the new name.
 	// ip_allocations keys on (network, ip), so vm_name is a plain column here and
 	// this shape is shared with the ordinary rename rather than replace-specific.
@@ -211,9 +219,9 @@ func max64(a, b int64) int64 {
 // (or its absence), and the authority this batch writes — so a receiver reaches a
 // single decision for the whole transition instead of gating each statement on
 // its own clock.
-func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name string, a vmReplaceAuthority) *MutationGuard {
+func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name, opID string, a vmReplaceAuthority) *MutationGuard {
 	g := &MutationGuard{
-		Protocol: workloadReplaceGuardV1, ResourceKind: "vm",
+		Protocol: workloadReplaceGuardV1, ResourceKind: "vm", OperationID: opID,
 		ResourceID: source.Name, TargetResourceID: name, HostName: source.HostName,
 		OwnerEpoch: source.OwnerEpoch, SpecGeneration: source.SpecGeneration,
 		CheckSpecGeneration: true,
@@ -239,7 +247,11 @@ func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name string, a vm
 // rows are retired LAST, so the source stays live — and therefore matches the
 // guard — right up to the final statement, exactly as the container owner re-key
 // does.
-func ReplaceVM(ctx context.Context, c *Client, replacement, name string) error {
+// prepared names the PrepareVMReplace operation whose cleanup this batch
+// authorizes. It is not optional: the batch writes that authorization, and a
+// transition that committed without it would displace the manifest's rows with
+// nothing left to say what the replaced VM owned.
+func ReplaceVM(ctx context.Context, c *Client, replacement, name string, prepared VMReplacePrepared) error {
 	source, err := GetVM(ctx, c, replacement)
 	if err != nil {
 		return err
@@ -261,8 +273,15 @@ func ReplaceVM(ctx context.Context, c *Client, replacement, name string) error {
 		return err
 	}
 
+	if prepared.OperationID == "" {
+		return fmt.Errorf("corrosion: VM replace requires a prepared cleanup operation")
+	}
+	if source.OwnerEpoch != prepared.OwnerEpoch {
+		return fmt.Errorf("%w: %q moved to owner epoch %d since its cleanup was journaled at %d",
+			ErrVMReplaceSourceUnsafe, replacement, source.OwnerEpoch, prepared.OwnerEpoch)
+	}
 	authority := vmReplaceAuthorityFor(source, target)
-	guard := vmReplaceMutationGuard(*source, target, name, authority)
+	guard := vmReplaceMutationGuard(*source, target, name, prepared.OperationID, authority)
 	now := c.NowTS()
 
 	stmts, err := vmReplaceStatements(ctx, c, *source, name, authority, guard, now)
@@ -432,6 +451,13 @@ func vmReplaceStatements(
 	stmts = append(stmts, Statement{SQL: vmNICsCreateCleanupSQL, Params: retire, Guard: guard})
 	stmts = append(stmts, Statement{SQL: vmPCIIntentCreateCleanupSQL, Params: retire, Guard: guard})
 	stmts = append(stmts, Statement{SQL: vmPCIRealCreateCleanupSQL, Params: retire, Guard: guard})
+	// The step that AUTHORIZES the destruction, in the same batch as the
+	// transition that makes it necessary. Atomic with it by construction: a
+	// receiver — or a crashed sender's own database — can never hold this step
+	// without the transition, or the transition without this step. A prepared
+	// operation on its own authorizes nothing.
+	stmts = append(stmts, operationStepInsertStatement(
+		guard.OperationID, source.OwnerEpoch, OpStepDesiredPersisted, "", wall, now, guard))
 	stmts = append(stmts, Statement{
 		SQL:    vmDeleteSQL,
 		Params: []interface{}{wall, now, source.Name, source.OwnerEpoch, source.SpecGeneration},
@@ -471,6 +497,7 @@ func getVMRowIncludingDeleted(ctx context.Context, c *Client, name string) (*VMR
 // live (the batch retires it last).
 func workloadReplaceGuardMatches(ctx context.Context, tx *sql.Tx, guard *MutationGuard) (bool, error) {
 	if guard.ResourceKind != "vm" || guard.ResourceID == "" || guard.TargetResourceID == "" ||
+		guard.OperationID == "" ||
 		guard.ResourceID == guard.TargetResourceID || guard.Incarnation == "" ||
 		guard.IdentityHash == "" || !guard.CheckSpecGeneration ||
 		guard.OwnerEpoch < 0 || guard.SpecGeneration < 0 ||
@@ -542,4 +569,152 @@ func workloadReplaceGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mutatio
 	return tgtCreated == guard.Incarnation &&
 		tgtEpoch == guard.NewOwnerEpoch &&
 		tgtGeneration == guard.NewSpecGeneration, nil
+}
+
+// ── the cleanup journal ─────────────────────────────────────────────────────
+//
+// The replacement transition and the destruction of what the replaced VM owned
+// cannot be one commit: the destruction is filesystem and storage-driver work
+// that must follow the transition (a failure before it must destroy nothing),
+// and the transition itself DISPLACES the rows that say what to destroy — the
+// replaced VM's parent row and any child row whose key the replacement claims.
+//
+// So a crash in between would otherwise leak the replaced VM's volumes forever,
+// with nothing left in the database naming them. The journal closes that window:
+//
+//  1. PrepareVMReplace records the manifest while those rows are still intact,
+//     as a PLANNED operation that authorizes nothing.
+//  2. ReplaceVM writes the desired_persisted step in the SAME batch as the
+//     transition, so the authorization cannot be observed without it.
+//  3. The owner frees what the manifest lists, then CompleteVMReplace.
+//
+// A restart resumes from (3) — never from (1) or (2), and never by reading the
+// reused name, which now belongs to the replacement.
+
+// VMReplaceManifest is the immutable record of what the REPLACED VM owned, taken
+// before the transition displaces it. Everything the cleanup needs is here:
+// reading it back is the only supported way to free those resources, because the
+// name they were recorded under now belongs to the replacement.
+type VMReplaceManifest struct {
+	// ReplacedVM is the contested name — whose resources these were, NOT whose
+	// they are now.
+	ReplacedVM string `json:"replaced_vm"`
+	// Replacement is the temporary name the replacement held. The cleanup passes
+	// it as the owning name for the shared-path check, because it owns no live row
+	// afterwards, which makes every live reference count as another VM's.
+	Replacement string `json:"replacement"`
+	HostName    string `json:"host_name"`
+	// FirmwareUUID keys the replaced VM's swtpm tree. Its NVRAM is name-keyed and
+	// so is covered by ReplacedVM.
+	FirmwareUUID string `json:"firmware_uuid,omitempty"`
+	// Disks are the replaced VM's recorded disk rows, driver-dispatched at cleanup
+	// so a non-default-pool volume is freed where it actually lives.
+	Disks []DiskRecord `json:"disks,omitempty"`
+	// Paths are whole-file artifacts keyed by the replaced VM's name (its
+	// cloud-init ISO), which the transition does not describe.
+	Paths []string `json:"paths,omitempty"`
+}
+
+// VMReplacePrepared is the handle PrepareVMReplace returns: the journaled
+// operation whose cleanup the transition must authorize, at the exact owner epoch
+// the manifest was recorded under. ReplaceVM refuses a mismatch rather than
+// authorizing under a different epoch, which would leave the authorization where
+// no resume can find it.
+type VMReplacePrepared struct {
+	OperationID string
+	OwnerEpoch  int64
+}
+
+// VMReplaceCleanup is a committed replace whose destruction has not been
+// recorded as done.
+type VMReplaceCleanup struct {
+	OperationID string
+	OwnerEpoch  int64
+	Manifest    VMReplaceManifest
+}
+
+// vmReplaceMethod names the operation in its deterministic id.
+const vmReplaceMethod = "CutoverVM"
+
+// PrepareVMReplace journals the cleanup manifest as a PLANNED operation and
+// returns its id. It must be called while the replaced VM's rows are still
+// intact — that is the only moment the manifest can be taken.
+//
+// A planned operation authorizes NOTHING. It is safe to leave one behind: the
+// resources it names are still owned by a VM that still exists.
+//
+// The id is deterministic over the replacement's incarnation, so a retry of the
+// same cutover reuses the same operation and the same manifest instead of
+// journaling a second one.
+func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, ownerEpoch int64) (VMReplacePrepared, error) {
+	var none VMReplacePrepared
+	if m.ReplacedVM == "" || m.Replacement == "" || m.HostName == "" {
+		return none, fmt.Errorf("corrosion: incomplete VM replace manifest")
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		return none, err
+	}
+	id := DeterministicOperationID(vmReplaceMethod, m.HostName, "", m.ReplacedVM, m.Replacement)
+	op := OperationRecord{
+		ID: id, Method: vmReplaceMethod, Principal: m.HostName,
+		ResourceKind: "vm", ResourceID: m.ReplacedVM,
+		OperationKind: string(OpVMReplace),
+		// The manifest IS the request: a retry that produced a different one would
+		// be describing different resources, which ClaimOrFindOperation refuses
+		// rather than silently adopting.
+		RequestHash: hashIdentity(string(body)), IdempotencyKey: m.Replacement,
+		ReservationJSON: string(body), DesiredRef: m.ReplacedVM, VMOwnerEpoch: ownerEpoch,
+	}
+	if _, _, err := ClaimOrFindOperation(ctx, c, op); err != nil {
+		return none, err
+	}
+	if err := AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: id, OwnerEpoch: ownerEpoch, StepName: OpStepPlanned,
+	}); err != nil {
+		return none, err
+	}
+	return VMReplacePrepared{OperationID: id, OwnerEpoch: ownerEpoch}, nil
+}
+
+// ListVMReplaceCleanups returns every replace on hostName whose transition
+// COMMITTED and whose cleanup has not been recorded as done — the work a
+// restarted daemon has to finish.
+//
+// A planned-only operation is deliberately excluded: its transition never landed,
+// so the resources its manifest names are still owned by a live VM.
+func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]VMReplaceCleanup, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+operationCols+` FROM operations
+		 WHERE operation_kind = ? AND deleted_at IS NULL ORDER BY created_at`,
+		string(OpVMReplace))
+	if err != nil {
+		return nil, err
+	}
+	var out []VMReplaceCleanup
+	for _, r := range rows {
+		op := scanOperation(r)
+		state, _, sErr := OperationCurrentState(ctx, c, op.ID, op.VMOwnerEpoch, OpVMReplace)
+		if sErr != nil {
+			return nil, sErr
+		}
+		if state != OpStepDesiredPersisted {
+			continue // planned (authorizes nothing) or already terminal
+		}
+		var m VMReplaceManifest
+		if json.Unmarshal([]byte(op.ReservationJSON), &m) != nil || m.HostName != hostName {
+			continue
+		}
+		out = append(out, VMReplaceCleanup{OperationID: op.ID, OwnerEpoch: op.VMOwnerEpoch, Manifest: m})
+	}
+	return out, nil
+}
+
+// CompleteVMReplace records that the cleanup ran. Appended ONLY after it
+// succeeded: the step is what stops a restart from trying again, so writing it
+// early would strand exactly the resources the journal exists to free.
+func CompleteVMReplace(ctx context.Context, c *Client, operationID string, ownerEpoch int64) error {
+	return AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: operationID, OwnerEpoch: ownerEpoch, StepName: OpStepCompleted,
+	})
 }

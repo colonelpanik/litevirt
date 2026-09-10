@@ -265,6 +265,8 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
+	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
 	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
 	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
@@ -817,11 +819,25 @@ func (s *Server) operationProtocolActive(ctx context.Context) bool {
 // with the latch, permits `lv cutover`.
 func (s *Server) SetVMReplaceEnforce(on bool) { s.enfVMReplace = on }
 
-// vmReplaceActive reports whether the guarded replace transition may be emitted:
-// this node opted in AND vm_replace_v1 is enforced cluster-wide. Both halves are
-// required — the flag alone would emit a guard protocol its peers cannot evaluate,
-// and the latch alone would emit one this node's operator never enabled.
+// vmReplaceActive reports whether a cutover may run at all: the operation journal
+// must be active, this node must have opted in, and vm_replace_v1 must be
+// enforced cluster-wide.
+//
+// operation_protocol_v1 is checked FIRST and short-circuits, the same way
+// hardwareV2Latched does, because it is a hard dependency rather than an
+// additional safety check. The replacement transition and the destruction of what
+// the replaced VM owned cannot be one commit, and the journal is what carries the
+// manifest across that gap — without it a crash in between leaks the replaced
+// VM's volumes with nothing left in the database naming them. A missing journal
+// therefore means not-active, whatever vm_replace_v1's own marker says.
+//
+// The other two halves are both required for the usual reason: the flag alone
+// would emit a guard protocol this node's peers cannot evaluate, and the latch
+// alone would emit one its own operator never enabled.
 func (s *Server) vmReplaceActive(ctx context.Context) bool {
+	if !s.operationProtocolActive(ctx) {
+		return false
+	}
 	return s.enfVMReplace && s.gate != nil && s.gate.Enforced(ctx, capabilities.VMReplaceV1)
 }
 

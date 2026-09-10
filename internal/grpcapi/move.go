@@ -304,7 +304,7 @@ type cutoverState int
 const (
 	cutoverNoVirt       cutoverState = iota // no libvirt backend (tests) — nothing references dst
 	cutoverRedefined                        // rewrote the disk source src→dst this call (origXML restores src)
-	cutoverAlreadyAtDst                      // the persistent config already pointed the disk at dst
+	cutoverAlreadyAtDst                     // the persistent config already pointed the disk at dst
 )
 
 // planCutover INSPECTS the persistent domain config and decides the cutover WITHOUT
@@ -472,16 +472,22 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 			"vm", vmName, "error", err)
 		return
 	}
-	s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+	// Best-effort by design on this path: the caller globs the default dir next.
+	_ = s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
 }
 
 // deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
 // Split out for cutover, which has to capture the replaced VM's rows before the
 // rekey moves them to its retired name and hands the name itself to the
 // replacement — reading them afterwards returns the REPLACEMENT's disks.
+// It reports the first failure rather than only logging it, because a caller that
+// records the cleanup as DONE must not do so while a volume is still there — the
+// record is what stops a restart from retrying. Skipping a path another VM still
+// references is a success, not a failure.
 func (s *Server) deleteRecordedVMDiskVolumeRecords(
 	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
-) {
+) error {
+	var firstErr error
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {
@@ -494,8 +500,12 @@ func (s *Server) deleteRecordedVMDiskVolumeRecords(
 			slog.Warn("delete: free disk volume",
 				"vm", vmName, "disk", d.DiskName, "path", d.Path,
 				"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool

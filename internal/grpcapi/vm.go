@@ -2746,8 +2746,10 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// replaced VM for nothing. Refusing up front leaves both VMs exactly as they were.
 	if !s.vmReplaceActive(ctx) {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"cutover requires the vm_replace_v1 capability: set enforcement.vm_replace on every "+
-				"node and wait for the cluster-wide latch (lv cluster capabilities). Nothing was changed")
+			"cutover requires the vm_replace_v1 capability and the operation journal "+
+				"(operation_protocol_v1): set enforcement.vm_replace and "+
+				"enforcement.operation_protocol on every node and wait for both cluster-wide "+
+				"latches. Nothing was changed")
 	}
 
 	nextName := req.VmName + "-next"
@@ -2822,11 +2824,11 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 	}
 	if oldVM != nil {
-		// Captured HERE, before any DB write: the re-key moves these rows to the
-		// retired name (tombstoned, so GetVMDisks stops returning them) and hands
-		// req.VmName to the replacement, so reading them afterwards would give
-		// the deleter the REPLACEMENT's disks. On a resumed attempt they are
-		// already tombstoned, which is exactly why they still need freeing.
+		// Captured HERE, before any DB write: the transition DISPLACES the replaced
+		// VM's parent row and every child row whose key the replacement claims, so
+		// reading them afterwards would hand the deleter the REPLACEMENT's disks —
+		// or nothing at all. On a resumed attempt they are already tombstoned,
+		// which is exactly why they still need freeing.
 		if oldVM.HostName == s.hostName {
 			var derr error
 			if resumed {
@@ -2872,14 +2874,39 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 	}
 
+	// Journal what the replaced VM owned, while the rows describing it are still
+	// intact. The transition below displaces them, so this is the last moment the
+	// manifest can be taken — and after it commits, this journal is the ONLY thing
+	// that still knows which volumes belong to a VM whose name now belongs to
+	// something else. A planned operation authorizes nothing; the transition
+	// writes the step that does, in the same batch.
+	manifest := corrosion.VMReplaceManifest{
+		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
+	}
+	if oldVM != nil && oldVM.HostName == s.hostName {
+		manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
+		manifest.Disks = replacedDisks
+		manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
+	}
+	prepared, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: journal the cleanup manifest: %v", err)
+	}
+	if hErr := s.fireCutoverCrashHook("before-commit"); hErr != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: %v", hErr)
+	}
+
 	// Give the -next VM the original name. DeleteVM SOFT-deletes, so the replaced
 	// VM's tombstone still holds vms.name and every child primary key this has to
 	// write. ReplaceVM does it as ONE guarded transition — a single receiver
 	// decision over both VMs' incarnations and authority — which is why it needs
 	// vm_replace_v1 and why that was checked before any of the teardown above.
-	if err := corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName); err != nil {
+	if err := corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared); err != nil {
 		return nil, status.Errorf(codes.Internal, "cutover: give %q the name %q: %v",
 			nextName, req.VmName, err)
+	}
+	if hErr := s.fireCutoverCrashHook("after-commit"); hErr != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: %v", hErr)
 	}
 	// The SURVIVING name, once. A cutover leaves NetBox two things to do — retire
 	// the replaced incarnation's object and mirror the promoted one — but the
@@ -2890,26 +2917,15 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
-	// Only now free what cannot be put back.
-	if oldVM != nil && oldVM.HostName == s.hostName {
-		// Owner = the replacement's FORMER name, which now owns no live row. Passing
-		// req.VmName would make diskPathReferencedByOtherVM read the replacement's own
-		// rows as this VM's and delete a path they share; passing a name that owns
-		// nothing makes every live reference count as another VM's, which is the
-		// conservative direction.
-		//
-		// There is deliberately no images.DeleteVMDisks default-dir sweep here.
-		// That globs "<name>-*.qcow2", which matches the replacement's own flat-
-		// named disks ("<name>-next-*.qcow2") — the sweep would delete the disks
-		// the cutover exists to keep. The recorded rows above are authoritative
-		// and driver-dispatched, and they skip paths another VM still references.
-		s.deleteRecordedVMDiskVolumeRecords(ctx, nextName, replacedDisks)
-		// Wipe the replaced VM's firmware state (its old UUID-keyed swtpm +
-		// name-keyed NVRAM) so cutover doesn't orphan it (G1). This must stay
-		// AHEAD of the NVRAM rename below, which moves the -next vars file into
-		// this same name-keyed path.
-		lv.WipeFirmwareState(s.dataDir, req.VmName, parseFirmwareSpec(oldVM.Spec).UUID)
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
+	// Only now free what cannot be put back, and only from the journal. This must
+	// stay AHEAD of the NVRAM rename below, which moves the -next vars file into
+	// the replaced VM's name-keyed path.
+	if err := s.finishVMReplaceCleanup(ctx, corrosion.VMReplaceCleanup{
+		OperationID: prepared.OperationID, OwnerEpoch: prepared.OwnerEpoch, Manifest: manifest,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cutover: free the replaced VM's resources: %v (the transition is committed; "+
+				"the journaled cleanup will be retried)", err)
 	}
 
 	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here

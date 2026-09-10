@@ -207,7 +207,7 @@ func TestDelayedTombstoneOfTheReplacedVMCannotKillTheReplacement(t *testing.T) {
 	tombstoned := src.DumpStateBytes()
 
 	// The receiver learns the finished cutover first…
-	if err := ReplaceVM(ctx, src, "app-next", "app"); err != nil {
+	if err := ReplaceVM(ctx, src, "app-next", "app", prepareCutover(t, src, "app", "app-next")); err != nil {
 		t.Fatalf("ReplaceVM: %v", err)
 	}
 	if err := dst.MergeStateBytesLWW(src.DumpStateBytes()); err != nil {

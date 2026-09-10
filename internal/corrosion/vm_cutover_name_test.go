@@ -37,9 +37,34 @@ func cutover(t *testing.T, c *Client, replaced, replacement string) {
 	if err := DeleteVM(ctx, c, replaced); err != nil {
 		t.Fatalf("DeleteVM %q: %v", replaced, err)
 	}
-	if err := ReplaceVM(ctx, c, replacement, replaced); err != nil {
+	if err := ReplaceVM(ctx, c, replacement, replaced, prepareCutover(t, c, replaced, replacement)); err != nil {
 		t.Fatalf("ReplaceVM %q → %q: %v", replacement, replaced, err)
 	}
+}
+
+// prepareCutover journals the cleanup manifest the transition has to authorize.
+// A test that skipped it would be exercising a transition production cannot
+// perform: ReplaceVM refuses without one, because committing the transition
+// without the authorization would displace the only record of what the replaced
+// VM owned.
+func prepareCutover(t *testing.T, c *Client, replaced, replacement string) VMReplacePrepared {
+	t.Helper()
+	ctx := context.Background()
+	src, err := GetVM(ctx, c, replacement)
+	if err != nil || src == nil {
+		t.Fatalf("read the replacement %q: %+v err=%v", replacement, src, err)
+	}
+	disks, err := GetDeletedVMDisks(ctx, c, replaced)
+	if err != nil {
+		t.Fatalf("read the replaced VM's disks: %v", err)
+	}
+	prepared, err := PrepareVMReplace(ctx, c, VMReplaceManifest{
+		ReplacedVM: replaced, Replacement: replacement, HostName: src.HostName, Disks: disks,
+	}, src.OwnerEpoch)
+	if err != nil {
+		t.Fatalf("PrepareVMReplace: %v", err)
+	}
+	return prepared
 }
 
 // walEntries returns every mutation the client has logged, oldest first, as
@@ -463,7 +488,7 @@ func TestRenameVMRefusesAnOccupiedTargetKey(t *testing.T) {
 
 			// ReplaceVM resolves the very same collision, by moving that
 			// tombstone aside — this is the case the fix exists for.
-			if err := ReplaceVM(ctx, c, "app-next", "app"); err != nil {
+			if err := ReplaceVM(ctx, c, "app-next", "app", prepareCutover(t, c, "app", "app-next")); err != nil {
 				t.Fatalf("ReplaceVM over a %s collision: %v", tc.table, err)
 			}
 			if vm, err := GetVM(ctx, c, "app"); err != nil || vm == nil {
@@ -481,7 +506,7 @@ func TestReplaceVMRefusesALiveOccupant(t *testing.T) {
 	mustInsertVM(t, c, VMRecord{Name: "app", HostName: "h1", Spec: `{}`, State: "running"}, nil, nil)
 	mustInsertVM(t, c, VMRecord{Name: "app-next", HostName: "h1", Spec: `{}`, State: "running"}, nil, nil)
 	before := vmTableSnapshot(t, c)
-	if err := ReplaceVM(ctx, c, "app-next", "app"); err == nil {
+	if err := ReplaceVM(ctx, c, "app-next", "app", prepareCutover(t, c, "app", "app-next")); err == nil {
 		t.Fatal("ReplaceVM took the name of a live VM")
 	}
 	if after := vmTableSnapshot(t, c); after != before {

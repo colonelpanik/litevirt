@@ -20,6 +20,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,9 @@ func TestFleet_Cutover_RefusedUntilEveryNodeOptsIn(t *testing.T) {
 	gates := gateAll(t, c)
 	owner := c.Nodes[0]
 	seedCutoverPair(t, c, owner)
+	// The operation journal is a hard dependency (it carries the cleanup
+	// manifest), so latch it up front — vm_replace is the variable under test.
+	latchOperationProtocol(t, c, gates)
 
 	// Two of three opt in: no latch, so no cutover anywhere.
 	enableVMReplaceFleet(c, gates, c.Nodes[0], c.Nodes[1])
@@ -131,6 +135,7 @@ func latchedCutoverCluster(t *testing.T, nodes int) (*Cluster, map[string]*healt
 	gates := gateAll(t, c)
 	owner := c.Nodes[0]
 	seedCutoverPair(t, c, owner)
+	latchOperationProtocol(t, c, gates)
 	enableVMReplaceFleet(c, gates)
 	eventually(t, 10*time.Second, "vm_replace_v1 to latch fleet-wide", func() bool {
 		return gates[owner.Name].Enforced(context.Background(), capabilities.VMReplaceV1)
@@ -261,3 +266,70 @@ func TestFleet_Cutover_DeclinesOnAPeerThatRefusedTheDelete(t *testing.T) {
 		t.Fatal("the peer's newer-authority VM was destroyed by a transition it had to decline")
 	}
 }
+
+// A daemon that died after the transition committed must finish the destruction
+// when it comes back, from the journal alone — the rows that said what the
+// replaced VM owned are gone, and the name they were under now belongs to the
+// replacement.
+//
+// This is the multi-node half of the guarantee: the journal is REPLICATED, so the
+// manifest and the step authorizing it reach every peer, and only the owning host
+// acts on them.
+func TestFleet_Cutover_RestartFinishesCommittedCleanup(t *testing.T) {
+	c, _, owner := latchedCutoverCluster(t, 2)
+	ctx := context.Background()
+	peer := c.Nodes[1]
+
+	// Die immediately after the transition commits.
+	owner.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "after-commit" {
+			return errFleetCrash
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(owner).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+
+	// The transition is committed and replicates; the cleanup is still owed.
+	converge(t, c, peer, owner)
+	for _, n := range c.Nodes {
+		vm, err := corrosion.GetVM(ctx, n.DB, "app")
+		if err != nil || vm == nil {
+			t.Fatalf("%s: the committed transition is missing: %+v err=%v", n.Name, vm, err)
+		}
+	}
+	owed, err := corrosion.ListVMReplaceCleanups(ctx, owner.DB, owner.Name)
+	if err != nil {
+		t.Fatalf("ListVMReplaceCleanups: %v", err)
+	}
+	if len(owed) != 1 || owed[0].Manifest.ReplacedVM != "app" {
+		t.Fatalf("committed cleanup awaiting a restart = %+v, want one for the replaced VM", owed)
+	}
+	// The journal reached the peer too, and the peer must NOT act on another
+	// host's cleanup.
+	if peerOwed, pErr := corrosion.ListVMReplaceCleanups(ctx, peer.DB, peer.Name); pErr != nil {
+		t.Fatalf("peer ListVMReplaceCleanups: %v", pErr)
+	} else if len(peerOwed) != 0 {
+		t.Fatalf("the peer claimed another host's cleanup: %+v", peerOwed)
+	}
+
+	// The restart finishes it, and nothing is owed afterwards.
+	owner.Server.SetCutoverCrashHook(nil)
+	if err := owner.Server.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, owner.DB, owner.Name); lErr != nil || len(left) != 0 {
+		t.Fatalf("cleanup is not recorded as done: %+v err=%v", left, lErr)
+	}
+	// The replacement is untouched by any of it.
+	disks, err := corrosion.GetVMDisks(ctx, owner.DB, "app")
+	if err != nil {
+		t.Fatalf("GetVMDisks: %v", err)
+	}
+	if len(disks) != 1 || disks[0].Path != "/disks/app-next-root.qcow2" {
+		t.Fatalf("the name holds %+v, want exactly the replacement's disk", disks)
+	}
+}
+
+var errFleetCrash = errors.New("simulated process exit")

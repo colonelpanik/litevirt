@@ -1863,6 +1863,7 @@ func validateGuardedVMReplaceEntry(stmts []Statement) error {
 		mustStatementFingerprint(vmReplacePCIRealizationSQL): true,
 	}
 	required := map[string]int{
+		mustStatementFingerprint(vmReplaceCleanupAuthSQL):      0,
 		mustStatementFingerprint(vmReplaceLeaseSQL):            0,
 		mustStatementFingerprint(vmInterfacesCreateCleanupSQL): 0,
 		mustStatementFingerprint(vmDisksCreateCleanupSQL):      0,
@@ -2236,6 +2237,19 @@ func validateReplaceStatementBinding(s Statement, sh StmtShape, g *MutationGuard
 	case "ip_allocations":
 		if len(s.Params) != 3 || !bound(coerceString(s.Params[0])) || !bound(coerceString(s.Params[2])) {
 			return invalidf("guarded replace lease transfer is not between the guard's two names")
+		}
+		return nil
+	case "operation_steps":
+		// The step authorizing the cleanup. It has to name the guard's OWN
+		// operation and epoch, or a matched guard would be authorizing destruction
+		// journaled for something else.
+		id, okID := guardedInsertField(sh, s, "operation_id")
+		epoch, okEpoch := guardedInsertField(sh, s, "owner_epoch")
+		step, okStep := guardedInsertField(sh, s, "step_name")
+		if !okID || !okEpoch || !okStep || coerceString(id) != g.OperationID ||
+			coerceString(epoch) != fmt.Sprintf("%d", g.OwnerEpoch) ||
+			coerceString(step) != OpStepDesiredPersisted {
+			return invalidf("guarded replace cleanup authorization does not match mutation guard")
 		}
 		return nil
 	default:

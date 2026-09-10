@@ -286,9 +286,29 @@ a receiver applies all of them or none. The row installed at the contested name 
 delayed tombstone of the replaced VM must read as an older one — and carries authority
 above **both** inputs.
 
+**The cleanup is journaled.** The transition and the destruction of what the replaced VM
+owned cannot be one commit: the destruction is filesystem and storage-driver work that has
+to follow it, and the transition itself displaces the rows describing what to free — the
+replaced VM's parent row, and any child row whose key the replacement claims. A crash in
+between would leak its volumes with nothing left in the database naming them.
+
+So a `vm_replace` operation records an immutable manifest — the replaced VM's disk records,
+its firmware UUID, its cloud-init ISO path — while those rows are still intact, and the
+step that AUTHORIZES the destruction (`desired_persisted`) is written in the same batch as
+the transition. A `planned` operation authorizes nothing, which is what makes a crash before
+the commit safe: the resources it names are still owned by a VM that still exists.
+`completed` is appended only after the destruction has actually run, so a crash in the
+middle leaves work a restart finds and finishes — from the manifest, never by reading the
+reused name, which now belongs to the replacement. Cleanup is idempotent and keeps the
+shared-reference check, so a volume the replacement also uses is skipped rather than freed.
+That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
+
 That is new receiver behaviour, which nothing in the historical ledger can retrofit onto an
 older peer, so it is gated:
 
+- **`enforcement.operation_protocol`** must be active too — the manifest lives in the
+  operation journal. Cutover treats a missing journal as not-available, checked before any
+  side effect.
 - **`enforcement.vm_replace`** (config flag, default false) gates **advertisement** of
   `vm_replace_v1`, so the cluster-wide latch requires config uniformity rather than just a
   uniform build — the same rule as `operation_protocol`.

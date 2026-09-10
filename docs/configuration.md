@@ -246,7 +246,11 @@ enforcement:
                               # is set AND vm_replace_v1 has latched fleet-wide — refusing before it
                               # stops a domain or writes to either VM, so a cluster that has not
                               # opted in gets a cutover that declines rather than one that
-                              # half-applies. Enable fleet-uniformly; the flag is the reversible
+                              # half-applies. Requires enforcement.operation_protocol as well:
+                              # the transition displaces the rows describing what the replaced
+                              # VM owned, so the cleanup manifest is journaled as an operation
+                              # and the step authorizing the destruction is committed with the
+                              # transition. Enable fleet-uniformly; the flag is the reversible
                               # kill switch.
   project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
                               # admission-authority holder instead of deciding from this node's

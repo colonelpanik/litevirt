@@ -54,6 +54,17 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.
+- **A freshly created VM is provable immediately.** The create path assigns its
+  first ownership generation and stamps both runtime markers (libvirt domain
+  metadata and the host-local marker file) before `CreateVM` returns.
+  Previously the row was born at the pre-epoch default and carried no marker
+  until the reconciler's next backfill sweep, so for up to that interval a
+  running VM could not prove which generation it belonged to.
+- **A marker value of `0` is not a generation.** It is treated as corrupt
+  wherever it is read — the marker file and the domain metadata alike — and
+  refused wherever it would be written. One consequence is visible on upgrade:
+  a VM already running with a `0` marker was never provable, and now reports as
+  such rather than passing silently.
 
 ### Time
 - HLC rejects remote timestamps more than **5 minutes ahead** of local wall

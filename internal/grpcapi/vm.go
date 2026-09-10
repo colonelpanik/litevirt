@@ -28,6 +28,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -977,6 +978,25 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			slog.Warn("vm create: could not assign the first owner epoch — the reconciler's "+
 				"backfill remains the backstop",
 				"name", spec.Name, "error", gerr)
+		}
+		// Stamp both runtime markers now, at the epoch just assigned.
+		//
+		// Neither failure is fatal. The row is already at a positive epoch, which is
+		// the precondition convergeOwnerEpochMarker needs, so the reconciler repairs
+		// a missing marker on its next sweep — the state this create would otherwise
+		// have left permanently. That is also why the epoch is assigned BEFORE these
+		// writes and not after: the reverse order fails into marker-present against
+		// an epoch-0 row, which convergence returns early on and never repairs.
+		//
+		// The literal 1 rather than a re-read: GraduateVMOwnerEpoch assigns exactly
+		// that, and a fresh read here would race the backfill for no gain.
+		if merr := s.virt.SetDomainOwnerEpoch(spec.Name, 1, true); merr != nil {
+			slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
+				"name", spec.Name, "error", merr)
+		}
+		if merr := health.WriteVMOwnerEpochMarker(s.dataDir, spec.Name, 1); merr != nil {
+			slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
+				"name", spec.Name, "error", merr)
 		}
 	}
 

@@ -236,6 +236,18 @@ enforcement:
                               # until the deferred operator-run contract (see docs/diagnostics.md).
                               # The flag gates advertisement/opt-in only; it does not revoke an
                               # already-formed latch. Advertised only while on; enable fleet-uniformly.
+  vm_replace: false           # allow `lv cutover` to give a replacement VM the name a replaced VM
+                              # still holds. The replaced VM is soft-deleted, so its tombstone still
+                              # occupies that PRIMARY KEY, and no pre-existing replicated statement
+                              # shape makes the handover safe on a RECEIVER — the batch needs ONE
+                              # receiver decision over both VMs' incarnations and authority, which
+                              # is a guard protocol only an upgraded peer understands. Advertised
+                              # only while this flag is on, and `lv cutover` REFUSES until the flag
+                              # is set AND vm_replace_v1 has latched fleet-wide — refusing before it
+                              # stops a domain or writes to either VM, so a cluster that has not
+                              # opted in gets a cutover that declines rather than one that
+                              # half-applies. Enable fleet-uniformly; the flag is the reversible
+                              # kill switch.
   project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
                               # admission-authority holder instead of deciding from this node's
                               # replica. Admission counts in-flight reservations, but two nodes

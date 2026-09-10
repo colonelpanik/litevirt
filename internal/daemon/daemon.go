@@ -536,6 +536,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
+	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
+	// LATCHED. Durable, not Latched or the config flag, for the same reason as
+	// canonical_registry above: a replace batch already on the wire must not become
+	// unacceptable across a restart, or it stalls that sender's stream forever.
+	d.db.SetVMReplaceAccept(func() bool {
+		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
+	})
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -813,6 +820,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
+	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
 	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND

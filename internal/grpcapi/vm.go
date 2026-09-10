@@ -2737,6 +2737,18 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if req.VmName == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
 	}
+	// FIRST, before a domain is stopped or either VM's rows are touched. Giving the
+	// replacement a name the replaced VM's tombstone still holds is a transition the
+	// pre-existing replicated statement shapes cannot make safe on a receiver, so it
+	// travels under a guard protocol only an upgraded peer can evaluate. Emitting it
+	// to a cluster that has not latched vm_replace_v1 would back-pressure that peer's
+	// stream; running the teardown first and discovering that here would destroy the
+	// replaced VM for nothing. Refusing up front leaves both VMs exactly as they were.
+	if !s.vmReplaceActive(ctx) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover requires the vm_replace_v1 capability: set enforcement.vm_replace on every "+
+				"node and wait for the cluster-wide latch (lv cluster capabilities). Nothing was changed")
+	}
 
 	nextName := req.VmName + "-next"
 	nextVM, err := corrosion.GetVM(ctx, s.db, nextName)
@@ -2795,14 +2807,35 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	oldVM, _ = corrosion.GetVM(ctx, s.db, req.VmName)
 	var retiredName string
 	var replacedDisks []corrosion.DiskRecord
+	// An earlier attempt may have tombstoned the original and then failed the
+	// re-key. GetVM hides a tombstone, so without this the retry would read
+	// oldVM == nil, conclude there is nothing to replace, and skip the cleanup
+	// block entirely — leaving the original's volumes, cloud-init ISO and
+	// UUID-keyed firmware state behind forever while reporting success. The
+	// tombstone is the record that its resources were never freed.
+	resumed := false
+	if oldVM == nil {
+		if tombstoned, tErr := corrosion.GetDeletedVM(ctx, s.db, req.VmName); tErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cutover: look for an interrupted teardown of %q: %v", req.VmName, tErr)
+		} else if tombstoned != nil {
+			oldVM, resumed = tombstoned, true
+		}
+	}
 	if oldVM != nil {
 		// Captured HERE, before any DB write: the re-key moves these rows to the
 		// retired name (tombstoned, so GetVMDisks stops returning them) and hands
 		// req.VmName to the replacement, so reading them afterwards would give
-		// the deleter the REPLACEMENT's disks.
+		// the deleter the REPLACEMENT's disks. On a resumed attempt they are
+		// already tombstoned, which is exactly why they still need freeing.
 		if oldVM.HostName == s.hostName {
 			var derr error
-			if replacedDisks, derr = corrosion.GetVMDisks(ctx, s.db, req.VmName); derr != nil {
+			if resumed {
+				replacedDisks, derr = corrosion.GetDeletedVMDisks(ctx, s.db, req.VmName)
+			} else {
+				replacedDisks, derr = corrosion.GetVMDisks(ctx, s.db, req.VmName)
+			}
+			if derr != nil {
 				return nil, status.Errorf(codes.Internal,
 					"cutover: read the replaced VM's disk records: %v", derr)
 			}
@@ -2811,10 +2844,17 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			s.virt.DestroyDomain(req.VmName)
 		}
 		// The old domain has to go before the -next domain can be redefined under
-		// its name. A plain VM's definition is rebuildable from its row, so this
-		// is not yet a point of no return.
+		// its name, but this must NOT be the destructive undefine: that one always
+		// passes DomainUndefineNvram (libvirt requires either Nvram or KeepNvram to
+		// undefine a UEFI domain), so it would delete the original's per-VM UEFI
+		// vars before the database transition below has committed — and a failure
+		// after that point leaves a Secure-Boot original that cannot start. The
+		// firmware state is freed explicitly, after the transition succeeds.
 		if oldVM.HostName == s.hostName {
-			s.virt.UndefineDomain(req.VmName, false)
+			if uerr := s.virt.UndefineDomainPreservingState(req.VmName); uerr != nil {
+				slog.Warn("cutover: undefine replaced domain (state preserved)",
+					"vm", req.VmName, "error", uerr)
+			}
 		}
 		// The replaced VM's addresses go back BEFORE its row does: the lease
 		// survives the row otherwise, and the sweeper's live-lease veto then
@@ -2826,8 +2866,10 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		// A declined tombstone must abort BEFORE the re-key: proceeding would
 		// leave the replaced VM's row live (a duplicate identity) under a name
 		// the replacement is taking.
-		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
-			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+		if !resumed {
+			if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
+				return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+			}
 		}
 	}
 

@@ -151,6 +151,7 @@ func cutoverNextServer(t *testing.T, vmName, host string) (*Server, *libvirtfake
 			t.Fatalf("write nvram: %v", err)
 		}
 	}
+	enableVMReplace(s)
 	return s, fake, ctx
 }
 
@@ -434,5 +435,5 @@ type fakeBackupStream struct {
 	ctx context.Context
 }
 
-func (f *fakeBackupStream) Context() context.Context  { return f.ctx }
+func (f *fakeBackupStream) Context() context.Context   { return f.ctx }
 func (f *fakeBackupStream) Send(*pb.BackupChunk) error { return nil }

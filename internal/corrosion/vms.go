@@ -408,10 +408,13 @@ func GetVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 	}, nil
 }
 
-// GetDeletedVM returns a soft-deleted VM by name, or nil if no deleted record exists.
+// GetDeletedVM returns a soft-deleted VM by name, or nil if no deleted record
+// exists. It carries the spec because a caller resuming an interrupted teardown
+// needs the tombstone's firmware identity (its UUID) to free the state that
+// teardown left behind — see CutoverVM.
 func GetDeletedVM(ctx context.Context, c *Client, name string) (*VMRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT name, host_name, state FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+		`SELECT name, host_name, state, spec FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
 	if err != nil {
 		return nil, err
 	}
@@ -423,6 +426,7 @@ func GetDeletedVM(ctx context.Context, c *Client, name string) (*VMRecord, error
 		Name:     r.String("name"),
 		HostName: r.String("host_name"),
 		State:    r.String("state"),
+		Spec:     r.String("spec"),
 	}, nil
 }
 
@@ -547,6 +551,44 @@ func SetInterfaceSecurityGroups(ctx context.Context, c *Client, vmName, networkN
 		`UPDATE vm_interfaces SET security_groups = ?, updated_at = ?
 		 WHERE vm_name = ? AND network_name = ? AND deleted_at IS NULL`,
 		sgsJSON, now, vmName, networkName)
+}
+
+// GetDeletedVMDisks returns a VM's SOFT-DELETED disk records. A teardown that
+// tombstoned a VM and then failed before freeing its volumes leaves them
+// recorded only here, and they still have to be freed — GetVMDisks hides them.
+func GetDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path, size_bytes,
+			backing_image, storage_type, storage_volume, target_dev,
+			COALESCE(backing_disk, '') AS backing_disk,
+			COALESCE(bus, '') AS bus,
+			COALESCE(device_kind, 'disk') AS device_kind,
+			COALESCE(delete_with_vm, 1) AS delete_with_vm,
+			COALESCE(controller_model, '') AS controller_model
+		 FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	disks := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		disks[i] = DiskRecord{
+			VMName:          r.String("vm_name"),
+			DiskName:        r.String("disk_name"),
+			HostName:        r.String("host_name"),
+			Path:            r.String("path"),
+			SizeBytes:       r.Int64("size_bytes"),
+			BackingImage:    r.String("backing_image"),
+			StorageType:     r.String("storage_type"),
+			StorageVolume:   r.String("storage_volume"),
+			TargetDev:       r.String("target_dev"),
+			BackingDisk:     r.String("backing_disk"),
+			Bus:             r.String("bus"),
+			DeviceKind:      r.String("device_kind"),
+			DeleteWithVM:    r.Int("delete_with_vm") == 1,
+			ControllerModel: r.String("controller_model"),
+		}
+	}
+	return disks, nil
 }
 
 // GetVMDisks returns all disks for a VM.

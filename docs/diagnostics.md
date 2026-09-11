@@ -303,6 +303,7 @@ same batch as the transition. Its phases are:
 | `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
 | `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
 | `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
+| `stopped` | the replacement's domain is confirmed INACTIVE. libvirt cannot rename a domain, and undefining an **active** one leaves it running as a *transient* domain still holding its UUID — after which defining that UUID under the contested name is refused. **Cutting over a running replacement therefore restarts it**; no libvirt operation moves a live domain to another name. |
 | `redefined` | the replacement's libvirt domain and firmware answer to the new name. The database transition does not do this, and a restart that finished only the destruction would leave a committed cutover with no domain at the name. |
 | `completed` | appended only after **both** later phases have run. |
 
@@ -324,7 +325,10 @@ VM shut off. For the same reason the running intent is taken from the journaled 
 rather than the row: an unfinished handoff looks exactly like a VM that stopped out of
 band, so a reconciler pass would otherwise sync it to `stopped` and erase the start still
 owed. Only an explicit operator stop overrides the manifest, and the reconciler leaves a VM
-with an owed handoff alone in the first place. The firmware file moves only while the temporary name is still the
+with an owed handoff alone in the first place. That marker is never overwritten by failure
+reporting either — it is the only override there is, so replacing it with diagnostic text
+would let the next retry start a VM the operator stopped. A failure goes to the VM's event
+feed and leaves the operation owed in the journal. The firmware file moves only while the temporary name is still the
 replacement's, and the destination definition is derived independently of whether this
 attempt performed that move, so a retry after a failed redefine does not point the VM at a
 vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just

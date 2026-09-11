@@ -862,6 +862,9 @@ type VMReplaceCleanup struct {
 	Manifest    VMReplaceManifest
 	CleanupDone bool
 	RuntimeDone bool
+	// StopDone records that the replacement's domain was confirmed inactive, so a
+	// retry does not re-stop a domain it has already redefined and restarted.
+	StopDone bool
 	// Handoff is the recorded domain definition, present once the runtime phase has
 	// durably journaled it. Empty means it has not been captured yet.
 	Handoff VMReplaceHandoff
@@ -974,6 +977,8 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 				pending.CleanupDone = true
 			case OpStepJournaled:
 				_ = json.Unmarshal([]byte(st.Facts), &pending.Handoff)
+			case OpStepStopped:
+				pending.StopDone = true
 			case OpStepRedefined:
 				pending.RuntimeDone = true
 			}
@@ -993,7 +998,8 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 // resources the journal exists to free, or — for the cleanup phase — let a later
 // resume wipe firmware that by then belongs to the replacement.
 func RecordVMReplacePhase(ctx context.Context, c *Client, operationID string, ownerEpoch int64, step string) error {
-	if step != OpStepConfigApplied && step != OpStepRedefined && step != OpStepCompleted {
+	if step != OpStepConfigApplied && step != OpStepStopped &&
+		step != OpStepRedefined && step != OpStepCompleted {
 		return fmt.Errorf("corrosion: %q is not a VM replace phase", step)
 	}
 	return AppendOperationStep(ctx, c, OperationStepRecord{

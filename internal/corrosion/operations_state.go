@@ -111,6 +111,13 @@ var opHappyPath = map[OperationKind][]string{
 	//                     recorded, before anything undefines it. Without this a
 	//                     transient redefine failure leaves neither name defined and
 	//                     no way to obtain the XML again — the recovery is stuck.
+	//   stopped           the replacement's domain is confirmed INACTIVE. libvirt
+	//                     cannot rename a domain, and undefining an ACTIVE one
+	//                     leaves it running as a TRANSIENT domain still holding its
+	//                     UUID — after which defining that UUID under the new name
+	//                     is refused. So a running replacement is stopped first, and
+	//                     the fact is journaled because the restart that follows is
+	//                     owed even if the process dies here.
 	//   redefined         the replacement's libvirt domain and firmware answer to
 	//                     the new name. The transition alone does not do this, and
 	//                     a restart that only finished the cleanup would leave a
@@ -118,7 +125,10 @@ var opHappyPath = map[OperationKind][]string{
 	//
 	// OpStepCompleted is appended only after BOTH later phases have run, so a crash
 	// anywhere between them leaves work a restart can find and finish.
-	OpVMReplace: {OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied, OpStepJournaled, OpStepRedefined},
+	OpVMReplace: {
+		OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied,
+		OpStepJournaled, OpStepStopped, OpStepRedefined,
+	},
 }
 
 var opTerminalStates = map[string]bool{

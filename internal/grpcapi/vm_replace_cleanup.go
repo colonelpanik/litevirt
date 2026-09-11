@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -27,6 +28,11 @@ import (
 // as opposed to a reconciler's observation of a domain that is shut off because
 // the handoff has not run yet.
 const operatorStopDetail = "operator-stop"
+
+// vmReplaceStopTimeout bounds the graceful shutdown of the replacement before it
+// is forced. The domain is about to be redefined and restarted under the new
+// name, so waiting long buys nothing.
+const vmReplaceStopTimeout = 30 * time.Second
 
 // SetCutoverCrashHook installs a TEST-ONLY seam that fires at each of cutover's
 // crash boundaries and, by returning an error, makes the handler abandon the
@@ -187,7 +193,12 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		// row for the desired runtime state, sees "error", concludes the VM was not
 		// asked to run, and completes the operation with it shut off. Operation
 		// failure and running intent are different facts and cannot share a column.
-		if firmware {
+		// NEVER over an acknowledged operator stop. That marker is the one thing
+		// that overrides the journaled running intent, so replacing it with
+		// diagnostic text makes the next retry start a VM the operator stopped.
+		// The failure is already on the VM's event feed and the operation stays
+		// owed in the journal; the row is not the only place it can be seen.
+		if firmware && desired.StateDetail != operatorStopDetail {
 			if werr := corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, desired.State,
 				"cutover "+step+" failed: "+e.Error()); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
@@ -236,7 +247,25 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		return failed("read the domain at the replacement's name", idErr)
 	}
 
-	// 2. Undefine — only ever the domain this operation recorded.
+	// 2. STOP it, and confirm. libvirt cannot rename a domain, and undefining an
+	// ACTIVE one leaves it running as a TRANSIENT domain that still holds its UUID
+	// — after which defining that UUID under the contested name is refused, so the
+	// whole handoff fails with the replacement left running under its temporary
+	// name. Cutting over a RUNNING replacement therefore restarts it; there is no
+	// libvirt operation that moves a live domain to another name.
+	//
+	// Journaled, because the restart it makes owed has to survive a crash here.
+	if handoff.XML != "" && ownsTemporary && !cl.StopDone {
+		if err := s.stopDomainForHandoff(m.Replacement); err != nil {
+			return failed("stop the replacement's domain", err)
+		}
+		if err := corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
+			corrosion.OpStepStopped); err != nil {
+			return err
+		}
+	}
+
+	// 3. Undefine — only ever the domain this operation recorded.
 	if handoff.XML != "" && ownsTemporary {
 		// KEEP NVRAM/vTPM: the recorded XML carries the stable <uuid>, so the
 		// UUID-keyed swtpm follows automatically and only the name-keyed vars file
@@ -247,7 +276,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		}
 	}
 
-	// 3. Redefine under the contested name, from the recorded definition.
+	// 4. Redefine under the contested name, from the recorded definition.
 	targetIsOurs, _, tErr := s.domainOwnership(m.ReplacedVM, m.ReplacementUUID)
 	if tErr != nil {
 		return failed("read the domain at the contested name", tErr)
@@ -276,7 +305,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		}
 	}
 
-	// 4. The runtime state the DATABASE currently asks for — never the manifest's
+	// 5. The runtime state the cutover asks for — never the manifest's
 	// snapshot. A domain merely existing is not the finished state: a start that
 	// failed on an earlier attempt leaves it defined and shut off, and recording
 	// the phase then would strand a VM the operator asked to be running.
@@ -302,6 +331,44 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	}
 	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
 		return failed("start", e)
+	}
+	return nil
+}
+
+// stopDomainForHandoff brings the replacement's domain to a stop and CONFIRMS it,
+// because an undefine of an active domain silently leaves it running.
+//
+// Graceful first, then forced — the same escalation StopVM uses. A domain that is
+// already inactive is a no-op.
+func (s *Server) stopDomainForHandoff(name string) error {
+	state, err := s.virt.DomainState(name)
+	if err != nil {
+		return err
+	}
+	if state != "running" {
+		return nil
+	}
+	if err := s.virt.ShutdownDomain(name); err != nil {
+		slog.Warn("cutover: graceful shutdown of the replacement failed; forcing",
+			"domain", name, "error", err)
+	} else if s.virt.WaitForShutdown(name, vmReplaceStopTimeout) {
+		return s.confirmDomainInactive(name)
+	}
+	if err := s.virt.DestroyDomain(name); err != nil {
+		return err
+	}
+	return s.confirmDomainInactive(name)
+}
+
+// confirmDomainInactive is the verification the undefine depends on: it must not
+// be inferred from the stop call returning nil.
+func (s *Server) confirmDomainInactive(name string) error {
+	state, err := s.virt.DomainState(name)
+	if err != nil {
+		return err
+	}
+	if state == "running" {
+		return fmt.Errorf("domain %q is still running after being stopped", name)
 	}
 	return nil
 }

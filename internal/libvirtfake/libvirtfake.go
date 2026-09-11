@@ -309,10 +309,49 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// libvirt refuses a definition whose UUID is already held by an ACTIVE domain
+	// under a different name. That is exactly what happens after undefining a
+	// RUNNING domain — it survives as a transient one, still holding its UUID — so
+	// a caller that undefines a running VM and then redefines it under a new name
+	// gets a failure here, not a rename. The fake modelled the rename, which hid a
+	// live defect in the cutover handoff.
+	if uuid := domainUUIDFromXML(xmlConfig); uuid != "" {
+		for other, st := range f.domains {
+			if other == name || st != StateRunning {
+				continue
+			}
+			if domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
+				return fmt.Errorf("libvirtfake: domain %q is already active with uuid %s", other, uuid)
+			}
+		}
+	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig
 	f.record("define", name, "")
 	return nil
+}
+
+// liveXMLLocked is the live view of a domain, caller holds f.mu.
+func (f *Fake) liveXMLLocked(name string) string {
+	if x, ok := f.activeXML[name]; ok {
+		return x
+	}
+	return f.xml[name]
+}
+
+// domainUUIDFromXML extracts <uuid>…</uuid>.
+func domainUUIDFromXML(xmlConfig string) string {
+	const open, close = "<uuid>", "</uuid>"
+	i := strings.Index(xmlConfig, open)
+	if i < 0 {
+		return ""
+	}
+	rest := xmlConfig[i+len(open):]
+	j := strings.Index(rest, close)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
 }
 
 func (f *Fake) StartDomain(name string) error {
@@ -404,6 +443,18 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// An ACTIVE domain survives an undefine as a TRANSIENT one: it keeps running,
+	// keeps its UUID, and loses only its persistent definition. Deleting it
+	// outright — as this fake used to — is what made the cutover handoff look like
+	// it could undefine a running replacement and redefine it under a new name.
+	if f.domains[name] == StateRunning {
+		if _, ok := f.activeXML[name]; !ok {
+			f.activeXML[name] = f.xml[name]
+		}
+		delete(f.xml, name)
+		f.record("undefine", name, "keep_state=true transient=true")
+		return nil
+	}
 	delete(f.domains, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)

@@ -930,3 +930,128 @@ func TestCutoverRecoveryReloadsPhasesUnderTheLock(t *testing.T) {
 		t.Fatal("the second pass repeated the destruction and wiped the installed firmware")
 	}
 }
+
+// A RUNNING replacement has to be stopped before its domain is undefined.
+//
+// libvirt cannot rename a domain, and undefining an ACTIVE one leaves it running
+// as a TRANSIENT domain still holding its UUID — after which defining that UUID
+// under the contested name is refused. The whole handoff then fails with the
+// replacement left running under its temporary name, which is how cutover of a
+// running VM never worked.
+func TestCutoverStopsARunningReplacementBeforeUndefining(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+	// Actually running, which is what the fixture's row already claims.
+	if err := s.virt.StartDomain("app-next"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cutover of a running replacement: %v", err)
+	}
+
+	// The domain answers to the contested name, and to nothing else.
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Fatalf("no domain at the contested name: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app-next"); err == nil {
+		t.Error("the replacement is still defined under its temporary name")
+	}
+	if st, _ := s.virt.DomainState("app-next"); st == "running" {
+		t.Error("the replacement is still RUNNING under its temporary name — it was undefined while active")
+	}
+	// And it is running again, under the new name.
+	if st, _ := s.virt.DomainState("app"); st != "running" {
+		t.Errorf("the VM is %q at the contested name, want running", st)
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("the operation did not finish: %+v", left)
+	}
+}
+
+// The stop is journaled, so a crash after it does not lose the restart it owes.
+func TestCutoverRestart_ResumesAfterTheReplacementWasStopped(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+	if err := s.virt.StartDomain("app-next"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail the redefine once, which lands after the stop has been journaled.
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the redefine failure must not report success")
+	}
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+	owed := pendingCleanups(t, s)
+	if len(owed) != 1 || !owed[0].StopDone {
+		t.Fatalf("the stop was not journaled: %+v", owed)
+	}
+
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st != "running" {
+		t.Errorf("the VM is %q after recovery, want running", st)
+	}
+}
+
+// An acknowledged operator stop must survive a handoff failure. It is the only
+// thing that overrides the journaled running intent, so overwriting it with
+// diagnostic text makes the next retry start a VM the operator stopped.
+func TestCutoverFailureDoesNotEraseAnOperatorStop(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	// The operator stops the VM while the handoff is owed, and the next attempt's
+	// read fails.
+	s.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-runtime" {
+			if err := s.db.Execute(ctx,
+				`UPDATE vms SET state = 'stopped', state_detail = 'operator-stop', updated_at = ? WHERE name = ?`,
+				s.db.NowTS(), "app"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	})
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the redefine failure must not report success")
+	}
+	s.SetCutoverCrashHook(nil)
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+
+	vm, err := corrosion.GetVM(ctx, s.db, "app")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %+v err=%v", vm, err)
+	}
+	if vm.StateDetail != operatorStopDetail {
+		t.Fatalf("state_detail = %q, want the operator stop preserved", vm.StateDetail)
+	}
+
+	// And the healthy retry must respect it.
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st == "running" {
+		t.Fatal("recovery started a VM the operator had stopped")
+	}
+	if vm, _ := corrosion.GetVM(ctx, s.db, "app"); vm == nil || vm.State != "stopped" {
+		t.Fatalf("the database no longer records the stop: %+v", vm)
+	}
+}

@@ -155,6 +155,10 @@ row installed at the name keeps the REPLACEMENT's `created_at` and carries autho
 above both VMs, which is what stops a lagging peer's pre-delete copy of the replaced VM
 from reappearing on top of it.
 
+A cutover of a RUNNING replacement restarts it. libvirt has no operation that moves a
+live domain to another name, so the replacement is stopped, redefined under the new name
+and started again — the cutover's journal makes that restart survive an interruption.
+
 That needs receiver behaviour an older peer does not have, so cutover **refuses** until
 `enforcement.vm_replace` is set on every node and `vm_replace_v1` has latched — refusing
 before it stops a domain or writes to either VM. See docs/diagnostics.md.

@@ -1055,3 +1055,88 @@ func TestCutoverFailureDoesNotEraseAnOperatorStop(t *testing.T) {
 		t.Fatalf("the database no longer records the stop: %+v", vm)
 	}
 }
+
+// A PAUSED replacement is ACTIVE. The coarse state query cannot see the
+// difference — it collapses paused, shut-off and pm-suspended all into
+// "stopped" — so inferring inactivity from it undefines an active domain, which
+// survives as a transient one holding its UUID and makes the new definition fail
+// after the original has already been cleaned up.
+func TestCutoverStopsAPausedReplacementBeforeUndefining(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+	if err := fake.StartDomain("app-next"); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetPaused("app-next")
+	// The trap: the coarse view reports it as stopped.
+	if st, _ := s.virt.DomainState("app-next"); st == "running" {
+		t.Fatal("fixture: the paused domain must not report as running")
+	}
+	if active, err := s.virt.DomainIsActive("app-next"); err != nil || !active {
+		t.Fatalf("fixture: the paused domain must be ACTIVE: active=%v err=%v", active, err)
+	}
+
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cutover of a paused replacement: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Fatalf("no domain at the contested name: %v", err)
+	}
+	if active, _ := s.virt.DomainIsActive("app-next"); active {
+		t.Error("the replacement is still active under its temporary name")
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("the operation did not finish: %+v", left)
+	}
+}
+
+// A recorded stop is a statement about the PAST. Between it and the undefine the
+// domain can be started again by hand — or by libvirt's own autostart after a
+// host reboot — so activity is re-checked before every undefine, including on a
+// retry that already has the phase recorded.
+func TestCutoverRestart_RechecksActivityEvenWithTheStopRecorded(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+	fake := s.virt.(*libvirtfake.Fake)
+	if err := fake.StartDomain("app-next"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail the redefine once: the stop is journaled, the handoff is not finished.
+	var failedOnce bool
+	fake.FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the redefine failure must not report success")
+	}
+	fake.FailDefineDomain = nil
+	owed := pendingCleanups(t, s)
+	if len(owed) != 1 || !owed[0].StopDone {
+		t.Fatalf("expected one owed operation with the stop recorded: %+v", owed)
+	}
+
+	// Something reactivates the temporary domain before recovery runs. (The
+	// undefine removed its persistent definition but left the live view, so
+	// redefining it is how a host reboot's autostart would leave things.)
+	if err := fake.DefineDomain(`<domain><name>app-next</name><uuid>next-uuid</uuid></domain>`); err == nil {
+		if err := fake.StartDomain("app-next"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Fatalf("recovery did not install the domain at the contested name: %v", err)
+	}
+	if active, _ := s.virt.DomainIsActive("app-next"); active {
+		t.Error("recovery undefined a reactivated domain while it was still active")
+	}
+}

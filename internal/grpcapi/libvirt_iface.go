@@ -36,6 +36,12 @@ type LibvirtBackend interface {
 	// domain (safe for destructive rollback) from a still-active paused /
 	// pm-suspended one (whose disks are attached and must not be touched).
 	DomainStateReason(name string) (libvirt.DomainStatus, error)
+	// DomainIsActive is libvirt's own activity question, which DomainState cannot
+	// answer: that collapses paused, shut-off and pm-suspended to "stopped", and a
+	// PAUSED domain is active. Anything about to undefine a domain must ask this —
+	// undefining an active domain leaves it running as a transient one, still
+	// holding its UUID.
+	DomainIsActive(name string) (bool, error)
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
 	DumpXML(name string) (string, error)

@@ -317,7 +317,7 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	// live defect in the cutover handoff.
 	if uuid := domainUUIDFromXML(xmlConfig); uuid != "" {
 		for other, st := range f.domains {
-			if other == name || st != StateRunning {
+			if other == name || (st != StateRunning && st != StatePaused) {
 				continue
 			}
 			if domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
@@ -447,7 +447,7 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	// keeps its UUID, and loses only its persistent definition. Deleting it
 	// outright — as this fake used to — is what made the cutover handoff look like
 	// it could undefine a running replacement and redefine it under a new name.
-	if f.domains[name] == StateRunning {
+	if st := f.domains[name]; st == StateRunning || st == StatePaused {
 		if _, ok := f.activeXML[name]; !ok {
 			f.activeXML[name] = f.xml[name]
 		}
@@ -462,6 +462,23 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.stats, name)
 	f.record("undefine", name, "keep_state=true")
 	return nil
+}
+
+// DomainIsActive mirrors libvirt's activity question. StateRunning and
+// StatePaused are both ACTIVE; only an undefined or shut-off domain is not.
+func (f *Fake) DomainIsActive(name string) (bool, error) {
+	if f.FailDomainState != nil {
+		if err := f.FailDomainState(name); err != nil {
+			return false, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return false, fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	return st == StateRunning || st == StatePaused, nil
 }
 
 func (f *Fake) DomainState(name string) (string, error) {
@@ -485,6 +502,14 @@ func (f *Fake) DomainState(name string) (string, error) {
 		return "stopped", nil
 	}
 	return string(s), nil
+}
+
+// SetPaused puts a domain into the ACTIVE-but-not-running state, which
+// DomainState cannot distinguish from shut off. Scenario helper.
+func (f *Fake) SetPaused(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.domains[name] = StatePaused
 }
 
 func (f *Fake) DomainExists(name string) bool {

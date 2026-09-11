@@ -255,13 +255,21 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	// libvirt operation that moves a live domain to another name.
 	//
 	// Journaled, because the restart it makes owed has to survive a crash here.
-	if handoff.XML != "" && ownsTemporary && !cl.StopDone {
+	// Checked EVERY time, never skipped because the phase is already recorded. A
+	// recorded stop is a statement about the past: between it and the undefine the
+	// domain can be started again by hand, or by libvirt's own autostart after a
+	// host reboot, and undefining it then hits exactly the conflict this exists to
+	// avoid. So the live activity query is the gate, and the phase record only
+	// keeps the journal honest about what has happened.
+	if handoff.XML != "" && ownsTemporary {
 		if err := s.stopDomainForHandoff(m.Replacement); err != nil {
 			return failed("stop the replacement's domain", err)
 		}
-		if err := corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
-			corrosion.OpStepStopped); err != nil {
-			return err
+		if !cl.StopDone {
+			if err := corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
+				corrosion.OpStepStopped); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -341,13 +349,19 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 // Graceful first, then forced — the same escalation StopVM uses. A domain that is
 // already inactive is a no-op.
 func (s *Server) stopDomainForHandoff(name string) error {
-	state, err := s.virt.DomainState(name)
+	// ACTIVITY, not the coarse state. DomainState collapses paused, shut-off and
+	// pm-suspended into "stopped", and a PAUSED domain is active: undefining it
+	// leaves a transient domain holding the UUID, and the new definition is then
+	// refused — after the original has already been cleaned up.
+	active, err := s.virt.DomainIsActive(name)
 	if err != nil {
 		return err
 	}
-	if state != "running" {
+	if !active {
 		return nil
 	}
+	// Graceful first, then forced — the same escalation StopVM uses. A paused
+	// domain will not answer ACPI, so the force path is the one that ends it.
 	if err := s.virt.ShutdownDomain(name); err != nil {
 		slog.Warn("cutover: graceful shutdown of the replacement failed; forcing",
 			"domain", name, "error", err)
@@ -360,15 +374,16 @@ func (s *Server) stopDomainForHandoff(name string) error {
 	return s.confirmDomainInactive(name)
 }
 
-// confirmDomainInactive is the verification the undefine depends on: it must not
-// be inferred from the stop call returning nil.
+// confirmDomainInactive is the verification the undefine depends on. It must be
+// neither inferred from the stop call returning nil nor read off DomainState,
+// which cannot see the difference between paused and shut off.
 func (s *Server) confirmDomainInactive(name string) error {
-	state, err := s.virt.DomainState(name)
+	active, err := s.virt.DomainIsActive(name)
 	if err != nil {
 		return err
 	}
-	if state == "running" {
-		return fmt.Errorf("domain %q is still running after being stopped", name)
+	if active {
+		return fmt.Errorf("domain %q is still active after being stopped", name)
 	}
 	return nil
 }

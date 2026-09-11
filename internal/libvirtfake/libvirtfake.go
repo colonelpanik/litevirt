@@ -544,7 +544,7 @@ func (f *Fake) synthesizeXMLLocked(name string) (string, error) {
 		return `<domain type='kvm'><name>` + name +
 			`</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu><devices></devices></domain>`, nil
 	}
-	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
+	return "", fmt.Errorf("libvirtfake: domain %q not found", name)
 }
 
 // DumpXMLInactive returns the domain's PERSISTENT (inactive) view — what a cold boot

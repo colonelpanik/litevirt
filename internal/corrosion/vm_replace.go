@@ -1001,6 +1001,26 @@ func RecordVMReplacePhase(ctx context.Context, c *Client, operationID string, ow
 	})
 }
 
+// VMReplaceHandoffPending reports whether vmName on hostName is the contested
+// name of a cutover whose RUNTIME HANDOFF has not finished.
+//
+// The reconciler asks before syncing a VM it finds shut off: an unfinished
+// handoff is precisely a VM whose domain has not been installed under this name
+// yet, so reconciling it to "stopped" would erase the running intent the retry
+// needs and finish the operation with the VM down.
+func VMReplaceHandoffPending(ctx context.Context, c *Client, hostName, vmName string) (bool, error) {
+	pending, err := ListVMReplaceCleanups(ctx, c, hostName)
+	if err != nil {
+		return false, err
+	}
+	for _, p := range pending {
+		if p.Manifest.ReplacedVM == vmName && !p.RuntimeDone {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RecordVMReplaceHandoff durably records the replacement's domain definition, so
 // the runtime phase can be finished after ANY interruption — including one that
 // leaves the domain undefined under both names. It must be called BEFORE the

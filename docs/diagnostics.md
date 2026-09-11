@@ -309,7 +309,9 @@ same batch as the transition. Its phases are:
 A restart resumes whichever phases are outstanding, from the manifest — never by
 re-running the transition, and never by reading the reused name, which now belongs to the
 replacement. Every runtime action checks the **recorded domain UUID** first, including the
-already-done shortcut: the temporary name is free the moment the transition commits, so a
+already-done shortcut, and a read that merely FAILED is neither "ours" nor "absent" — only
+a verified not-found is absence, so a transient libvirt error cannot authorize acting on a
+name whose real occupant is unknown: the temporary name is free the moment the transition commits, so a
 delayed recovery acting by name alone would undefine whatever VM has since taken it. The
 desired runtime state is read from the database at the moment the handoff acts, so an
 operator stop accepted mid-cutover is not undone by replaying a stale snapshot, and the
@@ -318,7 +320,11 @@ both names. A phase is recorded only when its step actually succeeded; a failed 
 start leaves it owed. A firmware VM's failure is surfaced in its `state_detail`,
 never as `state=error` — operation failure and running intent are different facts, and
 overwriting the state made the retry read the row as "not asked to run" and finish with the
-VM shut off. The firmware file moves only while the temporary name is still the
+VM shut off. For the same reason the running intent is taken from the journaled manifest
+rather than the row: an unfinished handoff looks exactly like a VM that stopped out of
+band, so a reconciler pass would otherwise sync it to `stopped` and erase the start still
+owed. Only an explicit operator stop overrides the manifest, and the reconciler leaves a VM
+with an owed handoff alone in the first place. The firmware file moves only while the temporary name is still the
 replacement's, and the destination definition is derived independently of whether this
 attempt performed that move, so a retry after a failed redefine does not point the VM at a
 vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just

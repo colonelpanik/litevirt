@@ -22,6 +22,12 @@ import (
 // taken before the transition and committed with the step that authorizes this,
 // is the only surviving description of what to free.
 
+// operatorStopDetail is the sticky marker StopVM records. It is the one thing
+// that overrides a cutover's journaled running intent: an operator's decision,
+// as opposed to a reconciler's observation of a domain that is shut off because
+// the handoff has not run yet.
+const operatorStopDetail = "operator-stop"
+
 // SetCutoverCrashHook installs a TEST-ONLY seam that fires at each of cutover's
 // crash boundaries and, by returning an error, makes the handler abandon the
 // operation exactly there.
@@ -191,6 +197,10 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	}
 
 	// 1. The definition, durably, before anything undefines it.
+	alreadyAtTarget, _, atErr := s.domainOwnership(m.ReplacedVM, m.ReplacementUUID)
+	if atErr != nil {
+		return failed("read the domain at the contested name", atErr)
+	}
 	handoff := cl.Handoff
 	if handoff.XML == "" {
 		xml, derr := s.virt.DumpXML(m.Replacement)
@@ -200,7 +210,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 			if rErr := corrosion.RecordVMReplaceHandoff(ctx, s.db, cl.OperationID, cl.OwnerEpoch, handoff); rErr != nil {
 				return rErr
 			}
-		case s.domainAtNameIs(m.ReplacedVM, m.ReplacementUUID):
+		case alreadyAtTarget:
 			// Already redefined by an earlier attempt; only the runtime state may
 			// still be owed, which the tail of this function settles.
 		case derr == nil:
@@ -216,12 +226,14 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	// Whether the temporary name is still OURS. A foreign domain there means some
 	// other VM has taken the freed name: neither its definition nor its firmware
 	// may be touched.
-	ownsTemporary := s.domainAtNameIs(m.Replacement, m.ReplacementUUID)
-	foreignAtTemporary := false
-	if !ownsTemporary {
-		if _, err := s.virt.DumpXML(m.Replacement); err == nil {
-			foreignAtTemporary = true
-		}
+	//
+	// A read that FAILED is neither answer. Treating it as "not foreign" is what
+	// let a transient libvirt error authorize moving an unrelated VM's firmware, so
+	// only a verified not-found counts as absence and anything else aborts the
+	// phase for the next attempt.
+	ownsTemporary, foreignAtTemporary, idErr := s.domainOwnership(m.Replacement, m.ReplacementUUID)
+	if idErr != nil {
+		return failed("read the domain at the replacement's name", idErr)
 	}
 
 	// 2. Undefine — only ever the domain this operation recorded.
@@ -236,7 +248,11 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	}
 
 	// 3. Redefine under the contested name, from the recorded definition.
-	if handoff.XML != "" && !s.domainAtNameIs(m.ReplacedVM, m.ReplacementUUID) {
+	targetIsOurs, _, tErr := s.domainOwnership(m.ReplacedVM, m.ReplacementUUID)
+	if tErr != nil {
+		return failed("read the domain at the contested name", tErr)
+	}
+	if handoff.XML != "" && !targetIsOurs {
 		oldNvram := lv.NvramPath(s.dataDir, m.Replacement)
 		newNvram := lv.NvramPath(s.dataDir, m.ReplacedVM)
 		// The destination definition, derived UNCONDITIONALLY — not as a side effect
@@ -264,7 +280,17 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	// snapshot. A domain merely existing is not the finished state: a start that
 	// failed on an earlier attempt leaves it defined and shut off, and recording
 	// the phase then would strand a VM the operator asked to be running.
-	if desired.State != "running" {
+	// The intent comes from the MANIFEST, captured before the teardown, not from
+	// the row. The row's state is observational: a reconciler pass that finds the
+	// domain shut off — which is exactly what an unfinished handoff looks like —
+	// syncs it to "stopped", and reading that back would erase the very start this
+	// phase owes. Only an explicit operator stop overrides the manifest, because
+	// that is a decision rather than an observation.
+	wantRunning := m.ReplacementState == "running"
+	if desired.StateDetail == operatorStopDetail {
+		wantRunning = false
+	}
+	if !wantRunning {
 		return nil
 	}
 	state, sErr := s.virt.DomainState(m.ReplacedVM)
@@ -287,14 +313,26 @@ func (s *Server) domainIdentityMatches(xml, want string) bool {
 	return want != "" && domainUUIDFromXML(xml) == want
 }
 
-// domainAtNameIs reports whether a domain is defined under name AND carries the
-// expected UUID.
-func (s *Server) domainAtNameIs(name, want string) bool {
-	xml, err := s.virt.DumpXML(name)
-	if err != nil {
-		return false
+// domainOwnership reports whether the domain at name is the expected one (ours),
+// whether some OTHER domain answers to that name (foreign), or an error.
+//
+// Three-valued on purpose. A failed read is not "absent" and not "not foreign":
+// collapsing it into either lets a transient libvirt error authorize acting on a
+// name whose real occupant is unknown, which for a reusable name means acting on
+// another VM. Only a verified not-found is absence (false, false, nil).
+func (s *Server) domainOwnership(name, want string) (ours, foreign bool, err error) {
+	xml, dErr := s.virt.DumpXML(name)
+	switch {
+	case dErr == nil:
+		if s.domainIdentityMatches(xml, want) {
+			return true, false, nil
+		}
+		return false, true, nil
+	case lv.IsNotFound(dErr):
+		return false, false, nil
+	default:
+		return false, false, dErr
 	}
-	return s.domainIdentityMatches(xml, want)
 }
 
 // domainUUIDFromXML extracts <uuid>…</uuid> from a domain definition.
@@ -322,7 +360,20 @@ func (s *Server) lockedFinishVMReplace(ctx context.Context, cl corrosion.VMRepla
 		unlock := s.lockVM(n)
 		defer unlock()
 	}
-	return s.finishVMReplaceCleanup(ctx, cl)
+	// RELOAD under the locks. The snapshot that got us here was taken before them,
+	// so another caller holding them may have finished phases in the meantime —
+	// and repeating the destruction phase after the handoff has moved the
+	// replacement's firmware onto the contested name would wipe it.
+	fresh, err := corrosion.ListVMReplaceCleanups(ctx, s.db, s.hostName)
+	if err != nil {
+		return err
+	}
+	for _, f := range fresh {
+		if f.OperationID == cl.OperationID {
+			return s.finishVMReplaceCleanup(ctx, f)
+		}
+	}
+	return nil // finished by whoever held the locks first
 }
 
 // ResumeVMReplaceCleanups finishes the destruction for every cutover on this host

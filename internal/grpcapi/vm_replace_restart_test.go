@@ -808,3 +808,125 @@ func TestCutoverRecoveryTakesTheLifecycleLock(t *testing.T) {
 		t.Errorf("recovery did not finish once it had the lock: %+v", left)
 	}
 }
+
+// A reconciler pass must not erase the start a cutover still owes.
+//
+// An unfinished handoff looks exactly like a VM that is shut off, so the
+// reconciler syncs the row to "stopped" — and recovery reading that row back
+// would conclude the VM was never asked to run and finish the operation with it
+// down. The intent lives in the journaled manifest, and the reconciler leaves an
+// owed handoff alone in the first place.
+func TestCutoverRestart_ReconcilerCannotEraseTheOwedStart(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailStartDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("a start failure must not report success")
+	}
+	s.virt.(*libvirtfake.Fake).FailStartDomain = nil
+
+	// What a reconciler pass does to a VM it finds shut off — no operator stop
+	// involved.
+	pending, err := corrosion.VMReplaceHandoffPending(ctx, s.db, s.hostName, "app")
+	if err != nil {
+		t.Fatalf("VMReplaceHandoffPending: %v", err)
+	}
+	if !pending {
+		t.Fatal("the owed handoff is invisible to the reconciler's check")
+	}
+	// Even if something does sync the row anyway, the intent must survive.
+	if err := corrosion.UpdateVMState(ctx, s.db, "app", "stopped", "guest-shutdown"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st != "running" {
+		t.Errorf("the VM is %q after recovery, want running — a reconciler sync erased the owed start", st)
+	}
+}
+
+// A failed identity read is not "not foreign". Treating it as such lets a
+// transient libvirt error authorize moving an unrelated VM's firmware.
+func TestCutoverRestart_IdentityReadFailureDoesNotAuthorizeTheMove(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the redefine failure must not report success")
+	}
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+
+	// Another VM takes the freed name with its own firmware…
+	newNvram := lv.NvramPath(s.dataDir, "app-next")
+	if err := os.WriteFile(newNvram, []byte("the other VM's firmware"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// …and the identity read fails transiently.
+	s.virt.(*libvirtfake.Fake).FailDumpXML = func(name string) error {
+		if name == "app-next" {
+			return errCrash
+		}
+		return nil
+	}
+	if err := s.ResumeVMReplaceCleanups(ctx); err == nil {
+		t.Fatal("recovery proceeded despite being unable to read who holds the temporary name")
+	}
+	body, err := os.ReadFile(newNvram)
+	if err != nil || string(body) != "the other VM's firmware" {
+		t.Fatalf("recovery moved firmware it could not prove was its own: %q err=%v", body, err)
+	}
+	// The operation stays owed for a later attempt.
+	if left := pendingCleanups(t, s); len(left) != 1 {
+		t.Errorf("the aborted phase was recorded anyway: %+v", left)
+	}
+}
+
+// Two recovery passes racing on the same pending snapshot must not both run the
+// destruction phase: the second would repeat a name-keyed wipe after the first
+// has already moved the replacement's firmware onto that name.
+func TestCutoverRecoveryReloadsPhasesUnderTheLock(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+	crashAt(s, "after-commit")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+	s.SetCutoverCrashHook(nil)
+
+	// Both callers hold the SAME stale snapshot, as two overlapping resumes would.
+	stale := pendingCleanups(t, s)
+	if len(stale) != 1 {
+		t.Fatalf("expected one owed operation, got %+v", stale)
+	}
+	if err := s.lockedFinishVMReplace(ctx, stale[0]); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	moved := lv.NvramPath(s.dataDir, "app")
+	if !exists(moved) {
+		t.Fatal("the first pass did not install the replacement's firmware")
+	}
+	if err := s.lockedFinishVMReplace(ctx, stale[0]); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if !exists(moved) {
+		t.Fatal("the second pass repeated the destruction and wiped the installed firmware")
+	}
+}

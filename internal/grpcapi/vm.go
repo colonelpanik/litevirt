@@ -2832,6 +2832,16 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			oldVM, resumed = tombstoned, true
 		}
 	}
+	// The identity the runtime handoff will act on, read BEFORE anything is torn
+	// down — a read failure here has to abort while both VMs are still intact,
+	// because an empty UUID is taken downstream to mean "no local domain to hand
+	// off" and would silently skip the handoff after the original was destroyed.
+	replacementUUID, err := s.replacementDomainUUID(nextVM)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover: read the replacement's domain identity: %v (nothing was changed)", err)
+	}
+
 	// Journalled FIRST, before anything is stopped or written. Two reasons it has
 	// to be here and not after the teardown: the manifest can only be taken while
 	// the replaced VM's rows are intact, and CLAIMING the operation is what detects
@@ -2840,7 +2850,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	manifest := corrosion.VMReplaceManifest{
 		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
 		ReplacementIncarnation: nextVM.CreatedAt,
-		ReplacementUUID:        s.replacementDomainUUID(nextVM),
+		ReplacementUUID:        replacementUUID,
 		ReplacementSpec:        nextVM.Spec,
 		ReplacementState:       nextVM.State,
 	}
@@ -2954,17 +2964,30 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 // reusable by then, so a name match alone proves nothing. The spec is the
 // fallback for a VM whose domain carries no UUID.
 //
-// Empty means there is no local domain to hand off, and the handoff phase
-// becomes a no-op: a cutover of a VM this host does not run has nothing to move.
-func (s *Server) replacementDomainUUID(vm *corrosion.VMRecord) string {
-	if vm.HostName == s.hostName {
-		if xml, err := s.virt.DumpXML(vm.Name); err == nil {
-			if id := domainUUIDFromXML(xml); id != "" {
-				return id
-			}
-		}
+// Empty means there is VERIFIABLY no local domain to hand off, and the handoff
+// phase becomes a no-op: a cutover of a VM this host does not run has nothing to
+// move. A read that merely FAILED is not that, and is returned as an error — a
+// transient libvirt hiccup must not be read as "nothing to do" and let the
+// teardown proceed to destroy the original for a cutover that then defines no
+// domain at all.
+func (s *Server) replacementDomainUUID(vm *corrosion.VMRecord) (string, error) {
+	if vm.HostName != s.hostName {
+		return "", nil
 	}
-	return parseFirmwareSpec(vm.Spec).UUID
+	xml, err := s.virt.DumpXML(vm.Name)
+	switch {
+	case err == nil:
+		if id := domainUUIDFromXML(xml); id != "" {
+			return id, nil
+		}
+		// Defined but reporting no UUID. Real libvirt always assigns one, so fall
+		// back to the spec rather than treating it as absent.
+		return parseFirmwareSpec(vm.Spec).UUID, nil
+	case lv.IsNotFound(err):
+		return "", nil // verifiably absent
+	default:
+		return "", err
+	}
 }
 
 // sortedPair orders two lock names, so a caller taking both always takes them in

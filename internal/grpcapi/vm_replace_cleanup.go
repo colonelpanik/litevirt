@@ -175,9 +175,14 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 			"step", step, "vm", m.ReplacedVM, "error", e, "firmware_vm", firmware)
 		s.recordVMEvent(ctx, m.ReplacedVM, "vm.cutover", "error", step+" failed: "+e.Error())
 		// A firmware VM cannot be healed by a fresh redefine (it would mint new
-		// firmware), so its row is marked errored for an operator to see.
+		// firmware), so the failure is surfaced on its row for an operator to see —
+		// in the DETAIL, keeping the state itself untouched. Writing state=error
+		// here is what made a failed start unrecoverable: the next attempt reads the
+		// row for the desired runtime state, sees "error", concludes the VM was not
+		// asked to run, and completes the operation with it shut off. Operation
+		// failure and running intent are different facts and cannot share a column.
 		if firmware {
-			if werr := corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, "error",
+			if werr := corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, desired.State,
 				"cutover "+step+" failed: "+e.Error()); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
@@ -208,8 +213,19 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		}
 	}
 
+	// Whether the temporary name is still OURS. A foreign domain there means some
+	// other VM has taken the freed name: neither its definition nor its firmware
+	// may be touched.
+	ownsTemporary := s.domainAtNameIs(m.Replacement, m.ReplacementUUID)
+	foreignAtTemporary := false
+	if !ownsTemporary {
+		if _, err := s.virt.DumpXML(m.Replacement); err == nil {
+			foreignAtTemporary = true
+		}
+	}
+
 	// 2. Undefine — only ever the domain this operation recorded.
-	if handoff.XML != "" && s.domainAtNameIs(m.Replacement, m.ReplacementUUID) {
+	if handoff.XML != "" && ownsTemporary {
 		// KEEP NVRAM/vTPM: the recorded XML carries the stable <uuid>, so the
 		// UUID-keyed swtpm follows automatically and only the name-keyed vars file
 		// moves. The undefine MUST precede that rename or the file is pulled out
@@ -221,14 +237,22 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 
 	// 3. Redefine under the contested name, from the recorded definition.
 	if handoff.XML != "" && !s.domainAtNameIs(m.ReplacedVM, m.ReplacementUUID) {
-		xml := replaceDomainName(handoff.XML, m.Replacement, m.ReplacedVM)
 		oldNvram := lv.NvramPath(s.dataDir, m.Replacement)
 		newNvram := lv.NvramPath(s.dataDir, m.ReplacedVM)
-		if _, e := os.Stat(oldNvram); e == nil {
-			if e := os.Rename(oldNvram, newNvram); e == nil {
-				xml = strings.ReplaceAll(xml, oldNvram, newNvram)
-			} else {
-				return failed("nvram rename", e)
+		// The destination definition, derived UNCONDITIONALLY — not as a side effect
+		// of this attempt performing the rename. A retry after a failed redefine
+		// finds the file already moved, skips the rename, and would otherwise define
+		// the VM pointing at a vars file that is no longer there.
+		xml := strings.ReplaceAll(
+			replaceDomainName(handoff.XML, m.Replacement, m.ReplacedVM), oldNvram, newNvram)
+		// The firmware moves only while the temporary name is still ours. It is a
+		// name-keyed path, so a VM that took the freed name owns the file at it now,
+		// and moving it would hand that VM's firmware to the contested name.
+		if !foreignAtTemporary {
+			if _, e := os.Stat(oldNvram); e == nil {
+				if e := os.Rename(oldNvram, newNvram); e != nil {
+					return failed("nvram rename", e)
+				}
 			}
 		}
 		if e := s.virt.DefineDomain(xml); e != nil {
@@ -288,6 +312,19 @@ func domainUUIDFromXML(xml string) string {
 	return strings.TrimSpace(rest[:j])
 }
 
+// lockedFinishVMReplace takes the lifecycle locks the phases require, in name
+// order, and finishes what is owed. Recovery has to serialize with StopVM/StartVM
+// exactly as the handler does: a resumed handoff reads the desired runtime state
+// and then acts on it, and a lifecycle call landing between those is how a VM the
+// operator just stopped gets started again.
+func (s *Server) lockedFinishVMReplace(ctx context.Context, cl corrosion.VMReplaceCleanup) error {
+	for _, n := range sortedPair(cl.Manifest.ReplacedVM, cl.Manifest.Replacement) {
+		unlock := s.lockVM(n)
+		defer unlock()
+	}
+	return s.finishVMReplaceCleanup(ctx, cl)
+}
+
 // ResumeVMReplaceCleanups finishes the destruction for every cutover on this host
 // whose transition COMMITTED and whose cleanup was never recorded as done — the
 // work a daemon that died mid-cutover left behind.
@@ -306,7 +343,7 @@ func (s *Server) ResumeVMReplaceCleanups(ctx context.Context) error {
 		slog.Info("cutover: resuming a committed cleanup left by an interrupted attempt",
 			"replaced_vm", cl.Manifest.ReplacedVM, "operation", cl.OperationID,
 			"disks", len(cl.Manifest.Disks))
-		if cErr := s.finishVMReplaceCleanup(ctx, cl); cErr != nil {
+		if cErr := s.lockedFinishVMReplace(ctx, cl); cErr != nil {
 			slog.Error("cutover: resumed cleanup failed — it stays journaled for the next attempt",
 				"replaced_vm", cl.Manifest.ReplacedVM, "operation", cl.OperationID, "error", cErr)
 			if firstErr == nil {

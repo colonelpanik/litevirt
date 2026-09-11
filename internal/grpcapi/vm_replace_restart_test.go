@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -580,5 +582,229 @@ func TestCutoverDoesNotUndoAnOperatorStop(t *testing.T) {
 	}
 	if vm.State != "stopped" {
 		t.Errorf("database state = %q, want the operator's stop to stand", vm.State)
+	}
+}
+
+// firmwareFixture is restartFixture with a UEFI replacement: its own NVRAM file,
+// a uuid in its spec and in its domain, and a running desired state.
+func firmwareFixture(t *testing.T) (s *Server, original, replacement, nvram string) {
+	t.Helper()
+	s, original, replacement, _ = restartFixture(t)
+	ctx := adminCtx()
+	nvram = lv.NvramPath(s.dataDir, "app-next")
+	if err := os.MkdirAll(filepath.Dir(nvram), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, nvram)
+	if err := s.db.Execute(ctx,
+		`UPDATE vms SET spec = ?, state = 'running', updated_at = ? WHERE name = ?`,
+		`{"name":"app-next","firmware":"uefi","secure_boot":true,"uuid":"next-uuid"}`,
+		s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.DefineDomain(`<domain><name>app-next</name><uuid>next-uuid</uuid>` +
+		`<os><nvram>` + nvram + `</nvram></os></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	return s, original, replacement, nvram
+}
+
+// A firmware VM whose START failed must still be started by the retry. Recording
+// the failure as state=error made the row read as "not asked to run", so recovery
+// completed the operation with the VM shut off — the failure state erased the
+// running intent it needed.
+func TestCutoverRestart_FirmwareStartFailureIsRetried(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailStartDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("a firmware start failure must not report success")
+	}
+	if left := pendingCleanups(t, s); len(left) != 1 {
+		t.Fatalf("the failed start left nothing owed: %+v", left)
+	}
+
+	s.virt.(*libvirtfake.Fake).FailStartDomain = nil
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st != "running" {
+		t.Errorf("the VM is %q after recovery, want running — the failure state erased its intent", st)
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("still owed after a successful resume: %+v", left)
+	}
+}
+
+// A retry after a failed redefine finds the firmware ALREADY moved. The
+// destination definition must be derived regardless, or recovery defines the VM
+// pointing at a vars file that is no longer there.
+func TestCutoverRestart_RedefineRetryPointsAtTheMovedFirmware(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("a firmware redefine failure must not report success")
+	}
+	moved := lv.NvramPath(s.dataDir, "app")
+	if !exists(moved) {
+		t.Skip("the firmware had not moved before the failure; nothing to check")
+	}
+
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	xml, err := s.virt.DumpXML("app")
+	if err != nil {
+		t.Fatalf("resume did not define the VM: %v", err)
+	}
+	if strings.Contains(xml, lv.NvramPath(s.dataDir, "app-next")) {
+		t.Fatalf("the restored definition points at the vars file that already moved:\n%s", xml)
+	}
+	if !strings.Contains(xml, moved) {
+		t.Fatalf("the restored definition does not point at the moved vars file:\n%s", xml)
+	}
+}
+
+// Firmware is name-keyed, so a VM that took the freed temporary name owns the
+// file at that path. Recovery must not move it onto the contested name.
+func TestCutoverRestart_RecoveryWillNotStealAReusedNamesFirmware(t *testing.T) {
+	s, _, _, _ := firmwareFixture(t)
+	ctx := adminCtx()
+
+	// Fail the redefine once. That leaves the definition JOURNALED and the
+	// firmware already moved — the state in which the capture-time identity check
+	// is skipped on the retry, so the firmware move is the only thing standing
+	// between recovery and another VM's vars file.
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the redefine failure must not report success")
+	}
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+	if left := pendingCleanups(t, s); len(left) != 1 || left[0].Handoff.XML == "" {
+		t.Fatalf("the definition was not journaled before the failure: %+v", left)
+	}
+
+	// Another VM takes the freed name, with its own firmware at the same path.
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "app-next", HostName: s.hostName, State: "stopped",
+			Spec: `{"name":"app-next","firmware":"uefi","uuid":"a-different-vm"}`}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	newNvram := lv.NvramPath(s.dataDir, "app-next")
+	if err := os.WriteFile(newNvram, []byte("the other VM's firmware"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.DefineDomain(`<domain><name>app-next</name><uuid>a-different-vm</uuid>` +
+		`<os><nvram>` + newNvram + `</nvram></os></domain>`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Logf("resume reported: %v", err)
+	}
+	body, err := os.ReadFile(newNvram)
+	if err != nil {
+		t.Fatalf("recovery took the other VM's firmware: %v", err)
+	}
+	if string(body) != "the other VM's firmware" {
+		t.Fatalf("the other VM's firmware was replaced: %q", body)
+	}
+}
+
+// A transient failure reading the replacement's identity must abort BEFORE the
+// teardown. Treated as "no domain to hand off", it destroys the original and
+// completes a cutover that defines nothing.
+func TestCutoverAbortsWhenTheReplacementsIdentityCannotBeRead(t *testing.T) {
+	s, original, replacement, _ := restartFixture(t)
+	ctx := adminCtx()
+	// A legacy spec with no uuid, so the spec cannot stand in for the read.
+	s.virt.(*libvirtfake.Fake).FailDumpXML = func(name string) error {
+		if name == "app-next" {
+			return errCrash
+		}
+		return nil
+	}
+
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover proceeded despite being unable to read the replacement's identity")
+	}
+	// Both VMs intact, both disks intact.
+	for _, name := range []string{"app", "app-next"} {
+		if vm, gErr := corrosion.GetVM(ctx, s.db, name); gErr != nil || vm == nil {
+			t.Fatalf("%s after the aborted cutover: %+v err=%v", name, vm, gErr)
+		}
+	}
+	if !exists(original) || !exists(replacement) {
+		t.Fatal("the aborted cutover destroyed a disk")
+	}
+}
+
+// Recovery has to serialize with lifecycle calls exactly as the handler does: a
+// resumed handoff reads the desired runtime state and then acts on it, and a
+// StopVM landing between those is how a VM the operator just stopped is started
+// again. The handler's locking is not enough on its own — recovery runs the same
+// two steps.
+func TestCutoverRecoveryTakesTheLifecycleLock(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+	crashAt(s, "after-commit")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+	s.SetCutoverCrashHook(nil)
+
+	// Hold the contested name's lock, then let recovery run. It must wait.
+	var mu sync.Mutex
+	released := false
+	unlock := s.lockVM("app")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = s.ResumeVMReplaceCleanups(ctx)
+	}()
+	// Give the goroutine a moment to reach the lock, then release it.
+	time.Sleep(150 * time.Millisecond)
+	mu.Lock()
+	released = true
+	mu.Unlock()
+	unlock()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery never finished")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !released {
+		t.Fatal("recovery ran without taking the lifecycle lock")
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("recovery did not finish once it had the lock: %+v", left)
 	}
 }

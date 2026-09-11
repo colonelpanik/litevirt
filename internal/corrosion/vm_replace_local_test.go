@@ -61,7 +61,7 @@ func TestReplaceRetiresTheReplacementsOwnRowsAndLeases(t *testing.T) {
 		nil, []DiskRecord{{VMName: "app-next", DiskName: "root", HostName: "h1", Path: "/disks/new.qcow2", StorageType: "local"}})
 	if err := src.Execute(ctx,
 		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
-		 VALUES ('default', '10.0.0.5', '52:54:00:aa:bb:01', 'app-next', 'vm', 'h1', ?, ?)`,
+		 VALUES ('default', '10.0.0.5', '52:54:00:aa:bb:01', 'app-next', 'vm', '', ?, ?)`,
 		nowRFC3339(), src.NowTS()); err != nil {
 		t.Fatalf("seed the lease: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestReplaceStealsNoReallocatedLease(t *testing.T) {
 	mustInsertVM(t, src, VMRecord{Name: "app-next", HostName: "h1", Spec: `{}`, State: "stopped"}, nil, nil)
 	if err := src.Execute(ctx,
 		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
-		 VALUES ('default', '10.0.0.5', '52:54:00:aa:bb:01', 'app-next', 'vm', 'h1', ?, ?)`,
+		 VALUES ('default', '10.0.0.5', '52:54:00:aa:bb:01', 'app-next', 'vm', '', ?, ?)`,
 		nowRFC3339(), src.NowTS()); err != nil {
 		t.Fatalf("seed the lease: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestReplaceLeaseStatementBindsItsCurrentOwner(t *testing.T) {
 	ctx := context.Background()
 	if err := c.Execute(ctx,
 		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
-		 VALUES ('default', '10.0.0.5', '52:54:00:ff:ff:ff', 'other', 'vm', 'h1', ?, ?)`,
+		 VALUES ('default', '10.0.0.5', '52:54:00:ff:ff:ff', 'other', 'vm', '', ?, ?)`,
 		nowRFC3339(), c.NowTS()); err != nil {
 		t.Fatal(err)
 	}
@@ -271,5 +271,33 @@ func TestReplaceLeaseStatementBindsItsCurrentOwner(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].String("vm_name") != "other" {
 		t.Fatalf("the lease moved despite a different owner: %+v", rows)
+	}
+}
+
+// A container whose name happens to match the replacement must not have its
+// address taken. ip_allocations keys ownership on (owner_kind, owner_host,
+// vm_name) exactly so a VM and a container cannot alias to one lease.
+func TestReplaceLeavesASameNamedContainersLeaseAlone(t *testing.T) {
+	c := testClientVMReplace(t)
+	ctx := context.Background()
+	mustInsertVM(t, c, VMRecord{Name: "app", HostName: "h1", Spec: `{}`, State: "stopped"}, nil, nil)
+	mustInsertVM(t, c, VMRecord{Name: "app-next", HostName: "h1", Spec: `{}`, State: "stopped"}, nil, nil)
+	// A CONTAINER called app-next, on this host, holding an address.
+	if err := c.Execute(ctx,
+		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		 VALUES ('default', '10.0.0.9', '52:54:00:cc:cc:cc', 'app-next', 'ct', 'h1', ?, ?)`,
+		nowRFC3339(), c.NowTS()); err != nil {
+		t.Fatalf("seed the container lease: %v", err)
+	}
+
+	cutover(t, c, "app", "app-next")
+
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, owner_kind FROM ip_allocations WHERE network = 'default' AND ip = '10.0.0.9'`)
+	if err != nil {
+		t.Fatalf("read the lease: %v", err)
+	}
+	if len(rows) != 1 || rows[0].String("vm_name") != "app-next" || rows[0].String("owner_kind") != "ct" {
+		t.Fatalf("a VM cutover moved a same-named CONTAINER's address: %+v", rows)
 	}
 }

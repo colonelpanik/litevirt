@@ -193,7 +193,8 @@ const (
 	// behind. The owner predicate makes such a row unmatchable, and the guard's
 	// lease digest declines the whole transition rather than silently skipping it.
 	vmReplaceLeaseSQL = `UPDATE ip_allocations SET vm_name = ?, updated_at = ?
-		 WHERE network = ? AND ip = ? AND vm_name = ? AND deleted_at IS NULL`
+		 WHERE network = ? AND ip = ? AND vm_name = ?
+		   AND owner_kind = 'vm' AND owner_host = '' AND deleted_at IS NULL`
 
 	vmReplacePCIRealizationSQL = `INSERT INTO vm_pci_realizations
 			 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
@@ -272,7 +273,8 @@ func max64(a, b int64) int64 {
 func vmReplaceLeaseDigest(ctx context.Context, c *Client, replacement, name string) (string, error) {
 	rows, err := c.Query(ctx,
 		`SELECT network, ip, COALESCE(mac, '') AS mac FROM ip_allocations
-		 WHERE vm_name IN (?, ?) AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
+		 WHERE vm_name IN (?, ?) AND owner_kind = 'vm' AND owner_host = ''
+		   AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
 	if err != nil {
 		return "", err
 	}
@@ -288,7 +290,8 @@ func vmReplaceLeaseDigest(ctx context.Context, c *Client, replacement, name stri
 func vmReplaceLeaseDigestInTx(ctx context.Context, tx *sql.Tx, replacement, name string) (string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT network, ip, COALESCE(mac, '') FROM ip_allocations
-		 WHERE vm_name IN (?, ?) AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
+		 WHERE vm_name IN (?, ?) AND owner_kind = 'vm' AND owner_host = ''
+		   AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
 	if err != nil {
 		return "", err
 	}
@@ -595,7 +598,9 @@ func vmReplaceStatements(
 	// bulk-by-vm_name form is dispatched through per-row LWW on a receiver, which
 	// is how a lease ends up still assigned to the name the transition retired.
 	leases, err := c.Query(ctx,
-		`SELECT network, ip FROM ip_allocations WHERE vm_name = ? AND deleted_at IS NULL`, source.Name)
+		`SELECT network, ip FROM ip_allocations
+		 WHERE vm_name = ? AND owner_kind = 'vm' AND owner_host = '' AND deleted_at IS NULL`,
+		source.Name)
 	if err != nil {
 		return nil, err
 	}

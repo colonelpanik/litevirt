@@ -315,12 +315,19 @@ desired runtime state is read from the database at the moment the handoff acts, 
 operator stop accepted mid-cutover is not undone by replaying a stale snapshot, and the
 whole operation — handler and recovery alike — is serialized against lifecycle calls on
 both names. A phase is recorded only when its step actually succeeded; a failed redefine or
-start leaves it owed. The operation's identity includes the replacement's **incarnation**, not just
+start leaves it owed. A firmware VM's failure is surfaced in its `state_detail`,
+never as `state=error` — operation failure and running intent are different facts, and
+overwriting the state made the retry read the row as "not asked to run" and finish with the
+VM shut off. The firmware file moves only while the temporary name is still the
+replacement's, and the destination definition is derived independently of whether this
+attempt performed that move, so a retry after a failed redefine does not point the VM at a
+vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
 the two names: both are reused by the next deployment, and an identity built from names
 alone collides with the previous cutover's header. Destruction exempts **no** VM from the
 shared-reference check, because the temporary name is free and reusable — a VM created
 after a crash can legitimately reference a captured volume. IPAM allocations move by their
-own primary key **and** current owner, and the guard carries a digest of the leases both
+own primary key and their **complete owner tuple** — `(owner_kind, owner_host, vm_name)`,
+which is what stops a same-named container's address being taken by a VM cutover, and the guard carries a digest of the leases both
 names hold: an address the receiver released and reallocated to an unrelated VM declines
 the whole transition rather than being quietly taken.
 

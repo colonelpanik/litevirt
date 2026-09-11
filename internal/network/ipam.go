@@ -187,7 +187,7 @@ func ipLeaseHeldBy(ctx context.Context, db *corrosion.Client, network, ip, owner
 	return len(rows) > 0, nil
 }
 
-// AllocateIP is the VM-owner wrapper (owner_kind='vm', owner_host='').
+// AllocateIP is the VM-owner wrapper (owner_kind='vm', an empty owner_host).
 func AllocateIP(ctx context.Context, db *corrosion.Client, network, subnet, mac, vmName string) (string, error) {
 	return AllocateIPFor(ctx, db, network, subnet, mac, "vm", "", vmName)
 }

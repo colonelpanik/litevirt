@@ -188,7 +188,7 @@ func GetHostNetwork(ctx context.Context, c *Client, hostName, name string) (*Hos
 }
 
 // ListHostNetworks returns the live intent rows, optionally scoped to one host
-// ('' = cluster-wide, ordered per host for the UI).
+// (an empty hostName = cluster-wide, ordered per host for the UI).
 func ListHostNetworks(ctx context.Context, c *Client, hostName string) ([]HostNetworkRecord, error) {
 	sql := hostNetworkSelect + ` WHERE deleted_at IS NULL`
 	var params []interface{}

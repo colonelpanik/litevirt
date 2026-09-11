@@ -155,7 +155,7 @@ func cutoverFixture(t *testing.T) (s *Server, fake *libvirtfake.Fake, originalDi
 			}}); err != nil {
 			t.Fatal(err)
 		}
-		if err := fake.DefineDomain(`<domain><name>` + name + `</name></domain>`); err != nil {
+		if err := fake.DefineDomain(`<domain><name>` + name + `</name><uuid>uuid-` + name + `</uuid></domain>`); err != nil {
 			t.Fatal(err)
 		}
 	}

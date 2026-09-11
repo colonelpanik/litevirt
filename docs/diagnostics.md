@@ -302,16 +302,27 @@ same batch as the transition. Its phases are:
 | `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
 | `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
 | `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
+| `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
 | `redefined` | the replacement's libvirt domain and firmware answer to the new name. The database transition does not do this, and a restart that finished only the destruction would leave a committed cutover with no domain at the name. |
 | `completed` | appended only after **both** later phases have run. |
 
 A restart resumes whichever phases are outstanding, from the manifest — never by
 re-running the transition, and never by reading the reused name, which now belongs to the
-replacement. The operation's identity includes the replacement's **incarnation**, not just
+replacement. Every runtime action checks the **recorded domain UUID** first, including the
+already-done shortcut: the temporary name is free the moment the transition commits, so a
+delayed recovery acting by name alone would undefine whatever VM has since taken it. The
+desired runtime state is read from the database at the moment the handoff acts, so an
+operator stop accepted mid-cutover is not undone by replaying a stale snapshot, and the
+whole operation — handler and recovery alike — is serialized against lifecycle calls on
+both names. A phase is recorded only when its step actually succeeded; a failed redefine or
+start leaves it owed. The operation's identity includes the replacement's **incarnation**, not just
 the two names: both are reused by the next deployment, and an identity built from names
 alone collides with the previous cutover's header. Destruction exempts **no** VM from the
 shared-reference check, because the temporary name is free and reusable — a VM created
-after a crash can legitimately reference a captured volume.
+after a crash can legitimately reference a captured volume. IPAM allocations move by their
+own primary key **and** current owner, and the guard carries a digest of the leases both
+names hold: an address the receiver released and reallocated to an unrelated VM declines
+the whole transition rather than being quietly taken.
 
 That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
 

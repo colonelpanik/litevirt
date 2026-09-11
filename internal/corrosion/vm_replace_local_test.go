@@ -198,3 +198,78 @@ func TestReplaceGuardIsEvaluatedInTheWriteTransaction(t *testing.T) {
 		t.Fatalf("a declined transition authorized destruction: %+v", owed)
 	}
 }
+
+// A delayed cutover must not steal an address the receiver already released and
+// handed to someone else. The key (network, ip) is stable and reusable, so a lease
+// UPDATE keyed on it alone reassigns an unrelated VM's allocation to the contested
+// name — keeping that VM's MAC, which is how it goes unnoticed.
+func TestReplaceStealsNoReallocatedLease(t *testing.T) {
+	src, dst := testClient(t), testClientVMReplace(t)
+	ctx := context.Background()
+	mustInsertVM(t, src, VMRecord{Name: "app", HostName: "h1", Spec: `{}`, State: "stopped"}, nil, nil)
+	mustInsertVM(t, src, VMRecord{Name: "app-next", HostName: "h1", Spec: `{}`, State: "stopped"}, nil, nil)
+	if err := src.Execute(ctx,
+		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		 VALUES ('default', '10.0.0.5', '52:54:00:aa:bb:01', 'app-next', 'vm', 'h1', ?, ?)`,
+		nowRFC3339(), src.NowTS()); err != nil {
+		t.Fatalf("seed the lease: %v", err)
+	}
+	if err := dst.MergeStateBytesLWW(src.DumpStateBytes()); err != nil {
+		t.Fatalf("seed the receiver: %v", err)
+	}
+
+	before := len(walEntries(t, src, "source"))
+	cutover(t, src, "app", "app-next")
+
+	// On the receiver the address was released and reallocated to an unrelated VM.
+	mustInsertVM(t, dst, VMRecord{Name: "other", HostName: "h1", Spec: `{}`, State: "running"}, nil, nil)
+	if err := dst.Execute(ctx,
+		`UPDATE ip_allocations SET vm_name = 'other', mac = '52:54:00:ff:ff:ff', updated_at = ?
+		 WHERE network = 'default' AND ip = '10.0.0.5'`, dst.NowTS()); err != nil {
+		t.Fatalf("reallocate the address: %v", err)
+	}
+
+	if _, err := NewReplicator(dst, "", RelayConfig{}).ApplyRemoteMutations(ctx, replaceWAL(t, src, before)); err != nil {
+		t.Fatalf("apply the replace: %v", err)
+	}
+
+	// The unrelated VM keeps its allocation, MAC and all.
+	rows, err := dst.Query(ctx,
+		`SELECT vm_name, mac FROM ip_allocations WHERE network = 'default' AND ip = '10.0.0.5'`)
+	if err != nil {
+		t.Fatalf("read the lease: %v", err)
+	}
+	if len(rows) != 1 || rows[0].String("vm_name") != "other" || rows[0].String("mac") != "52:54:00:ff:ff:ff" {
+		t.Fatalf("the cutover took a reallocated address: %+v", rows)
+	}
+	// And the disagreement declined the WHOLE transition rather than skipping one
+	// statement: this receiver's view of what these names own is not the sender's.
+	if vm, gErr := GetVM(ctx, dst, "app-next"); gErr != nil || vm == nil {
+		t.Fatalf("the transition applied despite the lease conflict: %+v err=%v", vm, gErr)
+	}
+}
+
+// The innermost layer, on its own: the lease statement binds the CURRENT owner, so
+// even reached outside its guard it cannot move an allocation that has changed
+// hands.
+func TestReplaceLeaseStatementBindsItsCurrentOwner(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	if err := c.Execute(ctx,
+		`INSERT INTO ip_allocations (network, ip, mac, vm_name, owner_kind, owner_host, allocated_at, updated_at)
+		 VALUES ('default', '10.0.0.5', '52:54:00:ff:ff:ff', 'other', 'vm', 'h1', ?, ?)`,
+		nowRFC3339(), c.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	// The shape the batch emits, aimed at an address someone else now holds.
+	if err := c.Execute(ctx, vmReplaceLeaseSQL, "app", c.NowTS(), "default", "10.0.0.5", "app-next"); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows, err := c.Query(ctx, `SELECT vm_name FROM ip_allocations WHERE network='default' AND ip='10.0.0.5'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].String("vm_name") != "other" {
+		t.Fatalf("the lease moved despite a different owner: %+v", rows)
+	}
+}

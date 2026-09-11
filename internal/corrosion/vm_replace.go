@@ -183,11 +183,17 @@ const (
 		     VALUES (?, ?, ?, ?, ?, ?, NULL)`
 
 	// vmReplaceLeaseSQL moves ONE of the replacement's IPAM leases onto the new
-	// name, keyed on the allocation's own primary key. The bulk-by-vm_name form
-	// would be dispatched through per-row LWW on a receiver, which is how a lease
-	// ends up still owned by a name the transition retired.
+	// name, keyed on the allocation's own primary key AND its current owner.
+	//
+	// The bulk-by-vm_name form would be dispatched through per-row LWW on a
+	// receiver, which is how a lease ends up still owned by a name the transition
+	// retired. But keying on (network, ip) alone is worse: a receiver that released
+	// that address and reallocated it to an unrelated VM would have the lease
+	// STOLEN by a delayed cutover — same key, different tenant, its MAC left
+	// behind. The owner predicate makes such a row unmatchable, and the guard's
+	// lease digest declines the whole transition rather than silently skipping it.
 	vmReplaceLeaseSQL = `UPDATE ip_allocations SET vm_name = ?, updated_at = ?
-		 WHERE network = ? AND ip = ? AND deleted_at IS NULL`
+		 WHERE network = ? AND ip = ? AND vm_name = ? AND deleted_at IS NULL`
 
 	vmReplacePCIRealizationSQL = `INSERT INTO vm_pci_realizations
 			 (vm_name, device_id, member_id, host_name, resolved_address, xml_alias, ordinal, updated_at, deleted_at)
@@ -253,12 +259,60 @@ func max64(a, b int64) int64 {
 	return b
 }
 
+// vmReplaceLeaseDigest fingerprints the IPAM allocations held by EITHER name, by
+// key and MAC, so a receiver can tell "the same leases the sender saw" from "that
+// address was released and handed to someone else".
+//
+// Both names, deliberately. The batch moves each allocation from the temporary
+// name to the contested one, so a digest over the source alone changes as the
+// batch applies — and the guard is re-evaluated for every statement in it. Over
+// the union it is INVARIANT across the transition, while an address that left
+// both names (released and reallocated to an unrelated VM, which is the case
+// worth declining for) still drops out of it.
+func vmReplaceLeaseDigest(ctx context.Context, c *Client, replacement, name string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT network, ip, COALESCE(mac, '') AS mac FROM ip_allocations
+		 WHERE vm_name IN (?, ?) AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
+	if err != nil {
+		return "", err
+	}
+	fields := make([]string, 0, len(rows)*3)
+	for _, r := range rows {
+		fields = append(fields, r.String("network"), r.String("ip"), r.String("mac"))
+	}
+	return hashIdentity(fields...), nil
+}
+
+// vmReplaceLeaseDigestInTx is the receiver-side recomputation, inside the apply
+// transaction.
+func vmReplaceLeaseDigestInTx(ctx context.Context, tx *sql.Tx, replacement, name string) (string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT network, ip, COALESCE(mac, '') FROM ip_allocations
+		 WHERE vm_name IN (?, ?) AND deleted_at IS NULL ORDER BY network, ip`, replacement, name)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var fields []string
+	for rows.Next() {
+		var network, ip, mac string
+		if err := rows.Scan(&network, &ip, &mac); err != nil {
+			return "", err
+		}
+		fields = append(fields, network, ip, mac)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return hashIdentity(fields...), nil
+}
+
 // vmReplaceMutationGuard is the ONE predicate every statement in the batch
 // carries. It binds the source's exact incarnation and authority, the target's
 // (or its absence), and the authority this batch writes — so a receiver reaches a
 // single decision for the whole transition instead of gating each statement on
 // its own clock.
-func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name, opID string, a vmReplaceAuthority) *MutationGuard {
+func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name, opID, leaseDigest string, a vmReplaceAuthority) *MutationGuard {
 	g := &MutationGuard{
 		Protocol: workloadReplaceGuardV1, ResourceKind: "vm", OperationID: opID,
 		ResourceID: source.Name, TargetResourceID: name, HostName: source.HostName,
@@ -266,6 +320,7 @@ func vmReplaceMutationGuard(source VMRecord, target *VMRecord, name, opID string
 		CheckSpecGeneration: true,
 		IdentityHash:        vmCreateIdentityHash(source),
 		Incarnation:         source.CreatedAt,
+		LeaseDigest:         leaseDigest,
 		NewOwnerEpoch:       a.epoch, NewSpecGeneration: a.generation,
 	}
 	if target != nil {
@@ -319,8 +374,12 @@ func ReplaceVM(ctx context.Context, c *Client, replacement, name string, prepare
 		return fmt.Errorf("%w: %q moved to owner epoch %d since its cleanup was journaled at %d",
 			ErrVMReplaceSourceUnsafe, replacement, source.OwnerEpoch, prepared.OwnerEpoch)
 	}
+	leaseDigest, err := vmReplaceLeaseDigest(ctx, c, replacement, name)
+	if err != nil {
+		return err
+	}
 	authority := vmReplaceAuthorityFor(source, target)
-	guard := vmReplaceMutationGuard(*source, target, name, prepared.OperationID, authority)
+	guard := vmReplaceMutationGuard(*source, target, name, prepared.OperationID, leaseDigest, authority)
 	now := c.NowTS()
 
 	stmts, err := vmReplaceStatements(ctx, c, *source, name, authority, guard, now)
@@ -543,7 +602,7 @@ func vmReplaceStatements(
 	for _, l := range leases {
 		stmts = append(stmts, Statement{
 			SQL:    vmReplaceLeaseSQL,
-			Params: []interface{}{name, now, l.String("network"), l.String("ip")},
+			Params: []interface{}{name, now, l.String("network"), l.String("ip"), source.Name},
 			Guard:  guard,
 		})
 	}
@@ -669,6 +728,20 @@ func workloadReplaceGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mutatio
 		return false, nil
 	}
 
+	// LEASES. The batch moves each of the replacement's allocations onto the
+	// contested name. If this receiver's set differs — an address released and
+	// reallocated to an unrelated VM is the dangerous case — the transition is
+	// declined WHOLE rather than applied with that statement quietly matching
+	// nothing, because the divergence means the sender and this node disagree about
+	// what the replacement owns.
+	localLeases, err := vmReplaceLeaseDigestInTx(ctx, tx, guard.ResourceID, guard.TargetResourceID)
+	if err != nil {
+		return false, err
+	}
+	if localLeases != guard.LeaseDigest {
+		return false, nil
+	}
+
 	// TARGET. Absent is safe. A tombstone is replaceable only when it is the exact
 	// incarnation and authority the sender bound — a NEWER tombstone, or one from a
 	// different incarnation, is an authority decision this batch must not undo. A
@@ -731,6 +804,12 @@ type VMReplaceManifest struct {
 	// afterwards, which makes every live reference count as another VM's.
 	Replacement string `json:"replacement"`
 	HostName    string `json:"host_name"`
+	// ReplacementUUID is the domain UUID recorded in the replacement's spec. The
+	// runtime handoff acts on libvirt BY NAME, and the temporary name is free and
+	// reusable the moment the transition commits — so every runtime action checks
+	// this first, or a delayed recovery undefines whatever VM happens to hold that
+	// name and installs its identity at the contested one.
+	ReplacementUUID string `json:"replacement_uuid,omitempty"`
 	// ReplacementIncarnation is the replacement's created_at. It is in the
 	// operation's deterministic identity because the NAMES are not unique over
 	// time: a second deployment reuses both of them, and an id built from names
@@ -778,10 +857,22 @@ type VMReplaceCleanup struct {
 	Manifest    VMReplaceManifest
 	CleanupDone bool
 	RuntimeDone bool
+	// Handoff is the recorded domain definition, present once the runtime phase has
+	// durably journaled it. Empty means it has not been captured yet.
+	Handoff VMReplaceHandoff
 }
 
-// Outstanding reports whether either phase still has to run.
+// Outstanding reports whether any phase still has to run.
 func (c VMReplaceCleanup) Outstanding() bool { return !c.CleanupDone || !c.RuntimeDone }
+
+// VMReplaceHandoff is the replacement's exact domain definition, recorded DURABLY
+// before anything undefines it. A redefine that fails transiently otherwise
+// leaves neither name defined and the XML only in a local variable, which no
+// later recovery can recover.
+type VMReplaceHandoff struct {
+	XML  string `json:"xml"`
+	UUID string `json:"uuid"`
+}
 
 // vmReplaceMethod names the operation in its deterministic id.
 const vmReplaceMethod = "CutoverVM"
@@ -876,6 +967,8 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 			switch st.StepName {
 			case OpStepConfigApplied:
 				pending.CleanupDone = true
+			case OpStepJournaled:
+				_ = json.Unmarshal([]byte(st.Facts), &pending.Handoff)
 			case OpStepRedefined:
 				pending.RuntimeDone = true
 			}
@@ -900,5 +993,26 @@ func RecordVMReplacePhase(ctx context.Context, c *Client, operationID string, ow
 	}
 	return AppendOperationStep(ctx, c, OperationStepRecord{
 		OperationID: operationID, OwnerEpoch: ownerEpoch, StepName: step,
+	})
+}
+
+// RecordVMReplaceHandoff durably records the replacement's domain definition, so
+// the runtime phase can be finished after ANY interruption — including one that
+// leaves the domain undefined under both names. It must be called BEFORE the
+// undefine, which is the only point at which the definition is still readable.
+//
+// Re-recording the same definition is a no-op; recording a DIFFERENT one for the
+// same operation is refused, because that would mean a second domain answered to
+// the temporary name.
+func RecordVMReplaceHandoff(
+	ctx context.Context, c *Client, operationID string, ownerEpoch int64, h VMReplaceHandoff,
+) error {
+	body, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	return AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: operationID, OwnerEpoch: ownerEpoch,
+		StepName: OpStepJournaled, Facts: string(body),
 	})
 }

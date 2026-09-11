@@ -5,11 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // A cutover cannot be one commit. The replacement transition is a database write;
@@ -416,5 +418,167 @@ func TestCutoverRestart_BeforeRuntimeFinishesTheHandoff(t *testing.T) {
 	}
 	if left := pendingCleanups(t, s); len(left) != 0 {
 		t.Errorf("the operation is not finished: %+v", left)
+	}
+}
+
+// A transient redefine failure must not strand the operation. Undefining destroys
+// the only copy of the replacement's domain definition, so it is journaled first —
+// otherwise recovery has neither name defined and nothing left to redefine from.
+func TestCutoverRestart_RedefineFailureLeavesTheDefinitionRecoverable(t *testing.T) {
+	s, _, replacement, _ := restartFixture(t)
+	ctx := adminCtx()
+
+	// The redefine fails once, after the undefine has already happened.
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		// A plain VM tolerates a redefine failure (the reconciler rebuilds), so the
+		// call may succeed; either way the definition must survive.
+		t.Logf("cutover reported: %v", err)
+	}
+
+	// Neither name is defined now — the state the journal has to survive.
+	if _, err := s.virt.DumpXML("app"); err == nil {
+		t.Skip("the redefine did not fail; nothing to recover")
+	}
+	// The definition is durably recorded, so recovery can finish.
+	s.virt.(*libvirtfake.Fake).FailDefineDomain = nil
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if _, err := s.virt.DumpXML("app"); err != nil {
+		t.Fatalf("recovery could not obtain the definition it needed: %v", err)
+	}
+	if !exists(replacement) {
+		t.Error("recovery destroyed the replacement's disk")
+	}
+}
+
+// A domain merely existing at the contested name is not the finished state. A
+// start that failed leaves it defined and shut off, and recording the phase then
+// strands a VM the operator asked to be running.
+func TestCutoverRestart_UnstartedVMIsNotComplete(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+	if err := s.db.Execute(ctx, `UPDATE vms SET state = 'running', updated_at = ? WHERE name = ?`,
+		s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+
+	var failedOnce bool
+	s.virt.(*libvirtfake.Fake).FailStartDomain = func(string) error {
+		if failedOnce {
+			return nil
+		}
+		failedOnce = true
+		return errCrash
+	}
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Logf("cutover reported: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st == "running" {
+		t.Skip("the start did not fail; nothing to recover")
+	}
+	// The operation must still be owed, not completed.
+	if left := pendingCleanups(t, s); len(left) != 1 {
+		t.Fatalf("an unstarted VM was recorded as a finished cutover: %+v", left)
+	}
+
+	s.virt.(*libvirtfake.Fake).FailStartDomain = nil
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if st, _ := s.virt.DomainState("app"); st != "running" {
+		t.Errorf("resume left the VM %q, want running", st)
+	}
+	if left := pendingCleanups(t, s); len(left) != 0 {
+		t.Errorf("the operation is still owed after a successful resume: %+v", left)
+	}
+}
+
+// The temporary name is free and reusable the moment the transition commits, so
+// the runtime handoff must act on the recorded IDENTITY, never on the name alone —
+// or a delayed recovery undefines whatever VM now holds it and installs that
+// identity at the contested name.
+func TestCutoverRestart_RecoveryWillNotConsumeAReusedDomain(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+
+	crashAt(s, "before-runtime")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon before the runtime handoff")
+	}
+
+	// Something else takes the freed name — a different VM, a different identity.
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "app-next", HostName: s.hostName, Spec: `{"name":"app-next"}`, State: "stopped"},
+		nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.DefineDomain(
+		`<domain><name>app-next</name><uuid>a-completely-different-vm</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+
+	s.SetCutoverCrashHook(nil)
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	// The other VM's domain is untouched…
+	xml, err := s.virt.DumpXML("app-next")
+	if err != nil {
+		t.Fatalf("recovery consumed a VM that reused the temporary name: %v", err)
+	}
+	if !strings.Contains(xml, "a-completely-different-vm") {
+		t.Fatalf("the domain at the reused name is not the VM that took it: %s", xml)
+	}
+	// …and its identity was not installed at the contested name.
+	if got, dErr := s.virt.DumpXML("app"); dErr == nil && strings.Contains(got, "a-completely-different-vm") {
+		t.Fatal("recovery installed an unrelated VM's identity at the contested name")
+	}
+}
+
+// An operator stop acknowledged while the cutover is in flight must stand. The
+// handoff reads the desired state from the database at the moment it acts, not
+// from the snapshot taken before the transition.
+func TestCutoverDoesNotUndoAnOperatorStop(t *testing.T) {
+	s, _, _, _ := restartFixture(t)
+	ctx := adminCtx()
+	// The replacement is running, so a stale snapshot would start it.
+	if err := s.db.Execute(ctx, `UPDATE vms SET state = 'running', updated_at = ? WHERE name = ?`,
+		s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stop lands after the transition commits, before the handoff.
+	s.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-runtime" {
+			if err := s.db.Execute(ctx,
+				`UPDATE vms SET state = 'stopped', state_detail = 'operator-stop', updated_at = ? WHERE name = ?`,
+				s.db.NowTS(), "app"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	})
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+
+	if st, _ := s.virt.DomainState("app"); st == "running" {
+		t.Fatal("the handoff started a VM the operator had stopped, from a stale snapshot")
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, "app")
+	if err != nil || vm == nil {
+		t.Fatalf("VM after the cutover: %+v err=%v", vm, err)
+	}
+	if vm.State != "stopped" {
+		t.Errorf("database state = %q, want the operator's stop to stand", vm.State)
 	}
 }

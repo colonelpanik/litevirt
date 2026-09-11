@@ -107,6 +107,10 @@ var opHappyPath = map[OperationKind][]string{
 	//                     cleanup phase: past this point the replacement's own
 	//                     firmware has moved onto the contested name, so re-running
 	//                     a name-keyed wipe would destroy the replacement's state.
+	//   journaled         the replacement's exact domain definition is DURABLY
+	//                     recorded, before anything undefines it. Without this a
+	//                     transient redefine failure leaves neither name defined and
+	//                     no way to obtain the XML again — the recovery is stuck.
 	//   redefined         the replacement's libvirt domain and firmware answer to
 	//                     the new name. The transition alone does not do this, and
 	//                     a restart that only finished the cleanup would leave a
@@ -114,7 +118,7 @@ var opHappyPath = map[OperationKind][]string{
 	//
 	// OpStepCompleted is appended only after BOTH later phases have run, so a crash
 	// anywhere between them leaves work a restart can find and finish.
-	OpVMReplace: {OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied, OpStepRedefined},
+	OpVMReplace: {OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied, OpStepJournaled, OpStepRedefined},
 }
 
 var opTerminalStates = map[string]bool{

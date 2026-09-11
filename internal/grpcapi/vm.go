@@ -2753,6 +2753,15 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	}
 
 	nextName := req.VmName + "-next"
+	// Serialize the whole cutover against lifecycle calls on BOTH names. The
+	// manifest captures runtime state and the handoff acts on it, and a StopVM
+	// accepted in between would be silently undone by the handoff starting the VM
+	// from a stale snapshot — leaving the runtime running and the database
+	// recording an operator stop. Locked in name order, since two locks are held.
+	for _, n := range sortedPair(req.VmName, nextName) {
+		unlock := s.lockVM(n)
+		defer unlock()
+	}
 	nextVM, err := corrosion.GetVM(ctx, s.db, nextName)
 	if err != nil || nextVM == nil {
 		return nil, status.Errorf(codes.NotFound, "no pending cutover — VM %q not found", nextName)
@@ -2831,6 +2840,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	manifest := corrosion.VMReplaceManifest{
 		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
 		ReplacementIncarnation: nextVM.CreatedAt,
+		ReplacementUUID:        s.replacementDomainUUID(nextVM),
 		ReplacementSpec:        nextVM.Spec,
 		ReplacementState:       nextVM.State,
 	}
@@ -2935,6 +2945,35 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	slog.Info("cutover complete", "vm", req.VmName, "replaced_from", nextName)
 	s.recordVMEvent(ctx, req.VmName, "vm.cutover", "ok", "from="+nextName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// replacementDomainUUID pins the identity the runtime handoff will act on.
+//
+// It is read from the LIVE domain, because that is the identity libvirt will show
+// when the handoff later looks the name up — and the temporary name is free and
+// reusable by then, so a name match alone proves nothing. The spec is the
+// fallback for a VM whose domain carries no UUID.
+//
+// Empty means there is no local domain to hand off, and the handoff phase
+// becomes a no-op: a cutover of a VM this host does not run has nothing to move.
+func (s *Server) replacementDomainUUID(vm *corrosion.VMRecord) string {
+	if vm.HostName == s.hostName {
+		if xml, err := s.virt.DumpXML(vm.Name); err == nil {
+			if id := domainUUIDFromXML(xml); id != "" {
+				return id
+			}
+		}
+	}
+	return parseFirmwareSpec(vm.Spec).UUID
+}
+
+// sortedPair orders two lock names, so a caller taking both always takes them in
+// the same order.
+func sortedPair(a, b string) [2]string {
+	if a <= b {
+		return [2]string{a, b}
+	}
+	return [2]string{b, a}
 }
 
 // replaceDomainName swaps the domain name in libvirt XML.

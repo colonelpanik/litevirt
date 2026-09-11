@@ -2257,7 +2257,8 @@ func validateReplaceStatementBinding(s Statement, sh StmtShape, g *MutationGuard
 	case "ip_allocations":
 		// One lease, moved onto the contested name by its own primary key.
 		if stmtFingerprint(sh) != mustStatementFingerprint(vmReplaceLeaseSQL) ||
-			len(s.Params) != 4 || coerceString(s.Params[0]) != g.TargetResourceID {
+			len(s.Params) != 5 || coerceString(s.Params[0]) != g.TargetResourceID ||
+			coerceString(s.Params[4]) != g.ResourceID {
 			return invalidf("guarded replace lease transfer does not move one lease onto the guard's target name")
 		}
 		return nil

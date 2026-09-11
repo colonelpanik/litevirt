@@ -68,7 +68,7 @@ func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMRepl
 		if hErr := s.fireCutoverCrashHook("before-runtime"); hErr != nil {
 			return hErr
 		}
-		if err := s.finishVMReplaceRuntime(ctx, cl.Manifest); err != nil {
+		if err := s.finishVMReplaceRuntime(ctx, cl); err != nil {
 			return err
 		}
 		if err := corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
@@ -121,75 +121,171 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 // domain and its name-keyed firmware still answer to the temporary name after the
 // transition commits, and moving them is the other half of a cutover.
 //
-// A restart cannot re-derive its inputs from the database — the replacement's row
-// is tombstoned under its temporary name and the contested name now holds the
-// transitioned record — so they come from the manifest. It is idempotent: a
-// domain already defined under the new name, with no domain left under the
-// temporary one, is the finished state and does nothing.
+// Three things make this harder than "rename the domain":
 //
-// For a Secure-Boot/vTPM VM a failure here is HARD: the reconciler cannot heal a
+//   - The temporary name is FREE the moment the transition commits, so acting on
+//     it by name alone can consume a VM that reused it. Every step checks the
+//     recorded domain UUID first, including the already-done shortcut.
+//   - Undefining destroys the only copy of the definition, so it is journaled
+//     first. A transient redefine failure would otherwise leave neither name
+//     defined and nothing left to redefine from.
+//   - The desired runtime state is read from the DATABASE now, not from the
+//     manifest's pre-transition snapshot. An operator stop acknowledged between
+//     capture and handoff must not be undone by replaying a stale "running".
+//
+// For a Secure-Boot/vTPM VM a failure is HARD: the reconciler cannot heal a
 // firmware VM (a fresh redefine would mint new firmware), so it is reported and
 // leaves the phase unrecorded for the next attempt. For a plain VM the reconciler
 // rebuilds from the row, so a failure is logged and the phase still completes.
-func (s *Server) finishVMReplaceRuntime(ctx context.Context, m corrosion.VMReplaceManifest) error {
+func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMReplaceCleanup) error {
+	m := cl.Manifest
 	if m.HostName != s.hostName {
 		return nil
 	}
+	// The authoritative desired state, and the proof this operation still owns the
+	// name. A different incarnation there means someone else's cutover or recreate
+	// has taken over; touching libvirt for it would be acting on another VM.
+	desired, err := corrosion.GetVM(ctx, s.db, m.ReplacedVM)
+	if err != nil {
+		return err
+	}
+	if desired == nil || desired.CreatedAt != m.ReplacementIncarnation {
+		slog.Warn("cutover: skipping the runtime handoff — the name no longer holds this incarnation",
+			"vm", m.ReplacedVM, "operation", cl.OperationID)
+		return nil
+	}
+
+	// No recorded identity means there was no local domain to move when the
+	// manifest was taken, so there is nothing for this phase to do. It is NOT a
+	// licence to act by name: the temporary name is reusable, and a name match
+	// alone would let a delayed recovery consume whatever VM now holds it.
+	if m.ReplacementUUID == "" {
+		return nil
+	}
 	firmware := usesFirmwareState(m.ReplacementSpec)
+	// EVERY failure here is returned, so the phase stays unrecorded and a restart
+	// retries it. The older behaviour tolerated a plain VM's failure on the grounds
+	// that the reconciler rebuilds from the row — but that predates the journal,
+	// and swallowing it now records the handoff as done: a redefine that failed
+	// leaves neither name defined with the operation closed, and a start that
+	// failed leaves a VM the operator asked to be running shut off for good. The
+	// reconciler is still a backstop; it is no longer the only one.
 	failed := func(step string, e error) error {
 		slog.Error("cutover: runtime handoff step failed",
 			"step", step, "vm", m.ReplacedVM, "error", e, "firmware_vm", firmware)
 		s.recordVMEvent(ctx, m.ReplacedVM, "vm.cutover", "error", step+" failed: "+e.Error())
+		// A firmware VM cannot be healed by a fresh redefine (it would mint new
+		// firmware), so its row is marked errored for an operator to see.
 		if firmware {
 			if werr := corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, "error",
 				"cutover "+step+" failed: "+e.Error()); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
-			return fmt.Errorf("%s: %w", step, e)
 		}
-		return nil // plain VM — the reconciler rebuilds it from its row
+		return fmt.Errorf("%s: %w", step, e)
 	}
 
-	// Libvirt has no rename: dump, undefine, redefine. A domain already at the new
-	// name means this phase has run.
-	xml, derr := s.virt.DumpXML(m.Replacement)
-	if derr != nil {
-		if _, atNew := s.virt.DumpXML(m.ReplacedVM); atNew == nil {
-			return nil // already handed over
-		}
-		return failed("dump XML", derr)
-	}
-	// KEEP NVRAM/vTPM — the dumped XML retains the stable <uuid> so the UUID-keyed
-	// swtpm follows it automatically; only the name-keyed NVRAM file moves. The
-	// undefine MUST succeed before that rename, or the vars file is pulled out from
-	// under a still-defined domain, leaving a dangling <nvram> path (G1).
-	if e := s.virt.UndefineDomainPreservingState(m.Replacement); e != nil {
-		if err := failed("undefine the replacement's domain", e); err != nil {
-			return err
-		}
-	}
-	xml = replaceDomainName(xml, m.Replacement, m.ReplacedVM)
-	oldNvram := lv.NvramPath(s.dataDir, m.Replacement)
-	newNvram := lv.NvramPath(s.dataDir, m.ReplacedVM)
-	if _, e := os.Stat(oldNvram); e == nil {
-		if e := os.Rename(oldNvram, newNvram); e == nil {
-			xml = strings.ReplaceAll(xml, oldNvram, newNvram)
-		} else if err := failed("nvram rename", e); err != nil {
-			return err
+	// 1. The definition, durably, before anything undefines it.
+	handoff := cl.Handoff
+	if handoff.XML == "" {
+		xml, derr := s.virt.DumpXML(m.Replacement)
+		switch {
+		case derr == nil && s.domainIdentityMatches(xml, m.ReplacementUUID):
+			handoff = corrosion.VMReplaceHandoff{XML: xml, UUID: m.ReplacementUUID}
+			if rErr := corrosion.RecordVMReplaceHandoff(ctx, s.db, cl.OperationID, cl.OwnerEpoch, handoff); rErr != nil {
+				return rErr
+			}
+		case s.domainAtNameIs(m.ReplacedVM, m.ReplacementUUID):
+			// Already redefined by an earlier attempt; only the runtime state may
+			// still be owed, which the tail of this function settles.
+		case derr == nil:
+			// A DIFFERENT VM answers to the temporary name. Never undefine it.
+			slog.Warn("cutover: the temporary name holds a different VM — leaving it alone",
+				"name", m.Replacement, "want_uuid", m.ReplacementUUID)
+			return nil
+		default:
+			return failed("dump the replacement's XML", derr)
 		}
 	}
-	if e := s.virt.DefineDomain(xml); e != nil {
-		if err := failed("redefine", e); err != nil {
-			return err
+
+	// 2. Undefine — only ever the domain this operation recorded.
+	if handoff.XML != "" && s.domainAtNameIs(m.Replacement, m.ReplacementUUID) {
+		// KEEP NVRAM/vTPM: the recorded XML carries the stable <uuid>, so the
+		// UUID-keyed swtpm follows automatically and only the name-keyed vars file
+		// moves. The undefine MUST precede that rename or the file is pulled out
+		// from under a still-defined domain, leaving a dangling <nvram> path (G1).
+		if e := s.virt.UndefineDomainPreservingState(m.Replacement); e != nil {
+			return failed("undefine the replacement's domain", e)
 		}
-	} else if m.ReplacementState == "running" {
-		if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
-			if err := failed("start", e); err != nil {
-				return err
+	}
+
+	// 3. Redefine under the contested name, from the recorded definition.
+	if handoff.XML != "" && !s.domainAtNameIs(m.ReplacedVM, m.ReplacementUUID) {
+		xml := replaceDomainName(handoff.XML, m.Replacement, m.ReplacedVM)
+		oldNvram := lv.NvramPath(s.dataDir, m.Replacement)
+		newNvram := lv.NvramPath(s.dataDir, m.ReplacedVM)
+		if _, e := os.Stat(oldNvram); e == nil {
+			if e := os.Rename(oldNvram, newNvram); e == nil {
+				xml = strings.ReplaceAll(xml, oldNvram, newNvram)
+			} else {
+				return failed("nvram rename", e)
 			}
 		}
+		if e := s.virt.DefineDomain(xml); e != nil {
+			return failed("redefine", e)
+		}
+	}
+
+	// 4. The runtime state the DATABASE currently asks for — never the manifest's
+	// snapshot. A domain merely existing is not the finished state: a start that
+	// failed on an earlier attempt leaves it defined and shut off, and recording
+	// the phase then would strand a VM the operator asked to be running.
+	if desired.State != "running" {
+		return nil
+	}
+	state, sErr := s.virt.DomainState(m.ReplacedVM)
+	if sErr != nil {
+		return failed("read the domain state", sErr)
+	}
+	if state == "running" {
+		return nil
+	}
+	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
+		return failed("start", e)
 	}
 	return nil
+}
+
+// domainIdentityMatches reports whether libvirt XML carries the expected UUID. An
+// empty expectation matches nothing: a manifest without a recorded UUID cannot
+// authorize acting on a reusable name.
+func (s *Server) domainIdentityMatches(xml, want string) bool {
+	return want != "" && domainUUIDFromXML(xml) == want
+}
+
+// domainAtNameIs reports whether a domain is defined under name AND carries the
+// expected UUID.
+func (s *Server) domainAtNameIs(name, want string) bool {
+	xml, err := s.virt.DumpXML(name)
+	if err != nil {
+		return false
+	}
+	return s.domainIdentityMatches(xml, want)
+}
+
+// domainUUIDFromXML extracts <uuid>…</uuid> from a domain definition.
+func domainUUIDFromXML(xml string) string {
+	const open, close = "<uuid>", "</uuid>"
+	i := strings.Index(xml, open)
+	if i < 0 {
+		return ""
+	}
+	rest := xml[i+len(open):]
+	j := strings.Index(rest, close)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
 }
 
 // ResumeVMReplaceCleanups finishes the destruction for every cutover on this host

@@ -72,6 +72,12 @@ type MutationGuard struct {
 	TargetSpecGeneration int64  `json:"target_spec_generation,omitempty"`
 	NewOwnerEpoch        int64  `json:"new_owner_epoch,omitempty"`
 	NewSpecGeneration    int64  `json:"new_spec_generation,omitempty"`
+	// LeaseDigest fingerprints the IPAM allocations the replacement holds, by key
+	// AND identity. The batch moves each of them onto the contested name, and a
+	// receiver that released one and reallocated the address to an unrelated VM
+	// must not have it taken: recomputing this digest locally makes that a declined
+	// transition rather than a silently skipped statement.
+	LeaseDigest string `json:"lease_digest,omitempty"`
 }
 
 func vmCreateMutationGuard(opID string, ownerEpoch int64, vm VMRecord, requireOperation bool) (*MutationGuard, error) {

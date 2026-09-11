@@ -24,8 +24,8 @@ func TestTsInstant(t *testing.T) {
 
 func TestTsFutureSkewed(t *testing.T) {
 	now := time.Date(2026, 7, 5, 10, 0, 0, 0, time.UTC)
-	future := now.Add(time.Hour).Format(nowTSLayout)          // > 5min cutoff
-	slightly := now.Add(time.Minute).Format(nowTSLayout)      // within cutoff
+	future := now.Add(time.Hour).Format(nowTSLayout)     // > 5min cutoff
+	slightly := now.Add(time.Minute).Format(nowTSLayout) // within cutoff
 	past := now.Add(-time.Hour).Format(nowTSLayout)
 	if !tsFutureSkewed(future, now) {
 		t.Error("now+1h must be skewed")

@@ -43,6 +43,7 @@ var startDHCPFunc = StartDHCP
 //     so SLAAC-only guests still get a default route.
 //   - dhcp-range still works for stateful DHCPv6 leases.
 //   - Bridges get the gateway address with `ip -6 addr add`, automatic.
+//
 // dnsmasqArgs builds the dnsmasq command line for a per-bridge DHCP+DNS
 // instance. Pure function so the argument set is unit-testable without
 // spawning dnsmasq.

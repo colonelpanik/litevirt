@@ -21,12 +21,12 @@ func (m *mockBackupStream) Send(chunk *pb.BackupChunk) error {
 	m.sent = append(m.sent, chunk)
 	return nil
 }
-func (m *mockBackupStream) Context() context.Context          { return m.ctx }
-func (m *mockBackupStream) SetHeader(_ metadata.MD) error     { return nil }
-func (m *mockBackupStream) SendHeader(_ metadata.MD) error    { return nil }
-func (m *mockBackupStream) SetTrailer(_ metadata.MD)          {}
-func (m *mockBackupStream) SendMsg(_ interface{}) error       { return nil }
-func (m *mockBackupStream) RecvMsg(_ interface{}) error       { return nil }
+func (m *mockBackupStream) Context() context.Context       { return m.ctx }
+func (m *mockBackupStream) SetHeader(_ metadata.MD) error  { return nil }
+func (m *mockBackupStream) SendHeader(_ metadata.MD) error { return nil }
+func (m *mockBackupStream) SetTrailer(_ metadata.MD)       {}
+func (m *mockBackupStream) SendMsg(_ interface{}) error    { return nil }
+func (m *mockBackupStream) RecvMsg(_ interface{}) error    { return nil }
 
 // TestBackupVM_Deprecated verifies the raw full-disk backup RPC is retired —
 // it returns Unimplemented regardless of arguments, directing callers to the

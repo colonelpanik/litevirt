@@ -29,7 +29,7 @@ func TestEngine_ConcurrentReloadAndRead(t *testing.T) {
 		t.Fatalf("SeedBuiltinRoles: %v", err)
 	}
 	if err := corrosion.InsertRoleBinding(ctx, db, corrosion.RoleBindingRecord{
-		ID: "alice-root-admin",
+		ID:   "alice-root-admin",
 		Path: "/", Role: "Admin", Principal: "user:alice@local", Propagate: true,
 	}); err != nil {
 		t.Fatalf("InsertRoleBinding: %v", err)

@@ -212,8 +212,8 @@ func TestScopedNetworkName(t *testing.T) {
 	}{
 		{"mystack", "LAN", "mystack_LAN"},
 		{"prod", "mgmt", "prod_mgmt"},
-		{"", "LAN", "LAN"},           // standalone — no prefix
-		{"s", "n", "s_n"},            // minimal
+		{"", "LAN", "LAN"}, // standalone — no prefix
+		{"s", "n", "s_n"},  // minimal
 	}
 	for _, tt := range tests {
 		got := ScopedNetworkName(tt.stack, tt.net)

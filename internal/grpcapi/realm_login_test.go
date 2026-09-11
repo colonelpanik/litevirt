@@ -28,16 +28,16 @@ import (
 // Mirrors the helper in internal/auth/oidc_test.go but lives here so
 // the gRPC-handler test doesn't have to go cross-package.
 type mockOIDCServer struct {
-	server   *httptest.Server
-	signer   *rsa.PrivateKey
-	keyID    string
-	issuer   string
-	clientID string
+	server       *httptest.Server
+	signer       *rsa.PrivateKey
+	keyID        string
+	issuer       string
+	clientID     string
 	clientSecret string
 	expectedCode string
-	subject  string
-	groups   []string
-	nonce    string // if set, echoed into the id_token's `nonce` claim
+	subject      string
+	groups       []string
+	nonce        string // if set, echoed into the id_token's `nonce` claim
 }
 
 func (m *mockOIDCServer) handleDiscovery(w http.ResponseWriter, _ *http.Request) {
@@ -87,10 +87,10 @@ func (m *mockOIDCServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	claims := map[string]interface{}{
 		"iss": m.issuer, "aud": m.clientID, "sub": m.subject,
-		"email": m.subject + "@example.test",
-		"name":  strings.Title(m.subject),
+		"email":  m.subject + "@example.test",
+		"name":   strings.Title(m.subject),
 		"groups": m.groups,
-		"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		"iat":    now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 	}
 	if m.nonce != "" {
 		claims["nonce"] = m.nonce

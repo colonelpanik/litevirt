@@ -23,10 +23,10 @@ type fakeLiteVirtClient struct {
 	stopVMCtx   context.Context
 
 	clusterHealth *pb.ClusterHealth
-	network    *pb.NetworkInfo
-	pool       *pb.StoragePool
-	lb         *pb.LoadBalancer
-	lbStats    *pb.LBStatsResponse
+	network       *pb.NetworkInfo
+	pool          *pb.StoragePool
+	lb            *pb.LoadBalancer
+	lbStats       *pb.LBStatsResponse
 }
 
 func (f *fakeLiteVirtClient) StopVM(ctx context.Context, _ *pb.StopVMRequest, _ ...grpc.CallOption) (*pb.VM, error) {

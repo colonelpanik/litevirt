@@ -132,7 +132,6 @@ func TestLiveMetrics_TracingOnDeadCollector_Scrape(t *testing.T) {
 		t.Errorf("export_errors_total=%v after failures; want > pre-Setup scrape %v", afterErrs, beforeErrs)
 	}
 
-
 	// 3. dropped_total is unlabeled (logs only — no signal="traces" series).
 	if strings.Contains(body, `litevirt_telemetry_dropped_total{`) {
 		t.Error("dropped_total must be unlabeled (logs only); found labeled series")

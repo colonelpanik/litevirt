@@ -7,6 +7,7 @@
 //   - a VM on a host missing from cluster state → codes.Unavailable (not Internal)
 //   - a VM on a peer whose daemon is down → codes.Unavailable "unreachable"
 //   - a stopped VM → codes.FailedPrecondition "not running"
+//
 // i.e. the daemon now hands the UI a specific, surface-able reason.
 package fleet
 

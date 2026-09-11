@@ -395,4 +395,3 @@ func TestPull_ProgressReporting(t *testing.T) {
 		t.Errorf("last status = %q, want complete", msgs[len(msgs)-1].Status)
 	}
 }
-

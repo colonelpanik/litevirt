@@ -69,10 +69,10 @@ func PushIncremental(
 	}
 
 	m := &Manifest{
-		VMName:     opts.VMName,
-		DiskName:   opts.DiskName,
-		Timestamp:  opts.Timestamp,
-		BasedOn:    parent.Timestamp,
+		VMName:         opts.VMName,
+		DiskName:       opts.DiskName,
+		Timestamp:      opts.Timestamp,
+		BasedOn:        parent.Timestamp,
 		BitmapName:     opts.BitmapName,
 		VMSpecJSON:     opts.VMSpecJSON,
 		DomainXML:      opts.DomainXML,
@@ -162,10 +162,10 @@ func pushIncrementalSeek(
 	}
 
 	m := &Manifest{
-		VMName:     opts.VMName,
-		DiskName:   opts.DiskName,
-		Timestamp:  opts.Timestamp,
-		BasedOn:    parent.Timestamp,
+		VMName:         opts.VMName,
+		DiskName:       opts.DiskName,
+		Timestamp:      opts.Timestamp,
+		BasedOn:        parent.Timestamp,
 		BitmapName:     opts.BitmapName,
 		VMSpecJSON:     opts.VMSpecJSON,
 		DomainXML:      opts.DomainXML,

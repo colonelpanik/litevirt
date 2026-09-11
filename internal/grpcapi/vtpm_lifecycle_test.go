@@ -434,5 +434,5 @@ type fakeBackupStream struct {
 	ctx context.Context
 }
 
-func (f *fakeBackupStream) Context() context.Context  { return f.ctx }
+func (f *fakeBackupStream) Context() context.Context   { return f.ctx }
 func (f *fakeBackupStream) Send(*pb.BackupChunk) error { return nil }

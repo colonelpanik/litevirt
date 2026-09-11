@@ -1,11 +1,11 @@
 package placement
 
 import (
-	"time"
 	"context"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )

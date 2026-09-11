@@ -33,11 +33,11 @@ import (
 // httptest.Server so no network I/O is involved.
 
 type mockOIDC struct {
-	server   *httptest.Server
-	signer   *rsa.PrivateKey
-	keyID    string
-	issuer   string
-	clientID string
+	server       *httptest.Server
+	signer       *rsa.PrivateKey
+	keyID        string
+	issuer       string
+	clientID     string
 	clientSecret string
 
 	// Pre-stamped values the test expects to round-trip.
@@ -96,10 +96,10 @@ type oauth2HTTPClientKey struct{}
 
 func (m *mockOIDC) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	doc := map[string]interface{}{
-		"issuer":                 m.issuer,
-		"authorization_endpoint": m.issuer + "/auth",
-		"token_endpoint":         m.issuer + "/token",
-		"jwks_uri":               m.issuer + "/jwks",
+		"issuer":                                m.issuer,
+		"authorization_endpoint":                m.issuer + "/auth",
+		"token_endpoint":                        m.issuer + "/token",
+		"jwks_uri":                              m.issuer + "/jwks",
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},

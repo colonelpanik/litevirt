@@ -10,9 +10,9 @@ import (
 type OpKind string
 
 const (
-	OpCreate  OpKind = "create"
-	OpUpdate  OpKind = "update"
-	OpDelete  OpKind = "delete"
+	OpCreate   OpKind = "create"
+	OpUpdate   OpKind = "update"
+	OpDelete   OpKind = "delete"
 	OpNoChange OpKind = "no-change"
 )
 
@@ -74,7 +74,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			cur, exists := currentByName[instanceName]
 			if !exists {
 				op := Op{Kind: OpCreate, VMName: instanceName,
-					Detail:    fmt.Sprintf("create %s (image=%s cpu=%d mem=%dMiB)",
+					Detail: fmt.Sprintf("create %s (image=%s cpu=%d mem=%dMiB)",
 						instanceName, vmDef.Image, vmDef.CPU, int(vmDef.Memory)),
 					DependsOn: vmDef.DependsOn}
 

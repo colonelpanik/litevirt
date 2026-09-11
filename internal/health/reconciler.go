@@ -1340,14 +1340,23 @@ func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
 // and convergence passes are what graduate them), and failing closed on an
 // unreadable marker would strand a legitimately-owned VM.
 func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
-	// Prefer the HOST-LOCAL marker: this check runs when libvirt has no domain,
-	// and undefining a domain destroys its metadata, so a metadata-only read is
-	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
-	// the domain metadata for a VM whose file marker has not been written yet.
+	// The HOST-LOCAL FILE MARKER IS THE ONLY INPUT, deliberately and by
+	// necessity. The sole caller sits inside `!DomainExists`, so by the time this
+	// runs libvirt has no domain for the VM — and undefining a domain destroys
+	// its metadata with it, which is the whole reason the durable file marker
+	// exists (lab-proven 2026-08-02).
+	//
+	// There used to be a domain-metadata fallback here "for a VM whose file
+	// marker has not been written yet". It could not fire: DomainExists IS a
+	// DomainLookupByName, the same lookup GetDomainOwnerEpoch performs first, so
+	// at this point that call can only ever return a lookup error. It read as a
+	// second line of defence that did not exist.
+	//
+	// So: a host with no readable file marker is never treated as superseded.
+	// That is fail-open, which is the intended direction for an unreadable
+	// marker, but it is the actual coverage — do not add a metadata read back
+	// without moving the call site to somewhere a domain still exists.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
-	if err != nil || !ok {
-		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
-	}
 	if err != nil || !ok {
 		return false
 	}

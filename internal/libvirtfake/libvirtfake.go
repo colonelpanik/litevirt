@@ -331,8 +331,12 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 		// with a DIFFERENT uuid — a name is not a slot you can overwrite. A caller
 		// whose undefine of the old occupant failed therefore cannot quietly
 		// replace it, which is what this fake used to model.
-		if existing, ok := f.xml[name]; ok {
-			if cur := domainUUIDFromXML(existing); cur != "" && cur != uuid {
+		//
+		// Read through the LIVE view, not the persistent one: undefining an active
+		// domain leaves it transient, at which point its identity lives only in the
+		// active XML — and a transient domain holds its name just as firmly.
+		if _, ok := f.domains[name]; ok {
+			if cur := domainUUIDFromXML(f.liveXMLLocked(name)); cur != "" && cur != uuid {
 				return fmt.Errorf("libvirtfake: domain %q already exists with uuid %s", name, cur)
 			}
 		}

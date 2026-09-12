@@ -1271,3 +1271,93 @@ func TestCutoverCleanupSparesARecreatedTargetsNameKeyedState(t *testing.T) {
 		t.Error("cleanup skipped the replaced VM's own volume, which nothing else can claim")
 	}
 }
+
+// A tombstone is still evidence of who last held the name — and a VM deleted with
+// its disks retained deliberately KEEPS its firmware and cloud-init state. Reading
+// ownership through GetVM hides that: the retained artifacts of a newer
+// incarnation read as belonging to nobody, and an old cleanup deletes them.
+//
+// The control matters as much: this operation's OWN tombstone must still be
+// cleaned up, or a cutover whose result was later deleted leaks everything.
+func TestCutoverCleanupReadsOwnershipThroughTombstones(t *testing.T) {
+	ctx := adminCtx()
+
+	stage := func(t *testing.T) (s *Server, nvram, iso, original string) {
+		t.Helper()
+		s, original, _, iso = restartFixture(t)
+		nvram = lv.NvramPath(s.dataDir, "app")
+		if err := os.MkdirAll(filepath.Dir(nvram), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		crashAt(s, "after-commit")
+		if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+			t.Fatal("the cutover did not abandon after the commit")
+		}
+		s.SetCutoverCrashHook(nil)
+		return s, nvram, iso, original
+	}
+
+	t.Run("a newer incarnation's retained state is spared", func(t *testing.T) {
+		s, nvram, iso, original := stage(t)
+		// The name is recreated as a different VM, which is then deleted with its
+		// disks — and therefore its firmware — RETAINED.
+		if err := corrosion.DeleteVM(ctx, s.db, "app"); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+			Name: "app", HostName: s.hostName, State: "stopped",
+			Spec: `{"name":"app","uuid":"a-new-incarnation"}`,
+		}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(nvram, []byte("retained firmware"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(iso, []byte("retained cloud-init"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Deleted with its state kept: the row is a TOMBSTONE, which GetVM hides.
+		if err := corrosion.DeleteVM(ctx, s.db, "app"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if body, err := os.ReadFile(nvram); err != nil || string(body) != "retained firmware" {
+			t.Errorf("cleanup deleted a newer incarnation's RETAINED firmware: %q err=%v", body, err)
+		}
+		if body, err := os.ReadFile(iso); err != nil || string(body) != "retained cloud-init" {
+			t.Errorf("cleanup deleted a newer incarnation's RETAINED cloud-init: %q err=%v", body, err)
+		}
+		if exists(original) {
+			t.Error("cleanup skipped the replaced VM's own volume, which nothing else can claim")
+		}
+	})
+
+	t.Run("this operation's own tombstone is still cleaned up", func(t *testing.T) {
+		s, nvram, iso, original := stage(t)
+		if err := os.WriteFile(nvram, []byte("the replaced VM's firmware"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The cutover's own result is deleted before the cleanup runs. Its
+		// tombstone carries THIS operation's incarnation, so the artifacts are
+		// still this operation's to free — skipping them would leak them forever.
+		if err := corrosion.DeleteVM(ctx, s.db, "app"); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if exists(nvram) {
+			t.Error("cleanup skipped the firmware of its OWN incarnation's tombstone")
+		}
+		if exists(iso) {
+			t.Error("cleanup skipped the cloud-init ISO of its OWN incarnation's tombstone")
+		}
+		if exists(original) {
+			t.Error("cleanup skipped the replaced VM's volume")
+		}
+	})
+}

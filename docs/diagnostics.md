@@ -335,8 +335,12 @@ attempt performed that move, so a retry after a failed redefine does not point t
 vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
 the two names: both are reused by the next deployment, and an identity built from names
 alone collides with the previous cutover's header. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
-contested name still holds the incarnation this operation transitioned. A name that has
-since been deleted and recreated belongs to a different VM, and its files with it; the
+contested name still holds the incarnation this operation transitioned, judged from a read
+that sees **tombstones** as well as live rows. A name that has since been deleted and
+recreated belongs to a different VM, and so do its files — including when that newer VM was
+itself deleted with its disks retained, which deliberately keeps its firmware and reads as
+"nobody owns this name" to any live-only lookup. This operation's own tombstone still
+counts as its own, so a cutover whose result was later deleted is still cleaned up. The
 swtpm tree is keyed by the replaced VM's own UUID and is freed regardless. Destruction
 exempts **no** VM from the
 shared-reference check, because the temporary name is free and reusable — a VM created

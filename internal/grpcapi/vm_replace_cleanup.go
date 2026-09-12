@@ -150,17 +150,21 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 // row this operation transitioned, which is what makes its NAME-keyed artifacts
 // this operation's to delete.
 //
-// An absent row is treated as ours: the name was deleted and not reused, so the
-// files belong to nobody and a later recreate mints its own.
+// It reads TOMBSTONES too, and that is the whole point. GetVM hides them, so a
+// newer incarnation deleted with its disks retained — which deliberately keeps
+// its firmware and cloud-init state — reads as "nobody owns this name" and its
+// retained artifacts get deleted by an old cleanup. Only genuine absence, or this
+// operation's OWN incarnation (live or since tombstoned, which must still be
+// cleaned up), is ownership.
 func (s *Server) nameStillHoldsThisIncarnation(
 	ctx context.Context, m corrosion.VMReplaceManifest,
 ) (bool, error) {
-	row, err := corrosion.GetVM(ctx, s.db, m.ReplacedVM)
+	row, err := corrosion.GetVMIncludingDeleted(ctx, s.db, m.ReplacedVM)
 	if err != nil {
 		return false, err
 	}
 	if row == nil {
-		return true, nil
+		return true, nil // nothing has held this name since
 	}
 	return row.CreatedAt == m.ReplacementIncarnation, nil
 }

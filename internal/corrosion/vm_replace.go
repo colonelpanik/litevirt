@@ -657,6 +657,17 @@ func vmReplaceStatements(
 	return stmts, nil
 }
 
+// GetVMIncludingDeleted reads a vms row whether or not it is tombstoned.
+//
+// Both ordinary readers hide something that matters here: GetVM hides a
+// tombstone, and GetDeletedVM hides a live row. A caller reasoning about who owns
+// a NAME needs neither hidden — a tombstone is still evidence of which
+// incarnation last held it, and a VM deleted with its disks retained still owns
+// the artifacts keyed by that name.
+func GetVMIncludingDeleted(ctx context.Context, c *Client, name string) (*VMRecord, error) {
+	return getVMRowIncludingDeleted(ctx, c, name)
+}
+
 // getVMRowIncludingDeleted reads the authority and incarnation of a vms row
 // whether or not it is tombstoned. A replace has to bind the tombstone it is
 // displacing, which the live-only and delete-only readers both hide.

@@ -322,7 +322,7 @@ func TestEvaluateHADegraded_QuarantinedNodeDoesNotBlameItsPeers(t *testing.T) {
 		t.Errorf("a quarantined node stopped reporting %s", haRolledBackLatch)
 	}
 	if reasons[haUnsupportedMember] {
-		t.Errorf("a quarantined node also raises unsupported_member, which reads as version "+
+		t.Errorf("a quarantined node also raises unsupported_member, which reads as version " +
 			"skew on its PEERS and arrives before rolled_back_latch in haReasons")
 	}
 	if got := tokensOf(degraded); len(got) != 0 {

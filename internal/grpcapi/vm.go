@@ -2874,15 +2874,21 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
 			manifest.Disks = replacedDisks
 			manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
-			leases, lErr := s.replacedVMLeases(ctx, req.VmName)
-			if lErr != nil {
-				return nil, status.Errorf(codes.Internal,
-					"cutover: read the replaced VM's addresses: %v (nothing was changed)", lErr)
-			}
-			manifest.Leases = leases
 		}
+		// OUTSIDE the host gate above, which scopes the host-local artifacts —
+		// volumes, firmware state, the cloud-init ISO. An IPAM lease is none of
+		// those: it is a cluster-global row and, on a bound network, an object in
+		// an external system. A cutover run from the replacement's host onto an
+		// original hosted elsewhere would otherwise journal no addresses at all and
+		// report success while the original's allocation stayed claimed forever.
+		leases, lErr := s.replacedVMLeases(ctx, oldVM)
+		if lErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cutover: read the replaced VM's addresses: %v (nothing was changed)", lErr)
+		}
+		manifest.Leases = leases
 	}
-	prepared, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
+	prepared, manifest, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"cutover: journal the cleanup manifest: %v (nothing was changed)", err)

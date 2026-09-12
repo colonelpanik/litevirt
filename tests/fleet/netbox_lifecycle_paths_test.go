@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -591,5 +592,214 @@ func TestCutoverRetriesAFailedAddressRelease(t *testing.T) {
 	}
 	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name); lErr != nil || len(left) != 0 {
 		t.Fatalf("the operation is still owed after a successful retry: %+v err=%v", left, lErr)
+	}
+}
+
+// A retry of an interrupted cutover has to reuse the manifest its predecessor
+// journaled. The address capture walks LIVE NIC rows, so once the first attempt
+// has tombstoned the original, a freshly built manifest names no addresses at
+// all — and rebuilding it was what the retry used to do. The operation is not
+// resumable on its own at that point (its transition never committed, so it is
+// still `planned`, which authorizes nothing), so the retry is the only thing that
+// can finish it.
+func TestCutoverRetryReusesTheJournaledManifest(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIdentity := nicIdentityOf(t, n, "app")
+
+	// Interrupted after the original is tombstoned and before the transition.
+	n.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-commit" {
+			return errors.New("injected crash before the transition")
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the cutover")
+	}
+	n.Server.SetCutoverCrashHook(nil)
+
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("a healthy retry of an interrupted cutover must commit: %v", err)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the retry did not release the replaced VM's lease: %d leases (want 1)", got)
+	}
+	if ids := identitySet(nb); ids[oldIdentity] {
+		t.Fatalf("the retry did not release the replaced VM's NetBox object: %v", nb.Identities())
+	}
+	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name); lErr != nil || len(left) != 0 {
+		t.Fatalf("the retry left the operation owed: %+v err=%v", left, lErr)
+	}
+}
+
+// A release whose halves both landed and whose `released` record did not must
+// resume cleanly. The recorded object id is enough to delete a second time and
+// get a not-found back forever, which used to leave every later attempt aborting
+// before the destruction and runtime handoff.
+func TestCutoverResumeTreatsAnAlreadyDeletedAddressAsReleased(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+
+	// Only the phase RECORD fails: both halves of the release land first.
+	if err := n.DB.Execute(ctx, `CREATE TRIGGER block_released_step BEFORE INSERT ON operation_steps
+ WHEN NEW.step_name = 'released' BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover reported success despite a refused phase record")
+	}
+	if got, ids := leaseCount(t, n, orphanNetwork), nb.Identities(); got != 1 || len(ids) != 1 {
+		t.Fatalf("the fixture did not reach the boundary it tests: %d leases, NetBox %v", got, ids)
+	}
+	if err := n.DB.Execute(ctx, `DROP TRIGGER block_released_step`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := n.Server.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("an already-deleted address must not block recovery: %v", err)
+	}
+	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name); lErr != nil || len(left) != 0 {
+		t.Fatalf("recovery did not finish the cutover: %+v err=%v", left, lErr)
+	}
+}
+
+// The object id a manifest carries is a name, not a claim. An address released
+// locally and then adopted by something else keeps the id and moves the identity,
+// and a retry that deletes on the id alone takes a live workload's address.
+func TestCutoverResumeLeavesAReassignedAddressAlone(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIP := vmNICIP(t, n, "app")
+	lease, err := corrosion.GetLeaseByIPForOwner(ctx, n.DB, orphanNetwork, oldIP, "vm", "", "app")
+	if err != nil || lease == nil || lease.NetBoxIPID == 0 {
+		t.Fatalf("the replaced VM's lease carries no NetBox object: %+v err=%v", lease, err)
+	}
+
+	// The local tombstone lands, the remote delete does not — the state the retry
+	// exists for.
+	nb.SetDown(true)
+	_, cutErr := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"})
+	nb.SetDown(false)
+	if cutErr == nil {
+		t.Fatal("a failed remote release must not report a finished cutover")
+	}
+
+	// NetBox keeps the object while an external owner adopts it.
+	nb.Reassign(lease.NetBoxIPID, "someone-else")
+	_ = n.Server.ResumeVMReplaceCleanups(ctx)
+
+	if ids := identitySet(nb); !ids["someone-else"] {
+		t.Fatalf("the retry deleted a reassigned NetBox object: %v", nb.Identities())
+	}
+}
+
+// IPAM leases are cluster-global; host-local artifacts are not. Capturing the
+// addresses inside the host-local gate meant a cutover run from the replacement's
+// host onto an original hosted elsewhere journaled no addresses, and reported
+// success while the original's allocation stayed claimed for good.
+func TestCutoverReleasesACrossHostOriginalsAddress(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 2)
+	oldHost, nextHost := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+
+	mustCreateVMWithDiskOnNetwork(t, c, oldHost, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, nextHost, "app-next", orphanNetwork)
+	oldIdentity := nicIdentityOf(t, oldHost, "app")
+
+	// Retire the original's runtime first, so this pins the ADDRESS half of a
+	// cross-host cutover rather than its domain teardown.
+	if _, err := c.SelfClient(oldHost).StopVM(ctx, &pb.StopVMRequest{Name: "app", Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldHost.Virt.UndefineDomainPreservingState("app"); err != nil {
+		t.Fatal(err)
+	}
+	old, err := corrosion.GetVM(ctx, nextHost.DB, "app")
+	if err != nil || old == nil || old.HostName != oldHost.Name {
+		t.Fatalf("the replaced VM is not hosted where this test needs it: %+v err=%v", old, err)
+	}
+	if got, ids := leaseCount(t, nextHost, orphanNetwork), nb.Identities(); got != 2 || len(ids) != 2 {
+		t.Fatalf("the fixture did not start with both allocations: %d leases, NetBox %v", got, ids)
+	}
+	latchCutoverCapabilities(t, c)
+
+	if _, err := c.SelfClient(nextHost).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cross-host cutover: %v", err)
+	}
+	if got := leaseCount(t, nextHost, orphanNetwork); got != 1 {
+		t.Fatalf("the cross-host original's lease survived the cutover: %d leases (want 1)", got)
+	}
+	if ids := identitySet(nb); ids[oldIdentity] {
+		t.Fatalf("the cross-host original's NetBox object survived the cutover: %v", nb.Identities())
+	}
+}
+
+// Name, MAC and key agreeing is not proof that the live lease row is still the
+// allocation the manifest captured. The contested name belongs to the
+// REPLACEMENT after the transition, and a cutover may reuse the original's MAC —
+// so the external object behind the row is what separates the incarnations.
+func TestCutoverLeavesAReclaimedLeaseRowAlone(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIP := vmNICIP(t, n, "app")
+	oldIdentity := nicIdentityOf(t, n, "app")
+
+	// Interrupted between the committed transition and the release phase.
+	n.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "after-commit" {
+			return errors.New("injected crash after the transition")
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the cutover")
+	}
+	n.Server.SetCutoverCrashHook(nil)
+
+	// The row at that key now backs a different allocation.
+	if err := n.DB.Execute(ctx,
+		`UPDATE ip_allocations SET netbox_ip_id = 12345 WHERE network = ? AND ip = ?`,
+		orphanNetwork, oldIP); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Server.ResumeVMReplaceCleanups(ctx)
+
+	held, err := corrosion.GetLeaseByIPForOwner(ctx, n.DB, orphanNetwork, oldIP, "vm", "", "app")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held == nil {
+		t.Fatal("recovery tombstoned a lease row that backs a different allocation now")
+	}
+	if ids := identitySet(nb); !ids[oldIdentity] {
+		t.Fatalf("recovery released an address that backs a different allocation now: %v", nb.Identities())
 	}
 }

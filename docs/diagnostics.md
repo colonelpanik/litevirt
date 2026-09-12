@@ -302,7 +302,7 @@ same batch as the transition. Its phases are:
 | — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. |
 | `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
 | `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
-| `released` | the replaced VM's IPAM addresses are given back — **after** the transition. Releasing first means a delete that then declines leaves a live VM whose address has already gone back to the pool, in the external IPAM too. Journaled because the release can fail on its remote half, and a best-effort attempt that did would strand the address under a cutover reporting success. The manifest carries each address's external object id, so a retry can finish a release whose local half already landed. |
+| `released` | the replaced VM's IPAM addresses are given back — **after** the transition. Releasing first means a delete that then declines leaves a live VM whose address has already gone back to the pool, in the external IPAM too. Journaled because the release can fail on its remote half, and a best-effort attempt that did would strand the address under a cutover reporting success. The manifest carries each address's external object id **and the identity it was claimed under**, so a retry can finish a release whose local half already landed — and can prove first that it is finishing its own. Captured for every address the replaced VM holds, wherever that VM is hosted: leases are cluster-global, unlike the volumes and firmware beside them in the manifest. |
 | `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
 | `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
 | `stopped` | the replacement's domain is confirmed INACTIVE — via libvirt's own activity query, not the coarse state, which collapses paused, shut-off and pm-suspended into "stopped" and so cannot see that a PAUSED domain is active. Activity is re-checked before **every** undefine, including a retry that already has this phase recorded: the record is a statement about the past, and an external start or libvirt autostart can reactivate the domain in between. libvirt cannot rename a domain, and undefining an **active** one leaves it running as a *transient* domain still holding its UUID — after which defining that UUID under the contested name is refused. **Cutting over a running replacement therefore restarts it**; no libvirt operation moves a live domain to another name, and `lv cutover` says so before it starts. |
@@ -335,7 +335,13 @@ replacement's, and the destination definition is derived independently of whethe
 attempt performed that move, so a retry after a failed redefine does not point the VM at a
 vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
 the two names: both are reused by the next deployment, and an identity built from names
-alone collides with the previous cutover's header. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
+alone collides with the previous cutover's header. A retry of the same cutover therefore
+finds its own header and **adopts the manifest already journaled there** rather than taking
+a second one. It has to: a manifest can only be captured while the replaced VM's rows are
+intact, and an attempt retrying past its own teardown reads live-only rows that no longer
+describe the VM it is finishing. Only the recorded owner **epoch** may not have moved —
+every phase is keyed on it, and continuing at another one would write the authorization
+where no resume can read it back. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
 contested name still holds the incarnation this operation transitioned, judged from a read
 that sees **tombstones** as well as live rows. A name that has since been deleted and
 recreated belongs to a different VM, and so do its files — including when that newer VM was
@@ -349,7 +355,17 @@ after a crash can legitimately reference a captured volume. IPAM allocations mov
 own primary key and their **complete owner tuple** — `(owner_kind, owner_host, vm_name)`,
 which is what stops a same-named container's address being taken by a VM cutover, and the guard carries a digest of the leases both
 names hold: an address the receiver released and reallocated to an unrelated VM declines
-the whole transition rather than being quietly taken.
+the whole transition rather than being quietly taken. The release phase applies the same
+rule to what it destroys. A live lease row has to still back the **same external object**
+the manifest captured — name, MAC and key agreeing prove nothing once the contested name
+belongs to the replacement and the MAC may have been reused. A row that is already gone is
+finished remotely only after the external object is read back **by identity** and still
+answers to the one the replaced VM claimed it under: the object id is a name, not a claim,
+and an address reallocated elsewhere keeps the id while the identity moves. That read is
+also what makes the phase idempotent — an object that is no longer there reads as absent,
+which is a completed release, so a crash between a successful delete and its record resumes
+instead of retrying into a permanent not-found. A read that FAILS is neither, and leaves the
+phase owed.
 
 That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
 

@@ -104,8 +104,14 @@ func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMRepl
 // replacedVMLeases captures the addresses the replaced VM holds, while its own
 // NIC rows still say so. After the transition the REPLACEMENT's leases have moved
 // onto the same name, so the owner name no longer separates them.
-func (s *Server) replacedVMLeases(ctx context.Context, vmName string) ([]corrosion.VMReplaceLease, error) {
-	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+//
+// Each entry carries the external IDENTITY as well as the object id, taken here
+// because it is derived from the replaced VM's own incarnation uuid — which the
+// transition displaces along with everything else. It is what lets the release
+// phase prove, later, that the object it is about to delete is still the one this
+// VM claimed.
+func (s *Server) replacedVMLeases(ctx context.Context, vm *corrosion.VMRecord) ([]corrosion.VMReplaceLease, error) {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vm.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -116,12 +122,22 @@ func (s *Server) replacedVMLeases(ctx context.Context, vmName string) ([]corrosi
 		}
 		entry := corrosion.VMReplaceLease{Network: nic.NetworkName, IP: nic.IP, MAC: nic.MAC}
 		// The external object's id, while the lease row still carries it.
-		lease, lErr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", vmName)
+		lease, lErr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", vm.Name)
 		if lErr != nil {
 			return nil, lErr
 		}
 		if lease != nil {
 			entry.NetBoxIPID = lease.NetBoxIPID
+		}
+		// A VM with no uuid in its spec never claimed anything externally, so an
+		// identity cannot be built and none is needed. It is NOT an error here: it
+		// only removes the release phase's licence to delete remotely, which is the
+		// safe side to land on.
+		if id, iErr := s.nicIdentity(ctx, vm, nic.MAC); iErr == nil {
+			entry.Identity = id
+		} else if entry.NetBoxIPID != 0 {
+			return nil, fmt.Errorf("build the external identity for %s on %s: %w",
+				nic.IP, nic.NetworkName, iErr)
 		}
 		out = append(out, entry)
 	}
@@ -154,21 +170,28 @@ func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VM
 			continue
 		}
 		if held == nil {
-			// The local half landed on an earlier attempt and the remote half did
-			// not — the one state releaseOneNICLease cannot finish, because the row
-			// it proves ownership from is already gone. The manifest still has the
-			// object's id, which is the whole reason it was captured.
-			if l.NetBoxIPID != 0 && s.netbox != nil {
-				if rErr := s.netbox.ReleaseIP(ctx, l.NetBoxIPID); rErr != nil {
-					failures = append(failures,
-						fmt.Sprintf("%s %s: remote release: %v", l.Network, l.IP, rErr))
-				}
+			// The local half landed on an earlier attempt and the remote half may
+			// or may not have — the one state releaseOneNICLease cannot finish,
+			// because the row it proves ownership from is already gone.
+			if rErr := s.finishReplacedAddressRemotely(ctx, l); rErr != nil {
+				failures = append(failures,
+					fmt.Sprintf("%s %s: remote release: %v", l.Network, l.IP, rErr))
 			}
 			continue
 		}
 		if held.MAC != l.MAC {
 			slog.Warn("cutover cleanup: the address is held by a different MAC now — not releasing it",
 				"network", l.Network, "ip", l.IP, "want_mac", l.MAC, "have_mac", held.MAC)
+			continue
+		}
+		if held.NetBoxIPID != l.NetBoxIPID {
+			// Same key, same owner name, same MAC — and still a different
+			// allocation. The contested name now belongs to the REPLACEMENT, and a
+			// cutover is allowed to reuse the original's MAC, so those three agreeing
+			// does not identify an incarnation. The external object behind the row
+			// does: a released-and-reclaimed address carries a new one.
+			slog.Warn("cutover cleanup: the address backs a different allocation now — not releasing it",
+				"network", l.Network, "ip", l.IP, "want_object", l.NetBoxIPID, "have_object", held.NetBoxIPID)
 			continue
 		}
 		if rErr := s.releaseOneNICLease(ctx, owner, corrosion.NICRecord{
@@ -180,6 +203,77 @@ func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VM
 	if len(failures) > 0 {
 		return fmt.Errorf("release the replaced VM's addresses: %s", strings.Join(failures, "; "))
 	}
+	return nil
+}
+
+// finishReplacedAddressRemotely completes the REMOTE half of a release whose
+// local half already landed — the state an earlier attempt leaves behind when it
+// tombstones the lease row and then cannot reach the external IPAM.
+//
+// The journaled object id is a NAME, not a claim. By the time this runs the
+// address may have been re-allocated to something else, which keeps the id and
+// moves the identity; deleting on the id alone takes a live workload's address.
+// So the object is read back by IDENTITY — an owner-independent read — and
+// deleted only while it still answers to the identity the replaced VM claimed it
+// under.
+//
+// That same read makes the phase IDEMPOTENT without having to interpret a status
+// code: an object that is no longer there is an empty result, and an empty result
+// is a completed release. A crash between a successful delete and the `released`
+// record therefore resumes cleanly, where re-deleting a known id would resume
+// into a permanent 404.
+//
+// A failed READ is a different thing from an absent object and is returned: the
+// ownership check was unavailable, so the phase stays owed for the next attempt
+// rather than falling through to a delete it could not justify.
+func (s *Server) finishReplacedAddressRemotely(ctx context.Context, l corrosion.VMReplaceLease) error {
+	if l.NetBoxIPID == 0 {
+		return nil // a builtin lease: the local tombstone was the whole release
+	}
+	alloc, binding, aErr := s.allocatorFor(ctx, "vm", l.Network)
+	if aErr != nil || alloc == nil || binding == nil {
+		// No reachable remote authority for this network — an unbound network (no
+		// external object can exist), or a binding that is suspended or cannot be
+		// resolved. Blocking the cutover's remaining phases on that would leave the
+		// replacement's domain stranded under its temporary name for as long as the
+		// binding stays broken, which is strictly worse than the address it would be
+		// protecting. Name the identity for the orphan sweep instead: the sweep
+		// applies the same ownership test and the same live-reference veto, so
+		// nothing is deleted that this path would not have deleted itself.
+		if aErr != nil {
+			slog.Warn("cutover cleanup: no allocator for the network — handing the address to the orphan sweep",
+				"network", l.Network, "ip", l.IP, "error", aErr)
+		}
+		if l.Identity != "" {
+			if eErr := s.enqueueOrphanCheck(ctx, l.Identity); eErr != nil {
+				slog.Error("cutover cleanup: could not enqueue an orphan check — the address may be stranded until the next full sweep",
+					"identity", l.Identity, "error", eErr)
+			}
+		}
+		return nil
+	}
+	if l.Identity == "" {
+		// Nothing to prove ownership WITH. The manifest was taken from a VM whose
+		// spec carried no uuid, so it never claimed this object under an identity
+		// litevirt can recognise, and deleting it would be the blind delete this
+		// whole function exists to remove.
+		slog.Warn("cutover cleanup: the address was journaled without an external identity — not releasing it remotely",
+			"network", l.Network, "ip", l.IP, "object", l.NetBoxIPID)
+		return nil
+	}
+	found, err := s.netbox.LookupByIdentity(ctx, l.Identity, binding.VRFID, binding.ObservedCIDR)
+	if err != nil {
+		return fmt.Errorf("read back %s to confirm it is still ours: %w", l.IP, err)
+	}
+	for _, obj := range found {
+		if obj.ID != l.NetBoxIPID {
+			continue
+		}
+		return s.netbox.ReleaseIP(ctx, obj.ID)
+	}
+	// Verified absence: either an earlier attempt's delete landed and its record
+	// did not, or the object was re-identified by something else. Neither is work
+	// this phase may still do.
 	return nil
 }
 

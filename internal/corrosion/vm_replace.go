@@ -869,6 +869,13 @@ type VMReplaceLease struct {
 	// retry has no other way to finish, which is how an address ends up allocated
 	// in the external IPAM for good.
 	NetBoxIPID int `json:"netbox_ip_id,omitempty"`
+	// Identity is the external IPAM identity this address was claimed under —
+	// cluster fingerprint, the replaced VM's incarnation uuid, and this MAC. It is
+	// what makes the retry above OWNERSHIP-CHECKED rather than blind: the object
+	// id alone is a name, not a claim, and an address released and re-allocated to
+	// something else keeps the id while the identity moves. The retry may delete
+	// the object only while the object still answers to THIS identity.
+	Identity string `json:"identity,omitempty"`
 }
 
 // VMReplacePrepared is the handle PrepareVMReplace returns: the journaled
@@ -921,26 +928,29 @@ type VMReplaceHandoff struct {
 const vmReplaceMethod = "CutoverVM"
 
 // PrepareVMReplace journals the cleanup manifest as a PLANNED operation and
-// returns its id. It must be called while the replaced VM's rows are still
-// intact — that is the only moment the manifest can be taken.
+// returns its id together with the manifest the caller must actually use. It has
+// to be called while the replaced VM's rows are still intact — that is the only
+// moment a manifest can be TAKEN.
 //
 // A planned operation authorizes NOTHING. It is safe to leave one behind: the
 // resources it names are still owned by a VM that still exists.
 //
 // The id is deterministic over the replacement's incarnation, so a retry of the
-// same cutover reuses the same operation and the same manifest instead of
-// journaling a second one.
-func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, ownerEpoch int64) (VMReplacePrepared, error) {
+// same cutover reuses the same operation — and the returned manifest is then the
+// one that retry's PREDECESSOR journaled, not the one it just built. The caller
+// has to use what comes back: after its own earlier attempt tombstoned the
+// replaced VM, several of the manifest's inputs can no longer be re-derived.
+func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, ownerEpoch int64) (VMReplacePrepared, VMReplaceManifest, error) {
 	var none VMReplacePrepared
 	if m.ReplacedVM == "" || m.Replacement == "" || m.HostName == "" {
-		return none, fmt.Errorf("corrosion: incomplete VM replace manifest")
+		return none, m, fmt.Errorf("corrosion: incomplete VM replace manifest")
 	}
 	body, err := json.Marshal(m)
 	if err != nil {
-		return none, err
+		return none, m, err
 	}
 	if m.ReplacementIncarnation == "" {
-		return none, fmt.Errorf("corrosion: VM replace manifest has no replacement incarnation")
+		return none, m, fmt.Errorf("corrosion: VM replace manifest has no replacement incarnation")
 	}
 	// The incarnation, not just the names: both names are reused by the next
 	// deployment, and a completed header sticks around until the retention sweep.
@@ -948,6 +958,31 @@ func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, owner
 	// deployment must be the same one.
 	id := DeterministicOperationID(vmReplaceMethod, m.HostName, "", m.ReplacedVM,
 		m.Replacement+"@"+m.ReplacementIncarnation)
+	// A retry of the SAME attempt adopts the manifest that was journaled while the
+	// replaced VM's rows were still intact, rather than re-deriving one now.
+	//
+	// The caller cannot rebuild an equivalent manifest once its own earlier attempt
+	// has tombstoned the rows it reads: the NIC rows a lease capture walks are
+	// live-only, so a retry after the teardown produces an EMPTY lease list. Hashing
+	// that against the stored body would refuse every subsequent attempt, and the
+	// operation is not yet resumable on its own — it is still `planned`, which
+	// authorizes nothing, so nothing else would ever finish it either.
+	//
+	// The stored manifest is the authority precisely because it is the earlier one.
+	if existing, gErr := GetOperation(ctx, c, id); gErr != nil {
+		return none, m, gErr
+	} else if existing != nil {
+		stored, aErr := adoptVMReplaceManifest(*existing, m, ownerEpoch)
+		if aErr != nil {
+			return none, m, aErr
+		}
+		if err := AppendOperationStep(ctx, c, OperationStepRecord{
+			OperationID: id, OwnerEpoch: existing.VMOwnerEpoch, StepName: OpStepPlanned,
+		}); err != nil {
+			return none, m, err
+		}
+		return VMReplacePrepared{OperationID: id, OwnerEpoch: existing.VMOwnerEpoch}, stored, nil
+	}
 	op := OperationRecord{
 		ID: id, Method: vmReplaceMethod, Principal: m.HostName,
 		ResourceKind: "vm", ResourceID: m.ReplacedVM,
@@ -960,14 +995,50 @@ func PrepareVMReplace(ctx context.Context, c *Client, m VMReplaceManifest, owner
 		ReservationJSON: string(body), DesiredRef: m.ReplacedVM, VMOwnerEpoch: ownerEpoch,
 	}
 	if _, _, err := ClaimOrFindOperation(ctx, c, op); err != nil {
-		return none, err
+		return none, m, err
 	}
 	if err := AppendOperationStep(ctx, c, OperationStepRecord{
 		OperationID: id, OwnerEpoch: ownerEpoch, StepName: OpStepPlanned,
 	}); err != nil {
-		return none, err
+		return none, m, err
 	}
-	return VMReplacePrepared{OperationID: id, OwnerEpoch: ownerEpoch}, nil
+	return VMReplacePrepared{OperationID: id, OwnerEpoch: ownerEpoch}, m, nil
+}
+
+// adoptVMReplaceManifest validates an already-journaled replace header against
+// the attempt now asking to continue it, and returns the manifest that attempt
+// must use.
+//
+// What is checked is what the deterministic id does NOT already pin: the
+// AUTHORITY the header was recorded under. Every cleanup phase is keyed on
+// (operation, owner epoch), so continuing at a different epoch would write the
+// authorization where no resume can read it back — and an epoch that moved at all
+// means the replacement's ownership moved to another node, whose attempt this one
+// may not adopt. Refusing leaves the header planned, which authorizes nothing.
+//
+// The identity fields are re-checked too. They are inputs to the id, so a
+// disagreement is a hash collision or a hand-edited row rather than an ordinary
+// race — but this is the function that hands a caller the resource list it is
+// about to destroy from, and it must not hand over a list belonging to a
+// different pair.
+func adoptVMReplaceManifest(existing OperationRecord, fresh VMReplaceManifest, ownerEpoch int64) (VMReplaceManifest, error) {
+	var stored VMReplaceManifest
+	if err := json.Unmarshal([]byte(existing.ReservationJSON), &stored); err != nil {
+		return fresh, fmt.Errorf("corrosion: decode the journaled VM replace manifest: %w", err)
+	}
+	if existing.VMOwnerEpoch != ownerEpoch {
+		return fresh, fmt.Errorf(
+			"corrosion: the journaled VM replace is at owner epoch %d, this attempt is at %d",
+			existing.VMOwnerEpoch, ownerEpoch)
+	}
+	if stored.ReplacedVM != fresh.ReplacedVM || stored.Replacement != fresh.Replacement ||
+		stored.HostName != fresh.HostName || stored.ReplacementIncarnation != fresh.ReplacementIncarnation {
+		return fresh, fmt.Errorf(
+			"corrosion: the journaled VM replace describes %q<-%q@%s on %q, this attempt describes %q<-%q@%s on %q",
+			stored.ReplacedVM, stored.Replacement, stored.ReplacementIncarnation, stored.HostName,
+			fresh.ReplacedVM, fresh.Replacement, fresh.ReplacementIncarnation, fresh.HostName)
+	}
+	return stored, nil
 }
 
 // ListVMReplaceCleanups returns every replace on hostName whose transition

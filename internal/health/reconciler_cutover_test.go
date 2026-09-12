@@ -39,7 +39,7 @@ func TestReconciler_LeavesAVMWithAnOwedCutoverHandoffAlone(t *testing.T) {
 		if err != nil || next == nil {
 			t.Fatalf("read the replacement: %+v err=%v", next, err)
 		}
-		prepared, err := corrosion.PrepareVMReplace(ctx, db, corrosion.VMReplaceManifest{
+		prepared, _, err := corrosion.PrepareVMReplace(ctx, db, corrosion.VMReplaceManifest{
 			ReplacedVM: "app", Replacement: "app-next", HostName: "host-a",
 			ReplacementIncarnation: next.CreatedAt, ReplacementUUID: "next-uuid",
 			ReplacementSpec: next.Spec, ReplacementState: "running",

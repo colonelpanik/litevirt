@@ -2841,6 +2841,23 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"cutover: read the replacement's domain identity: %v (nothing was changed)", err)
 	}
+	// A replaced VM hosted ELSEWHERE has a domain this node cannot retire. The
+	// local branch below stops and undefines it before anything is torn down; there
+	// is no equivalent reach across hosts, and proceeding anyway hands the name and
+	// the address over while that guest is still running and still using them.
+	//
+	// So the retirement is REQUIRED rather than performed: the original's own host
+	// is asked, and only a complete survey that finds no domain at the name is
+	// accepted. An incomplete one reads back as unknown, an unreachable or older
+	// peer as an error, and both refuse — absence that could not be established is
+	// not absence. Checked here, before the operation is even journaled, so a
+	// refusal costs nothing.
+	if oldVM != nil && oldVM.HostName != s.hostName {
+		if rErr := s.confirmOriginalRetiredOnItsHost(ctx, oldVM.HostName, req.VmName); rErr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cutover: %v (nothing was changed)", rErr)
+		}
+	}
 
 	// Journalled FIRST, before anything is stopped or written. Two reasons it has
 	// to be here and not after the teardown: the manifest can only be taken while
@@ -2953,6 +2970,16 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
+	// The runtime intent this transition committed, read back from the journal
+	// rather than kept from the value that was sent — so the live path and a
+	// restart's recovery answer it from the same durable place.
+	accepted, aErr := corrosion.VMReplaceAcceptedState(ctx, s.db, prepared.OperationID, prepared.OwnerEpoch)
+	if aErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cutover: read the committed runtime intent: %v (the transition is committed; the "+
+				"journaled phases will be retried)", aErr)
+	}
+
 	// The destruction of what the replaced VM owned, then the runtime handoff that
 	// moves the replacement's domain and firmware onto the name — both driven from
 	// the journal, in that order (the handoff puts the replacement's vars file at
@@ -2960,6 +2987,7 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// A crash between them leaves the rest journaled for a restart to finish.
 	if err := s.finishVMReplaceCleanup(ctx, corrosion.VMReplaceCleanup{
 		OperationID: prepared.OperationID, OwnerEpoch: prepared.OwnerEpoch, Manifest: manifest,
+		AcceptedState: accepted,
 	}); err != nil {
 		return nil, status.Errorf(codes.Internal,
 			"cutover: finish the replacement: %v (the transition is committed; the journaled "+

@@ -348,3 +348,125 @@ func TestFleet_Cutover_RestartFinishesCommittedCleanup(t *testing.T) {
 }
 
 var errFleetCrash = errors.New("simulated process exit")
+
+// latchedRealCutoverCluster is latchedCutoverCluster with the pair created through
+// the real CreateVM RPC instead of seeded rows.
+//
+// The difference that matters is the libvirt domain. seedCutoverPair defines a
+// name-only XML with no uuid, and an empty replacement uuid is what cutover reads
+// as "no local domain to hand off" — so the runtime handoff never runs under it.
+// A scenario about what the handoff restores has to start from a domain that
+// actually has an identity.
+func latchedRealCutoverCluster(t *testing.T, nodes int) (*Cluster, *Node) {
+	t.Helper()
+	c := New(t, Options{Nodes: nodes})
+	gates := gateAll(t, c)
+	owner := c.Nodes[0]
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+	for _, name := range []string{"app", "app-next"} {
+		if _, err := c.SelfClient(owner).CreateVM(context.Background(), &pb.CreateVMRequest{
+			Spec: &pb.VMSpec{
+				Name: name, Cpu: 1, MemoryMib: 512,
+				Placement: &pb.PlacementSpec{Host: owner.Name},
+				Disks:     []*pb.DiskSpec{{Name: "root", Size: "64M"}},
+			},
+		}); err != nil {
+			t.Fatalf("CreateVM %s: %v", name, err)
+		}
+	}
+	latchOperationProtocol(t, c, gates)
+	enableVMReplaceFleet(c, gates)
+	eventually(t, 10*time.Second, "vm_replace_v1 to latch fleet-wide", func() bool {
+		return gates[owner.Name].Enforced(context.Background(), capabilities.VMReplaceV1)
+	})
+	return c, owner
+}
+
+// A manifest is captured before the FIRST attempt's teardown and adopted verbatim
+// by every retry, so it cannot be where the runtime intent comes from: an operator
+// who starts the replacement between two attempts made a decision, and replaying
+// the older snapshot would stop the VM for the rename and then not start it again.
+// The intent is journaled with the transition instead, which is the moment it is
+// actually accepted.
+func TestFleet_Cutover_RetryHonoursAStartAcceptedBetweenAttempts(t *testing.T) {
+	c, owner := latchedRealCutoverCluster(t, 1)
+	ctx := context.Background()
+
+	// The replacement is stopped when the first attempt captures its manifest.
+	if _, err := c.SelfClient(owner).StopVM(ctx, &pb.StopVMRequest{Name: "app-next", Force: true}); err != nil {
+		t.Fatalf("stop the replacement: %v", err)
+	}
+	owner.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-commit" {
+			return errFleetCrash
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(owner).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the cutover")
+	}
+	owner.Server.SetCutoverCrashHook(nil)
+
+	// The operator starts it between the two attempts.
+	if _, err := c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "app-next"}); err != nil {
+		t.Fatalf("start the replacement: %v", err)
+	}
+	if active, err := owner.Virt.DomainIsActive("app-next"); err != nil || !active {
+		t.Fatalf("the accepted start did not reach the domain: active=%v err=%v", active, err)
+	}
+
+	if _, err := c.SelfClient(owner).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if active, err := owner.Virt.DomainIsActive("app"); err != nil || !active {
+		t.Fatalf("the retry undid a start the operator had accepted: active=%v err=%v", active, err)
+	}
+}
+
+// The same intent, read back by a RESTART rather than by the attempt that wrote
+// it. Recovery has only the journal — the manifest it carries is the first
+// attempt's — so the accepted state has to survive there, not in the handler's
+// memory.
+func TestFleet_Cutover_RecoveryHonoursAStartAcceptedBetweenAttempts(t *testing.T) {
+	c, owner := latchedRealCutoverCluster(t, 1)
+	ctx := context.Background()
+
+	if _, err := c.SelfClient(owner).StopVM(ctx, &pb.StopVMRequest{Name: "app-next", Force: true}); err != nil {
+		t.Fatalf("stop the replacement: %v", err)
+	}
+	owner.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-commit" {
+			return errFleetCrash
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(owner).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the first attempt")
+	}
+
+	// The operator starts it, then the attempt that COMMITS dies before the
+	// handoff — so only a restart can finish the start it owes.
+	owner.Server.SetCutoverCrashHook(nil)
+	if _, err := c.SelfClient(owner).StartVM(ctx, &pb.StartVMRequest{Name: "app-next"}); err != nil {
+		t.Fatalf("start the replacement: %v", err)
+	}
+	owner.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "before-runtime" {
+			return errFleetCrash
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(owner).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the committing attempt")
+	}
+	owner.Server.SetCutoverCrashHook(nil)
+
+	if err := owner.Server.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if active, err := owner.Virt.DomainIsActive("app"); err != nil || !active {
+		t.Fatalf("recovery undid a start the operator had accepted: active=%v err=%v", active, err)
+	}
+}

@@ -647,8 +647,20 @@ func vmReplaceStatements(
 	// receiver — or a crashed sender's own database — can never hold this step
 	// without the transition, or the transition without this step. A prepared
 	// operation on its own authorizes nothing.
+	//
+	// Its FACTS carry the runtime intent the cutover is committing to — the
+	// replacement's accepted state as of this transition, which is what the
+	// handoff has to restore afterwards. It cannot come from the manifest: a
+	// manifest is taken before the first attempt's teardown and then adopted
+	// verbatim by every retry, so an operator who starts the replacement between
+	// two attempts would have that start reverted by a snapshot older than their
+	// decision. It cannot come from the row either, because a reconciler pass
+	// syncs an unfinished handoff's shut-off domain to "stopped" and reading that
+	// back erases the start still owed. Written HERE it is neither: it is what was
+	// accepted at the moment the transition committed, and it is as durable as the
+	// authorization beside it.
 	stmts = append(stmts, operationStepInsertStatement(
-		guard.OperationID, source.OwnerEpoch, OpStepDesiredPersisted, "", wall, now, guard))
+		guard.OperationID, source.OwnerEpoch, OpStepDesiredPersisted, source.State, wall, now, guard))
 	stmts = append(stmts, Statement{
 		SQL:    vmDeleteSQL,
 		Params: []interface{}{wall, now, source.Name, source.OwnerEpoch, source.SpecGeneration},
@@ -908,6 +920,15 @@ type VMReplaceCleanup struct {
 	// Handoff is the recorded domain definition, present once the runtime phase has
 	// durably journaled it. Empty means it has not been captured yet.
 	Handoff VMReplaceHandoff
+	// AcceptedState is the runtime intent recorded ATOMICALLY with the transition:
+	// the replacement's accepted state at the moment the cutover committed. It is
+	// what the runtime handoff restores, in preference to the manifest's snapshot —
+	// the manifest is taken before the first attempt and adopted verbatim by every
+	// retry, so a start accepted between two attempts is not in it.
+	//
+	// Empty only for an operation journaled by a build that did not record it; the
+	// handoff falls back to the manifest there.
+	AcceptedState string
 }
 
 // Outstanding reports whether any phase still has to run.
@@ -1041,6 +1062,27 @@ func adoptVMReplaceManifest(existing OperationRecord, fresh VMReplaceManifest, o
 	return stored, nil
 }
 
+// VMReplaceAcceptedState reads back the runtime intent the transition committed —
+// the facts on the `desired_persisted` step, written in the same batch as the
+// transition itself.
+//
+// The handler reads it through the journal rather than keeping the value it just
+// sent, so the live path and the restart path answer the question from the same
+// durable place. An empty string means an operation journaled before this was
+// recorded, and the caller falls back to the manifest.
+func VMReplaceAcceptedState(ctx context.Context, c *Client, operationID string, ownerEpoch int64) (string, error) {
+	steps, err := ListOperationSteps(ctx, c, operationID, ownerEpoch)
+	if err != nil {
+		return "", err
+	}
+	for _, st := range steps {
+		if st.StepName == OpStepDesiredPersisted {
+			return st.Facts, nil
+		}
+	}
+	return "", nil
+}
+
 // ListVMReplaceCleanups returns every replace on hostName whose transition
 // COMMITTED and whose cleanup has not been recorded as done — the work a
 // restarted daemon has to finish.
@@ -1089,6 +1131,8 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 				pending.StopDone = true
 			case OpStepRedefined:
 				pending.RuntimeDone = true
+			case OpStepDesiredPersisted:
+				pending.AcceptedState = st.Facts
 			}
 		}
 		if !pending.Outstanding() {

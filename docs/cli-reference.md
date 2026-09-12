@@ -165,6 +165,12 @@ That needs receiver behaviour an older peer does not have, so cutover **refuses*
 `enforcement.vm_replace` is set on every node and `vm_replace_v1` has latched — refusing
 before it stops a domain or writes to either VM. See docs/diagnostics.md.
 
+A cutover retires the replaced VM's domain only on the node it runs on. If the replaced
+VM is hosted elsewhere, cutover asks that node instead, and **refuses** unless it reports
+no domain left at the name — a domain still defined there, an incomplete survey, or a
+node it cannot reach all refuse, before anything is written. Stop and remove the original
+on its own host first.
+
 The database transition runs before the replaced VM's disks and firmware state are
 freed, so a cutover that fails partway leaves the original intact and can simply be
 retried. Because that transition also displaces the rows describing what the replaced

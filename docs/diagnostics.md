@@ -299,9 +299,9 @@ same batch as the transition. Its phases are:
 
 | step | meaning |
 |---|---|
-| — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. |
+| — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. Only on the node the cutover RUNS on: a replaced VM hosted elsewhere is asked about instead, and only a complete survey reporting no domain at the name is accepted — a domain still defined there, an incomplete survey, or an unreachable or older peer all refuse, before the operation is even journaled. Absence that could not be established is not absence, and proceeding would hand the name and the address over while that guest was still using both. |
 | `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
-| `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
+| `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. Its facts carry the **runtime intent** the transition committed to — the replacement's accepted state at that moment — which is what the handoff restores. |
 | `released` | the replaced VM's IPAM addresses are given back — **after** the transition. Releasing first means a delete that then declines leaves a live VM whose address has already gone back to the pool, in the external IPAM too. Journaled because the release can fail on its remote half, and a best-effort attempt that did would strand the address under a cutover reporting success. The manifest carries each address's external object id **and the identity it was claimed under**, so a retry can finish a release whose local half already landed — and can prove first that it is finishing its own. Captured for every address the replaced VM holds, wherever that VM is hosted: leases are cluster-global, unlike the volumes and firmware beside them in the manifest. |
 | `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
 | `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
@@ -323,11 +323,14 @@ both names. A phase is recorded only when its step actually succeeded; a failed 
 start leaves it owed. A firmware VM's failure is surfaced in its `state_detail`,
 never as `state=error` — operation failure and running intent are different facts, and
 overwriting the state made the retry read the row as "not asked to run" and finish with the
-VM shut off. For the same reason the running intent is taken from the journaled manifest
-rather than the row: an unfinished handoff looks exactly like a VM that stopped out of
-band, so a reconciler pass would otherwise sync it to `stopped` and erase the start still
-owed. Only an explicit operator stop overrides the manifest, and the reconciler leaves a VM
-with an owed handoff alone in the first place. That marker is never overwritten by failure
+VM shut off. For the same reason the running intent is taken from the JOURNAL rather than
+the row: an unfinished handoff looks exactly like a VM that stopped out of band, so a
+reconciler pass would otherwise sync it to `stopped` and erase the start still owed. Nor
+from the manifest, which is older still — captured before the first attempt's teardown and
+adopted verbatim by every retry, so a start the operator asked for between two attempts is
+not in it; the manifest is the fallback only for an operation journaled before the intent
+was recorded. Only an explicit operator stop overrides either, and the reconciler leaves a
+VM with an owed handoff alone in the first place. That marker is never overwritten by failure
 reporting either — it is the only override there is, so replacing it with diagnostic text
 would let the next retry start a VM the operator stopped. A failure goes to the VM's event
 feed and leaves the operation owed in the journal. The firmware file moves only while the temporary name is still the

@@ -803,3 +803,86 @@ func TestCutoverLeavesAReclaimedLeaseRowAlone(t *testing.T) {
 		t.Fatalf("recovery released an address that backs a different allocation now: %v", nb.Identities())
 	}
 }
+
+// The identity check has to cover the branch where the lease row SURVIVED too. A
+// first attempt whose local tombstone was refused leaves the row live, and the
+// retry that finds it there still ends in a remote delete — which a matching name,
+// MAC and object id do not authorize once the external object has moved on.
+func TestCutoverRetryLeavesAReassignedAddressAloneWhenTheLeaseRowSurvived(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIP := vmNICIP(t, n, "app")
+	lease, err := corrosion.GetLeaseByIPForOwner(ctx, n.DB, orphanNetwork, oldIP, "vm", "", "app")
+	if err != nil || lease == nil || lease.NetBoxIPID == 0 {
+		t.Fatalf("the replaced VM's lease carries no NetBox object: %+v err=%v", lease, err)
+	}
+
+	// The LOCAL half is refused, so the lease row outlives the first attempt.
+	drop := n.FailLeaseTombstones(t)
+	_, cutErr := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"})
+	drop()
+	if cutErr == nil {
+		t.Fatal("a refused lease tombstone must not report a finished cutover")
+	}
+	held, hErr := corrosion.GetLeaseByIPForOwner(ctx, n.DB, orphanNetwork, oldIP, "vm", "", "app")
+	if hErr != nil || held == nil {
+		t.Fatalf("the fixture did not reach the live-lease-row branch: %+v err=%v", held, hErr)
+	}
+
+	// NetBox keeps the object while an external owner adopts it.
+	nb.Reassign(lease.NetBoxIPID, "someone-else")
+	if rErr := n.Server.ResumeVMReplaceCleanups(ctx); rErr != nil {
+		t.Fatalf("resume: %v", rErr)
+	}
+	if ids := identitySet(nb); !ids["someone-else"] {
+		t.Fatalf("the retry deleted a reassigned NetBox object: %v", nb.Identities())
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the retry did not release the replaced VM's lease row: %d leases (want 1)", got)
+	}
+}
+
+// Cutover retires the replaced VM's domain only on the node it runs on. With the
+// original hosted elsewhere there is nothing to run that with — so the retirement
+// becomes a precondition, answered by the host that can see its own libvirt, and a
+// cutover that cannot establish it must change nothing at all. Without the gate it
+// handed the name and the address over while that guest was still running on both.
+func TestCutoverRefusesWhileTheOriginalStillHasADomainOnAnotherHost(t *testing.T) {
+	nb, c := boundMirrorCluster(t, 2)
+	oldHost, nextHost := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	for _, n := range c.Nodes {
+		setHostCapacity(t, c, n.Name, 64, 65536, nil)
+	}
+
+	mustCreateVMWithDiskOnNetwork(t, c, oldHost, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, nextHost, "app-next", orphanNetwork)
+	oldIdentity := nicIdentityOf(t, oldHost, "app")
+	if active, aErr := oldHost.Virt.DomainIsActive("app"); aErr != nil || !active {
+		t.Fatalf("the original has to be running for this test: active=%v err=%v", active, aErr)
+	}
+	latchCutoverCapabilities(t, c)
+
+	if _, err := c.SelfClient(nextHost).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover reported success while the original still had a domain on its host")
+	}
+	if active, aErr := oldHost.Virt.DomainIsActive("app"); aErr != nil || !active {
+		t.Fatalf("the refused cutover touched the original's domain: active=%v err=%v", active, aErr)
+	}
+	if got := leaseCount(t, nextHost, orphanNetwork); got != 2 {
+		t.Fatalf("the refused cutover gave an address back: %d leases (want 2)", got)
+	}
+	if ids := identitySet(nb); !ids[oldIdentity] {
+		t.Fatalf("the refused cutover released the original's NetBox object: %v", nb.Identities())
+	}
+	vm, err := corrosion.GetVM(ctx, nextHost.DB, "app")
+	if err != nil || vm == nil || vm.HostName != oldHost.Name {
+		t.Fatalf("the refused cutover moved the original's row: %+v err=%v", vm, err)
+	}
+}

@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // The destruction half of `lv cutover`, driven entirely from the journaled
@@ -148,10 +150,23 @@ func (s *Server) replacedVMLeases(ctx context.Context, vm *corrosion.VMRecord) (
 // transition has committed and from the manifest rather than from rows that no
 // longer distinguish the two VMs.
 //
-// Ownership-checked per address: the live allocation at that key must still carry
-// the MAC that held it. An address released and reallocated to something else in
-// the meantime is left alone — releasing it would take a live VM's address, and
-// leaving it is what the orphan sweep exists for.
+// Ownership is checked on BOTH halves, and neither check stands in for the other.
+// Locally, the live allocation at that key must still carry the MAC that held it
+// AND still back the external object the manifest captured — after the transition
+// the contested name belongs to the replacement, and a cutover may reuse the
+// original's MAC, so name, key and MAC agreeing identify no incarnation.
+// Remotely, the object is read back by identity, because a numeric object id is a
+// name and not a claim. An address that has moved on is left alone: releasing it
+// would take a live workload's address, and leaving it is what the orphan sweep
+// exists for.
+//
+// This does not go through releaseOneNICLease, which the ordinary delete and
+// detach paths share. That function proves ownership from the LEASE ROW, which is
+// the one thing a cutover cannot rely on — the row it would read may already be
+// the replacement's, and the object it would delete is named by a manifest the row
+// knows nothing about. So the two halves are done explicitly here, and the remote
+// half by the same identity-checked, idempotent helper the row-already-gone case
+// uses.
 //
 // A failure is returned, not logged: the phase stays owed and a restart retries
 // it, instead of the address being stranded under a cutover that said it was
@@ -161,7 +176,6 @@ func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VM
 	if m.HostName != s.hostName || len(m.Leases) == 0 {
 		return nil
 	}
-	owner := &corrosion.VMRecord{Name: m.ReplacedVM, HostName: m.HostName}
 	var failures []string
 	for _, l := range m.Leases {
 		held, err := corrosion.GetLeaseByIPForOwner(ctx, s.db, l.Network, l.IP, "vm", "", m.ReplacedVM)
@@ -169,35 +183,37 @@ func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VM
 			failures = append(failures, fmt.Sprintf("%s %s: read: %v", l.Network, l.IP, err))
 			continue
 		}
-		if held == nil {
-			// The local half landed on an earlier attempt and the remote half may
-			// or may not have — the one state releaseOneNICLease cannot finish,
-			// because the row it proves ownership from is already gone.
-			if rErr := s.finishReplacedAddressRemotely(ctx, l); rErr != nil {
-				failures = append(failures,
-					fmt.Sprintf("%s %s: remote release: %v", l.Network, l.IP, rErr))
+		// held == nil is not "nothing to do": an earlier attempt may have landed
+		// the local half and failed the remote one, which is the single state the
+		// lease row can no longer describe. The remote half runs either way.
+		if held != nil {
+			if held.MAC != l.MAC {
+				slog.Warn("cutover cleanup: the address is held by a different MAC now — not releasing it",
+					"network", l.Network, "ip", l.IP, "want_mac", l.MAC, "have_mac", held.MAC)
+				continue
 			}
-			continue
+			if held.NetBoxIPID != l.NetBoxIPID {
+				// Same key, same owner name, same MAC — and still a different
+				// allocation. The external object behind the row is what separates
+				// the incarnations: a released-and-reclaimed address carries a new one.
+				slog.Warn("cutover cleanup: the address backs a different allocation now — not releasing it",
+					"network", l.Network, "ip", l.IP, "want_object", l.NetBoxIPID, "have_object", held.NetBoxIPID)
+				continue
+			}
+			// The LOCAL half first, owner-scoped, so it still fails loudly if
+			// ownership moved between the read and the write. Local before remote is
+			// the same order every other release uses: a live local row pointing at
+			// an object that is already gone is the state the sweeper's live-lease
+			// veto can never reclaim.
+			if rErr := network.ReleaseLease(ctx, s.db, l.Network, l.IP, l.MAC, "vm", "", m.ReplacedVM); rErr != nil {
+				failures = append(failures,
+					fmt.Sprintf("%s %s: tombstone lease: %v", l.Network, l.IP, rErr))
+				continue
+			}
 		}
-		if held.MAC != l.MAC {
-			slog.Warn("cutover cleanup: the address is held by a different MAC now — not releasing it",
-				"network", l.Network, "ip", l.IP, "want_mac", l.MAC, "have_mac", held.MAC)
-			continue
-		}
-		if held.NetBoxIPID != l.NetBoxIPID {
-			// Same key, same owner name, same MAC — and still a different
-			// allocation. The contested name now belongs to the REPLACEMENT, and a
-			// cutover is allowed to reuse the original's MAC, so those three agreeing
-			// does not identify an incarnation. The external object behind the row
-			// does: a released-and-reclaimed address carries a new one.
-			slog.Warn("cutover cleanup: the address backs a different allocation now — not releasing it",
-				"network", l.Network, "ip", l.IP, "want_object", l.NetBoxIPID, "have_object", held.NetBoxIPID)
-			continue
-		}
-		if rErr := s.releaseOneNICLease(ctx, owner, corrosion.NICRecord{
-			VMName: m.ReplacedVM, NetworkName: l.Network, IP: l.IP, MAC: l.MAC,
-		}); rErr != nil {
-			failures = append(failures, fmt.Sprintf("%s %s: %v", l.Network, l.IP, rErr))
+		if rErr := s.finishReplacedAddressRemotely(ctx, l); rErr != nil {
+			failures = append(failures,
+				fmt.Sprintf("%s %s: remote release: %v", l.Network, l.IP, rErr))
 		}
 	}
 	if len(failures) > 0 {
@@ -542,13 +558,21 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	// snapshot. A domain merely existing is not the finished state: a start that
 	// failed on an earlier attempt leaves it defined and shut off, and recording
 	// the phase then would strand a VM the operator asked to be running.
-	// The intent comes from the MANIFEST, captured before the teardown, not from
-	// the row. The row's state is observational: a reconciler pass that finds the
-	// domain shut off — which is exactly what an unfinished handoff looks like —
-	// syncs it to "stopped", and reading that back would erase the very start this
-	// phase owes. Only an explicit operator stop overrides the manifest, because
-	// that is a decision rather than an observation.
-	wantRunning := m.ReplacementState == "running"
+	// The intent comes from the JOURNAL — the facts recorded atomically with the
+	// transition — not from the row and not from the manifest. The row's state is
+	// observational: a reconciler pass that finds the domain shut off, which is
+	// exactly what an unfinished handoff looks like, syncs it to "stopped", and
+	// reading that back would erase the very start this phase owes. The manifest is
+	// older still: it is captured before the FIRST attempt's teardown and adopted
+	// verbatim by every retry, so a start the operator asked for between two
+	// attempts is not in it. Only an operation journaled before this was recorded
+	// falls back to the manifest. Only an explicit operator stop overrides either,
+	// because that is a decision rather than an observation.
+	accepted := cl.AcceptedState
+	if accepted == "" {
+		accepted = m.ReplacementState
+	}
+	wantRunning := accepted == "running"
 	if desired.StateDetail == operatorStopDetail {
 		wantRunning = false
 	}
@@ -564,6 +588,36 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	}
 	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
 		return failed("start", e)
+	}
+	return nil
+}
+
+// confirmOriginalRetiredOnItsHost establishes, from the node that actually holds
+// the replaced VM, that no domain occupies the contested name there.
+//
+// Cutover retires the original's domain itself — stopped if active, undefined,
+// absence confirmed — but only on the node it runs on. When the original is
+// hosted elsewhere there is nothing to run that sequence with, and the parts that
+// follow are not conditional on it: the transition hands the name over, the
+// journal frees the address, and the guest on the other host keeps running on
+// both. So the retirement becomes a PRECONDITION, answered by the host that can
+// actually see its own libvirt.
+//
+// Only `absent` is accepted. `defined_stopped` still occupies the name;
+// `unknown` is what an incomplete survey reports, and treating it as absence is
+// the exact inversion the inventory's own contract warns against; an error —
+// including the Unimplemented an older peer answers with — is a definite failure
+// to establish anything. Every one of those refuses.
+func (s *Server) confirmOriginalRetiredOnItsHost(ctx context.Context, host, vmName string) error {
+	state, err := s.CheckPeerVMRuntime(ctx, host, vmName)
+	if err != nil {
+		return fmt.Errorf("confirm the replaced VM %q has no domain left on %s: %w", vmName, host, err)
+	}
+	if state != health.RuntimeAbsent {
+		return fmt.Errorf(
+			"the replaced VM %q is hosted on %s, where its domain is %s — a cutover retires a "+
+				"domain only on the node it runs on, so that one has to be stopped and undefined "+
+				"there first", vmName, host, state)
 	}
 	return nil
 }

@@ -33,7 +33,7 @@ func TestBuildVMSpec_Basic(t *testing.T) {
 		Memory: 1024,
 	}
 
-	spec := mustBuildVMSpec(t,"web", "web", vm, f)
+	spec := mustBuildVMSpec(t, "web", "web", vm, f)
 
 	if spec.Name != "web" {
 		t.Errorf("Name = %q, want %q", spec.Name, "web")
@@ -70,7 +70,7 @@ func TestBuildVMSpec_WithDisks(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"db", "db", vm, f)
+	spec := mustBuildVMSpec(t, "db", "db", vm, f)
 
 	if len(spec.Disks) != 2 {
 		t.Fatalf("expected 2 disks, got %d", len(spec.Disks))
@@ -119,7 +119,7 @@ func TestBuildVMSpec_WithNetwork(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if len(spec.Network) != 2 {
 		t.Fatalf("expected 2 network attachments, got %d", len(spec.Network))
@@ -170,7 +170,7 @@ func TestBuildVMSpec_WithCloudInit(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.CloudInit == nil {
 		t.Fatal("CloudInit should not be nil")
@@ -199,7 +199,7 @@ func TestBuildVMSpec_WithPlacement(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"web", "web", vm, f)
+	spec := mustBuildVMSpec(t, "web", "web", vm, f)
 
 	if spec.Placement == nil {
 		t.Fatal("Placement should not be nil")
@@ -244,7 +244,7 @@ func TestBuildVMSpec_WithLoadBalancer(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"app", "app", vm, f)
+	spec := mustBuildVMSpec(t, "app", "app", vm, f)
 
 	if spec.Loadbalancer == nil {
 		t.Fatal("Loadbalancer should not be nil")
@@ -288,7 +288,7 @@ func TestBuildVMSpec_WithLoadBalancer_Disabled(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"app", "app", vm, f)
+	spec := mustBuildVMSpec(t, "app", "app", vm, f)
 
 	if spec.Loadbalancer != nil {
 		t.Error("Loadbalancer should be nil when disabled")
@@ -311,7 +311,7 @@ func TestBuildVMSpec_WithHealthCheck(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"app", "app", vm, f)
+	spec := mustBuildVMSpec(t, "app", "app", vm, f)
 
 	if spec.Healthcheck == nil {
 		t.Fatal("Healthcheck should not be nil")
@@ -353,7 +353,7 @@ func TestBuildVMSpec_WithHooks(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Hooks == nil {
 		t.Fatal("Hooks should not be nil")
@@ -393,7 +393,7 @@ func TestBuildVMSpec_WithResources(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Resources == nil {
 		t.Fatal("Resources should not be nil")
@@ -431,7 +431,7 @@ func TestBuildVMSpec_WithDevices(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"gpu-vm", "gpu-vm", vm, f)
+	spec := mustBuildVMSpec(t, "gpu-vm", "gpu-vm", vm, f)
 
 	if len(spec.Devices) != 3 {
 		t.Fatalf("expected 3 devices, got %d", len(spec.Devices))
@@ -461,7 +461,7 @@ func TestBuildVMSpec_ISO(t *testing.T) {
 		Memory: 4096,
 	}
 
-	spec := mustBuildVMSpec(t,"win", "win", vm, f)
+	spec := mustBuildVMSpec(t, "win", "win", vm, f)
 
 	if spec.Image != "windows-server-2022.iso" {
 		t.Errorf("Image = %q, want ISO path", spec.Image)
@@ -482,7 +482,7 @@ func TestBuildVMSpec_NilOptionalFields(t *testing.T) {
 		Memory: 256,
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.CloudInit != nil {
 		t.Error("CloudInit should be nil")
@@ -519,7 +519,7 @@ func TestBuildVMSpec_Labels(t *testing.T) {
 		Labels: map[string]string{"env": "prod", "team": "platform"},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if len(spec.Labels) != 2 {
 		t.Fatalf("Labels len = %d", len(spec.Labels))
@@ -539,7 +539,7 @@ func TestBuildVMSpec_MachineAndFirmware(t *testing.T) {
 		Firmware: "uefi",
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Machine != "q35" {
 		t.Errorf("Machine = %q", spec.Machine)
@@ -598,7 +598,7 @@ func TestBuildVMSpec_StopGracePeriod(t *testing.T) {
 		StopGracePeriod: "2m",
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.StopTimeoutSec != 120 {
 		t.Errorf("StopTimeoutSec = %d, want 120 (2m)", spec.StopTimeoutSec)
@@ -614,7 +614,7 @@ func TestBuildVMSpec_StopGracePeriod_Seconds(t *testing.T) {
 		StopGracePeriod: "30s",
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.StopTimeoutSec != 30 {
 		t.Errorf("StopTimeoutSec = %d, want 30", spec.StopTimeoutSec)
@@ -629,7 +629,7 @@ func TestBuildVMSpec_StopGracePeriod_Empty(t *testing.T) {
 		Memory: 512,
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.StopTimeoutSec != 0 {
 		t.Errorf("StopTimeoutSec = %d, want 0 (unset)", spec.StopTimeoutSec)
@@ -650,7 +650,7 @@ func TestBuildVMSpec_Restart(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Restart == nil {
 		t.Fatal("Restart should not be nil")
@@ -678,7 +678,7 @@ func TestBuildVMSpec_Restart_Nil(t *testing.T) {
 		Memory: 512,
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Restart != nil {
 		t.Error("Restart should be nil when not set")
@@ -696,7 +696,7 @@ func TestBuildVMSpec_Placement_MaxPerNode(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"web-1", "web", vm, f)
+	spec := mustBuildVMSpec(t, "web-1", "web", vm, f)
 
 	if spec.Placement == nil {
 		t.Fatal("Placement should not be nil")
@@ -718,7 +718,7 @@ func TestBuildVMSpec_Placement_MaxPerNode_Zero(t *testing.T) {
 		},
 	}
 
-	spec := mustBuildVMSpec(t,"vm1", "vm1", vm, f)
+	spec := mustBuildVMSpec(t, "vm1", "vm1", vm, f)
 
 	if spec.Placement == nil {
 		t.Fatal("Placement should not be nil")

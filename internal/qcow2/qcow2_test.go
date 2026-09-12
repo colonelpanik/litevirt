@@ -698,7 +698,7 @@ func TestCompressedL2Encoding(t *testing.T) {
 	// QEMU stores nb_csectors directly, then adds 1 when decoding.
 	clusterBits := uint32(16)
 	hostOffset := uint64(0x10000) // 64KB aligned
-	nbCsectors := uint64(3)      // 3 sector boundaries crossed
+	nbCsectors := uint64(3)       // 3 sector boundaries crossed
 
 	entry := encodeCompressedL2(hostOffset, nbCsectors, clusterBits)
 

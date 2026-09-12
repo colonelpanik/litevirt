@@ -116,8 +116,8 @@ func TestCanHotModify(t *testing.T) {
 		wantReason                     string
 	}{
 		{2, 4096, 4, 8192, true, ""},
-		{2, 4096, 2, 8192, true, ""},  // mem-only increase
-		{2, 4096, 4, 4096, true, ""},  // cpu-only increase
+		{2, 4096, 2, 8192, true, ""}, // mem-only increase
+		{2, 4096, 4, 4096, true, ""}, // cpu-only increase
 		{4, 8192, 2, 8192, false, "CPU reduction not supported for hot-modify"},
 		{4, 8192, 4, 4096, false, "memory reduction not supported for hot-modify"},
 		{4, 8192, 4, 8192, false, "no change"},

@@ -24,10 +24,10 @@ type SysFS interface {
 
 type realFS struct{}
 
-func (realFS) ReadFile(path string) ([]byte, error)                      { return os.ReadFile(path) }
-func (realFS) WriteFile(path string, d []byte, p os.FileMode) error      { return os.WriteFile(path, d, p) }
-func (realFS) Readlink(path string) (string, error)                      { return os.Readlink(path) }
-func (realFS) ReadDir(path string) ([]os.DirEntry, error)                { return os.ReadDir(path) }
+func (realFS) ReadFile(path string) ([]byte, error)                 { return os.ReadFile(path) }
+func (realFS) WriteFile(path string, d []byte, p os.FileMode) error { return os.WriteFile(path, d, p) }
+func (realFS) Readlink(path string) (string, error)                 { return os.Readlink(path) }
+func (realFS) ReadDir(path string) ([]os.DirEntry, error)           { return os.ReadDir(path) }
 
 var sysfs SysFS = realFS{}
 

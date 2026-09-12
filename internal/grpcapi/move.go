@@ -304,7 +304,7 @@ type cutoverState int
 const (
 	cutoverNoVirt       cutoverState = iota // no libvirt backend (tests) — nothing references dst
 	cutoverRedefined                        // rewrote the disk source src→dst this call (origXML restores src)
-	cutoverAlreadyAtDst                      // the persistent config already pointed the disk at dst
+	cutoverAlreadyAtDst                     // the persistent config already pointed the disk at dst
 )
 
 // planCutover INSPECTS the persistent domain config and decides the cutover WITHOUT

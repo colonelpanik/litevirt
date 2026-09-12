@@ -51,12 +51,12 @@ type ReplicationRunner interface {
 // runs its own instance; ownership is decided at tick time by reading
 // `vms.host_name`. There is no cluster-wide lease.
 type SnapshotScheduler struct {
-	DB            *corrosion.Client
-	HostName      string
-	Runner        SnapshotRunner
-	ReplRunner    ReplicationRunner // optional; handles type='replication' rows
-	PollInterval  time.Duration     // default 60s
-	Now           func() time.Time
+	DB           *corrosion.Client
+	HostName     string
+	Runner       SnapshotRunner
+	ReplRunner   ReplicationRunner // optional; handles type='replication' rows
+	PollInterval time.Duration     // default 60s
+	Now          func() time.Time
 
 	stopOnce sync.Once
 	stopCh   chan struct{}

@@ -139,7 +139,7 @@ func CountDisksUsingPool(ctx context.Context, c *Client, host, poolName string) 
 // resource is DRIVER-SPECIFIC, not just "same source":
 //
 //   - nfs: the litevirt-DERIVED mountpoint, keyed by source. Only OTHER
-//     litevirt-owned NFS pools (target='') with the same source mount it at the
+//     litevirt-owned NFS pools (those with an empty target) with the same source mount it at the
 //     same path; an operator-managed (targetOverride) pool mounts elsewhere and
 //     is excluded — counting it would falsely block a derived-mount unmount.
 //   - iscsi: the (target IQN, portal) session. Same source (IQN) AND same portal

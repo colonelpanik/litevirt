@@ -453,7 +453,7 @@ func TestResolve_WarningLocalDiskRestartAny(t *testing.T) {
 	f := makeFile("mystack", map[string]compose.VMDef{
 		"db": {
 			Image: "ubuntu", CPU: 1, Memory: 512,
-			Disks: map[string]compose.DiskDef{"data": {Size: "10G"}},
+			Disks:   map[string]compose.DiskDef{"data": {Size: "10G"}},
 			Migrate: &compose.MigrateDef{OnHostFailure: "restart-any"},
 		},
 	})

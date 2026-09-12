@@ -32,7 +32,7 @@ func (f *fakeReconciler) Reconcile(_ context.Context) error {
 	f.lastTS = time.Now()
 	return nil
 }
-func (f *fakeReconciler) LastError() error  { return f.err }
+func (f *fakeReconciler) LastError() error    { return f.err }
 func (f *fakeReconciler) LastTick() time.Time { return f.lastTS }
 
 // adminCtxWithEngine grants alice admin via a root binding so

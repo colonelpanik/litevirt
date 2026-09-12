@@ -14,12 +14,14 @@ import (
 // Checklist (c) — self-upgrade re-exec env contract, runnable on macOS.
 //
 // Proves the two halves of findings 1 & 2 without systemd or libvirt:
+//
 //  1. reExecSelf hands the pristine snapshot to execFn (not live os.Environ).
+//
 //  2. A real child process started with that pristine env still has the
 //     collector credential after obs.Setup has scrubbed the parent's live env,
 //     and does NOT see post-Setup pollution.
 //
-//	go test ./cmd/litevirt/ -count=1 -v -run TestChecklist_C
+//     go test ./cmd/litevirt/ -count=1 -v -run TestChecklist_C
 func TestChecklist_C_ReExecPristineEnv_ChildKeepsCredential(t *testing.T) {
 	// Child mode: re-entered via exec of this test binary with the pristine env.
 	if os.Getenv("CHECKLIST_C_CHILD") == "1" {

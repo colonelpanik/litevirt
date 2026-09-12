@@ -49,33 +49,33 @@ type RealmConfig struct {
 // preferred over inlining the secret in config.yaml — the path's
 // permissions are checked at load time (must be 0600).
 type OIDCRealmConfig struct {
-	IssuerURL          string   `yaml:"issuer_url"`
-	ClientID           string   `yaml:"client_id"`
-	ClientSecret       string   `yaml:"client_secret,omitempty"`
-	ClientSecretFile   string   `yaml:"client_secret_file,omitempty"`
-	RedirectURL        string   `yaml:"redirect_url"`
-	Scopes             []string `yaml:"scopes,omitempty"`
-	GroupsClaim        string   `yaml:"groups_claim,omitempty"`
-	EmailClaim         string   `yaml:"email_claim,omitempty"`
-	NameClaim          string   `yaml:"name_claim,omitempty"`
-	SubjectClaim       string   `yaml:"subject_claim,omitempty"`
+	IssuerURL        string   `yaml:"issuer_url"`
+	ClientID         string   `yaml:"client_id"`
+	ClientSecret     string   `yaml:"client_secret,omitempty"`
+	ClientSecretFile string   `yaml:"client_secret_file,omitempty"`
+	RedirectURL      string   `yaml:"redirect_url"`
+	Scopes           []string `yaml:"scopes,omitempty"`
+	GroupsClaim      string   `yaml:"groups_claim,omitempty"`
+	EmailClaim       string   `yaml:"email_claim,omitempty"`
+	NameClaim        string   `yaml:"name_claim,omitempty"`
+	SubjectClaim     string   `yaml:"subject_claim,omitempty"`
 }
 
 // LDAPRealmConfig is the YAML view of LDAPConfig.
 type LDAPRealmConfig struct {
-	URL                string   `yaml:"url"`
-	BindDN             string   `yaml:"bind_dn,omitempty"`
-	BindPassword       string   `yaml:"bind_password,omitempty"`
-	BindPasswordFile   string   `yaml:"bind_password_file,omitempty"`
-	UserBaseDN         string   `yaml:"user_base_dn"`
-	UserFilter         string   `yaml:"user_filter,omitempty"`
-	GroupBaseDN        string   `yaml:"group_base_dn,omitempty"`
-	GroupFilter        string   `yaml:"group_filter,omitempty"`
-	UserNameAttr       string   `yaml:"user_name_attr,omitempty"`
-	UserMailAttr       string   `yaml:"user_mail_attr,omitempty"`
-	UserGroupAttr      string   `yaml:"user_group_attr,omitempty"`
-	GroupNameAttr      string   `yaml:"group_name_attr,omitempty"`
-	SkipTLSVerify      bool     `yaml:"skip_tls_verify,omitempty"`
+	URL              string `yaml:"url"`
+	BindDN           string `yaml:"bind_dn,omitempty"`
+	BindPassword     string `yaml:"bind_password,omitempty"`
+	BindPasswordFile string `yaml:"bind_password_file,omitempty"`
+	UserBaseDN       string `yaml:"user_base_dn"`
+	UserFilter       string `yaml:"user_filter,omitempty"`
+	GroupBaseDN      string `yaml:"group_base_dn,omitempty"`
+	GroupFilter      string `yaml:"group_filter,omitempty"`
+	UserNameAttr     string `yaml:"user_name_attr,omitempty"`
+	UserMailAttr     string `yaml:"user_mail_attr,omitempty"`
+	UserGroupAttr    string `yaml:"user_group_attr,omitempty"`
+	GroupNameAttr    string `yaml:"group_name_attr,omitempty"`
+	SkipTLSVerify    bool   `yaml:"skip_tls_verify,omitempty"`
 }
 
 // BuildRegistry constructs a Registry from a list of RealmConfigs and

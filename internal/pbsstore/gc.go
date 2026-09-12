@@ -13,12 +13,12 @@ import (
 
 // GCStats summarises a mark-and-sweep pass.
 type GCStats struct {
-	ManifestsScanned int
-	ChunksReferenced int   // unique chunks reached from any manifest
-	ChunksOnDisk     int   // chunks present in chunks/ at scan time
-	ChunksDeleted    int   // chunks removed because no manifest pointed at them
-	ChunksSkippedYoung int // unreferenced chunks retained because within the grace window
-	BytesReclaimed   int64 // total bytes of deleted chunks
+	ManifestsScanned   int
+	ChunksReferenced   int   // unique chunks reached from any manifest
+	ChunksOnDisk       int   // chunks present in chunks/ at scan time
+	ChunksDeleted      int   // chunks removed because no manifest pointed at them
+	ChunksSkippedYoung int   // unreferenced chunks retained because within the grace window
+	BytesReclaimed     int64 // total bytes of deleted chunks
 }
 
 // DefaultChunkGracePeriod is how long an unreferenced chunk is retained

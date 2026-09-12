@@ -24,15 +24,15 @@ func deriveAuthPass(name string) string {
 
 // Config holds everything needed to render HAProxy + keepalived configs for one LB instance.
 type Config struct {
-	Name      string   // e.g. "app-server"
-	VIP       string   // e.g. "10.0.100.100"
-	VIPPrefix int      // CIDR prefix length
-	Interface string   // network interface for VRRP (e.g. "eth0")
-	VRID      int      // VRRP virtual router ID (1–255, unique per VIP)
-	Priority  int      // 100 = master, 50 = backup
+	Name      string // e.g. "app-server"
+	VIP       string // e.g. "10.0.100.100"
+	VIPPrefix int    // CIDR prefix length
+	Interface string // network interface for VRRP (e.g. "eth0")
+	VRID      int    // VRRP virtual router ID (1–255, unique per VIP)
+	Priority  int    // 100 = master, 50 = backup
 	Backends  []Backend
 	Ports     []Port
-	Algorithm string   // roundrobin | leastconn | source
+	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.

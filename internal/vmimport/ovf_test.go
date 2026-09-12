@@ -103,11 +103,11 @@ func TestParseOVF_RejectsOVF2(t *testing.T) {
 
 func TestUnitMultiplier(t *testing.T) {
 	cases := map[string]uint64{
-		"":           1,
-		"byte":       1,
+		"":            1,
+		"byte":        1,
 		"byte * 2^20": 1 << 20,
 		"byte * 2^30": 1 << 30,
-		"MegaBytes":  1 << 20,
+		"MegaBytes":   1 << 20,
 	}
 	for in, want := range cases {
 		if got := unitMultiplier(in); got != want {

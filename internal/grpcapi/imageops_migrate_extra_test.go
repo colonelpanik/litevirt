@@ -250,10 +250,10 @@ func TestAutoPullImage_PeerExists_DialFails(t *testing.T) {
 
 // mockImportImageStream implements grpc.ClientStreamingServer[pb.ImportImageRequest, pb.ImportImageResponse].
 type mockImportImageStream struct {
-	ctx      context.Context
-	msgs     []*pb.ImportImageRequest
-	idx      int
-	closed   *pb.ImportImageResponse
+	ctx    context.Context
+	msgs   []*pb.ImportImageRequest
+	idx    int
+	closed *pb.ImportImageResponse
 }
 
 func (m *mockImportImageStream) Recv() (*pb.ImportImageRequest, error) {
@@ -654,4 +654,3 @@ func containsImpl(s, substr string) bool {
 	}
 	return false
 }
-

@@ -32,13 +32,13 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	vni, _ := strconv.Atoi(r.FormValue("vni"))
 	req := &pb.CreateNetworkRequest{
-		Name:    name,
-		Type:    r.FormValue("type"),
-		Iface:   r.FormValue("iface"),
-		Subnet:  r.FormValue("subnet"),
-		Dhcp:    r.FormValue("dhcp") == "on",
-		Vni:     int32(vni),
-		Pf:      r.FormValue("pf"),
+		Name:   name,
+		Type:   r.FormValue("type"),
+		Iface:  r.FormValue("iface"),
+		Subnet: r.FormValue("subnet"),
+		Dhcp:   r.FormValue("dhcp") == "on",
+		Vni:    int32(vni),
+		Pf:     r.FormValue("pf"),
 	}
 	if _, err := s.grpc.CreateNetwork(s.uiBearerCtx(r), req); err != nil {
 		sendToast(w, "Create network failed: "+err.Error(), "error")

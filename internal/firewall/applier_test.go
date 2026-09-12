@@ -12,10 +12,10 @@ import (
 // fakeNft records every Apply call. Useful for asserting the cache
 // hit/miss behaviour of Applier.
 type fakeNft struct {
-	mu        sync.Mutex
-	applies   []string
-	flushes   int32
-	failNext  error
+	mu       sync.Mutex
+	applies  []string
+	flushes  int32
+	failNext error
 }
 
 func (f *fakeNft) Apply(_ context.Context, ruleset string) (string, error) {

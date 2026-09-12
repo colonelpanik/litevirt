@@ -952,7 +952,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T00:00:00Z",
 	}); err != nil {
 		t.Fatalf("seed condition: %v", err)
@@ -978,7 +978,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T01:00:00Z",
 	}); err != nil {
 		t.Fatalf("resolve condition: %v", err)

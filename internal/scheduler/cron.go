@@ -13,7 +13,7 @@ import (
 //
 // Each field accepts:
 //
-//	*           — any value
+//	"*"         — any value
 //	N           — literal
 //	a,b,c       — list of literals
 //	a-b         — inclusive range

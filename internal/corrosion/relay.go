@@ -7,8 +7,8 @@ import (
 
 // RelayConfig holds tunables for the Crescent relay protocol.
 type RelayConfig struct {
-	BaseRelays    int           // minimum relay count (default 3)
-	NodesPerRelay int           // add 1 relay per this many nodes (default 50)
+	BaseRelays      int           // minimum relay count (default 3)
+	NodesPerRelay   int           // add 1 relay per this many nodes (default 50)
 	FallbackTimeout time.Duration // leaf fallback activation threshold (default 15s)
 }
 
@@ -27,8 +27,8 @@ func (c RelayConfig) withDefaults() RelayConfig {
 
 // RelaySet represents the current set of elected relays and leaf-to-relay assignments.
 type RelaySet struct {
-	relays          []string           // sorted relay hostnames
-	set             map[string]bool    // O(1) relay lookup
+	relays          []string             // sorted relay hostnames
+	set             map[string]bool      // O(1) relay lookup
 	leafAssignments map[string][2]string // leaf → [primary, backup] relay
 	relayLeaves     map[string][]string  // relay → assigned leaves
 }
@@ -57,7 +57,7 @@ func ComputeRelays(members []PeerInfo, selfName string, cfg RelayConfig) *RelayS
 	sort.Strings(names)
 
 	N := len(names)
-	R := cfg.BaseRelays + (N + cfg.NodesPerRelay - 1) / cfg.NodesPerRelay
+	R := cfg.BaseRelays + (N+cfg.NodesPerRelay-1)/cfg.NodesPerRelay
 	if R > N {
 		R = N
 	}

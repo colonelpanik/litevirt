@@ -51,14 +51,16 @@ type fakeResponseWriter struct {
 	localIP net.Addr
 }
 
-func (f *fakeResponseWriter) LocalAddr() net.Addr         { return f.localIP }
-func (f *fakeResponseWriter) RemoteAddr() net.Addr         { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345} }
-func (f *fakeResponseWriter) WriteMsg(m *mdns.Msg) error   { f.msg = m; return nil }
-func (f *fakeResponseWriter) Write(b []byte) (int, error)   { return len(b), nil }
-func (f *fakeResponseWriter) Close() error                  { return nil }
-func (f *fakeResponseWriter) TsigStatus() error             { return nil }
-func (f *fakeResponseWriter) TsigTimersOnly(bool)           {}
-func (f *fakeResponseWriter) Hijack()                        {}
+func (f *fakeResponseWriter) LocalAddr() net.Addr { return f.localIP }
+func (f *fakeResponseWriter) RemoteAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+}
+func (f *fakeResponseWriter) WriteMsg(m *mdns.Msg) error  { f.msg = m; return nil }
+func (f *fakeResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (f *fakeResponseWriter) Close() error                { return nil }
+func (f *fakeResponseWriter) TsigStatus() error           { return nil }
+func (f *fakeResponseWriter) TsigTimersOnly(bool)         {}
+func (f *fakeResponseWriter) Hijack()                     {}
 
 func TestHandleLocal_Found(t *testing.T) {
 	db := testDNSDB(t)

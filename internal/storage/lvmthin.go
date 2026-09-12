@@ -13,11 +13,12 @@ import (
 // at the LVM layer — useful for fast backups without quiescing qemu.
 //
 // Pool config:
-//   driver:  lvm-thin
-//   source:  <volume-group>             # e.g. "vg0"
-//   options:
-//     thinpool: pool0                   # required; name of the LVM thin pool
-//     filesystem: ""                    # leave blank — we hand the raw LV to qemu
+//
+//	driver:  lvm-thin
+//	source:  <volume-group>             # e.g. "vg0"
+//	options:
+//	  thinpool: pool0                   # required; name of the LVM thin pool
+//	  filesystem: ""                    # leave blank — we hand the raw LV to qemu
 type lvmThinDriver struct {
 	vg   string
 	opts map[string]string

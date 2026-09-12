@@ -886,3 +886,65 @@ func TestCutoverRefusesWhileTheOriginalStillHasADomainOnAnotherHost(t *testing.T
 		t.Fatalf("the refused cutover moved the original's row: %+v err=%v", vm, err)
 	}
 }
+
+// An owner-scoped read answers a foreign live allocation and a genuinely absent
+// one with the same nil, and those authorize opposite actions: absence is what
+// licenses finishing a remote delete on its own. A live allocation another
+// workload now holds has to veto both halves — the local row is not this
+// operation's to retire, and its external object is backing an address still in
+// use, whatever identity happens to be on it.
+func TestCutoverLeavesAnAddressAnotherWorkloadNowHoldsAlone(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIP := vmNICIP(t, n, "app")
+	oldIdentity := nicIdentityOf(t, n, "app")
+
+	// Interrupted between the committed transition and the release phase.
+	n.Server.SetCutoverCrashHook(func(stage string) error {
+		if stage == "after-commit" {
+			return errors.New("injected crash after the transition")
+		}
+		return nil
+	})
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the injected crash did not fail the cutover")
+	}
+	n.Server.SetCutoverCrashHook(nil)
+
+	// The allocation's OWNER moves while everything else about it — address, MAC,
+	// external object, external identity — stays exactly as the manifest captured
+	// it. A local owner is not part of a NetBox identity, so the identity check
+	// alone cannot see this.
+	if err := n.DB.Execute(ctx,
+		`UPDATE ip_allocations SET vm_name = ?, updated_at = ? WHERE network = ? AND ip = ?`,
+		"retained", n.DB.NowTS(), orphanNetwork, oldIP); err != nil {
+		t.Fatal(err)
+	}
+	// The veto is a REFUSAL, not a failure: an address this operation may not
+	// retire is left for the orphan sweep, and the phases after it — the
+	// destruction and the runtime handoff — still run. Retrying a release that can
+	// never succeed would wedge the cutover with no domain at the name.
+	if rErr := n.Server.ResumeVMReplaceCleanups(ctx); rErr != nil {
+		t.Fatalf("a foreign allocation must not wedge the cleanup: %v", rErr)
+	}
+	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name); lErr != nil || len(left) != 0 {
+		t.Fatalf("the cutover is still owed after recovery: %+v err=%v", left, lErr)
+	}
+
+	held, err := corrosion.GetLeaseByIPForOwner(ctx, n.DB, orphanNetwork, oldIP, "vm", "", "retained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held == nil {
+		t.Fatal("recovery retired a lease row another workload now owns")
+	}
+	if ids := identitySet(nb); !ids[oldIdentity] {
+		t.Fatalf("recovery deleted the NetBox object backing a live foreign allocation: %v", nb.Identities())
+	}
+}

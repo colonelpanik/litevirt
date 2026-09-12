@@ -359,9 +359,14 @@ own primary key and their **complete owner tuple** — `(owner_kind, owner_host,
 which is what stops a same-named container's address being taken by a VM cutover, and the guard carries a digest of the leases both
 names hold: an address the receiver released and reallocated to an unrelated VM declines
 the whole transition rather than being quietly taken. The release phase applies the same
-rule to what it destroys. A live lease row has to still back the **same external object**
-the manifest captured — name, MAC and key agreeing prove nothing once the contested name
-belongs to the replacement and the MAC may have been reused. A row that is already gone is
+rule to what it destroys. The allocation at that key is read **owner-blind**, because an
+owner-scoped read answers a foreign live row and a genuinely absent one with the same
+nothing — and those license opposite actions, since absence is what permits finishing a
+remote delete alone. An allocation another workload now holds vetoes both halves, and is
+left for the orphan sweep rather than retried, so it cannot wedge the phases behind it.
+One that is still this operation's has to also carry the same MAC and back the **same
+external object** the manifest captured — name, MAC and key agreeing prove nothing once
+the contested name belongs to the replacement and the MAC may have been reused. A row that is already gone is
 finished remotely only after the external object is read back **by identity** and still
 answers to the one the replaced VM claimed it under: the object id is a name, not a claim,
 and an address reallocated elsewhere keeps the id while the identity moves. That read is

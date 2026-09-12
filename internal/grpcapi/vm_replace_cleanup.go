@@ -151,14 +151,20 @@ func (s *Server) replacedVMLeases(ctx context.Context, vm *corrosion.VMRecord) (
 // longer distinguish the two VMs.
 //
 // Ownership is checked on BOTH halves, and neither check stands in for the other.
-// Locally, the live allocation at that key must still carry the MAC that held it
-// AND still back the external object the manifest captured — after the transition
-// the contested name belongs to the replacement, and a cutover may reuse the
-// original's MAC, so name, key and MAC agreeing identify no incarnation.
-// Remotely, the object is read back by identity, because a numeric object id is a
-// name and not a claim. An address that has moved on is left alone: releasing it
-// would take a live workload's address, and leaving it is what the orphan sweep
-// exists for.
+// Locally, the allocation at that key is read OWNER-BLIND and must still be this
+// VM's: the same owner tuple, the MAC that held it, and the external object the
+// manifest captured. An owner-scoped read cannot be the gate here, because it
+// answers a foreign live row and a genuinely absent one with the same nil — and
+// those authorize opposite actions, since absence is what licenses finishing a
+// remote delete. Even a matching owner and MAC identify no incarnation on their
+// own: the contested name belongs to the replacement after the transition and a
+// cutover may reuse the original's MAC, so the external object is what separates
+// them. Remotely, that object is read back by identity, because a numeric object
+// id is a name and not a claim — a local identity does not encode the owner tuple
+// any more than the owner tuple encodes the object.
+//
+// An address that has moved on either way is left alone: releasing it would take a
+// live workload's address, and leaving it is what the orphan sweep exists for.
 //
 // This does not go through releaseOneNICLease, which the ordinary delete and
 // detach paths share. That function proves ownership from the LEASE ROW, which is
@@ -178,15 +184,29 @@ func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VM
 	}
 	var failures []string
 	for _, l := range m.Leases {
-		held, err := corrosion.GetLeaseByIPForOwner(ctx, s.db, l.Network, l.IP, "vm", "", m.ReplacedVM)
+		held, err := corrosion.GetLeaseByIP(ctx, s.db, l.Network, l.IP)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s %s: read: %v", l.Network, l.IP, err))
 			continue
 		}
 		// held == nil is not "nothing to do": an earlier attempt may have landed
 		// the local half and failed the remote one, which is the single state the
-		// lease row can no longer describe. The remote half runs either way.
+		// lease row can no longer describe. The remote half runs either way — but
+		// ONLY on a row that is genuinely gone, which is why the read above is
+		// owner-blind.
 		if held != nil {
+			if held.OwnerKind != "vm" || held.OwnerHost != "" || held.VMName != m.ReplacedVM {
+				// A live allocation someone else now holds. It vetoes BOTH halves:
+				// the local row is not ours to retire, and the external object it
+				// names is backing an address that is still in use — deleting it
+				// because our identity still happens to be on it would strand that
+				// workload with a local claim and no remote one.
+				slog.Warn("cutover cleanup: the address belongs to another workload now — not releasing it",
+					"network", l.Network, "ip", l.IP, "want_owner", m.ReplacedVM,
+					"have_owner", held.VMName, "have_owner_kind", held.OwnerKind,
+					"have_owner_host", held.OwnerHost)
+				continue
+			}
 			if held.MAC != l.MAC {
 				slog.Warn("cutover cleanup: the address is held by a different MAC now — not releasing it",
 					"network", l.Network, "ip", l.IP, "want_mac", l.MAC, "have_mac", held.MAC)

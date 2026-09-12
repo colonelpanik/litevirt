@@ -111,6 +111,16 @@ type LibvirtBackend interface {
 	// hotplug ceiling (live_resize).
 	SetVCPUs(name string, count int) error
 
+	// Owner-epoch runtime marker, mirrored into domain metadata. The create path
+	// stamps it so a fresh VM is provable before CreateVM returns; internal/health
+	// converges it thereafter. Get returns (0,false,nil) for a domain carrying
+	// none; corrupt content is an error, never epoch 0.
+	//
+	// Get is here alongside Set deliberately: an interface able to write a marker
+	// it cannot read is the asymmetry that let the file marker drift unnoticed.
+	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
+	GetDomainOwnerEpoch(name string) (int64, bool, error)
+
 	// Stats / introspection.
 	NodeInfo() (cpus int, memMiB int, err error)
 	GetDomainStats(name string) (*libvirt.DomainStats, error)

@@ -1329,6 +1329,12 @@ func (f *Fake) Close() error { return nil }
 // stored in domain metadata. The fake records them per domain so fleet and
 // unit tests can assert write-through and convergence without libvirt.
 func (f *Fake) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	// The real client refuses a pre-epoch value (a generation starts at 1); the
+	// fake must too, or a test could pass against a marker state production
+	// cannot produce.
+	if epoch < 1 {
+		return fmt.Errorf("refusing to set owner-epoch metadata %d on %q: a generation starts at 1", epoch, name)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {

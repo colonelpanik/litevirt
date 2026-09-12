@@ -1274,6 +1274,52 @@ func SoftDeleteInterfaceByMAC(ctx context.Context, c *Client, vmName, mac string
 		nowRFC3339(), now, vmName, mac)
 }
 
+// graduateVMOwnerEpochSQL moves a vms row off the pre-epoch default. It is the
+// ONE statement for that intent, shared by BackfillOwnerEpochs and
+// GraduateVMOwnerEpoch, because two texts for one operation would be two
+// replicated fingerprints — and a peer registered for only one of them cannot
+// resolve the other, which fails its apply closed and head-of-line blocks its
+// whole stream.
+//
+// Guarded on vm_owner_epoch = 0 so it is idempotent on its own and cannot walk a
+// live generation backwards: a retry, or a race with the per-sweep backfill, is
+// a no-op rather than a reset.
+const graduateVMOwnerEpochSQL = `UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`
+
+// GraduateVMOwnerEpoch assigns the first ownership generation to one named VM.
+//
+// The create path calls this immediately after inserting the row, because
+// INSERT INTO vms does not name vm_owner_epoch (12 columns, and widening it
+// would move the insert's fingerprint) so a fresh row takes the column default
+// of 0 — and a running VM at epoch 0 has no marker, since
+// convergeOwnerEpochMarker returns early for one, which is the window
+// colonelpanik/litevirt#157 is about.
+//
+// Returns ErrNoRowsAffected when the guarded UPDATE matched nothing, via
+// ExecuteRows rather than Execute. This is the difference between "the row is
+// now at generation 1" and "some other row state exists that this statement
+// declined to touch" — a soft-deleted row (a DeleteVM racing the create) or one
+// a replicated write already moved off 0. A caller that stamps a runtime marker
+// on the strength of this call MUST distinguish them: Execute discards the row
+// count, so a no-op would read as success and the marker would name a
+// generation the row does not hold, which is the one mismatch nothing
+// converges. On a nil return the row is at 1, which is what makes stamping the
+// literal 1 sound.
+//
+// BackfillOwnerEpochs deliberately does NOT use this: it is idempotent by
+// predicate across many rows, and a row a concurrent graduation already moved
+// is a success for it, not a fault.
+func GraduateVMOwnerEpoch(ctx context.Context, c *Client, name string) error {
+	n, err := c.ExecuteRows(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // BackfillOwnerEpochs graduates every workload THIS host owns out of the
 // pre-epoch 0 (0→1) — the Phase 4 one-time backfill, run by the health sweeps
 // while enforcement.owner_epoch is on. Only owned, live rows are touched:
@@ -1292,8 +1338,7 @@ func BackfillOwnerEpochs(ctx context.Context, c *Client, hostName string) error 
 		return err
 	}
 	for _, r := range vms {
-		if err := c.Execute(ctx,
-			`UPDATE vms SET vm_owner_epoch = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = 0`,
+		if err := c.Execute(ctx, graduateVMOwnerEpochSQL,
 			int64(1), c.NowTS(), r.String("name")); err != nil {
 			return err
 		}

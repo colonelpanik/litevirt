@@ -1169,6 +1169,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			// checked against. Best-effort — the VM is already running, and the
 			// convergence pass repairs a missed write; failing the start over a
 			// marker would be strictly worse than a temporarily absent marker.
+			// No pre-epoch guard here on purpose: the epoch cannot be 0 at this
+			// point. This block runs only where CompleteVMStartProof APPLIED, and
+			// its second statement is `vm_owner_epoch = vm_owner_epoch + 1` under
+			// the same guard, so the row re-read below is at 1 or more by
+			// construction. A `fresh.OwnerEpoch < 1` branch would be unreachable,
+			// and unreachable branches can only be tested vacuously. The writers
+			// refuse a pre-epoch value anyway, which is where that rule belongs.
 			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
 				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
 					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
@@ -1345,7 +1352,23 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
 	// the domain metadata for a VM whose file marker has not been written yet.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
+	if errors.Is(err, ErrPreEpochMarker) {
+		// A marker asserting generation 0 is not an unreadable marker, and must not
+		// be treated as one. It is this host's own statement that its runtime
+		// belongs to NO generation — so any row at a real generation has superseded
+		// it, and the comparison below reaches that conclusion with marker = 0.
+		// Collapsing it into the unreadable case instead would license exactly the
+		// resurrection this check exists to refuse, for precisely the population
+		// most likely to carry such a marker: a node returning from an older build.
+		marker, ok, err = 0, true, nil
+	}
 	if err != nil || !ok {
+		// No pre-epoch coercion on this fallback: it cannot fire. This function is
+		// reached only from the !DomainExists branch, and DomainExists IS a
+		// DomainLookupByName — the same lookup GetDomainOwnerEpoch does first — so
+		// here it can only ever return a lookup error, never a parse result. The
+		// fallback is retained as written because that is pre-existing behaviour,
+		// but nothing decides anything from it.
 		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
 	}
 	if err != nil || !ok {

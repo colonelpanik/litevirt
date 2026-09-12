@@ -592,6 +592,7 @@ func TestCutoverQueuesTheSurvivingName(t *testing.T) {
 	n := c.Nodes[0]
 
 	mustCreateVM(t, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
 	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 0 {
 		t.Fatalf("precondition: %d mirror items queued before the cutover, want 0", got)
 	}

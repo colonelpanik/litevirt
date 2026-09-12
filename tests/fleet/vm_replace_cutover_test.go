@@ -48,6 +48,21 @@ func enableVMReplaceFleet(c *Cluster, gates map[string]*health.Checker, nodes ..
 	}
 }
 
+// latchCutoverCapabilities brings a cluster to the state a cutover requires:
+// enforcement.vm_replace and enforcement.operation_protocol on every node, both
+// tokens latched, and the receiver-side accept predicate wired. For a fixture
+// that already built its own gates (boundCluster), a fresh Checker re-reads the
+// same durable markers, so tokens latched earlier stay latched.
+func latchCutoverCapabilities(t *testing.T, c *Cluster) {
+	t.Helper()
+	gates := gateAll(t, c)
+	latchOperationProtocol(t, c, gates)
+	enableVMReplaceFleet(c, gates)
+	eventually(t, 10*time.Second, "vm_replace_v1 to latch fleet-wide", func() bool {
+		return gates[c.Nodes[0].Name].Enforced(context.Background(), capabilities.VMReplaceV1)
+	})
+}
+
 // seedCutoverPair puts a VM and its ready replacement on owner, each with one
 // disk, and converges every other node onto that state.
 func seedCutoverPair(t *testing.T, c *Cluster, owner *Node) {

@@ -468,15 +468,12 @@ func TestStaleRecordCleanupEnqueuesOrphanCheckWhenReleaseFails(t *testing.T) {
 // TestCutoverReleasesTheReplacedVMsLease covers the cutover path's half of the
 // same rule.
 //
-// It asserts ONLY the release, and deliberately does not require the cutover to
-// return cleanly: with the replaced VM's row present, the rename that follows
-// the tombstone collides with the soft-deleted row on the `vms.name` unique
-// constraint. That is a PRE-EXISTING cutover defect, unrelated to addressing and
-// out of scope here — every existing CutoverVM test drives the case where the
-// replaced VM does not exist, which is why it has not been caught. The release
-// is ordered BEFORE the tombstone, so it has already run either way, and it is
-// what this scenario is about. Should the rename be fixed, the assertions below
-// hold unchanged.
+// The release is ordered BEFORE the tombstone, which is what this scenario is
+// about. It used to assert only that, tolerating a failed cutover: with the
+// replaced VM's row present, the rename that followed the tombstone collided
+// with the soft-deleted row on the `vms.name` unique constraint. That defect is
+// fixed — the handover is now a guarded transition — so the cutover is required
+// to succeed, and the assertions are unchanged.
 func TestCutoverReleasesTheReplacedVMsLease(t *testing.T) {
 	nb, c := boundCluster(t, 1)
 	n := c.Nodes[0]
@@ -485,6 +482,7 @@ func TestCutoverReleasesTheReplacedVMsLease(t *testing.T) {
 
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
 	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
 
 	oldIP := vmNICIP(t, n, "app")
 	oldIdentity := nicIdentityOf(t, n, "app")
@@ -496,7 +494,9 @@ func TestCutoverReleasesTheReplacedVMsLease(t *testing.T) {
 		t.Fatalf("test setup: want two leases before the cutover, got %d", got)
 	}
 
-	_, _ = c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"})
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
 
 	if got := leaseCount(t, n, orphanNetwork); got != 1 {
 		t.Fatalf("the replaced VM's lease must be released by the cutover, got %d leases (want 1)", got)

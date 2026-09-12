@@ -299,6 +299,7 @@ same batch as the transition. Its phases are:
 
 | step | meaning |
 |---|---|
+| — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. |
 | `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
 | `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. |
 | `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
@@ -333,7 +334,11 @@ replacement's, and the destination definition is derived independently of whethe
 attempt performed that move, so a retry after a failed redefine does not point the VM at a
 vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
 the two names: both are reused by the next deployment, and an identity built from names
-alone collides with the previous cutover's header. Destruction exempts **no** VM from the
+alone collides with the previous cutover's header. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
+contested name still holds the incarnation this operation transitioned. A name that has
+since been deleted and recreated belongs to a different VM, and its files with it; the
+swtpm tree is keyed by the replaced VM's own UUID and is freed regardless. Destruction
+exempts **no** VM from the
 shared-reference check, because the temporary name is free and reusable — a VM created
 after a crash can legitimately reference a captured volume. IPAM allocations move by their
 own primary key and their **complete owner tuple** — `(owner_kind, owner_host, vm_name)`,

@@ -117,9 +117,26 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 		if hErr := s.fireCutoverCrashHook("mid-cleanup"); hErr != nil {
 			return hErr
 		}
-		// The replaced VM's UUID-keyed swtpm tree and name-keyed NVRAM, so the
-		// cutover does not orphan them (G1).
-		lv.WipeFirmwareState(s.dataDir, m.ReplacedVM, m.FirmwareUUID)
+		// The swtpm tree is keyed by the replaced VM's own UUID, so it cannot
+		// belong to anything else and is always safe to free (G1).
+		lv.WipeFirmwareStateByUUID(m.FirmwareUUID)
+
+		// The vars file and the cloud-init ISO are keyed by the NAME, which is
+		// reusable. If the contested name has since been deleted and recreated,
+		// those files are the NEW incarnation's and deleting them destroys a VM
+		// this operation has nothing to do with. Everything uniquely identified
+		// is still freed above; only the name-keyed artifacts are held back.
+		ours, oErr := s.nameStillHoldsThisIncarnation(ctx, m)
+		if oErr != nil {
+			return oErr
+		}
+		if !ours {
+			slog.Warn("cutover cleanup: the contested name holds a different incarnation — "+
+				"leaving its name-keyed firmware and cloud-init state alone",
+				"vm", m.ReplacedVM, "operation", cl.OperationID)
+			return nil
+		}
+		lv.WipeNameKeyedFirmwareState(s.dataDir, m.ReplacedVM)
 		for _, p := range m.Paths {
 			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("remove %s: %w", p, err)
@@ -127,6 +144,25 @@ func (s *Server) freeReplacedVMResources(ctx context.Context, cl corrosion.VMRep
 		}
 	}
 	return nil
+}
+
+// nameStillHoldsThisIncarnation reports whether the contested name is still the
+// row this operation transitioned, which is what makes its NAME-keyed artifacts
+// this operation's to delete.
+//
+// An absent row is treated as ours: the name was deleted and not reused, so the
+// files belong to nobody and a later recreate mints its own.
+func (s *Server) nameStillHoldsThisIncarnation(
+	ctx context.Context, m corrosion.VMReplaceManifest,
+) (bool, error) {
+	row, err := corrosion.GetVM(ctx, s.db, m.ReplacedVM)
+	if err != nil {
+		return false, err
+	}
+	if row == nil {
+		return true, nil
+	}
+	return row.CreatedAt == m.ReplacementIncarnation, nil
 }
 
 // finishVMReplaceRuntime is the runtime-handoff phase: the replacement's libvirt
@@ -339,6 +375,40 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	}
 	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
 		return failed("start", e)
+	}
+	return nil
+}
+
+// retireOriginalDomain removes the REPLACED VM's domain from the contested name
+// and verifies it is gone, so the replacement can be defined there.
+//
+// Not the destructive undefine: that one always passes DomainUndefineNvram
+// (libvirt requires either Nvram or KeepNvram to undefine a UEFI domain), which
+// would delete the original's per-VM UEFI vars before the database transition has
+// committed. The firmware is freed explicitly, from the journal, afterwards.
+//
+// Verified at every step. An already-absent domain is success; anything else that
+// leaves the name occupied is an error, because the caller is about to destroy
+// this VM's disks on the strength of it.
+func (s *Server) retireOriginalDomain(name string) error {
+	active, err := s.virt.DomainIsActive(name)
+	switch {
+	case err != nil && lv.IsNotFound(err):
+		return nil // nothing holds the name
+	case err != nil:
+		return err
+	case active:
+		if sErr := s.stopDomainForHandoff(name); sErr != nil {
+			return sErr
+		}
+	}
+	if uErr := s.virt.UndefineDomainPreservingState(name); uErr != nil && !lv.IsNotFound(uErr) {
+		return uErr
+	}
+	if _, dErr := s.virt.DumpXML(name); dErr == nil {
+		return fmt.Errorf("domain %q is still defined after being undefined", name)
+	} else if !lv.IsNotFound(dErr) {
+		return dErr
 	}
 	return nil
 }

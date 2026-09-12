@@ -181,6 +181,9 @@ func TestCutoverKeepsTheOriginalsNVRAMWhenTheTransitionFails(t *testing.T) {
 		s.db.NowTS(), "app"); err != nil {
 		t.Fatal(err)
 	}
+	if err := fake.UndefineDomainPreservingState("app"); err != nil {
+		t.Fatal(err)
+	}
 	if err := fake.DefineDomain(
 		`<domain><name>app</name><uuid>old-uuid</uuid><os><nvram>` + nvram + `</nvram></os></domain>`); err != nil {
 		t.Fatal(err)

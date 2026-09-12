@@ -126,8 +126,11 @@ type Fake struct {
 	// shut-off reclaim path), symmetric with FailDetachHostdev for the live path.
 	FailDetachHostdevConfig func(domain, pciAddress string) error
 	FailShutdownDomain      func(name string) error
-	FailUndefineDomain      func(name string, removeStorage bool) error
-	FailUndefinePreserv     func(name string) error
+	// FailDestroyDomain injects a forced-stop failure, so a scenario can reach the
+	// path where a domain cannot be taken off a name at all.
+	FailDestroyDomain   func(name string) error
+	FailUndefineDomain  func(name string, removeStorage bool) error
+	FailUndefinePreserv func(name string) error
 	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
 	// fail-closed path that must NOT proceed when the live membership is unreadable
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
@@ -324,6 +327,15 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 				return fmt.Errorf("libvirtfake: domain %q is already active with uuid %s", other, uuid)
 			}
 		}
+		// libvirt also refuses a definition that reuses an existing domain's NAME
+		// with a DIFFERENT uuid — a name is not a slot you can overwrite. A caller
+		// whose undefine of the old occupant failed therefore cannot quietly
+		// replace it, which is what this fake used to model.
+		if existing, ok := f.xml[name]; ok {
+			if cur := domainUUIDFromXML(existing); cur != "" && cur != uuid {
+				return fmt.Errorf("libvirtfake: domain %q already exists with uuid %s", name, cur)
+			}
+		}
 	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig
@@ -406,6 +418,11 @@ func (f *Fake) ShutdownDomain(name string) error {
 }
 
 func (f *Fake) DestroyDomain(name string) error {
+	if f.FailDestroyDomain != nil {
+		if err := f.FailDestroyDomain(name); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {

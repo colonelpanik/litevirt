@@ -277,6 +277,9 @@ func TestCutoverRestart_AfterCommitFinishesTheRuntimeHandoff(t *testing.T) {
 		s.db.NowTS(), "app-next"); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.virt.UndefineDomainPreservingState("app-next"); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.virt.DefineDomain(
 		`<domain><name>app-next</name><uuid>next-uuid</uuid><os><nvram>` + nvram + `</nvram></os></domain>`); err != nil {
 		t.Fatal(err)
@@ -324,6 +327,9 @@ func TestCutoverRestart_ResumeDoesNotWipeTheReplacementsFirmware(t *testing.T) {
 	mustWrite(t, nvram)
 	if err := s.db.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = ?`,
 		`{"name":"app-next","firmware":"uefi","uuid":"next-uuid"}`, s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.UndefineDomainPreservingState("app-next"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.virt.DefineDomain(
@@ -523,6 +529,11 @@ func TestCutoverRestart_RecoveryWillNotConsumeAReusedDomain(t *testing.T) {
 		nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	// The old occupant is gone (this crash was before the runtime handoff, so it
+	// is still defined) before the new one takes the name — as a real create would.
+	if err := s.virt.UndefineDomainPreservingState("app-next"); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.virt.DefineDomain(
 		`<domain><name>app-next</name><uuid>a-completely-different-vm</uuid></domain>`); err != nil {
 		t.Fatal(err)
@@ -600,6 +611,9 @@ func firmwareFixture(t *testing.T) (s *Server, original, replacement, nvram stri
 		`UPDATE vms SET spec = ?, state = 'running', updated_at = ? WHERE name = ?`,
 		`{"name":"app-next","firmware":"uefi","secure_boot":true,"uuid":"next-uuid"}`,
 		s.db.NowTS(), "app-next"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.virt.UndefineDomainPreservingState("app-next"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.virt.DefineDomain(`<domain><name>app-next</name><uuid>next-uuid</uuid>` +
@@ -1138,5 +1152,122 @@ func TestCutoverRestart_RechecksActivityEvenWithTheStopRecorded(t *testing.T) {
 	}
 	if active, _ := s.virt.DomainIsActive("app-next"); active {
 		t.Error("recovery undefined a reactivated domain while it was still active")
+	}
+}
+
+// The ORIGINAL's domain must be verifiably gone from the contested name before
+// anything is torn down. Deciding from the database state, ignoring a failed
+// destroy, or continuing past a failed undefine all leave the name occupied — and
+// real libvirt then refuses to define the replacement there, because the UUID
+// differs, by which point the original's disks are already deleted.
+func TestCutoverRefusesWhenTheOriginalsDomainCannotBeFreed(t *testing.T) {
+	ctx := adminCtx()
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, s *Server, fake *libvirtfake.Fake)
+	}{
+		{"the original is PAUSED, which the coarse state hides", func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := fake.StartDomain("app"); err != nil {
+				t.Fatal(err)
+			}
+			fake.SetPaused("app")
+			// It is stopped as far as the database and the coarse query can tell.
+			fake.FailDestroyDomain = func(string) error { return errCrash }
+			fake.FailShutdownDomain = func(string) error { return errCrash }
+		}},
+		{"the destroy fails", func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			if err := fake.StartDomain("app"); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Execute(ctx, `UPDATE vms SET state='running', updated_at=? WHERE name='app'`,
+				s.db.NowTS()); err != nil {
+				t.Fatal(err)
+			}
+			fake.FailDestroyDomain = func(string) error { return errCrash }
+			fake.FailShutdownDomain = func(string) error { return errCrash }
+		}},
+		{"the undefine fails", func(t *testing.T, s *Server, fake *libvirtfake.Fake) {
+			fake.FailUndefinePreserv = func(name string) error {
+				if name == "app" {
+					return errCrash
+				}
+				return nil
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, original, replacement, iso := restartFixture(t)
+			fake := s.virt.(*libvirtfake.Fake)
+			tc.prepare(t, s, fake)
+
+			if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+				t.Fatal("the cutover proceeded without freeing the name from the original's domain")
+			}
+			// Nothing destroyed, nothing transitioned, nothing authorized.
+			for _, p := range []string{original, replacement, iso} {
+				if !exists(p) {
+					t.Errorf("a refused cutover destroyed %s", p)
+				}
+			}
+			for _, name := range []string{"app", "app-next"} {
+				if vm, gErr := corrosion.GetVM(ctx, s.db, name); gErr != nil || vm == nil {
+					t.Errorf("%s after the refused cutover: %+v err=%v", name, vm, gErr)
+				}
+			}
+			if owed := pendingCleanups(t, s); len(owed) != 0 {
+				t.Errorf("a refused cutover authorized destruction: %+v", owed)
+			}
+		})
+	}
+}
+
+// A delayed cleanup must not delete the NAME-keyed state of a VM that has since
+// been recreated at that name. Those files belong to the new incarnation; the
+// swtpm tree, keyed by the replaced VM's own UUID, is still this operation's.
+func TestCutoverCleanupSparesARecreatedTargetsNameKeyedState(t *testing.T) {
+	s, original, _, iso := restartFixture(t)
+	ctx := adminCtx()
+	nvram := lv.NvramPath(s.dataDir, "app")
+	if err := os.MkdirAll(filepath.Dir(nvram), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	crashAt(s, "after-commit")
+	if _, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover did not abandon after the commit")
+	}
+	s.SetCutoverCrashHook(nil)
+
+	// The name is deleted and RECREATED as a different VM, with its own files.
+	if err := corrosion.DeleteVM(ctx, s.db, "app"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "app", HostName: s.hostName, Spec: `{"name":"app","uuid":"a-new-incarnation"}`,
+		State: "stopped",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nvram, []byte("the new VM's firmware"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(iso, []byte("the new VM's cloud-init"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	body, err := os.ReadFile(nvram)
+	if err != nil || string(body) != "the new VM's firmware" {
+		t.Errorf("cleanup deleted the recreated VM's firmware: %q err=%v", body, err)
+	}
+	body, err = os.ReadFile(iso)
+	if err != nil || string(body) != "the new VM's cloud-init" {
+		t.Errorf("cleanup deleted the recreated VM's cloud-init ISO: %q err=%v", body, err)
+	}
+	// The uniquely identified resources are still freed.
+	if exists(original) {
+		t.Error("cleanup skipped the replaced VM's own volume, which nothing else can claim")
 	}
 }

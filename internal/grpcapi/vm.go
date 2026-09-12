@@ -2882,20 +2882,21 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			"cutover: journal the cleanup manifest: %v (nothing was changed)", err)
 	}
 	if oldVM != nil {
-		if oldVM.HostName == s.hostName && oldVM.State == "running" {
-			s.virt.DestroyDomain(req.VmName)
-		}
-		// The old domain has to go before the -next domain can be redefined under
-		// its name, but this must NOT be the destructive undefine: that one always
-		// passes DomainUndefineNvram (libvirt requires either Nvram or KeepNvram to
-		// undefine a UEFI domain), so it would delete the original's per-VM UEFI
-		// vars before the database transition below has committed — and a failure
-		// after that point leaves a Secure-Boot original that cannot start. The
-		// firmware state is freed explicitly, after the transition succeeds.
+		// The original's domain has to be GONE from the name before anything else
+		// happens, and that has to be verified rather than attempted. A destroy
+		// decided from the database state misses a PAUSED original (and any
+		// row/runtime divergence), an ignored destroy error leaves it running, and
+		// a swallowed undefine error leaves it defined — in every case the name is
+		// still held when the replacement is redefined at it, which real libvirt
+		// refuses because the UUID differs. By then the original's disks are gone.
+		//
+		// A failure here is safe: nothing has been torn down or written, and the
+		// journaled operation is still only `planned`, which authorizes nothing.
 		if oldVM.HostName == s.hostName {
-			if uerr := s.virt.UndefineDomainPreservingState(req.VmName); uerr != nil {
-				slog.Warn("cutover: undefine replaced domain (state preserved)",
-					"vm", req.VmName, "error", uerr)
+			if rErr := s.retireOriginalDomain(req.VmName); rErr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cutover: free the name %q from the replaced VM's domain: %v (nothing was changed)",
+					req.VmName, rErr)
 			}
 		}
 		// The replaced VM's addresses go back BEFORE its row does: the lease

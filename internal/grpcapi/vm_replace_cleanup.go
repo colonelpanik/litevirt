@@ -67,6 +67,15 @@ func (s *Server) fireCutoverCrashHook(stage string) error {
 // are all successes. The shared-path check is retained — a volume another VM
 // still references is skipped, not freed.
 func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMReplaceCleanup) error {
+	if !cl.ReleaseDone {
+		if err := s.releaseReplacedVMAddresses(ctx, cl); err != nil {
+			return err
+		}
+		if err := corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
+			corrosion.OpStepReleased); err != nil {
+			return err
+		}
+	}
 	if !cl.CleanupDone {
 		if err := s.freeReplacedVMResources(ctx, cl); err != nil {
 			return err
@@ -90,6 +99,88 @@ func (s *Server) finishVMReplaceCleanup(ctx context.Context, cl corrosion.VMRepl
 	}
 	return corrosion.RecordVMReplacePhase(ctx, s.db, cl.OperationID, cl.OwnerEpoch,
 		corrosion.OpStepCompleted)
+}
+
+// replacedVMLeases captures the addresses the replaced VM holds, while its own
+// NIC rows still say so. After the transition the REPLACEMENT's leases have moved
+// onto the same name, so the owner name no longer separates them.
+func (s *Server) replacedVMLeases(ctx context.Context, vmName string) ([]corrosion.VMReplaceLease, error) {
+	nics, err := corrosion.MergedVMNICs(ctx, s.db, vmName)
+	if err != nil {
+		return nil, err
+	}
+	var out []corrosion.VMReplaceLease
+	for _, nic := range nics {
+		if nic.IP == "" {
+			continue // never addressed — nothing to give back
+		}
+		entry := corrosion.VMReplaceLease{Network: nic.NetworkName, IP: nic.IP, MAC: nic.MAC}
+		// The external object's id, while the lease row still carries it.
+		lease, lErr := corrosion.GetLeaseByIPForOwner(ctx, s.db, nic.NetworkName, nic.IP, "vm", "", vmName)
+		if lErr != nil {
+			return nil, lErr
+		}
+		if lease != nil {
+			entry.NetBoxIPID = lease.NetBoxIPID
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// releaseReplacedVMAddresses gives the replaced VM's addresses back, after the
+// transition has committed and from the manifest rather than from rows that no
+// longer distinguish the two VMs.
+//
+// Ownership-checked per address: the live allocation at that key must still carry
+// the MAC that held it. An address released and reallocated to something else in
+// the meantime is left alone — releasing it would take a live VM's address, and
+// leaving it is what the orphan sweep exists for.
+//
+// A failure is returned, not logged: the phase stays owed and a restart retries
+// it, instead of the address being stranded under a cutover that said it was
+// finished.
+func (s *Server) releaseReplacedVMAddresses(ctx context.Context, cl corrosion.VMReplaceCleanup) error {
+	m := cl.Manifest
+	if m.HostName != s.hostName || len(m.Leases) == 0 {
+		return nil
+	}
+	owner := &corrosion.VMRecord{Name: m.ReplacedVM, HostName: m.HostName}
+	var failures []string
+	for _, l := range m.Leases {
+		held, err := corrosion.GetLeaseByIPForOwner(ctx, s.db, l.Network, l.IP, "vm", "", m.ReplacedVM)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s %s: read: %v", l.Network, l.IP, err))
+			continue
+		}
+		if held == nil {
+			// The local half landed on an earlier attempt and the remote half did
+			// not — the one state releaseOneNICLease cannot finish, because the row
+			// it proves ownership from is already gone. The manifest still has the
+			// object's id, which is the whole reason it was captured.
+			if l.NetBoxIPID != 0 && s.netbox != nil {
+				if rErr := s.netbox.ReleaseIP(ctx, l.NetBoxIPID); rErr != nil {
+					failures = append(failures,
+						fmt.Sprintf("%s %s: remote release: %v", l.Network, l.IP, rErr))
+				}
+			}
+			continue
+		}
+		if held.MAC != l.MAC {
+			slog.Warn("cutover cleanup: the address is held by a different MAC now — not releasing it",
+				"network", l.Network, "ip", l.IP, "want_mac", l.MAC, "have_mac", held.MAC)
+			continue
+		}
+		if rErr := s.releaseOneNICLease(ctx, owner, corrosion.NICRecord{
+			VMName: m.ReplacedVM, NetworkName: l.Network, IP: l.IP, MAC: l.MAC,
+		}); rErr != nil {
+			failures = append(failures, fmt.Sprintf("%s %s: %v", l.Network, l.IP, rErr))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("release the replaced VM's addresses: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // freeReplacedVMResources is the destruction phase. It must run exactly once:

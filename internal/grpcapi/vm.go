@@ -2874,6 +2874,12 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 			manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
 			manifest.Disks = replacedDisks
 			manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
+			leases, lErr := s.replacedVMLeases(ctx, req.VmName)
+			if lErr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cutover: read the replaced VM's addresses: %v (nothing was changed)", lErr)
+			}
+			manifest.Leases = leases
 		}
 	}
 	prepared, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
@@ -2899,13 +2905,14 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 					req.VmName, rErr)
 			}
 		}
-		// The replaced VM's addresses go back BEFORE its row does: the lease
-		// survives the row otherwise, and the sweeper's live-lease veto then
-		// makes it unreclaimable for good. Best-effort — the -next VM is about
-		// to take this name, and a cutover halted between the two would leave
-		// two rows claiming one identity — but a failure is logged at ERROR and
-		// every NIC handed to the orphan sweep rather than passing silently.
-		s.releaseNICLeasesBestEffort(ctx, oldVM, "cutover")
+		// The replaced VM's addresses are NOT given back here. Releasing before the
+		// transition means a delete that then declines — or any later failure —
+		// leaves a LIVE VM whose address has already gone back to the pool, locally
+		// and in the external IPAM. They are captured in the manifest above and
+		// released by a journaled phase after the transition commits, which is also
+		// what makes a failed release retryable instead of a stranded address under
+		// a cutover that reported success.
+		//
 		// A declined tombstone must abort BEFORE the re-key: proceeding would
 		// leave the replaced VM's row live (a duplicate identity) under a name
 		// the replacement is taking.

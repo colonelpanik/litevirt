@@ -508,3 +508,88 @@ func TestCutoverReleasesTheReplacedVMsLease(t *testing.T) {
 		t.Fatalf("exactly the surviving VM's address must remain in NetBox, got %v", nb.Identities())
 	}
 }
+
+// A cutover that never commits must not have given the replaced VM's address
+// away. Releasing before the transition meant a declined delete — or any later
+// failure — left a LIVE VM with its address back in the pool, locally and in the
+// external IPAM.
+func TestCutoverKeepsTheReplacedVMsAddressWhenItDoesNotCommit(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIP := vmNICIP(t, n, "app")
+	oldIdentity := nicIdentityOf(t, n, "app")
+
+	// The transition cannot commit: the tombstone is refused.
+	if err := n.DB.Execute(ctx, `CREATE TRIGGER block_cutover_delete BEFORE UPDATE OF deleted_at ON vms
+ WHEN OLD.name = 'app' AND NEW.deleted_at IS NOT NULL BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"}); err == nil {
+		t.Fatal("the cutover reported success despite a refused tombstone")
+	}
+
+	// The VM is still live, and still holds its address — here and in NetBox.
+	vm, err := corrosion.GetVM(ctx, n.DB, "app")
+	if err != nil || vm == nil {
+		t.Fatalf("the replaced VM after a failed cutover: %+v err=%v", vm, err)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 2 {
+		t.Fatalf("a failed cutover gave an address back: %d leases (want 2)", got)
+	}
+	if got := vmNICIP(t, n, "app"); got != oldIP {
+		t.Fatalf("the live VM's address changed to %q, want %q", got, oldIP)
+	}
+	if ids := identitySet(nb); !ids[oldIdentity] {
+		t.Fatalf("a failed cutover released the live VM's NetBox object: %v", nb.Identities())
+	}
+}
+
+// A release that fails must leave the operation OWED, not the address stranded
+// under a cutover that reported success. The journaled phase is retried.
+func TestCutoverRetriesAFailedAddressRelease(t *testing.T) {
+	nb, c := boundCluster(t, 1)
+	n := c.Nodes[0]
+	ctx := context.Background()
+	setHostCapacity(t, c, n.Name, 64, 65536, nil)
+
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app", orphanNetwork)
+	mustCreateVMWithDiskOnNetwork(t, c, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
+	oldIdentity := nicIdentityOf(t, n, "app")
+
+	// The remote half of the release fails for this attempt.
+	nb.SetDown(true)
+	_, cutErr := c.SelfClient(n).CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "app"})
+	nb.SetDown(false)
+	if cutErr == nil {
+		t.Fatal("a failed address release must not report a finished cutover")
+	}
+
+	owed, err := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name)
+	if err != nil {
+		t.Fatalf("ListVMReplaceCleanups: %v", err)
+	}
+	if len(owed) != 1 || owed[0].ReleaseDone {
+		t.Fatalf("the failed release left nothing owed: %+v", owed)
+	}
+
+	// The retry finishes it, and the address goes back.
+	if err := n.Server.ResumeVMReplaceCleanups(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := leaseCount(t, n, orphanNetwork); got != 1 {
+		t.Fatalf("the replaced VM's lease was not released by the retry: %d leases (want 1)", got)
+	}
+	if ids := identitySet(nb); ids[oldIdentity] {
+		t.Fatalf("the replaced VM's NetBox object survived the retry: %v", nb.Identities())
+	}
+	if left, lErr := corrosion.ListVMReplaceCleanups(ctx, n.DB, n.Name); lErr != nil || len(left) != 0 {
+		t.Fatalf("the operation is still owed after a successful retry: %+v err=%v", left, lErr)
+	}
+}

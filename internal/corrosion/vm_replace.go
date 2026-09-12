@@ -841,6 +841,12 @@ type VMReplaceManifest struct {
 	// Paths are whole-file artifacts keyed by the replaced VM's name (its
 	// cloud-init ISO), which the transition does not describe.
 	Paths []string `json:"paths,omitempty"`
+	// Leases are the replaced VM's IPAM addresses, to be given back AFTER the
+	// transition. They are captured here because the transition moves the
+	// REPLACEMENT's leases onto the contested name: afterwards both VMs' addresses
+	// answer to one owner name, and only the address itself — with the MAC that
+	// held it — still says which was whose.
+	Leases []VMReplaceLease `json:"leases,omitempty"`
 	// ReplacementSpec and ReplacementState are the runtime-handoff inputs: the
 	// libvirt domain and firmware still answer to the temporary name after the
 	// transition commits, and moving them is the other half of a cutover. A
@@ -849,6 +855,20 @@ type VMReplaceManifest struct {
 	// transitioned record — so they are captured here alongside the manifest.
 	ReplacementSpec  string `json:"replacement_spec,omitempty"`
 	ReplacementState string `json:"replacement_state,omitempty"`
+}
+
+// VMReplaceLease is one address the replaced VM held, identified well enough to
+// prove — after the transition — that it is still the same allocation.
+type VMReplaceLease struct {
+	Network string `json:"network"`
+	IP      string `json:"ip"`
+	MAC     string `json:"mac"`
+	// NetBoxIPID is the external object backing this address, captured because
+	// the local lease row is what normally carries it — and a release whose LOCAL
+	// half landed and whose REMOTE half failed has already destroyed that row. The
+	// retry has no other way to finish, which is how an address ends up allocated
+	// in the external IPAM for good.
+	NetBoxIPID int `json:"netbox_ip_id,omitempty"`
 }
 
 // VMReplacePrepared is the handle PrepareVMReplace returns: the journaled
@@ -873,6 +893,8 @@ type VMReplaceCleanup struct {
 	Manifest    VMReplaceManifest
 	CleanupDone bool
 	RuntimeDone bool
+	// ReleaseDone records that the replaced VM's addresses were given back.
+	ReleaseDone bool
 	// StopDone records that the replacement's domain was confirmed inactive, so a
 	// retry does not re-stop a domain it has already redefined and restarted.
 	StopDone bool
@@ -882,7 +904,9 @@ type VMReplaceCleanup struct {
 }
 
 // Outstanding reports whether any phase still has to run.
-func (c VMReplaceCleanup) Outstanding() bool { return !c.CleanupDone || !c.RuntimeDone }
+func (c VMReplaceCleanup) Outstanding() bool {
+	return !c.ReleaseDone || !c.CleanupDone || !c.RuntimeDone
+}
 
 // VMReplaceHandoff is the replacement's exact domain definition, recorded DURABLY
 // before anything undefines it. A redefine that fails transiently otherwise
@@ -984,6 +1008,8 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 		pending := VMReplaceCleanup{OperationID: op.ID, OwnerEpoch: op.VMOwnerEpoch, Manifest: m}
 		for _, st := range steps {
 			switch st.StepName {
+			case OpStepReleased:
+				pending.ReleaseDone = true
 			case OpStepConfigApplied:
 				pending.CleanupDone = true
 			case OpStepJournaled:
@@ -1009,7 +1035,7 @@ func ListVMReplaceCleanups(ctx context.Context, c *Client, hostName string) ([]V
 // resources the journal exists to free, or — for the cleanup phase — let a later
 // resume wipe firmware that by then belongs to the replacement.
 func RecordVMReplacePhase(ctx context.Context, c *Client, operationID string, ownerEpoch int64, step string) error {
-	if step != OpStepConfigApplied && step != OpStepStopped &&
+	if step != OpStepReleased && step != OpStepConfigApplied && step != OpStepStopped &&
 		step != OpStepRedefined && step != OpStepCompleted {
 		return fmt.Errorf("corrosion: %q is not a VM replace phase", step)
 	}

@@ -51,6 +51,7 @@ const (
 	OpStepBound            = "bound"
 	OpStepAttached         = "attached"
 	OpStepPrepared         = "prepared"
+	OpStepReleased         = "released"
 	OpStepRuntimeStarted   = "runtime_started"
 
 	// Shared, cross-kind steps.
@@ -103,6 +104,13 @@ var opHappyPath = map[OperationKind][]string{
 	//                     batch as that transition, so it cannot be observed
 	//                     without it, and it is what authorizes the destruction.
 	//
+	//   released          the replaced VM's IPAM addresses are given back. AFTER the
+	//                     transition, not before: releasing first means a delete
+	//                     that then declines leaves a LIVE VM whose address has
+	//                     already gone back to the pool, locally and in the
+	//                     external IPAM. Journaled because the release can fail on
+	//                     its remote half, and a best-effort attempt that did would
+	//                     strand the address with the cutover reporting success.
 	//   config_applied    the replaced VM's resources are freed. It also CLOSES the
 	//                     cleanup phase: past this point the replacement's own
 	//                     firmware has moved onto the contested name, so re-running
@@ -126,7 +134,7 @@ var opHappyPath = map[OperationKind][]string{
 	// OpStepCompleted is appended only after BOTH later phases have run, so a crash
 	// anywhere between them leaves work a restart can find and finish.
 	OpVMReplace: {
-		OpStepPlanned, OpStepDesiredPersisted, OpStepConfigApplied,
+		OpStepPlanned, OpStepDesiredPersisted, OpStepReleased, OpStepConfigApplied,
 		OpStepJournaled, OpStepStopped, OpStepRedefined,
 	},
 }

@@ -472,6 +472,10 @@ type EnforcementConfig struct {
 	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
 	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
 	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
+	// LeaseTerm opts this node into leader-lease term enforcement. Also the
+	// reversible kill switch: enforcement is this flag AND the lease_term_v1
+	// latch, so clearing it disables enforcement even after the latch closes.
+	LeaseTerm bool `yaml:"lease_term,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a

@@ -90,12 +90,13 @@ func TestReplicatedUpdatedAtUsesNowTS(t *testing.T) {
 			return nil // unparseable (generated/partial) — skip
 		}
 		rel, _ := filepath.Rel(root, path)
+		consts := packageStringConsts(f)
 		for _, decl := range f.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				continue
 			}
-			lits := funcStringLiterals(fn)
+			lits := funcStringLiterals(fn, consts)
 			if !writesReplicatedUpdatedAt(lits, replicated) {
 				continue
 			}
@@ -149,7 +150,12 @@ func hasInjectedNowParam(fn *ast.FuncDecl) bool {
 			continue
 		}
 		for _, name := range field.Names {
-			if name.Name == "now" {
+			// `updatedAt`/`nowTS` count alongside `now`: a builder that names its
+			// parameter for the COLUMN it fills is delegating exactly the same
+			// way, and forcing the name `now` on it would make the parameter
+			// less accurate to satisfy a matcher.
+			switch name.Name {
+			case "now", "nowTS", "updatedAt":
 				return true
 			}
 		}
@@ -196,16 +202,63 @@ func TestLBWriteEntrypointsUseNowTS(t *testing.T) {
 
 // funcStringLiterals returns the unquoted value of every string literal (backtick
 // or double-quoted) inside a function — comments are excluded by construction.
-func funcStringLiterals(fn *ast.FuncDecl) []string {
+//
+// It also resolves package-level string consts the function REFERENCES by name,
+// via consts. Without that, hoisting a statement into a `const fooSQL = ...` at
+// package scope removed it from every writer function's literal set and the
+// tripwire went green for a purely structural reason — which is exactly how a
+// replicated updated_at written from a bare time.RFC3339 clock shipped. The
+// hoist is good practice (stmtshapecheck requires a statically resolvable
+// constant), so the guard has to follow it rather than forbid it.
+func funcStringLiterals(fn *ast.FuncDecl, consts map[string]string) []string {
 	var out []string
 	ast.Inspect(fn, func(n ast.Node) bool {
-		if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING {
-			if v, err := strconv.Unquote(bl.Value); err == nil {
+		switch x := n.(type) {
+		case *ast.BasicLit:
+			if x.Kind == token.STRING {
+				if v, err := strconv.Unquote(x.Value); err == nil {
+					out = append(out, v)
+				}
+			}
+		case *ast.Ident:
+			if v, ok := consts[x.Name]; ok {
 				out = append(out, v)
 			}
 		}
 		return true
 	})
+	return out
+}
+
+// packageStringConsts collects package-level `const name = "…"` string values in
+// one file, so funcStringLiterals can resolve a hoisted SQL constant back to the
+// functions that reference it.
+func packageStringConsts(f *ast.File) map[string]string {
+	out := map[string]string{}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range vs.Names {
+				if i >= len(vs.Values) {
+					continue
+				}
+				bl, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || bl.Kind != token.STRING {
+					continue
+				}
+				if v, err := strconv.Unquote(bl.Value); err == nil {
+					out[name.Name] = v
+				}
+			}
+		}
+	}
 	return out
 }
 

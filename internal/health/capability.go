@@ -185,7 +185,7 @@ func (c *Checker) PeerSupports(ctx context.Context, peer, token string) bool {
 // still refreshes the cache for subsequent cheap PeerSupports reads.
 // HealthyPeers returns the peers this daemon currently counts toward quorum: probed healthy
 // at least once THIS run AND currently voting-eligible by host state (the SAME two predicates
-// QuorumProof applies — probe freshness + votingEligible). A peer since marked
+// QuorumProof applies — probe freshness + VotingEligible). A peer since marked
 // offline/maintenance/fenced is therefore excluded, matching the "quorum-counted this run"
 // relay constraint. Used to pick a "quorum-visible" relay peer for the VIP absence proof (the
 // caller still confirms reachability by dialing it). Fail closed: if the host table can't be
@@ -197,7 +197,7 @@ func (c *Checker) HealthyPeers(ctx context.Context) []string {
 	}
 	eligible := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
-		if votingEligible(h.State) {
+		if VotingEligible(h.State) {
 			eligible[h.Name] = true
 		}
 	}
@@ -236,7 +236,7 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 
 // CapabilityActive reports whether `token` is advertised by every
 // enforcement-relevant member (non-deleted, non-fenced, non-maintenance,
-// non-offline — i.e. votingEligible), computed from fresh Pings. On any
+// non-offline — i.e. VotingEligible), computed from fresh Pings. On any
 // unreachable or unsupporting relevant member it returns (false, reason) so the
 // caller stays log-only and surfaces HA-degraded. Recomputed every call.
 func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, string) {
@@ -259,12 +259,9 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 	pctx, cancel := context.WithTimeout(ctx, capActivationTimeout)
 	defer cancel()
 
-	for _, h := range hosts {
-		if !votingEligible(h.State) {
-			continue // decommissioned/offline/maintenance/fenced don't gate enforcement
-		}
+	for _, name := range c.activationTargets(hosts, token) {
 		reqStart := time.Now()
-		caps, peerWall, err := pinger(pctx, h.Name)
+		caps, peerWall, err := pinger(pctx, name)
 		reqEnd := time.Now()
 		if err != nil {
 			// Unreachable enforcement-relevant member — can't confirm support.
@@ -272,7 +269,7 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 		}
 		// This sweep already holds a fresh Ping from every voting member, so it
 		// is the cheapest place in the daemon to observe cluster-wide drift.
-		c.checkClockSkew(ctx, h.Name, peerWall, reqStart, reqEnd)
+		c.checkClockSkew(ctx, name, peerWall, reqStart, reqEnd)
 		if !capabilities.Has(caps, token) {
 			return c.cacheNeg(token, ReasonUnsupportedCapability)
 		}
@@ -284,6 +281,52 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 	delete(c.capActiveNeg, token)
 	c.mu.Unlock()
 	return true, ""
+}
+
+// activationTargets is the set of peers whose advertisement of `token` must be
+// confirmed before it may latch.
+//
+// For an ordinary token that is the VOTING-eligible membership: the token gates
+// a decision, so the members that have to agree are the ones that vote, and a
+// host in maintenance must not be able to hold a fencing decision hostage.
+//
+// A capabilities.ReplicationGated token needs the peers this node REPLICATES TO
+// as well, because its latch is a claim about what they can DECODE rather than
+// about what they agree to enforce. The replicator takes its targets from
+// memberlist membership with no host-state filter, so those two sets diverge on
+// exactly the host the token was added for: one in `maintenance`, queued to be
+// upgraded next, whose daemon is up and which is still a live replication
+// target. The voting sweep skipped it, the latch formed, and the first write
+// emitted a statement shape its binary has no ledger entry for — so its apply
+// failed closed, its batch rolled back and its watermark stalled, head-of-line
+// blocking the stream into it.
+//
+// Membership rather than "every host that is not decommissioned": a host
+// outside memberlist receives nothing and so cannot stall, while demanding a
+// confirmation from an unreachable host would stop the latch ever forming.
+func (c *Checker) activationTargets(hosts []corrosion.HostRecord, token string) []string {
+	seen := make(map[string]bool, len(hosts))
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		if !VotingEligible(h.State) {
+			continue // decommissioned/offline/maintenance/fenced don't gate enforcement
+		}
+		if !seen[h.Name] {
+			seen[h.Name] = true
+			out = append(out, h.Name)
+		}
+	}
+	if !capabilities.ReplicationGated(token) {
+		return out
+	}
+	for _, p := range c.db.Members() {
+		if p.Name == "" || p.Name == c.hostName || seen[p.Name] {
+			continue
+		}
+		seen[p.Name] = true
+		out = append(out, p.Name)
+	}
+	return out
 }
 
 // CapabilityActiveForHealth is CapabilityActive with a POSITIVE-result cache, for the

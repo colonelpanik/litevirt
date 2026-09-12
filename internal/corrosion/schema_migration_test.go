@@ -336,11 +336,11 @@ func buildV42DB(t *testing.T, c *Client) {
 	}
 }
 
-// TestInitSchema_MigratesV42ToV51 is the release upgrade path in one test: a DB
+// TestInitSchema_MigratesV42ToV54 is the release upgrade path in one test: a DB
 // at the last pre-consolidation upstream schema must come out of InitSchema at
-// the current schema version with every intervening table and column present
-// and the whole ledger recorded — and with pre-existing data intact.
-func TestInitSchema_MigratesV42ToV51(t *testing.T) {
+// CurrentSchemaVersion with every intervening table and column present and the
+// whole ledger recorded — and with pre-existing data intact.
+func TestInitSchema_MigratesV42ToV54(t *testing.T) {
 	c, err := NewTestClient()
 	if err != nil {
 		t.Fatalf("NewTestClient: %v", err)
@@ -355,22 +355,23 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 	}
 
 	if err := InitSchema(ctx, c); err != nil {
-		t.Fatalf("InitSchema v42→v51: %v", err)
+		t.Fatalf("InitSchema v42→v54: %v", err)
 	}
 
 	if v := storedVersion(t, c); v != CurrentSchemaVersion {
 		t.Fatalf("stored version after migration = %d, want %d", v, CurrentSchemaVersion)
 	}
-	// Every post-42 table healed, including the three v50 health tables and the
-	// four v51 NetBox tables.
+	// Every post-42 table healed, including the three v50 health tables, the
+	// four v51 NetBox tables and the v52 lease-term ledger.
 	for _, table := range []string{
 		"audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle",
 		"cluster_crl", "host_networks",
 		"health_conditions", "health_evaluator_status", "host_capacity_observations",
 		"netbox_bindings", "netbox_objects", "netbox_sync_queue", "netbox_host_config",
+		"leader_lease_terms",
 	} {
 		if ok, _ := tableExists(ctx, c, table); !ok {
-			t.Errorf("table %s missing after v42→v51 migration", table)
+			t.Errorf("table %s missing after v42→v54 migration", table)
 		}
 	}
 	// And NOT the three prerelease permanent-loss trust tables. They are gone
@@ -381,19 +382,21 @@ func TestInitSchema_MigratesV42ToV51(t *testing.T) {
 		"netbox_retirement_withdrawals",
 	} {
 		if ok, _ := tableExists(ctx, c, table); ok {
-			t.Errorf("table %s was created by the v42→v51 migration; the permanent-loss "+
+			t.Errorf("table %s was created by the v42→v54 migration; the permanent-loss "+
 				"trust mechanism was removed and nothing may re-create its tables", table)
 		}
 	}
 	// Every post-42 column healed (spot-check one per version class).
 	for _, tc := range []struct{ table, col string }{
-		{"hosts", "capacity_policy_hash"},      // v44
-		{"audit_log", "seq"},                   // v45
-		{"hosts", "isolation_epoch"},           // v49
-		{"containers", "owner_epoch"},          // v44
-		{"ip_allocations", "netbox_ip_id"},     // v51
-		{"ip_allocations", "netbox_prefix_id"}, // v51
-		{"netbox_bindings", "netbox_cluster"},  // v51
+		{"hosts", "capacity_policy_hash"},       // v44
+		{"audit_log", "seq"},                    // v45
+		{"hosts", "isolation_epoch"},            // v49
+		{"containers", "owner_epoch"},           // v44
+		{"ip_allocations", "netbox_ip_id"},      // v51
+		{"ip_allocations", "netbox_prefix_id"},  // v51
+		{"netbox_bindings", "netbox_cluster"},   // v51
+		{"runtime_action_proofs", "lease_term"}, // v53
+		{"runtime_action_proofs", "lease_key"},  // v54
 	} {
 		if ok, _ := columnExists(ctx, c.db, tc.table, tc.col); !ok {
 			t.Errorf("column %s.%s missing after migration", tc.table, tc.col)

@@ -114,6 +114,17 @@ var firstShapeAcks = map[string]string{
 	"netbox_host_config": "published only through netboxClusterComparable, which returns " +
 		"errNetBoxClusterNotYetComparable until DurablyLatched(netbox_ipam_v1) — the publication " +
 		"is deliberately withheld until the latch makes it safe to replicate",
+	"leader_lease_terms": "the only writer is corrosion.AcquireLeaseWithTerm, which returns " +
+		"without touching the table unless DurablyLatched(lease_term_ledger_v1) — a token with " +
+		"no config flag, advertised by every build that carries the ledger and by no build that " +
+		"does not, and in capabilities.replicationGated so the latch is confirmed against every " +
+		"peer this node REPLICATES TO rather than only the voting members — `listening` is not a " +
+		"property of voting, and a host in `maintenance` on the old build is skipped by the " +
+		"voting sweep while still receiving the mint. So the latch cannot form while a " +
+		"previous-release peer is still listening. " +
+		"Pre-latch the lease still transfers through the bare leader_election upsert, whose " +
+		"shape predates this release, so nothing but the term waits on the roll. A subsequent " +
+		"downgrade below the latch is the isolation-epoch case (schema v49), not this guard's",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

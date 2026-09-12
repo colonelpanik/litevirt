@@ -73,6 +73,16 @@ const (
 	ReasonProofConflict         = "proof_conflict"
 	ReasonProofClaimError       = "proof_claim_error" // transient DB error claiming a proof (not a spent/terminal proof)
 	ReasonStaleEpoch            = "stale_epoch"       // Phase 5 (fence/owner epoch staleness)
+	// ReasonStaleLeaseTerm: FENCED. The proof's lease term is below the
+	// quorum-observed high-water mark for its key, or its coordinator is not
+	// the holder this node recorded at that term.
+	ReasonStaleLeaseTerm = "stale_lease_term"
+	// ReasonLeaseTermUnconfirmed: NOT fenced — could not establish WHETHER it
+	// was fenced. Quorum was unreachable, or a ledger read failed. Kept
+	// distinct from ReasonStaleLeaseTerm because the first is the mechanism
+	// working and the second is the mechanism degraded; collapsing them loses
+	// the only signal that tells an operator which one is happening.
+	ReasonLeaseTermUnconfirmed  = "lease_term_unconfirmed"
 	ReasonFenceUnproven         = "fence_unproven"
 	ReasonDemotionFailed        = "demotion_failed"
 	ReasonVIPReleaseUnconfirmed = "vip_release_unconfirmed"
@@ -93,30 +103,28 @@ type GateResult struct {
 func gateOK() GateResult         { return GateResult{OK: true} }
 func gateNo(r string) GateResult { return GateResult{OK: false, Reason: r} }
 
-// votingEligible mirrors failover.countLiveHosts' predicate exactly: a host is a
+// VotingEligible mirrors failover.countLiveHosts' predicate exactly: a host is a
 // live voting member iff its state is not offline/maintenance/fenced (witnesses
 // included, since countLiveHosts counts them in the denominator). The self-count
 // predicate and the quorum denominator MUST be identical or quorum skews.
-func votingEligible(state string) bool {
+//
+// Exported because callers outside this package need "is this host live" and
+// must not invent a fourth answer to it. The NetBox cluster-name uniformity
+// check is one: it compares each live host's published configuration, and a
+// host that is down, in maintenance or fenced must not be able to stop the
+// inventory mirror forever by holding a stale value. It deliberately does NOT
+// use HealthyPeers for that, which additionally requires a successful probe
+// THIS run — that answer differs per node and is empty on a freshly started
+// daemon, so two nodes would disagree about who is live and a restart would
+// briefly count nobody. This predicate is cluster STATE, so every node
+// computes the same set.
+func VotingEligible(state string) bool {
 	switch state {
 	case "offline", "maintenance", "fenced":
 		return false
 	}
 	return true
 }
-
-// VotingEligible is votingEligible, exported for callers outside this package
-// that need "is this host live" and must not invent a fourth answer to it.
-//
-// The NetBox cluster-name uniformity check is one: it compares each live host's
-// published configuration, and a host that is down, in maintenance or fenced
-// must not be able to stop the inventory mirror forever by holding a stale
-// value. It deliberately does NOT use HealthyPeers for that, which additionally
-// requires a successful probe THIS run — that answer differs per node and is
-// empty on a freshly started daemon, so two nodes would disagree about who is
-// live and a restart would briefly count nobody. This predicate is cluster
-// STATE, so every node computes the same set.
-func VotingEligible(state string) bool { return votingEligible(state) }
 
 // QuorumProof computes whether this daemon currently sees a live voting majority,
 // using its OWN probe results. Returns the tri-state plus the live/needed counts
@@ -154,7 +162,7 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	denom := 0
 	selfEligible := false
 	for _, h := range hosts {
-		if !votingEligible(h.State) {
+		if !VotingEligible(h.State) {
 			continue
 		}
 		denom++
@@ -168,7 +176,7 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		live++
 	}
 	for _, h := range hosts {
-		if h.Name == c.hostName || !votingEligible(h.State) {
+		if h.Name == c.hostName || !VotingEligible(h.State) {
 			continue
 		}
 		if healthy[h.Name] {
@@ -256,7 +264,7 @@ func (c *Checker) DecisionGate(ctx context.Context) GateResult {
 	// stopping the rebalance executor (decideGate) on a healthy even cluster.
 	workers, witnesses := 0, 0
 	for i := range hosts {
-		if !votingEligible(hosts[i].State) {
+		if !VotingEligible(hosts[i].State) {
 			continue
 		}
 		if hosts[i].IsWitness() {

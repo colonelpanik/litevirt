@@ -9,7 +9,74 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// TestCapabilityActive_AReplicationGatedTokenConsultsEveryRecipient: a token
+// whose latch is a claim about what peers can DECODE must be confirmed by the
+// peers this node replicates to, not by the ones that vote.
+//
+// The two sets diverge on exactly the host such a token exists for. Putting a
+// host into `maintenance` is the normal way to queue it for upgrade next: its
+// daemon stays up, it stays in memberlist, and the replicator — which takes its
+// targets from membership with no host-state filter — keeps streaming to it.
+// The voting sweep skips it. So the latch formed while the old-build peer was
+// still listening, the first mint emitted a statement shape its binary has no
+// ledger entry for, and its apply failed closed, rolled the batch back and
+// stalled its watermark — head-of-line blocking the stream into it, which is
+// the precise outage the token was added to prevent.
+//
+// The second case is why this is not simply "stop skipping non-voting hosts".
+// An ordinary token gates a DECISION, and a host in maintenance must not be
+// able to hold a fencing decision hostage.
+func TestCapabilityActive_AReplicationGatedTokenConsultsEveryRecipient(t *testing.T) {
+	setup := func(t *testing.T) *Checker {
+		t.Helper()
+		db := testCheckHostDB(t)
+		gateHost(t, db, "host-a", "active", "worker")
+		gateHost(t, db, "host-b", "active", "worker")
+		// Queued to be upgraded next. Not enforcement-relevant, still gossiping.
+		gateHost(t, db, "host-old", "maintenance", "worker")
+		db.SetMembersForTests(func() []corrosion.PeerInfo {
+			return []corrosion.PeerInfo{{Name: "host-b"}, {Name: "host-old"}}
+		})
+		return NewChecker("host-a", "/etc/litevirt/pki", db)
+	}
+
+	// host-old runs the previous release, so it advertises neither token — it has
+	// never heard of either name.
+	pinger := func(_ context.Context, host string) ([]string, time.Time, error) {
+		if host == "host-old" {
+			return nil, time.Time{}, nil
+		}
+		return []string{capabilities.SplitBrainGateV1, capabilities.LeaseTermLedgerV1}, time.Time{}, nil
+	}
+
+	t.Run("replication-gated token waits for the maintenance recipient", func(t *testing.T) {
+		c := setup(t)
+		c.SetPeerPinger(pinger)
+		ok, reason := c.CapabilityActive(context.Background(), capabilities.LeaseTermLedgerV1)
+		if ok {
+			t.Fatalf("%s latched while host-old — an old build, in maintenance, and still a "+
+				"live replication target — was listening. The mint it authorises emits a "+
+				"statement shape host-old cannot resolve, which stalls its replication "+
+				"watermark entirely", capabilities.LeaseTermLedgerV1)
+		}
+		if reason != ReasonUnsupportedCapability {
+			t.Errorf("reason = %q, want %q", reason, ReasonUnsupportedCapability)
+		}
+	})
+
+	t.Run("an ordinary token still latches across it", func(t *testing.T) {
+		c := setup(t)
+		c.SetPeerPinger(pinger)
+		if ok, reason := c.CapabilityActive(context.Background(), capabilities.SplitBrainGateV1); !ok {
+			t.Errorf("%s did not latch (reason %q). It gates a DECISION, so only voting "+
+				"members gate it — a host parked in maintenance must not be able to hold "+
+				"a fencing decision hostage", capabilities.SplitBrainGateV1, reason)
+		}
+	})
+}
 
 func TestCapabilityActive(t *testing.T) {
 	const tok = capabilities.SplitBrainGateV1

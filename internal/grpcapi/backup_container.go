@@ -427,11 +427,16 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 		// Carry the FULL relocation proof (read from our just-written local row) so
 		// the target validates + claims it without depending on proof-row gossip.
 		if pr, ok, _ := corrosion.GetActionProofByToken(ctx, s.db, token); ok {
-			proof = &pb.RuntimeActionProof{
-				Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
-				DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
-				OwnerEpoch: pr.OwnerEpoch,
-			}
+			// Every field claimCarriedProof binds must be forwarded. The executor
+			// compares the carried proof against the row it has PERSISTED, so a
+			// field dropped here reads as a divergent row and refuses the action
+			// with an error blaming divergence rather than a dropped field.
+			//
+			// Which is why this goes through proofToPB rather than a field list
+			// written out here: the hand-written version dropped fence_epoch
+			// once and lease_key the next time the bound set grew. The DB is
+			// this call's source of truth, so the whole proof comes off pr.
+			proof = proofToPB(pr.ActionProof)
 		} else if s.gateActive(ctx) {
 			// Under enforcement the coordinator minted a proof for this token; a miss
 			// means we must NOT drive a proofless restore (the target would refuse) —

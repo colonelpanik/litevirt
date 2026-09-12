@@ -49,6 +49,17 @@ type Server struct {
 	invCacheAt time.Time
 	pkiDir     string
 	db         *corrosion.Client
+
+	// dualRunLeaseTerm is the fencing term of the dual-run detector's current
+	// lease incarnation, 0 when this node does not hold it. Recorded for
+	// observability only: the detector is alert-only and destroys nothing, so
+	// there is no protected write here to fence.
+	//
+	// Atomic because Server is shared across every gRPC handler goroutine; the
+	// detector loop is the only writer today, but an unguarded mutable field on
+	// this struct is a race waiting for its first reader.
+	dualRunLeaseTerm atomic.Int64
+
 	virt       LibvirtBackend
 	images     *image.Store
 	events     *events.Bus
@@ -273,6 +284,11 @@ type Server struct {
 	// (the health backfill reports it). Both required — the fleet must never
 	// latch across a node whose workloads are ungraduated.
 	enfOwnerEpoch bool
+	// enfLeaseTerm + leaseTermReady gate lease_term_v1 advertisement: the flag
+	// is the operator opt-in, readiness is "this node can enforce and the
+	// cluster is big enough that enforcing does not break failover".
+	enfLeaseTerm   bool
+	leaseTermReady func() bool
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool
@@ -295,9 +311,28 @@ type Server struct {
 	// configured-on token (checkOneCapabilityHealth, round-robin one/cycle) so the HA
 	// monitor detects a POST-latch capability regression (a peer that later stops
 	// advertising) that the one-way durable latch can't reflect. Guarded by capHealthMu.
-	capHealthMu     sync.Mutex
-	capHealthLast   map[string]bool
+	capHealthMu   sync.Mutex
+	capHealthLast map[string]bool
+	// capHealthCause is the health.Reason* the last negative freshness check
+	// returned for a token. The bool above says a token could not be confirmed;
+	// this says WHY, and the two answers demand opposite remedies —
+	// unsupported_capability means a peer really does not advertise it (finish
+	// the rollout), activation_unconfirmed means the sweep could not tell (a
+	// peer's Ping failed, a hosts read failed), which is usually a host being
+	// down and no capability problem at all. Guarded by capHealthMu.
+	capHealthCause  map[string]string
 	capHealthCursor int
+	// capDriveCursor round-robins the ACTIVATION drive over Supported(). Without
+	// it the drive restarted at index 0 every cycle and spent its one peer op on
+	// the first unlatched enabled token, so a token that cannot currently latch —
+	// a config-uniformity flag switched on here but not yet on a peer — consumed
+	// every cycle and starved every token after it indefinitely. Guarded by
+	// capHealthMu.
+	capDriveCursor int
+	// capPeerOpCycle counts HA-monitor cycles so a share of them can be reserved
+	// for the freshness axis even while activation is incomplete. Guarded by
+	// capHealthMu.
+	capPeerOpCycle int
 	// isolationCursor round-robins the §A self-reported-quarantine check
 	// (one peer per HA cycle). Guarded by capHealthMu.
 	isolationCursor int
@@ -366,6 +401,32 @@ type Server struct {
 	// classified restore outcome directly, so a test can model a landed restore, a
 	// pre-row failure, or an indeterminate stream break. Production leaves it nil.
 	migrateRestoreOverride func(ctx context.Context, target, repoPath, name, timestamp string, start bool) (corrosion.RestoreOutcome, error)
+
+	// leaseBarrierCache holds the last quorum-observed lease-term threshold per
+	// key. Read ONLY to serve refusals — see leaseTermBarrier for why accepting
+	// from it would be unsound. leaseBarrierFlight collapses concurrent callers
+	// for one key onto a single in-flight sweep.
+	leaseBarrierMu     sync.Mutex
+	leaseBarrierCache  map[string]leaseBarrierEntry
+	leaseBarrierFlight map[string]*leaseBarrierSweep
+
+	// leaseBarrierSilent remembers, per peer, when it last gave the barrier no
+	// answer at all. A remembered peer is probed on a SHORT deadline instead of
+	// the full budget on the next sweep — see runLeaseTermSweep. It never
+	// changes which peers are asked, only how long a peer that just proved
+	// silent is waited on, and any sweep that then falls short of quorum pays
+	// full price before refusing.
+	leaseBarrierSilent map[string]time.Time
+
+	// leaseBarrierArrived is a test seam called once per caller, immediately
+	// after it stamps the instant it began validating and before it can publish
+	// or join a flight. Production leaves it nil.
+	//
+	// It exists because sweep SHARING is only reachable when a burst of callers
+	// all arrive before the first of them starts reading, and no amount of
+	// sleeping in a test establishes that: serialise the callers (GOMAXPROCS=1)
+	// and each correctly runs its own sweep. See sweepLeaseTermHighWater.
+	leaseBarrierArrived func()
 
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
@@ -658,6 +719,30 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfAuditSignature {
 		caps = withoutCapability(caps, capabilities.AuditSignatureV1)
 	}
+	// shared_storage_fence_v1 is deliberately NOT withheld here, and the reason is
+	// worth keeping because the change has been proposed more than once. Ask where
+	// the guarantee is enforced: the coordinator refuses to CREATE a shared-disk
+	// transfer without a proof-grade fence of the old owner
+	// (failover/coordinator.go), so whenever a transfer exists at all the old
+	// owner is provably down and even a destination with the flag off starts it
+	// safely. No node relies on a peer enforcing this one, so withholding
+	// prevents no corruption — while costing a great deal, all of it verified:
+	//
+	//   - the latch gates on every voting-eligible host and health/capability.go
+	//     has NO role filter, so a WITNESS with the flag off (its operator has no
+	//     reason to set it — a witness cannot perform a fence) would keep the
+	//     fence off fleet-wide, permanently and invisibly
+	//   - during any partial rollout the token would not latch, so the nodes that
+	//     HAVE opted in would stop enforcing — both the source-side refusal and
+	//     the executor's re-verify (health/reconciler.go) gate on the latch
+	//   - a config-on token that can never latch would consume the HA monitor's
+	//     one-unlatched-token-per-cycle budget forever (driveCapabilityActivation),
+	//     starving every token after it in Supported() and stopping the post-latch
+	//     freshness check entirely
+	//
+	// The gap withholding WOULD close — a latched token proving config uniformity
+	// — is reported directly by `lv doctor fence` instead, which asks each host
+	// for its own posture. See TestAdvertise_SharedStorageFenceIsUnconditional.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -675,6 +760,15 @@ func (s *Server) advertisedCapabilities() []string {
 	// a node whose runtime markers and generations don.t exist yet.
 	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
 		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
+	}
+	// lease_term_v1 (Phase 2) follows the same model: the operator opt-in plus
+	// local readiness. Readiness here is deliberately LOCAL-ONLY (no Ping, no
+	// Enforced, no barrier) — this function runs inside the Ping handler, and
+	// hardwareV2Ready already documents why anything that Pings from here
+	// recurses. A nil probe is NOT ready: the fleet must not latch a regime
+	// across a node that never proved it could honour it.
+	if !s.enfLeaseTerm || s.leaseTermReady == nil || !s.leaseTermReady() {
+		caps = withoutCapability(caps, capabilities.LeaseTermV1)
 	}
 	return caps
 }
@@ -723,6 +817,11 @@ type serverGate interface {
 	// healthy this run AND voting-eligible by host state). Used to pick a quorum-visible
 	// relay for the VIP absence proof when the target isn't directly reachable.
 	HealthyPeers(ctx context.Context) []string
+	// QuorumProof is the tri-state quorum view plus the live/needed counts. The
+	// lease-term barrier compares its own responder count against `needed`, so
+	// the barrier's denominator is the one every other gate in this path uses
+	// rather than a second quorum rule inside one failover decision.
+	QuorumProof(ctx context.Context) (health.QuorumState, int, int)
 }
 
 // SetGate injects the split-brain safety gate.
@@ -878,6 +977,23 @@ func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
 // SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
 func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
 
+// SetLeaseTermEnforce wires the Phase 2 config flag (enforcement.lease_term).
+// It is both the opt-in that lets the fleet latch and the reversible kill
+// switch afterwards — see capabilities.LeaseTermV1.
+func (s *Server) SetLeaseTermEnforce(on bool) { s.enfLeaseTerm = on }
+
+// SetLeaseTermReady wires the readiness probe consulted before advertising
+// lease_term_v1 (nil = never ready).
+func (s *Server) SetLeaseTermReady(fn func() bool) { s.leaseTermReady = fn }
+
+// leaseTermEnforced reports whether this node refuses proofs on their lease
+// term: the config flag AND the cluster-wide latch, the same model as the rest
+// of the family. The flag is the way back out of a latched cluster that has
+// since shrunk below leaseTermMinVotingHosts.
+func (s *Server) leaseTermEnforced(ctx context.Context) bool {
+	return s.enfLeaseTerm && s.gate != nil && s.gate.Enforced(ctx, capabilities.LeaseTermV1)
+}
+
 // SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
 // it on and the token latched, this node refuses replication from a host the
 // cluster recorded as isolated.
@@ -908,14 +1024,19 @@ func (s *Server) liveResizeActive(ctx context.Context) bool {
 
 // tokenEnabled reports whether this node is configured to ENFORCE token — the
 // single source of "configured-to-enforce" the HA monitor uses to decide which
-// tokens to latch-drive and which may contribute to HA-degraded. split_brain_gate_v1
-// is mandatory (no flag); every other token is gated by its config kill-switch.
+// tokens to latch-drive and which may contribute to HA-degraded. The tokens with
+// no config flag are capabilities.MandatoryTokens(); every other token is gated
+// by its config kill-switch.
 // NOTE: enabled ≠ latched ≠ advertised — advertisement is build-static, latch is
 // cluster confirmation, this is local config intent.
 func (s *Server) tokenEnabled(token string) bool {
-	switch token {
-	case capabilities.SplitBrainGateV1:
+	// The no-kill-switch set is declared once, in capabilities.mandatory. It
+	// used to be restated here in prose that named split_brain_gate_v1 as the
+	// only member, which stopped being true when the ledger token arrived.
+	if capabilities.Mandatory(token) {
 		return true
+	}
+	switch token {
 	case capabilities.SafeFenceDefaultV1:
 		return s.enfSafeFence
 	case capabilities.LWWSkewGuardV1:
@@ -950,6 +1071,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.LeaseTermV1:
+		return s.enfLeaseTerm
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:

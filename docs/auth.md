@@ -94,7 +94,7 @@ Built-in roles (seeded by `auth.SeedBuiltinRoles`):
 | Role | Verbs |
 |---|---|
 | Admin | `*` |
-| Operator | `vm.*`, `ct.*`, `network.{read,create,delete}`, `lb.*`, `image.{read,pull,import,push,build}`, `backup.*`, `snapshot.*`, `sg.read`, `audit.read`, `host.read`, `storage.pool.{read,write}`, `storage.content.{read,write}`, `resourcemap.{read,write}` |
+| Operator | `vm.*`, `ct.*`, `network.{read,create,delete}`, `lb.*`, `image.{read,pull,import,push,build}`, `backup.*`, `snapshot.*`, `sg.read`, `audit.read`, `host.read`, `storage.pool.{read,write}`, `storage.content.{read,write}`, `resourcemap.{read,write}`, `cluster.lww.acknowledge` |
 | VMOperator | `vm.{start,stop,restart,console,read,exec}` |
 | Viewer | `*.read` |
 | Auditor | `*.read`, `audit.export` |
@@ -132,6 +132,13 @@ binding can:
   any known cluster host cert can reach pool contents via these RPCs.
 - **Networks** (`network.create`, `network.delete`) and **resource mappings**
   (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
+- **Acknowledging a contested leader-lease term**
+  (`cluster.lww.acknowledge`, `lv cluster acknowledge-lease-term`) is checked at
+  `/`. It is the only `cluster.*` verb Operator holds, and deliberately not
+  `cluster.update`: it clears one node's evidence tracking and elects no winner,
+  so it is a day-to-day remedy rather than a cluster mutation. The RPC is
+  node-local and refuses peer certs — see
+  [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 > **Upgrade note (content RBAC):** storage-pool content ops moved off the legacy flat
 > path `/storage/pools/<name>` onto the project-scoped path above. Re-issue any explicit

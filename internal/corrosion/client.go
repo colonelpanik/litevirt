@@ -158,11 +158,41 @@ type Client struct {
 	// so the resolver (called while mu is held during a merge) records without
 	// re-entrancy.
 	tieMu sync.Mutex
-	// unresolvedTies records, per (table,PK), the sorted content-hash pair of the
-	// last classified-unresolved tie. It makes lww_tie_unresolved count DISTINCT
-	// rows (re-observing the same divergence is a no-op) and drives the alert.
-	// Cleared when the row converges or is repaired (a newer write to the PK).
-	unresolvedTies map[string]string
+	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
+	// its sorted content-hash pair and its CATEGORY. The pair makes
+	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is
+	// a no-op) and drives the alert. Cleared when the row converges or is
+	// repaired (a newer write to the PK).
+	//
+	// The category is retained because "is this tie about a workload's ownership"
+	// is a property of the CONFLICT, not of the table's name, and a consumer in
+	// another package cannot keep a table list in step with this package's
+	// schema. It used to be passed in and dropped, which is what forced
+	// internal/grpcapi to maintain one.
+	unresolvedTies map[string]unresolvedTie
+	// acknowledgedTies records, per (table,PK), the content pair an operator has
+	// stated they have seen. A re-observation of the SAME pair is then not
+	// tracked at all.
+	//
+	// Stickiness is the entire point and was not optional. An acknowledgement
+	// that merely deleted the register entry was undone by the next anti-entropy
+	// sweep: the two rows still disagree, so the merge re-compares them,
+	// rowFactsEqual is still false, and trackUnresolved re-registers within
+	// seconds. Verified empirically before this was written. It also means a
+	// daemon restart is not a remedy either — the register is in-memory, so a
+	// restart clears it, and the next sweep brings the tie straight back.
+	//
+	// Keyed on the PAIR, not just the row, so a genuinely DIFFERENT conflict on
+	// the same row still surfaces. An acknowledgement is a statement about one
+	// observed divergence, never a standing mute on a row.
+	//
+	// A superseded entry is RETAINED, here and in the table. It cannot mask the
+	// live divergence — suppression demands an exact pair match — and if its
+	// pair is ever observed again the operator did acknowledge exactly that.
+	// Deleting it was tried and had to be reverted: the only place that knows a
+	// pair went stale is trackUnresolvedPair, which runs with c.mu held, so the
+	// delete deadlocked the merge. See the comment there.
+	acknowledgedTies map[string]string
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.
@@ -205,6 +235,13 @@ type Client struct {
 	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
 	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
 	digestV2Enabled func() bool
+
+	// leaseTermLedger, when non-nil and returning true, permits a WRITE to
+	// leader_lease_terms. Injected via SetLeaseTermLedgerGate, wired to
+	// DurablyLatched(LeaseTermLedgerV1). Nil or false means the lease is still
+	// taken but no term is minted — see SetLeaseTermLedgerGate for why this one
+	// predicate fails CLOSED when unset.
+	leaseTermLedger func() bool
 
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
@@ -321,6 +358,50 @@ func (c *Client) SetDigestV2Enabled(fn func() bool) { c.digestV2Enabled = fn }
 
 // digestV2On reports whether digest_v2 emission is enabled on this node (nil-safe).
 func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digestV2Enabled() }
+
+// SetLeaseTermLedgerGate injects the predicate that permits WRITING to
+// leader_lease_terms. Wired at daemon start to
+// `checker.DurablyLatched(LeaseTermLedgerV1)`.
+//
+// Nil-safe and FAIL CLOSED, unlike the other predicates here: an unset gate
+// means no mint. That is the legacy behaviour — before this work the ledger did
+// not exist — and it is the safe side, because the mint emits a statement shape
+// a previous-release peer cannot resolve, which back-pressures its whole
+// replication stream rather than degrading. A wiring omission then costs terms
+// (and, downstream, refused reschedules) instead of costing the fleet its
+// replication.
+//
+// The test constructors wire it open: a test cluster is single-version by
+// construction, and this gate answers a rolling-upgrade question.
+func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn }
+
+// MayMintLeaseTerm reports whether this node may write a term row (nil-safe,
+// fail closed).
+//
+// Exported because lease_term_v1 readiness must answer for the same fact: a node
+// that mints no term must not advertise readiness to enforce on one. Reading the
+// gate itself keeps that from becoming a second, drifting copy of the predicate.
+func (c *Client) MayMintLeaseTerm() bool {
+	return c.leaseTermLedger != nil && c.leaseTermLedger()
+}
+
+// MayEmitTermCarryingProof reports whether this node may put the WIDENED
+// runtime_action_proofs insert on the wire — the one carrying lease_term and
+// lease_key.
+//
+// Same gate as MayMintLeaseTerm, deliberately, because it answers the same
+// question: has every peer this node replicates to got a binary that can
+// resolve this release's term-carrying statement shapes. Adding the two columns
+// moved that insert's fingerprint, and a peer holding only the previous one
+// fails its apply closed and stalls its whole replication stream — so until the
+// latch forms, proofs go out in the released shape (see insertProofPreTermSQL).
+//
+// It is a separate name rather than a second call to MayMintLeaseTerm so each
+// site reads as what it is deciding. Proofs are written mid-roll and lease
+// terms are not, so a future change could legitimately split these two.
+func (c *Client) MayEmitTermCarryingProof() bool {
+	return c.MayMintLeaseTerm()
+}
 
 // SetHLCSkewGuard injects the predicate that enables LWW future-skew quarantine.
 // Wired at daemon start to the LWWSkewGuardV1 enforcement latch. Nil-safe: an unset
@@ -1191,6 +1272,18 @@ func (r Row) Int64(col string) int64 {
 		return int64(n)
 	case int64:
 		return n
+	case int:
+		// Int and Float have always had this arm; Int64 did not, and the gap
+		// matters now. sync.go documents that a cell's runtime Go type depends
+		// on the READ PATH — int64 from direct SQL, float64 or json.Number from
+		// a JSON state dump — so an int reaching here read as 0, which is
+		// lease_term's "minted without a term" sentinel, with nothing logged.
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+		return 0
 	default:
 		return 0
 	}

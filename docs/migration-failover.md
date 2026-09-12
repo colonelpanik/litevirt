@@ -318,6 +318,13 @@ row proven to be its own restore; `container_restore_timeout_sec`). See
 
 Scrape `http://<host>:7444/metrics` for:
 
+> That endpoint has **no authentication and no TLS**, and `metrics_bind`
+> defaults to all interfaces. Scraping it across a network means the cluster
+> inventory and this node's hardening posture are readable by anything that can
+> reach the port — see
+> [configuration.md → Metrics endpoint exposure](configuration.md#metrics-endpoint-exposure).
+
+
 - `litevirt_host_cpu_total`, `litevirt_host_memory_total_mib` — host resources
 - `litevirt_host_vm_count` — VMs per host
 - `litevirt_vm_state` — `1` if the VM is running, `0` otherwise
@@ -334,6 +341,11 @@ Scrape `http://<host>:7444/metrics` for:
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
   (`action` = `relocate`)
+- `litevirt_failover_stranded_workloads` — GAUGE: workloads still assigned to a host in state
+  `fenced`/`offline` that failover would move off a dead host. This node's view, so it reads `0`
+  unless the node holds the failover lease — alert on `max()` across instances, never `avg()`.
+  Zero is normal; the remedy for a sustained non-zero depends on why the host is down (see
+  [operating-model.md](operating-model.md))
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up

@@ -12,6 +12,8 @@
 // than reverting to the legacy ungated path.
 package capabilities
 
+import "sort"
+
 const (
 	// SplitBrainGateV1 gates the composable dangerous-action gate (Phase 1): both
 	// the use of the non-LWW runtime_action_proofs table AND enforcement of the
@@ -46,6 +48,68 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+
+	// LeaseTermLedgerV1 gates WRITING to the term ledger at all — one step below
+	// LeaseTermV1, which gates deciding on what is written.
+	//
+	// It exists for the replication contract, not for policy. leader_lease_terms
+	// gained the first replicated statement shape of its life in this work, and a
+	// peer on the previous release has no ledger entry for that fingerprint: an
+	// unregistered shape BACK-PRESSURES rather than degrading (the apply is
+	// rejected, the batch rolls back, and that peer's replication watermark
+	// stalls, head-of-line blocking the stream into every not-yet-rolled node).
+	// The pre-stage migration pass does not help — it equalizes DB schema, and
+	// the statement ledger is a property of the BINARY.
+	//
+	// So the mint waits for proof that no such peer is listening, and a
+	// capability latch is exactly that proof: a node on the old build cannot
+	// advertise a token it has never heard of.
+	//
+	// That argument only holds over the right set of peers, which is why this
+	// token is in replicationGated. An ordinary latch is computed over
+	// VOTING-eligible members, and "listening" is not a property of voting: a
+	// host in `maintenance` — the normal state for one queued to be upgraded
+	// next — is skipped by the voting sweep while the replicator, which filters
+	// on nothing but memberlist membership, keeps streaming to it. Over the
+	// voting set alone this latch could form with the old-build peer still
+	// listening, proving nothing about the only host it was meant to wait for.
+	//
+	// Deliberately advertised UNCONDITIONALLY — no config flag, in the
+	// SplitBrainGateV1 style — so terms begin minting on their own the moment the
+	// roll completes. Gating the mint on LeaseTermV1 instead would have been
+	// cheaper, but no term would exist until an operator enabled enforcement, so
+	// enforcement would latch onto an empty ledger; a term is meant to be an
+	// audit fact before anything decides on one (docs/operating-model.md).
+	LeaseTermLedgerV1 = "lease_term_ledger_v1"
+
+	// LeaseTermV1 gates leader-lease term enforcement: once active, a
+	// runtime-action proof must carry the lease term of the incarnation that
+	// minted it, and an executor refuses a proof whose term is below the
+	// QUORUM-observed high-water mark for that key, or whose coordinator is not
+	// the holder this node recorded at that term.
+	//
+	// Advertised CONDITIONALLY on enforcement.lease_term AND local readiness
+	// (three or more voting-eligible hosts, a readable ledger, and
+	// SplitBrainGateV1 already latched), so the fleet cannot latch across a node
+	// that would refuse recovery — or across one that would accept a PROOFLESS
+	// protected call ungated, which is what that last predicate is for: this
+	// regime gates proof-bearing calls only.
+	//
+	// Config-gated in the REVERSIBLE StrictMTLSIdentityV1 style rather than
+	// latch-only, and for a specific reason: the quorum barrier makes protected
+	// actions refuse on a partition minority, and a latched cluster that later
+	// shrinks below three voting-eligible hosts arrives at that cliff with no way
+	// back — a latch is one-way. Enforcement is config AND Enforced, so clearing
+	// the flag is the operator's exit.
+	//
+	// It does NOT fix two nodes each believing they hold the lease; that needs
+	// consensus. What it gives is per-executor: no single host executes for two
+	// claimants of one tenure, because the CLAIM binds that host to the first
+	// claimant it acted for at that term. The equal-term ledger arm alone would
+	// not deliver that — it fires only once a term row has replicated, and
+	// during a partition neither claimant's has. The cluster still does not
+	// agree on which claimant is legitimate.
+	LeaseTermV1 = "lease_term_v1"
 	// IsolationEpochV1 gates the §A isolation regime: a host recorded with a
 	// nonzero hosts.isolation_epoch has its replication REFUSED by every peer
 	// until a verified reseed clears it. Gated because it can refuse a peer
@@ -340,16 +404,36 @@ const (
 // it before consulting current advertised support — the whole point of the
 // fail-closed latch (a partition mustn't silently re-open the legacy path).
 //
-// KILL SWITCH (the modern way — DO NOT delete marker files): every flippable token
-// EXCEPT split_brain_gate_v1 is gated `configFlag && Enforced/Latched` at its
+// KILL SWITCH (the modern way — DO NOT delete marker files): every FLIPPABLE token
+// is gated `configFlag && Enforced/Latched` at its
 // decision site (auth.strict_mtls_identity/forwarded_identity, and
 // enforcement.{safe_fence_default,lww_skew_guard,vip_self_demote,vip_proof_reclaim}).
 // The config flag is authoritative for enforcement AND recovery: set it false +
 // restart and enforcement stops regardless of the latch marker. Deleting a marker
 // file to "stand down" is retired — it confuses the state machine (the HA monitor
-// re-establishes the latch while the flag is on and the cluster is healthy). Only
-// split_brain_gate_v1 has no config flag; for it, marker deletion remains the sole
-// stand-down (it flips via `supported` alone).
+// re-establishes the latch while the flag is on and the cluster is healthy).
+//
+// The MANDATORY tokens are the exception and they are listed in one place, in
+// mandatory below — read it rather than trusting any prose, here or elsewhere,
+// that names a single one. A mandatory token has no config flag because it does
+// not state a policy an operator chooses; it states a FACT about this binary,
+// and letting an operator misreport that fact is how a cluster corrupts itself.
+//
+// Standing one down therefore differs per token and neither has a config flag
+// to turn off:
+//
+//   - split_brain_gate_v1 flips via `supported` alone, so marker deletion
+//     remains its sole stand-down.
+//   - lease_term_ledger_v1 has no stand-down at all, deliberately. Deleting its
+//     marker does nothing lasting, because the HA monitor re-establishes the
+//     latch the moment the fleet is uniform and there is no flag to stop it.
+//     The intended way to stop minting terms is to stop the fleet being
+//     uniform — roll a host back below this build, or leave one on the previous
+//     release — which the latch already reacts to, since it is
+//     ReplicationGated and so consults every host still receiving replication.
+//     Terms are additive audit facts and nothing reads them until
+//     enforcement.lease_term is on, which IS a flag, so the thing an operator
+//     might actually need to stop is reachable by ordinary means.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -363,6 +447,11 @@ var supported = []string{
 	VIPReleaseProbeV1,
 	StrictMTLSIdentityV1,
 	ForwardedIdentityV1,
+	// SharedStorageFenceV1 stays UNCONDITIONAL despite gating a corruption
+	// hazard, which is not the contradiction it looks like: the guarantee is
+	// enforced where the transfer is CREATED, so no node relies on a peer
+	// enforcing it. The grpcapi advertisement filter carries the full reasoning
+	// and what withholding it would cost.
 	SharedStorageFenceV1,
 	RBACRealmV1,
 	OperationProtocolV1,
@@ -385,6 +474,17 @@ var supported = []string{
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
 	OwnerEpochV1,
+	// LeaseTermLedgerV1 is advertised UNCONDITIONALLY: it has no config flag, and
+	// its whole purpose is to tell peers "this build understands the term
+	// ledger's statement shapes". Withholding it on a flag would keep the latch
+	// from forming on a fleet that is fully rolled.
+	LeaseTermLedgerV1,
+	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
+	// this node ready (>= 3 voting-eligible hosts, readable ledger,
+	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
+	// cannot mint a term must not advertise readiness to enforce on one). See
+	// grpcapi.LeaseTermReadiness.
+	LeaseTermV1,
 	// IsolationEpochV1 is advertised CONDITIONALLY on enforcement.isolation_epoch,
 	// like OperationProtocolV1: the regime REFUSES a peer's replication, so the
 	// fleet-wide latch must require CONFIG uniformity — a node that isn't
@@ -397,7 +497,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -407,6 +507,78 @@ func All() []string {
 // Supported returns a copy of the tokens this build advertises.
 func Supported() []string {
 	return append([]string(nil), supported...)
+}
+
+// replicationGated is the set of tokens whose latch is a claim about what peers
+// can DECODE, rather than about what members agree to enforce.
+//
+// The distinction decides which peers must confirm the token before it latches,
+// and getting it wrong is silent. An ordinary token gates a DECISION — a fence,
+// a demote, a promote — so the members that must agree are the ones that vote,
+// and health.VotingEligible is exactly right: a host in maintenance does not
+// vote, and must not be able to hold a fencing decision hostage.
+//
+// A token in this set gates EMITTING a replicated statement shape that a
+// previous-release peer has no ledger entry for. That is not a vote, it is a
+// wire-format claim, and the peers it has to be true of are the ones this node
+// REPLICATES TO. Those two sets are not the same: the replicator derives its
+// targets from memberlist membership with no host-state filter, so a host in
+// maintenance — the normal state for a host queued to be upgraded next — is
+// skipped by the voting sweep while still receiving every statement we write.
+// A latch formed over the voting set alone therefore proved nothing about the
+// peer it was meant to wait for, and emitting the new shape stalled that peer's
+// replication watermark, which head-of-line blocks the stream into it. That is
+// the precise outage these tokens exist to prevent.
+//
+// Membership is the right set rather than "every host that is not
+// decommissioned", because a host outside memberlist receives nothing and so
+// cannot stall — whereas requiring an unreachable host to confirm would keep
+// the latch from ever forming, and the fail-closed side of these tokens costs
+// availability of the feature, not of the cluster.
+var replicationGated = map[string]bool{
+	LeaseTermLedgerV1: true,
+}
+
+// ReplicationGated reports whether token's latch must be confirmed by every
+// peer this node replicates to, not merely by every voting-eligible member.
+// See replicationGated for why the two sets differ.
+func ReplicationGated(token string) bool {
+	return replicationGated[token]
+}
+
+// mandatory is every token with NO config kill switch — the ones enforced on
+// every cluster with no operator opt-in.
+//
+// THE set, in one place. It was previously spelled out in prose in four
+// (capabilities.go's KILL SWITCH block, grpcapi's tokenEnabled,
+// docs/diagnostics.md, CLAUDE.md), three of which still claimed
+// split_brain_gate_v1 was the only one long after it stopped being true, and
+// one of which named a token that is not in this set at all. Prose copies of a
+// set do not stay true; a declaration does.
+//
+// Adding an entry is a decision to be made in the open. It means the token
+// latches on every cluster, drives enforcement with no way for an operator to
+// decline, and has no config flag to turn off in an incident — so it is only
+// appropriate for a token stating a FACT about the binary (what wire shapes it
+// can decode, what merge resolver it carries) rather than a policy.
+var mandatory = map[string]bool{
+	SplitBrainGateV1:  true,
+	LeaseTermLedgerV1: true,
+}
+
+// Mandatory reports whether token is enforced with no config kill switch.
+func Mandatory(token string) bool {
+	return mandatory[token]
+}
+
+// MandatoryTokens lists the no-kill-switch tokens, sorted for stable output.
+func MandatoryTokens() []string {
+	out := make([]string, 0, len(mandatory))
+	for tok := range mandatory {
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Has reports whether tokens contains want.

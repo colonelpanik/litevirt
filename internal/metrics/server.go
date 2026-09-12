@@ -2,11 +2,15 @@ package metrics
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,7 +35,52 @@ type Server struct {
 	virt     *libvirt.Client
 	ctStat   containerStatter
 	hostName string
-	httpSrv  *http.Server
+	// mu guards httpSrv and stopped. Start assigns httpSrv from whatever
+	// goroutine the daemon launches it on (`go d.metrics.Start()`), and Stop
+	// runs on the shutdown path — so the two race, and an unsynchronised Stop
+	// could read nil during startup, skip the shutdown, and leave the endpoint
+	// serving after shutdown was requested.
+	mu      sync.Mutex
+	httpSrv *http.Server
+	stopped bool
+	// reg is where the collector registers. nil means
+	// prometheus.DefaultRegisterer, which is what the daemon uses.
+	// Injectable ONLY so a test can drive the real Start more than once in a
+	// process: MustRegister panics on a duplicate, and Stop shuts the HTTP
+	// server down without unregistering, so `go test -count=2` would panic on
+	// the second run. promhttp still serves the default registry, so an
+	// injected one isolates registration, not the served output.
+	reg prometheus.Registerer
+	// log is the logger the exposure warning goes to. nil means slog.Default().
+	// Injectable ONLY so a test can read what was logged without calling
+	// slog.SetDefault, which cannot be restored: SetDefault also rewires the
+	// std log package, and the restore path skips that when the previous
+	// handler is the default one — so a save/restore pair permanently routes
+	// std-log writes into the test's dead buffer for the rest of the binary.
+	log *slog.Logger
+}
+
+// registerer is the injected registry or the process default. Never nil.
+func (s *Server) registerer() prometheus.Registerer {
+	if s.reg != nil {
+		return s.reg
+	}
+	return prometheus.DefaultRegisterer
+}
+
+// logger is the injected logger or the process default. Never nil.
+func (s *Server) logger() *slog.Logger {
+	if s.log != nil {
+		return s.log
+	}
+	return slog.Default()
+}
+
+// Addr is the address the metrics listener binds, composed the one way. The
+// daemon's startup banner reads it from here rather than reassembling it, which
+// is how the banner came to claim 0.0.0.0 for a loopback-bound endpoint.
+func (s *Server) Addr() string {
+	return net.JoinHostPort(normalizeBind(s.bindAddr), strconv.Itoa(s.port))
 }
 
 // NewServer creates a metrics server. bindAddr is the interface to listen on
@@ -52,28 +101,150 @@ func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Cl
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
-	prometheus.MustRegister(collector)
+	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/api/v1/status", s.handleStatus)
 
-	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", s.bindAddr, s.port),
+	srv := &http.Server{
+		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
+		// not get them twice. See normalizeBind.
+		Addr:    s.Addr(),
 		Handler: mux,
 	}
 
-	slog.Info("metrics server starting", "addr", s.httpSrv.Addr, "bind", s.bindAddr)
-	if err := s.httpSrv.ListenAndServe(); err != http.ErrServerClosed {
-		slog.Error("metrics server error", "error", err)
+	s.mu.Lock()
+	if s.stopped {
+		// Stop already ran, so serving now would outlive the shutdown that
+		// asked for it. Nothing has listened yet, so there is nothing to close.
+		s.mu.Unlock()
+		return
+	}
+	s.httpSrv = srv
+	s.mu.Unlock()
+
+	s.logger().Info("metrics server starting", "addr", srv.Addr, "bind", s.bindAddr)
+	warnIfMetricsWorldReadable(s.logger(), s.bindAddr, s.port)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		s.logger().Error("metrics server error", "error", err)
+	}
+}
+
+// metricsExposure is how far a metrics_bind value reaches.
+type metricsExposure int
+
+const (
+	// metricsBindRestricted is loopback, an RFC1918 private address, a CGNAT
+	// address (a tailnet), or link-local. Reachable by something, but by a
+	// bounded something the operator chose.
+	metricsBindRestricted metricsExposure = iota
+	// metricsBindWildcard is every interface — the DEFAULT, and the case an
+	// operator most likely did not choose.
+	metricsBindWildcard
+	// metricsBindPublic is a globally routable address. Almost never deliberate
+	// for an endpoint with no authentication.
+	metricsBindPublic
+)
+
+// cgnatV4 is 100.64.0.0/10, RFC 6598 shared address space. netip has no
+// predicate for it and classifies it exactly like 8.8.8.8 — not private, global
+// unicast — but it is where tailnet addresses live, so binding there is a
+// deliberately restricted choice and must not be warned about.
+var cgnatV4 = netip.MustParsePrefix("100.64.0.0/10")
+
+// normalizeBind strips the brackets an operator may write around an IPv6
+// literal, so ONE spelling reaches both the listener and the classifier.
+//
+// This also fixes a bind that could not work: the address was composed with
+// Sprintf("%s:%d"), so metrics_bind "::" produced ":::7444" — "too many colons"
+// — and ListenAndServe failed, silently leaving the node with no metrics
+// endpoint at all, because Start only logs that error. "[::]" worked. Both
+// spellings now normalise to the same host and are joined with
+// net.JoinHostPort, which re-adds the brackets exactly once.
+func normalizeBind(bindAddr string) string {
+	return strings.Trim(bindAddr, "[]")
+}
+
+// classifyMetricsBind decides how far this bind reaches.
+//
+// A hostname is reported RESTRICTED rather than resolved. Resolution at startup
+// can block, can disagree with what the listener later does, and a hostname
+// pointing at a wildcard is rare — while a false warning is one an operator
+// cannot silence, which is how a startup warning becomes one everybody skips.
+// The doc comment on the warning says plainly that silence is not a safety
+// claim, and configuration.md repeats it.
+func classifyMetricsBind(bindAddr string) metricsExposure {
+	host := normalizeBind(bindAddr)
+	if host == "" {
+		return metricsBindWildcard
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return metricsBindRestricted // a hostname — not classified, see above
+	}
+	addr = addr.Unmap()
+	switch {
+	case addr.IsUnspecified():
+		return metricsBindWildcard
+	case addr.IsLoopback(), addr.IsPrivate(), addr.IsLinkLocalUnicast(), cgnatV4.Contains(addr):
+		return metricsBindRestricted
+	default:
+		return metricsBindPublic
+	}
+}
+
+// warnIfMetricsWorldReadable says once, at startup, when this endpoint is
+// reachable from off-box with no credential.
+//
+// It is easy to read `metrics_bind: ""` as a listener detail. It is not: the
+// endpoint has no TLS and no authentication of any kind, and it serves the
+// cluster's inventory — every VM name, every container name, this host's name,
+// their CPU/memory/disk allocations — alongside `litevirt_enforcement_*`, which
+// states which security kill-switches are off on this node. Anyone who can
+// reach the port gets all of it. That is a reasonable default for a metrics
+// endpoint on a trusted management network and a poor one anywhere else, and
+// nothing in the daemon distinguishes the two.
+//
+// SILENCE IS NOT A SAFETY CLAIM. It means the bind is not a wildcard and not
+// obviously public — a private, CGNAT or link-local address, or a hostname this
+// deliberately does not resolve. Whether the networks that can reach it are
+// trusted is not something the daemon can know.
+//
+// The default is deliberately NOT changed to loopback here. A silent flip would
+// break every deployment scraping from a remote Prometheus, and it would break
+// it invisibly — the endpoint would simply stop answering. This repo's
+// convention for a behaviour change is a flag whose default keeps the existing
+// behaviour, so the flag stays and the exposure is stated instead.
+func warnIfMetricsWorldReadable(log *slog.Logger, bindAddr string, port int) {
+	const what = "it serves VM and container names, host inventory and resource allocations, " +
+		"and litevirt_enforcement_* (which security kill-switches are off on this node)"
+	switch classifyMetricsBind(bindAddr) {
+	case metricsBindWildcard:
+		log.Warn("metrics endpoint is bound to EVERY interface with NO authentication or TLS: "+
+			what+". Set metrics_bind to 127.0.0.1, or to a management-network address, unless "+
+			"every network that can reach this port is trusted",
+			"port", port, "metrics_bind", bindAddr)
+	case metricsBindPublic:
+		log.Warn("metrics endpoint is bound to a PUBLIC address with NO authentication or TLS: "+
+			what+". Anyone who can route to this address can read it — set metrics_bind to "+
+			"127.0.0.1 or a management-network address",
+			"port", port, "metrics_bind", bindAddr)
 	}
 }
 
 // Stop gracefully shuts down the metrics server.
+//
+// Safe before Start has assigned the listener: it records the intent, so a Start
+// that has not begun serving yet returns instead of coming up after shutdown.
 func (s *Server) Stop(ctx context.Context) {
-	if s.httpSrv != nil {
-		s.httpSrv.Shutdown(ctx)
+	s.mu.Lock()
+	s.stopped = true
+	srv := s.httpSrv
+	s.mu.Unlock()
+	if srv != nil {
+		srv.Shutdown(ctx)
 	}
 }
 
@@ -116,6 +287,7 @@ type collector struct {
 
 	// cluster-correctness metrics.
 	leaderHolder       *prometheus.Desc // who holds the failover lease
+	leaseTerm          *prometheus.Desc // highest lease incarnation per lease key
 	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
 	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
@@ -249,6 +421,15 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"1 if this host currently holds the failover-leader lease",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		leaseTerm: prometheus.NewDesc(
+			"litevirt_leader_lease_term",
+			"Highest recorded lease incarnation (fencing term) per leader-lease key. "+
+				"Each new term is one acquisition, so the RATE is leadership churn — alert on "+
+				"it climbing faster than the expected failover rate. Whether a term is "+
+				"ENFORCED depends on enforcement.lease_term plus the lease_term_v1 latch; "+
+				"this gauge is the audit record either way.",
+			[]string{"key"}, prometheus.Labels{"host": hostName},
+		),
 		fenceFailures: prometheus.NewDesc(
 			"litevirt_fence_failures_total",
 			"Cumulative count of fencing_log rows with result != 'fenced' or 'manual-confirmed'",
@@ -336,6 +517,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.clockSkew
 	ch <- c.snapshotDepth
 	ch <- c.leaderHolder
+	ch <- c.leaseTerm
 	ch <- c.fenceFailures
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
@@ -472,6 +654,20 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.leaderHolder, prometheus.GaugeValue, leaderVal)
+
+	// Leader-lease terms, one series per key. This is the signal
+	// docs/operating-model.md tells operators to alert on: the docs named term
+	// growth before any metric exposed it, leaving raw SQL as the only access
+	// path. The key label is bounded by the rows that exist, and only three keys
+	// are ever written (failover, the rebalancer's, dual_run_detector).
+	if termRows, terr := c.db.Query(ctx,
+		`SELECT key, MAX(term) AS term FROM leader_lease_terms
+		 WHERE deleted_at IS NULL GROUP BY key`); terr == nil {
+		for _, r := range termRows {
+			ch <- prometheus.MustNewConstMetric(c.leaseTerm, prometheus.GaugeValue,
+				float64(r.Int64("term")), r.String("key"))
+		}
+	}
 
 	// Cumulative fence failures.
 	if rows, ferr := c.db.Query(ctx,

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -36,6 +37,27 @@ const (
 	// leaseRenewBefore is how much head-room the leader has to renew before
 	// the lease expires. Failover renews when remaining time drops below this.
 	leaseRenewBefore = 10 * time.Second
+	// minFenceLease is the lease head-room required before a fence may START.
+	// leaseRenewBefore (10 s) is NOT enough: an IPMI fence spends up to
+	// fence.PowerOffVerifyTimeout (15 s) on verification alone, so a fence begun
+	// with only the renewal margin left outlives the lease that authorised it —
+	// the row expires mid-call, a second coordinator takes it, and two nodes
+	// fence and reschedule the same host concurrently. This is a floor, not a
+	// budget: the actual deadline comes from the lease time this node really
+	// holds, which is usually the full leaseDuration.
+	minFenceLease = 20 * time.Second
+	// leaseFenceMargin is withheld from the fence deadline so the call returns
+	// while this node is still demonstrably the leader, leaving room for the
+	// post-fence re-check to read the lease row before it expires.
+	leaseFenceMargin = 5 * time.Second
+	// failoverLeaseKey is this coordinator's row in leader_election. Named once
+	// so the acquire and the three read sites cannot drift apart; it used to be
+	// a bare 'failover' literal repeated in each of them.
+	//
+	// It aliases corrosion.LeaseKeyFailover rather than re-spelling the string,
+	// so an enforcement path outside this package and this coordinator can never
+	// disagree about which ledger the failover lease lives in.
+	failoverLeaseKey = corrosion.LeaseKeyFailover
 	// healthFreshness is the maximum age of a host_health row that may count
 	// toward fencing quorum. Stale rows from dead observers must not fence
 	// hosts they last saw failing days ago.
@@ -93,6 +115,16 @@ type Coordinator struct {
 	fencer   Fencer
 	// capacity is the cluster-wide capacity policy; see placement.Request.Capacity.
 	capacity corrosion.CapacityPolicy
+	// leaseTerm is the fencing term of the lease incarnation this coordinator
+	// currently holds, 0 when it holds none. Recorded here in Phase 1 and read by
+	// the Phase-2 enforcement path; nothing enforces on it yet.
+	//
+	// Atomic because Phase 2 adds readers outside the poll loop. Today every
+	// access is on the single poll goroutine (acquireLease is reached only from
+	// the poll cycle and from holdLease within it), so the atomic is
+	// future-proofing rather than a fix for a live race — unlike the
+	// rebalancer's, which has two concurrent callers.
+	leaseTerm atomic.Int64
 	// Promoter, when set, lets failover promote replicas for auto_promote VMs.
 	Promoter ReplicaPromoter
 	// Restorer, when set, lets host-loss relocation restore a container from its
@@ -143,6 +175,24 @@ type Coordinator struct {
 	// regressed target can never receive an unfenced shared-disk transfer. Wired by
 	// the daemon.
 	SharedStorageFenceEnforce bool
+	// LeaseTermEnforce is the per-node kill-switch for leader-lease term
+	// enforcement (config.Enforcement.LeaseTerm). Enforcement is this flag AND the
+	// LeaseTermV1 capability latch, matching the executor's own predicate
+	// (grpcapi's leaseTermEnforced) — the two halves of one decision, and they
+	// must agree. When enforced, the coordinator refuses to stamp a proof whose
+	// term has been superseded. It is a precheck, not the guarantee: the
+	// executor's quorum barrier is, because a stale coordinator can skip this and
+	// nothing can skip that. Wired by the daemon.
+	//
+	// It does NOT run "before any destructive work", and must not be described
+	// that way. Every stamp site is reached AFTER the host has been fenced —
+	// c.fenced is set and the fencer has run long before, and the host row is
+	// already persisted offline — so a refusal here abandons a workload whose host
+	// is already powered off. A fenced host is processed only once (see the
+	// auto-promote fallback comment in failover), so nothing revisits it: that is
+	// why the threshold read below fails OPEN, and why a refusal on this path is a
+	// last resort rather than a cheap safety net.
+	LeaseTermEnforce bool
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
@@ -300,11 +350,13 @@ func (c *Coordinator) run(ctx context.Context) {
 	// stops renewing coordinator leadership.
 	if c.selfFenced() {
 		c.mAttempt(PhaseSkip, ResultSkipped, ErrSelfFenced)
+		c.stepDownGauges()
 		return
 	}
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
 	if !c.acquireLease(ctx) {
+		c.stepDownGauges()
 		return
 	}
 
@@ -384,6 +436,9 @@ func (c *Coordinator) run(ctx context.Context) {
 		if !c.holdLease(ctx) {
 			slog.Warn("failover: lease lost mid-cycle, aborting", "host", c.hostName)
 			c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
+			// Losing the lease is a step-down: the node that takes it owns the
+			// fleet's view from here.
+			c.stepDownGauges()
 			return
 		}
 
@@ -454,7 +509,34 @@ func (c *Coordinator) run(ctx context.Context) {
 	// fence path (an already-fenced host is skipped above, so relocateContainers
 	// won't re-run for it) — so a deferred restore still gets resolved.
 	c.resolvePendingRelocations(ctx)
+
+	// Report workloads left on a host the cluster considers down. Read-only: see
+	// strandedWorkloads for what the number does and does not mean, and for why
+	// this reports rather than recovers. Runs after recoverHosts and
+	// resolvePendingRelocations so a host or marker settled THIS cycle is already
+	// out of the count.
+	if n, err := c.strandedWorkloads(ctx); err != nil {
+		// Leave the gauge holding its last measured value: publishing 0 here
+		// would clear an operator's alert using a number we failed to read.
+		slog.Error("failover: count stranded workloads", "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+	} else {
+		c.mStranded(n)
+	}
 }
+
+// stepDownGauges clears the gauges this node owns when it is NOT driving
+// failover — self-fenced, or not the lease holder. Every node runs a coordinator
+// and every node serves /metrics, so without this a demoted leader pins its last
+// value forever (Prometheus gauges retain) and pages the fleet after the
+// condition heals, while every node that never held the lease publishes a
+// permanent 0 that hides a real one. Same contract as stepDownDualRun: the
+// leader's view is the fleet's view, and the rest keep their series clear.
+//
+// Nothing durable is lost by clearing. strandedWorkloads holds no state between
+// cycles — it re-derives the count from hosts/vms/containers — so the new
+// leader's first pass republishes the true value within one poll interval.
+func (c *Coordinator) stepDownGauges() { c.mStranded(0) }
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
@@ -589,87 +671,243 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 // The CRDT row store cannot offer linearisable CAS across partitions, so this
 // is best-effort. We mitigate races by:
 //  1. Updating only when the existing row is expired or already held by us.
-//  2. Re-reading after the write and refusing to act if the holder changed.
+//  2. Validating that precondition INSIDE the write transaction (the shared
+//     helper's guard), so acquisition needs no post-write read; the renewal
+//     path still reads back and refuses if the holder changed.
 //  3. Re-validating before every destructive call (holdLease).
 //  4. Renewing well before expiry (leaseRenewBefore head-room).
+//
+// The guarded upsert, its read-back, and the same-day expiry-compare fix now
+// live in corrosion.AcquireLeaseWithTerm, shared with the rebalancer and the
+// dual-run detector. leaseDuration and c.now() stay this coordinator's own:
+// c.now() is the virtual clock the fleet harness overrides, and passing
+// time.Now() instead would make its scenarios unable to advance past lease
+// expiry without sleeping.
 func (c *Coordinator) acquireLease(ctx context.Context) bool {
-	now := c.now().UTC()
-	nowRFC := now.Format(time.RFC3339)
-	expiresAt := now.Add(leaseDuration).Format(time.RFC3339)
-	// The expired-check compares against a bound RFC3339 `now` (?), NOT
-	// datetime('now'): expires_at is stored RFC3339 ("…T…Z") and datetime('now')
-	// yields space-separated text, so a string compare breaks once the date
-	// matches ('T' > ' ') — a same-day lease NEVER looked expired, so a dead
-	// leader's lease could never transfer to another host (failover stalls
-	// cluster-wide until the UTC date rolls over). Same format on both sides
-	// fixes the compare; using c.now() also keeps virtual-time tests correct.
-	if err := c.db.Execute(ctx,
-		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
-		 VALUES ('failover', ?, ?, ?)
-		 ON CONFLICT(key) DO UPDATE
-		   SET holder = excluded.holder,
-		       expires_at = excluded.expires_at,
-		       updated_at = excluded.updated_at
-		   WHERE leader_election.expires_at < ?
-		      OR leader_election.holder = excluded.holder`,
-		c.hostName, expiresAt, nowRFC, nowRFC); err != nil {
+	held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
+	if err != nil {
+		// Covers both former error outcomes — the write failing and the
+		// read-back failing — which reported this same metric triple.
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
 		return false
 	}
-
-	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
-	if err != nil {
-		slog.Error("failover: lease read", "error", err)
-		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		return false
-	}
-	if len(rows) == 0 {
-		// Write succeeded but read returned nothing — abort cycle.
-		slog.Warn("failover: lease row missing after write")
-		c.mAttempt(PhaseLease, ResultError, ErrDBError)
-		return false
-	}
-	holder := rows[0].String("holder")
-	if holder != c.hostName {
+	if !held {
 		// Another coordinator holds it — the normal non-leader case.
+		c.leaseTerm.Store(0)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
 		return false
 	}
+	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
 	return true
 }
 
+// LeaseTerm is the fencing term of the lease incarnation this coordinator holds,
+// 0 when it holds none. Exported for the Phase-2 enforcement path and for tests;
+// nothing enforces on it yet.
+func (c *Coordinator) LeaseTerm() int64 { return c.leaseTerm.Load() }
+
 // holdLease re-validates that we still hold the failover lease and that the
 // remaining TTL is at least leaseRenewBefore. Renews if low. Returns false if
 // the lease is lost or read fails.
+// Every false return here CLEARS leaseTerm. holdLease is this coordinator's
+// displacement detector — it is called per fence candidate and again immediately
+// before the destructive call — so it is the one path that most needs to stop
+// reporting a token this node has demonstrably lost. It did not clear it, so a
+// coordinator displaced mid-cycle kept answering with its old term for up to a
+// poll interval, including at the pre-fence check. acquireLease cleared on every
+// loss path, which made the asymmetry easy to miss.
 func (c *Coordinator) holdLease(ctx context.Context) bool {
+	_, ok := c.holdLeaseAtLeast(ctx, leaseRenewBefore)
+	return ok
+}
+
+// holdLeaseAtLeast re-validates the failover lease and guarantees strictly more
+// than `need` remaining on it, renewing when the margin is short. It returns
+// the remaining TTL so a caller can bound a long operation by the authority it
+// actually holds rather than by a hardcoded guess.
+//
+// A renewal that still cannot reach `need` is a refusal, not a success: it
+// means this node no longer holds enough of the lease to finish the work
+// safely, and proceeding would be acting past its own authority.
+func (c *Coordinator) holdLeaseAtLeast(ctx context.Context, need time.Duration) (time.Duration, bool) {
+	left, ok := c.leaseRemaining(ctx)
+	if !ok {
+		return 0, false
+	}
+	if left > need {
+		return left, true
+	}
+	if !c.acquireLease(ctx) {
+		return 0, false
+	}
+	left, ok = c.leaseRemaining(ctx)
+	if !ok || left <= need {
+		return 0, false
+	}
+	return left, true
+}
+
+// leaseRemaining reports how much of the failover lease this node still holds.
+// It returns ok=false when the row is missing or unreadable, when the holder is
+// someone else, or when expires_at cannot be parsed — every case in which this
+// node cannot prove it is the leader.
+//
+// Every ok=false return CLEARS leaseTerm. This is the coordinator's
+// displacement detector — holdLease reaches it per fence candidate and again
+// immediately before the destructive call — so it is the one path that most
+// needs to stop reporting a token this node has demonstrably lost. It did not
+// clear it, so a coordinator displaced mid-cycle kept answering with its old
+// term for up to a poll interval, including at the pre-fence check.
+// acquireLease cleared on every loss path, which made the asymmetry easy to
+// miss.
+//
+// Both callers inherit that: holdLease and the fence-bounding
+// holdLeaseAtLeast read the lease through here and nowhere else.
+func (c *Coordinator) leaseRemaining(ctx context.Context) (time.Duration, bool) {
 	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
-	if err != nil || len(rows) == 0 {
-		return false
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
+	if err != nil {
+		slog.Error("failover: lease read", "error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
+		return 0, false
+	}
+	if len(rows) == 0 {
+		// The lease row is absent while this coordinator believes it may hold
+		// it. Nothing in the tree ever DELETEs a leader_election row, so this is
+		// local corruption or truncation, not the ordinary non-leader case — it
+		// must stay distinguishable from the skip that fires on N-1 nodes every
+		// poll, and must keep tripping the result="error" alert.
+		slog.Warn("failover: lease row missing")
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
+		return 0, false
 	}
 	if rows[0].String("holder") != c.hostName {
-		return false
+		c.leaseTerm.Store(0)
+		return 0, false
 	}
 	expiresAt, err := time.Parse(time.RFC3339, rows[0].String("expires_at"))
 	if err != nil {
-		return false
+		slog.Error("failover: lease expiry unparseable", "value", rows[0].String("expires_at"))
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		c.leaseTerm.Store(0)
+		return 0, false
 	}
-	if expiresAt.Sub(c.now()) > leaseRenewBefore {
+	return expiresAt.Sub(c.now()), true
+}
+
+// leaseTermEnforced reports whether this coordinator refuses to stamp on the
+// strength of its lease term: the config flag AND the cluster-wide latch, the
+// same `flag && Enforced` model as the rest of this family.
+//
+// Both halves are load-bearing, and the latch half especially. An operator sets
+// enforcement.lease_term ahead of the latch during a roll — that is the intended
+// order — and pre-latch a perfectly healthy leader holds term 0, because the
+// ledger mint gate is still closed and AcquireLeaseWithTerm deliberately reports
+// no term. Enforcing on the flag alone would therefore stand this coordinator
+// down from every action it drives, on every node, for the whole rollout, while
+// the executor (which gates on the same latch) went on accepting term-0 proofs.
+// All cost, no safety.
+func (c *Coordinator) leaseTermEnforced(ctx context.Context) bool {
+	return c.LeaseTermEnforce && c.Gate != nil && c.Gate.Enforced(ctx, capabilities.LeaseTermV1)
+}
+
+// leaseTermStampAllowed reports whether this coordinator may stamp a proof with
+// its recorded term.
+//
+// The term is c.LeaseTerm() — the incarnation this coordinator actually acquired
+// — and NEVER a fresh ledger read. Deriving it here would let a displaced holder
+// that has received the winner's term row stamp proofs with the winner's term,
+// the privilege escalation Phase 1 closed. The ledger read below is the
+// THRESHOLD, used only to reject, never to adopt.
+func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
+	if !c.leaseTermEnforced(ctx) {
+		// Nothing to check: pre-latch there is no term to be stale, and with the
+		// flag off the operator has taken enforcement off this node deliberately.
+		// Stamp whatever term we hold — 0 pre-latch — so the term is observable
+		// before the flip rather than appearing for the first time with it.
 		return true
 	}
-	// Renew.
-	return c.acquireLease(ctx)
+	term := c.LeaseTerm()
+	if term <= 0 {
+		// Enforcing, so the ledger has latched and a real holder has a real term.
+		// No term here means this coordinator holds no lease incarnation — never
+		// acquired one, or holdLease cleared it on a loss path — and acting as
+		// leader without one produces exactly the unfenced write the term exists
+		// to prevent.
+		c.mAttempt(PhaseLease, ResultSkipped, ErrLeaseLost)
+		return false
+	}
+	threshold, err := corrosion.CurrentLeaseTerm(ctx, c.db, failoverLeaseKey)
+	if err != nil {
+		// FAIL OPEN, deliberately, and this is the one place in the family that
+		// does. Every caller is past the fence: the host is powered off and its
+		// row is persisted offline, and a fenced host is processed only once, so
+		// refusing here does not defer the work — it abandons it, and the
+		// workload stays assigned to a dead host until an operator intervenes.
+		//
+		// Weigh that against what refusing buys. This precheck is an
+		// optimisation; the executor's quorum barrier is the guarantee and runs
+		// regardless. An unreadable threshold is no evidence we are superseded —
+		// the overwhelmingly likely cause is a transient DB error on a
+		// coordinator whose term is perfectly current — so stamping produces a
+		// valid proof the executor accepts, and in the rare case we ARE stale the
+		// barrier refuses it exactly as designed. Fail-closed here trades a
+		// guaranteed stranded workload for a check that was never the guarantee.
+		//
+		// The error is still counted, so a threshold read that fails persistently
+		// is visible rather than silently permissive.
+		slog.Error("failover: read lease term threshold — stamping anyway (precheck fails open)",
+			"error", err)
+		c.mAttempt(PhaseLease, ResultError, ErrDBError)
+		return true
+	}
+	if term < threshold {
+		slog.Warn("failover: this coordinator's lease term is superseded — refusing to stamp",
+			"term", term, "threshold", threshold)
+		c.mAttempt(PhaseLease, ResultSkipped, ErrStaleLeaseTerm)
+		return false
+	}
+	return true
+}
+
+// leaseStamp returns everything a proof records about this coordinator's tenure:
+// the holder and expiry read from the lease row, and the fencing term from
+// c.LeaseTerm(). ok is false when this coordinator must not stamp at all, and the
+// caller must abandon the action rather than stamp a partial record.
+//
+// All three stamp sites go through this, and that is the point of it existing.
+// The term is RETURNED rather than read at each site, so a site cannot silently
+// omit it. And the holder comes from the lease row, not from c.hostName: two of
+// the three sites previously wrote their own identity into LeaseHolder, which
+// asserts "I hold the lease" on the authority of the process making the claim —
+// precisely the assertion the fencing term exists to stop trusting. leaseSnapshot
+// returns empty on a read error, so this field can be blank on a perfectly valid
+// proof; blank is correct and self-reporting was a fabrication.
+func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, ok bool) {
+	if !c.leaseTermStampAllowed(ctx) {
+		return "", "", 0, false
+	}
+	holder, expiresAt = c.leaseSnapshot(ctx)
+	return holder, expiresAt, c.LeaseTerm(), true
 }
 
 // leaseSnapshot returns the current failover-lease holder + expiry to record in a
-// proof. leader_election has no lease TERM column, so the proof captures the
-// snapshot (holder + expires_at), matching the plan's honest trust model.
+// proof, as the human-readable record of the tenure.
+//
+// It is NOT the proof's enforceable token: that is ActionProof.LeaseTerm, which
+// comes from c.LeaseTerm() via leaseStamp. This snapshot deliberately returns
+// empty on a read error — an honesty record must not FABRICATE a holder — so it
+// can be blank on a perfectly valid proof, which is exactly why the executor's
+// equal-term check compares against Coordinator rather than LeaseHolder.
 func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt string) {
 	rows, err := c.db.Query(ctx,
-		`SELECT holder, expires_at FROM leader_election WHERE key = 'failover'`)
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, failoverLeaseKey)
 	if err != nil || len(rows) == 0 {
 		// An honesty record must not FABRICATE a holder on a read error — reporting self
 		// would falsely assert this node held the lease. Return empty (unknown).
@@ -845,17 +1083,29 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// split-brain. See recoverHosts.
 	c.fenceRelocated[h.Name] = false
 
-	// Re-validate lease immediately before the destructive fence call. Fence
-	// runs (especially IPMI verify) can take ~15 s; a second coordinator must
-	// not begin fencing the same host concurrently.
-	if !c.holdLease(ctx) {
-		slog.Warn("failover: lease lost before fence, aborting", "host", h.Name)
+	// Re-validate the lease immediately before the destructive fence call, and
+	// require enough of it left to FINISH that call. Checking only that the
+	// lease is currently held is not sufficient: a fence run (IPMI verify alone
+	// is up to 15 s) can outlast the remaining TTL, and once the row expires a
+	// second coordinator can take the lease and start fencing the same host
+	// while this call is still in flight.
+	leaseLeft, ok := c.holdLeaseAtLeast(ctx, minFenceLease)
+	if !ok {
+		slog.Warn("failover: lease lost or too short to fence, aborting",
+			"host", h.Name, "required", minFenceLease)
 		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 		return
 	}
 
+	// Bound the fence by the lease that authorises it. The deadline is derived
+	// from the time this node actually holds, less a margin so the call returns
+	// while it is still the leader — not from a constant that could quietly
+	// exceed the lease if either value is ever retuned.
+	fenceCtx, cancelFence := context.WithTimeout(ctx, leaseLeft-leaseFenceMargin)
+	defer cancelFence()
+
 	// Step 1: Fence the host.
-	fr := c.fencer(ctx, fence.HostConfig{
+	fr := c.fencer(fenceCtx, fence.HostConfig{
 		Name:          h.Name,
 		Address:       h.Address,
 		SSHUser:       h.SSHUser,
@@ -892,6 +1142,20 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 
 	if c.OnFence != nil {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
+	}
+
+	// The fence is recorded; confirm this node is still the leader before acting
+	// on it. If the lease expired while the fence ran, another coordinator may
+	// already be driving this host's recovery, and continuing would mean two
+	// coordinators rescheduling the same VMs. Deliberately placed AFTER the
+	// fence log and OnFence: those record a physical act that did happen and
+	// must survive regardless of who holds the lease now. What stops here is
+	// everything that ASSERTS authority — the host state write and the
+	// reschedule below.
+	if !c.holdLease(ctx) {
+		slog.Warn("failover: lease lost during fence, not rescheduling", "host", h.Name)
+		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
+		return
 	}
 
 	// Step 2: Mark host as fenced (fr.Success) or offline (best-effort/manual
@@ -963,6 +1227,36 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		}
 	}
 
+	// The fence is done and h's state row is written; everything below is
+	// recovery, and every refusal in it is therefore post-fence.
+	c.recoverWorkloads(ctx, h)
+}
+
+// recoverWorkloads moves every recoverable workload off a host that is already
+// fenced: VMs by replica promotion or reschedule, containers by relocation.
+//
+// It performs NO fencing. failover has already fenced h and written its state
+// row by the time this runs, so re-fencing here would power-cycle a machine
+// that is already down and mint a second fence epoch for one outage.
+//
+// Everything it needs is re-derived from persisted state rather than passed in:
+// fenceEpoch from fencing_log via proofGradeFenceRef, the candidate set from
+// healthyHosts, and the work itself from the rows still pointing at h. That
+// makes it idempotent — a successful reschedule re-homes the VM row and a
+// successful relocation tombstones the source row — which is what lets it be
+// read as a separate step rather than as the tail of the fence.
+//
+// It is a separate function because the fence and the recovery answer different
+// questions, and because every refusal inside it happens AFTER the fence: the
+// host is already marked down, so a decline here leaves work assigned to a
+// machine that will not run it. strandedWorkloads reports that condition.
+//
+// One consequence of taking fenceEpoch from fencing_log is deliberate:
+// proofGradeFenceRef only counts a fence inside recentFenceWindow, so a VM with
+// a writable shared disk fails CLOSED at the shared-storage gate once that
+// window lapses. Transferring a shared disk on aged-out evidence of power-off is
+// the split-brain the gate exists to prevent.
+func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRecord) {
 	// Bind cross-host transfer proofs to THIS fence: for a VM with a writable
 	// shared disk the executor requires a proof-grade power-off of the old owner
 	// (SharedStorageFenceV1), re-verified from fencing_log via this reference. ""
@@ -1243,13 +1537,30 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 				continue
 			}
 			_, live, needed := c.Gate.QuorumProof(ctx)
-			leaseHolder, leaseExp := c.leaseSnapshot(ctx)
+			// The fencing term of THIS tenure, taken from what the coordinator
+			// recorded at acquisition — never from a fresh MAX(term) read, which
+			// would let a displaced holder adopt the winner's term.
+			//
+			// reschedule is the one action in leaseTermRequiredActions, and this
+			// is its only mint site, so an unstamped proof here is refused
+			// outright once lease_term_v1 latches: judgeProofLeaseTerm sees
+			// term 0 with an empty key and returns ReasonStaleLeaseTerm, so the
+			// VM is never started and sits pending forever. Nothing detected
+			// that, because LeaseTermReadiness checks whether this node can MINT
+			// a term, not whether its producers STAMP one.
+			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			if !ok {
+				c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
+				c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
+				continue
+			}
 			proof := corrosion.ActionProof{
 				ID: randid.New(), Action: corrosion.ActionReschedule, TargetKind: "vm",
 				TargetName: vm.Name, DestHost: targetName, Coordinator: c.hostName,
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
+				LeaseTerm:  leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1372,11 +1683,19 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 				return
 			}
+			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			if !ok {
+				c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
+				c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+				return
+			}
 			proof := corrosion.ActionProof{
 				ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 				TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
-				LeaseHolder: c.hostName, RelocationToken: token,
-				OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
+				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
+				RelocationToken: token,
+				OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
+				LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -1523,12 +1842,20 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 			return
 		}
+		leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+		if !ok {
+			c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
+			c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+			return
+		}
 		relocToken = randid.New()
 		proof := corrosion.ActionProof{
 			ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 			TargetName: ct.Name, DestHost: target, Coordinator: c.hostName,
-			LeaseHolder: c.hostName, RelocationToken: relocToken,
-			OwnerEpoch: ownerEpochString(ct.OwnerEpoch),
+			LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
+			RelocationToken: relocToken,
+			OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
+			LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)
@@ -1648,6 +1975,155 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 		}
 	}
 	return out, nil
+}
+
+// vmNeedsFailover reports whether this VM is one the coordinator would ever try
+// to move off a dead host.
+//
+// It answers only the PERMANENT question — is this workload a failover candidate
+// at all — and deliberately not "can it move right now", which depends on
+// quorum, gates, candidate hosts and this coordinator's lease term. A VM this
+// returns false for stays on its dead host by design.
+//
+// Auto-promotion is checked by the caller, not here: the reschedule loop reaches
+// AutoPromoteReplica BEFORE it consults on_host_failure, so a VM enrolled in
+// replication with the default policy of "none" is still recoverable — by
+// promotion rather than reschedule.
+func vmNeedsFailover(vm corrosion.VMRecord, autoPromote bool) bool {
+	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
+	// the host. Neither a reschedule nor a disk-only replica promotion
+	// reconstructs it, so this is not work that becomes possible later — recovery
+	// is an operator restore from a backup that carried the firmware.
+	if vmUsesFirmwareState(vm) {
+		return false
+	}
+	if p := vmFailurePolicy(vm); p != "" && p != "none" {
+		return true
+	}
+	return autoPromote
+}
+
+// containerNeedsFailover is the container half of vmNeedsFailover.
+func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
+	if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
+		return false
+	}
+	// Already triaged as unrecoverable on an earlier pass (no re-pullable image
+	// and no usable backup) and left in place on purpose so an operator can see
+	// it. Re-processing it would loop on a decision already made.
+	if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
+		return false
+	}
+	// A relocate-restore marker means this row has an ACTIVE owner, not that it
+	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
+	// on EVERY cycle, independent of the fence path, and retries until the marker
+	// ages out at defaultRelocateRestoreTimeout. Counting these reports work
+	// somebody is doing — and in the worst case inverts the truth, since a
+	// restore that LANDED but failed to tombstone its source row leaves the
+	// container running on the target with only this row behind.
+	if _, _, ok := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); ok {
+		return false
+	}
+	return true
+}
+
+// strandedWorkloads counts workloads still assigned to a host in state 'fenced'
+// or 'offline' that the coordinator would move off a dead host.
+//
+// It measures exactly that and claims nothing more. It is NOT a count of
+// post-fence refusals, and the difference matters because the two sets are not
+// the same. A refusal inside recoverWorkloads does land here — the host is
+// already marked down when the refusal happens. But three ordinary paths reach
+// those states with their workloads intact and no refusal anywhere:
+//
+//   - `lv host fence` marks a host 'offline' unconditionally and never
+//     enumerates workloads (see FenceHost's own comment), so it counts a live
+//     host's VMs until recoverHosts clears the state.
+//   - `lv host fence-confirm` writes 'fenced' on any host with no precondition.
+//   - failover itself writes 'offline' and RETURNS above recoverWorkloads when a
+//     safe-fence or manual fence is unconfirmed, or the fence failed. For a
+//     manual-strategy host that is a documented NORMAL state, awaiting an
+//     operator's confirmation — and it is the likeliest real non-zero.
+//
+// So a non-zero value means "workloads are sitting on a host the cluster
+// considers down", which is worth an operator's attention however it arose, and
+// the remedy depends on which of the above it is. docs/operating-model.md
+// branches on that; a blanket `lv host undrain` is wrong for the third case,
+// where the fence was never confirmed and undraining is the split-brain move the
+// gate refused to make.
+//
+// Two limits are inherent to deriving this from hosts.state. A host whose state
+// write failed after a successful fence is invisible here even with work
+// stranded on it (the write logs and does not return, by design, so the fence
+// still counts). And a workload counted here may have an owner: containers with
+// a live relocate-restore marker are excluded for that reason, but a VM the
+// operator is restoring by hand is not distinguishable.
+//
+// It REPORTS and does not act. Every refusal inside recoverWorkloads happens
+// after the fence, because the checks that can refuse are deliberately as late
+// as possible — they close races, and moving them earlier would make them staler
+// than the writes they guard. That window is structural and cannot be reordered
+// away. Automatic recovery from it was attempted and withdrawn: acting safely
+// requires proving the host was POWERED OFF, and no evidence available to a
+// coordinator supports that. hosts.state records only that somebody decided it,
+// while health quorum proves unreachability — equally true of a partitioned host
+// still running its VMs. Evacuating on either produces two writers on one disk.
+// Proving it needs a fence proof bound to the current outage, which the schema
+// does not carry today. Until it does, this surfaces the condition in seconds
+// instead of whenever somebody notices VMs are down, and the recovery stays a
+// decision an operator makes with commands they already have.
+//
+// Returns an error rather than a partial count: a number the caller publishes as
+// a gauge must be measured, not guessed. A read failure leaves the previous
+// value in place and reports through the error metric instead, because "0"
+// during a store outage is the all-clear on the one signal an operator alerts on.
+func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
+	hosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		return 0, err
+	}
+	// Read ONCE per cycle, not once per down host: ListBackupSchedules has no
+	// host or vm_name predicate (a full scan), and the map it builds is keyed by
+	// VM name across the whole fleet, so it is byte-identical for every host.
+	// The c.Promoter guard mirrors the reschedule loop's, so a VM is treated as
+	// promotable here exactly when that loop would try to promote it.
+	enrolled := map[string]bool{}
+	if c.Promoter != nil {
+		rows, serr := corrosion.ListBackupSchedules(ctx, c.db)
+		if serr != nil {
+			return 0, serr
+		}
+		for _, r := range rows {
+			if r.Type == "replication" && r.AutoPromote {
+				enrolled[r.VMName] = true
+			}
+		}
+	}
+	total := 0
+	for _, h := range hosts {
+		if h.State != "fenced" && h.State != "offline" {
+			continue
+		}
+		vms, verr := corrosion.ListVMs(ctx, c.db, "", h.Name)
+		if verr != nil {
+			return 0, verr
+		}
+		for _, vm := range vms {
+			if vmNeedsFailover(vm, enrolled[vm.Name]) {
+				total++
+			}
+		}
+		cts, cerr := corrosion.ListContainers(ctx, c.db, h.Name)
+		if cerr != nil {
+			return 0, cerr
+		}
+		for _, ct := range cts {
+			if containerNeedsFailover(ct) {
+				total++
+			}
+		}
+	}
+	return total, nil
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.

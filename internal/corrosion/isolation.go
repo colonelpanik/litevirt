@@ -150,6 +150,19 @@ var reseedKeepTables = map[string]bool{
 	"audit_signing_keys":  true,
 	"audit_key_lifecycle": true,
 	"hosts":               true,
+	// leader_lease_terms: this host's own record of which lease incarnations it
+	// held, and the allocation high-water mark that keeps a term number from ever
+	// being reused. Discarding it is an unbounded GC of the one table whose own
+	// comment refuses GC (see nextLeaseTerm), and the terms an isolated node
+	// minted are exactly the ones that never reached the peer it reseeds from —
+	// so re-merging cannot restore them. MAX(term) would regress and the next
+	// acquisition would hand out a number a previous incarnation already used
+	// with a different holder. Because the merge keeps the local row, peers that
+	// still hold the old row would IGNORE the reallocated one, and the two
+	// incarnations' (term, holder) mapping would diverge permanently — the split
+	// this ledger exists to prevent. Same grounds as audit_chain_heads: it is
+	// this host's OWN evidence, not shared state being replaced.
+	"leader_lease_terms": true,
 }
 
 // ReseedKeepsTable reports whether a reseed KEEPS this table's local rows. It

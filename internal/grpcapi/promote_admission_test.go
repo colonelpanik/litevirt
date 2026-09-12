@@ -14,6 +14,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -269,4 +270,59 @@ func TestPromoteReplica_MarkedRunningRetry_AdoptedWithoutDoubleReserve(t *testin
 	if s.promoteMarkerPresent("vm1") {
 		t.Fatal("marker must be removed once the re-homed row persists")
 	}
+}
+
+// TestPromoteReplica_RefusesAnUnproducibleLeaseKeyBeforeItPersists: promote
+// seeds the durable proof row ITSELF, from req.Proof, before it relays or
+// executes — so the key has to be validated before that seed, not only in the
+// claimCarriedProof call several hundred lines later.
+//
+// req.Proof is caller-supplied on this path: the block is gated on
+// `req.Proof != nil`, not on `automated`, so a peer-mTLS caller's proof lands
+// there too. WriteActionProofValidated commits the presented statement to
+// mutation_log, which relays the whole batch, so by the time the later check
+// refused the same proto the row had already shipped to every peer — and the
+// row, not the proto, is what enforcement reads afterwards.
+//
+// The assertion is therefore on the ROW's absence, not merely on the error:
+// refusing the action while leaving the forged row behind is the failure being
+// pinned.
+func TestPromoteReplica_RefusesAnUnproducibleLeaseKeyBeforeItPersists(t *testing.T) {
+	s := testServer(t)
+	poolDir := seedPromotableVM(t, s, s.hostName, "up", "", 1, 512)
+
+	// A PEER-mTLS caller, because that is who can supply a proof at all: the
+	// block is gated on req.Proof != nil, and requirePeerCert is the only thing
+	// standing in front of it.
+	// A gate must be present, or destSupportsGate fails closed on s.gate == nil
+	// and the refusal never reaches the stamp check this test is about.
+	s.SetGate(fakeServerGate{
+		execOK: true, decideOK: true,
+		enforcedTok: map[string]bool{capabilities.SplitBrainGateV1: true},
+		quorum:      health.QuorumYes,
+	})
+
+	ctx := peerCtxFor(t, s, "peer1")
+	ctx = context.WithValue(ctx, ctxKeyUsername, "admin")
+	ctx = context.WithValue(ctx, ctxKeyRole, "admin")
+	err := s.PromoteReplica(&pb.PromoteReplicaRequest{
+		VmName: "vm1", TargetPool: "replica-pool", NoLocalize: true,
+		Proof: &pb.RuntimeActionProof{
+			Id: "p-forged", Action: corrosion.ActionPromote,
+			TargetKind: "vm", TargetName: "vm1",
+			Coordinator: "node-a", LeaseTerm: 1,
+			LeaseKey: corrosion.LeaseKeyRebalancer,
+		},
+	}, &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument: %v", status.Code(err), err)
+	}
+
+	if _, ok, gerr := corrosion.GetActionProof(context.Background(), s.db, "p-forged"); gerr != nil {
+		t.Fatalf("read back the proof: %v", gerr)
+	} else if ok {
+		t.Error("the refused promote still persisted its proof row, so the forged lease key " +
+			"replicated to every peer and became that row's permanent authorization record")
+	}
+	assertNoPromotedArtifacts(t, s, poolDir, "vm1")
 }

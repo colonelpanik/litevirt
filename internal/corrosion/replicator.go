@@ -583,13 +583,36 @@ func dropUnsupportedProofEntries(entries []mutationEntry) []mutationEntry {
 	return kept
 }
 
+// proofDropExemptTables are customMergeTables tables whose statements must NOT
+// make an entry droppable by dropUnsupportedProofEntries.
+//
+// The drop filter exists for the split_brain_gate_v1 proof capability: a proof
+// dropped to an unready peer reconverges via the sensitive anti-entropy net, so
+// dropping is safe for the tables it was written for. leader_lease_terms breaks
+// that assumption in one specific way: its mint is co-batched, in a single
+// mutation entry, with the leader_election upsert it must be atomic with — and
+// leader_election is anti-entropy EXCLUDED (merging it would corrupt
+// leadership), so it has NO repair path. Dropping the entry would therefore stop
+// replicating lease ownership itself to any peer lacking proof support, for the
+// whole rolling upgrade, silently. The comment on the drop site names
+// leader_election explicitly as something that must keep flowing.
+//
+// The term row itself is in tableNames, so it reconverges via ordinary
+// anti-entropy — it never needed the drop filter's protection. Un-batching to
+// dodge this instead would reopen the crash-between-writes window that
+// acquireLeaseWithTerm's guarded batch exists to close.
+var proofDropExemptTables = map[string]bool{
+	"leader_lease_terms": true,
+}
+
 // entryTouchesCustomMerge reports whether a serialized mutation entry contains ANY
-// statement targeting a customMergeTables table (runtime_action_proofs). Such an
-// entry must be replicated ATOMICALLY (proof + co-batched vms.pending_action_id
-// marker together) or DROPPED WHOLE for a peer that can't yet apply the proof —
-// never split (the dropped proof reconverges via the sensitive AE net). On a parse
-// error it returns true (conservative: treat as proof-bearing and drop, rather than
-// risk sending a partial to an unready peer).
+// statement targeting a proof-gated customMergeTables table (runtime_action_proofs).
+// Such an entry must be replicated ATOMICALLY (proof + co-batched
+// vms.pending_action_id marker together) or DROPPED WHOLE for a peer that can't yet
+// apply the proof — never split (the dropped proof reconverges via the sensitive AE
+// net). Tables in proofDropExemptTables are skipped; see there. On a parse error it
+// returns true (conservative: treat as proof-bearing and drop, rather than risk
+// sending a partial to an unready peer).
 func entryTouchesCustomMerge(stmtsJSON string) bool {
 	var stmts []Statement
 	if err := json.Unmarshal([]byte(stmtsJSON), &stmts); err != nil {
@@ -602,7 +625,7 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		// (non-custom → KEEP; crl_versions is AE-excluded, so dropping it would lose the update with
 		// no repair); the spent-proof-GC transformer targets runtime_action_proofs (custom → drop).
 		if lt, ok := legacyTransformerFor(s.SQL); ok {
-			if customMergeTables[lt.table] != nil {
+			if customMergeTables[lt.table] != nil && !proofDropExemptTables[lt.table] {
 				return true
 			}
 			continue
@@ -612,7 +635,10 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		// treated as proof-bearing (conservative — drop rather than risk a partial to an unready
 		// peer).
 		sh, err := parseStmtShape(s.SQL, nil)
-		if err != nil || customMergeTables[sh.Table] != nil {
+		if err != nil {
+			return true
+		}
+		if customMergeTables[sh.Table] != nil && !proofDropExemptTables[sh.Table] {
 			return true
 		}
 	}
@@ -1165,8 +1191,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	case DispAppendOnly:
 		// Immutable append-only INSERT (fencing_log/audit_log/mutation_log/vm_events):
 		// INSERT OR IGNORE, so it only creates the row when absent and never overwrites.
-		_, execErr := tx.ExecContext(ctx, setInsertOrIgnore(s.SQL, sh), s.Params...)
-		return execErr
+		res, execErr := tx.ExecContext(ctx, setInsertOrIgnore(s.SQL, sh), s.Params...)
+		if execErr != nil {
+			return execErr
+		}
+		r.noteIgnoredInsert(ctx, tx, res, s, sh, tableName, "append_only")
+		return nil
 
 	case DispCustomMerge:
 		// Monotone lifecycle / immutable journal (runtime_action_proofs, operations, …): an
@@ -1182,8 +1212,14 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		if sh.Kind == KindInsert {
 			sqlStmt = setInsertOrIgnore(sqlStmt, sh)
 		}
-		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
-		return execErr
+		res, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
+		if execErr != nil {
+			return execErr
+		}
+		if sh.Kind == KindInsert {
+			r.noteIgnoredInsert(ctx, tx, res, s, sh, tableName, "custom_merge")
+		}
+		return nil
 
 	case DispCreateBegin:
 		if s.Guard == nil || s.Guard.Protocol != workloadCreateBeginGuardV1 {
@@ -3240,6 +3276,53 @@ func (r *Replicator) applyBulkUpdate(ctx context.Context, tx *sql.Tx, s Statemen
 		return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
 	}
 	return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, cat)
+}
+
+// noteIgnoredInsert reports a replicated INSERT that OR IGNORE silently dropped
+// for a reason other than the intended primary-key conflict.
+//
+// SQLite's OR IGNORE conflict resolution skips a row violating NOT NULL, CHECK
+// and UNIQUE exactly as it skips a PK conflict, and ValidateParamArity only
+// checks parameter COUNT — so a malformed peer statement was discarded with a
+// nil error and no signal at all. On an append-only or immutable table that is
+// permanent data loss, not a retryable fault: the receiver keeps a state the
+// sender believes it has, and because the merge keeps the local row, the sender
+// will never overwrite it.
+//
+// A zero-rows result whose primary key IS present is the ordinary idempotent
+// re-delivery this disposition exists for, and stays silent.
+func (r *Replicator) noteIgnoredInsert(ctx context.Context, tx *sql.Tx, res sql.Result, s Statement, sh StmtShape, tableName string, reason string) {
+	if res == nil || rowsChanged(res) {
+		return
+	}
+	pkVals, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pkVals) == 0 {
+		return
+	}
+	// pkCols comes from this node's own tablePrimaryKeys registry, and an
+	// unregistered table yields none — so the length check below is also what
+	// keeps a peer-supplied table name out of the query built from it.
+	pkCols := tablePrimaryKeys[tableName]
+	if len(pkCols) == 0 || len(pkCols) != len(pkVals) {
+		return
+	}
+	preds := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		preds[i] = col + " = ?"
+	}
+	var present int
+	q := `SELECT COUNT(*) FROM ` + tableName + ` WHERE ` + strings.Join(preds, " AND ")
+	if err := tx.QueryRowContext(ctx, q, pkVals...).Scan(&present); err != nil {
+		return
+	}
+	if present > 0 {
+		return // idempotent re-delivery of a row we already hold
+	}
+	// boundedTableLabel, not tableName: the name came off a peer's statement and
+	// an unbounded string must never become a metric label.
+	r.client.observeMergeRejected(boundedTableLabel(tableName), string(pathWAL), "constraint_ignored")
+	slog.Warn("replication: replicated INSERT silently ignored and the row is absent — a constraint other than the primary key rejected it",
+		"table", tableName, "pk", fmt.Sprint(pkVals...), "disposition", reason)
 }
 
 // pkValuesFromShape returns the primary-key values a full-PK statement binds. For an INSERT the PK

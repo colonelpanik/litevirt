@@ -536,6 +536,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
+
+	d.wireLeaseTermLedgerGate()
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -561,7 +563,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner := lxc.NewLxcRunner()
 	lxcRunner.HostName = d.cfg.HostName
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
-	go d.metrics.Start()
+	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
+	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
+	// and bound an EPHEMERAL port on every interface — an unauthenticated
+	// inventory endpoint on an unpredictable port, which is the opposite of
+	// what an operator setting 0 is asking for, and the exposure warning then
+	// named port 0, so the one datum needed to firewall it was useless.
+	if d.cfg.MetricsPort > 0 {
+		go d.metrics.Start()
+	} else {
+		slog.Info("metrics endpoint disabled (metrics_port: 0)")
+	}
 
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
@@ -826,6 +838,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 		ready, reason := svc.OwnerEpochReadiness(ctx)
 		if !ready {
 			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		}
+		return ready
+	})
+	// Phase 2: lease_term_v1 is advertised only when the operator opted in AND
+	// this node can enforce — a readable ledger, split_brain_gate_v1 already
+	// latched, and a cluster large enough that the quorum barrier does not break
+	// failover.
+	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+	// The reconciler is the SECOND executor boundary for this regime: a VM
+	// reschedule proof never travels over an RPC, so it is claimed off the
+	// replicated row there rather than in claimCarriedProof. The judgment is
+	// injected because internal/grpcapi imports internal/health and cannot be
+	// imported back — one implementation, wired to both callers.
+	reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
+	svc.SetLeaseTermReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ready, reason := svc.LeaseTermReadiness(ctx)
+		if !ready {
+			slog.Debug("lease_term_v1 readiness withheld", "reason", reason)
 		}
 		return ready
 	})
@@ -1188,6 +1220,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
 	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
+	// The coordinator half of lease-term enforcement: a local precheck that
+	// refuses to stamp a superseded term. svc.SetLeaseTermEnforce above is the
+	// executor half, and both read this one flag so the source and the enforcer
+	// can never disagree about whether enforcement is on.
+	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is
@@ -1280,7 +1317,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("litevirtd starting",
 		"host", d.cfg.HostName,
 		"grpc", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort),
-		"metrics", fmt.Sprintf("0.0.0.0:%d", d.cfg.MetricsPort),
+		// From the metrics server, not reassembled: this line said 0.0.0.0
+		// unconditionally, so a host that had applied metrics_bind: 127.0.0.1
+		// got two startup lines asserting opposite things, and the louder one
+		// was wrong. Reads "disabled" when metrics_port is 0.
+		"metrics", d.metricsAddrForBanner(),
 		"ui", fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort),
 	)
 
@@ -2111,4 +2152,40 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			gc()
 		}
 	}
+}
+
+// metricsAddrForBanner is what the startup banner prints for the metrics
+// endpoint: the address the listener will actually bind, or "disabled".
+//
+// The banner used to hardcode 0.0.0.0, which contradicted both metrics_bind and
+// the exposure warning the metrics server logs a few lines later.
+func (d *Daemon) metricsAddrForBanner() string {
+	if d.cfg.MetricsPort <= 0 {
+		return "disabled"
+	}
+	if d.metrics == nil {
+		return fmt.Sprintf("%s:%d", d.cfg.MetricsBind, d.cfg.MetricsPort)
+	}
+	return d.metrics.Addr()
+}
+
+// wireLeaseTermLedgerGate lets corrosion mint a leader-lease term only once
+// lease_term_ledger_v1 is DURABLY latched.
+//
+// The mint is the first replicated statement shape leader_lease_terms ever had,
+// and an unregistered shape back-pressures a previous-release peer's whole
+// replication stream instead of degrading — so the write waits for a latch that
+// cannot form while such a peer is still listening. No config flag (the token
+// has no kill switch): terms begin on their own once the roll completes.
+//
+// Extracted from Run so a test can reach it. Its absence is SILENT: this is the
+// one injected predicate on the corrosion client that fails CLOSED, so an
+// unwired gate mints nothing forever and looks exactly like a legitimate
+// mid-roll — the same signature as a starved latch. Deleting this call left the
+// corrosion, grpcapi and daemon suites all green, because every test injects the
+// gate directly and the test constructors hardcode it open.
+func (d *Daemon) wireLeaseTermLedgerGate() {
+	d.db.SetLeaseTermLedgerGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
+	})
 }

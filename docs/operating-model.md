@@ -51,6 +51,13 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **No double-fencing.** Once a successful fence is recorded in `fencing_log`
   (or operator confirmation under manual strategy), no coordinator will
   re-fence the same host within a 5-minute window.
+- **A fence and its recovery can land on different coordinators.** The fence is
+  bounded by the lease that authorises it, and the leader re-checks the lease
+  before rescheduling anything. If it lost the lease meanwhile it stops there —
+  but the verified power-off is already recorded, in `fencing_log` and in the
+  host's `fenced` state, so the next leader resumes the reschedule from that
+  record instead of powering the host off a second time. The resumed pass is
+  counted as `phase=recovery, error_class=recovery_resumed`.
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.

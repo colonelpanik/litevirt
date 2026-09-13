@@ -139,14 +139,15 @@ func TestFailover_FenceIsBoundedByTheLease(t *testing.T) {
 // TestFailover_LeaseLostDuringFence_DoesNotReschedule is the load-bearing guard.
 //
 // The fence is bounded by the lease, but it can still end with the lease gone (a
-// slow fence, a clock jump, a peer taking over). Everything after it — host
-// state, placement, reschedule proofs, container relocation — is the half that
-// must not run twice, and gate.go states the property as
-// "holdLease() && DecisionGate.OK". Without a post-fence re-check, two
-// coordinators can each recover the same host.
+// slow fence, a clock jump, a peer taking over). Everything after it — placement,
+// reschedule proofs, container relocation — is the half that must not run twice,
+// and gate.go states the property as "holdLease() && DecisionGate.OK". Without a
+// post-fence re-check, two coordinators can each recover the same host.
 //
-// The fence_log row must SURVIVE: it records what physically happened to the
-// host, which is true regardless of who holds the lease.
+// What must SURVIVE is the record of what physically happened: the fencing_log
+// row and, for a verified power-off, hosts.state. Those are facts, not claims of
+// authority, and they are how the next leader resumes the recovery instead of
+// re-fencing a host that is already off.
 func TestFailover_LeaseLostDuringFence_DoesNotReschedule(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -154,9 +155,22 @@ func TestFailover_LeaseLostDuringFence_DoesNotReschedule(t *testing.T) {
 
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "h1", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
-		GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+		GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
 	}); err != nil {
 		t.Fatalf("InsertHost: %v", err)
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h2", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	// A VM with somewhere to go, so "did not reschedule" is a real observation
+	// rather than a vacuous one about an empty host.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "h1", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
 	}
 
 	c := NewCoordinator("me", db)
@@ -182,13 +196,142 @@ func TestFailover_LeaseLostDuringFence_DoesNotReschedule(t *testing.T) {
 		t.Errorf("fencing_log rows for h1 = %d, want 1 — the power-off happened and must be recorded", n)
 	}
 
-	// The recovery half must NOT have run.
+	// The recovery half must NOT have run: the VM is what a second coordinator
+	// would move concurrently, so it is the thing that must stay put.
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "h1" {
+		t.Errorf("vm1 moved to %q after the lease was lost — a second coordinator can reschedule it too", vm.HostName)
+	}
+
+	// The fact of the verified power-off IS kept, so the next leader has
+	// something to resume from.
 	after, _ := corrosion.GetHost(ctx, db, "h1")
 	if after == nil {
 		t.Fatal("host disappeared")
 	}
-	if after.State != "active" {
-		t.Errorf("host state = %q, want unchanged \"active\": the coordinator recovered a host "+
-			"after losing the lease, so a second coordinator can do it concurrently", after.State)
+	if after.State != "fenced" {
+		t.Errorf("host state = %q, want \"fenced\": a verified power-off is a fact about the host, "+
+			"and losing it strands the workloads until the fence record ages out", after.State)
+	}
+}
+
+// TestRun_ResumesRecoveryFromARecordedFence is the other half of the guard
+// above: refusing to reschedule after a handoff is only safe if somebody else
+// picks the work up.
+//
+// A fence that ends with the lease gone leaves a host powered off, recorded as
+// "fenced", with its VMs still assigned to it. The next leader used to skip that
+// host entirely — recentlyFenced suppressed the fence, and nothing else looked
+// at it — so the workloads sat on a dead host until the fence aged out of
+// recentFenceWindow and the host was pointlessly powered off a second time.
+func TestRun_ResumesRecoveryFromARecordedFence(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, name := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fenceQuorum(t, ctx, db, []string{"first", "good"}, "bad")
+
+	// Leader one fences "bad" and loses the lease to "good" while the fence runs.
+	first := NewCoordinator("first", db)
+	first.Now = func() time.Time { return now }
+	first.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		seedLease(t, db, "good", now.Add(leaseDuration))
+		return fence.Result{Method: "ipmi", Detail: "powered off", Success: true}
+	})
+	first.RunOnce(ctx)
+
+	if vm, err := corrosion.GetVM(ctx, db, "vm1"); err != nil || vm == nil || vm.HostName != "bad" {
+		t.Fatalf("fixture failed: vm1 should still be on bad after the handoff (err=%v)", err)
+	}
+
+	// Leader two sees a host it did not fence, in "fenced" state, still holding a
+	// VM. It must finish the job from the record, not re-fence and not ignore it.
+	second := NewCoordinator("good", db)
+	second.Now = func() time.Time { return now }
+	second.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		t.Error("the new leader powered off a host that was already provably off")
+		return fence.Result{Method: "ipmi", Success: true}
+	})
+	second.RunOnce(ctx)
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "good" {
+		t.Fatalf("vm1 is still on %q — a successful fence followed by a lease handoff strands the "+
+			"workload on a powered-off host", vm.HostName)
+	}
+	if n := fenceLogCount(t, db, "bad"); n != 1 {
+		t.Errorf("fencing_log rows for bad = %d, want 1 — the resumed recovery must not re-fence", n)
+	}
+}
+
+// TestRun_DoesNotResumeRecoveryForAStaleFence pins the boundary of the resume
+// path: it acts on a fence recent enough to still be authority, and only while
+// the host state still says the cluster believes that fence. A host an operator
+// has undrained is back in service — its VMs must not be moved off it on the
+// strength of an old fencing_log row instead of a fresh one.
+func TestRun_DoesNotResumeRecoveryForAStaleFence(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, name := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fenceQuorum(t, ctx, db, []string{"first", "good"}, "bad")
+	// A recorded, still-recent proof-grade fence...
+	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
+		ID: "f1", HostName: "bad", Method: "ipmi", Result: "fenced", Detail: "powered off",
+	}); err != nil {
+		t.Fatalf("InsertFenceLog: %v", err)
+	}
+	// ...that an operator has since consumed by putting the host back in service.
+	if err := corrosion.UpdateHostState(ctx, db, "bad", "active"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+
+	c := NewCoordinator("good", db)
+	c.Now = func() time.Time { return now }
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		t.Fatal("unreachable: recentlyFenced still suppresses the fence itself")
+		return fence.Result{}
+	})
+	c.RunOnce(ctx)
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "bad" {
+		t.Errorf("vm1 moved to %q on the strength of a fence the operator had already undrained past — "+
+			"a reschedule with no fresh fence behind it is the split-brain the fence exists to prevent", vm.HostName)
 	}
 }

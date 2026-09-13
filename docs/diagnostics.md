@@ -261,6 +261,143 @@ pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) �
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
 
+### `vm_replace` — `lv cutover`
+
+`lv cutover` gives the `<vm>-next` replacement the name of the VM it replaces. That VM is
+deleted first, and the delete is a **soft** delete, so its tombstone still occupies the
+`vms.name` PRIMARY KEY — and every child table it tombstones holds its own composite key
+the same way.
+
+No pre-existing replicated statement shape makes that handover safe on a **receiver**.
+Clearing the tombstone with a retention DELETE is applied unconditionally there, while the
+write meant to replace the row is only last-writer-wins gated — so a delayed replay erases
+a tombstone and puts nothing in its place. Moving it aside instead splits the handover into
+two independently gated statements, and a receiver can commit one and skip the other,
+leaving no row at the name, or moving a still-live VM aside when its own newer ownership
+made the sender's delete decline there. Neither addresses the merge rules, which decide a
+both-live conflict at the contested name on owner/generation authority alone: the replaced
+VM has usually been running longer than its replacement, so its stale copy simply
+overwrites it.
+
+The transition therefore ships as **one receiver decision**: every statement in the batch
+carries the same `workload_replace_v1` guard over both VMs' incarnations and authority, and
+a receiver applies all of them or none. The row installed at the contested name keeps the
+**replacement's** `created_at` — a delete is terminal only for its own incarnation, so a
+delayed tombstone of the replaced VM must read as an older one — and carries authority
+above **both** inputs.
+
+**The cleanup is journaled.** The transition and the destruction of what the replaced VM
+owned cannot be one commit: the destruction is filesystem and storage-driver work that has
+to follow it, and the transition itself displaces the rows describing what to free — the
+replaced VM's parent row, and any child row whose key the replacement claims. A crash in
+between would leak its volumes with nothing left in the database naming them.
+
+So a `vm_replace` operation records an immutable manifest — the replaced VM's disk records,
+its firmware UUID and cloud-init ISO path, plus the replacement's spec and state — while
+those rows are still intact, and the step that AUTHORIZES the destruction is written in the
+same batch as the transition. Its phases are:
+
+| step | meaning |
+|---|---|
+| — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. Only on the node the cutover RUNS on: a replaced VM hosted elsewhere is asked about instead, and only a complete survey reporting no domain at the name is accepted — a domain still defined there, an incomplete survey, or an unreachable or older peer all refuse, before the operation is even journaled. Absence that could not be established is not absence, and proceeding would hand the name and the address over while that guest was still using both. |
+| `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
+| `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. Its facts carry the **runtime intent** the transition committed to — the replacement's accepted state at that moment — which is what the handoff restores. |
+| `released` | the replaced VM's IPAM addresses are given back — **after** the transition. Releasing first means a delete that then declines leaves a live VM whose address has already gone back to the pool, in the external IPAM too. Journaled because the release can fail on its remote half, and a best-effort attempt that did would strand the address under a cutover reporting success. The manifest carries each address's external object id **and the identity it was claimed under**, so a retry can finish a release whose local half already landed — and can prove first that it is finishing its own. Captured for every address the replaced VM holds, wherever that VM is hosted: leases are cluster-global, unlike the volumes and firmware beside them in the manifest. |
+| `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
+| `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
+| `stopped` | the replacement's domain is confirmed INACTIVE — via libvirt's own activity query, not the coarse state, which collapses paused, shut-off and pm-suspended into "stopped" and so cannot see that a PAUSED domain is active. Activity is re-checked before **every** undefine, including a retry that already has this phase recorded: the record is a statement about the past, and an external start or libvirt autostart can reactivate the domain in between. libvirt cannot rename a domain, and undefining an **active** one leaves it running as a *transient* domain still holding its UUID — after which defining that UUID under the contested name is refused. **Cutting over a running replacement therefore restarts it**; no libvirt operation moves a live domain to another name, and `lv cutover` says so before it starts. |
+| `redefined` | the replacement's libvirt domain and firmware answer to the new name. The database transition does not do this, and a restart that finished only the destruction would leave a committed cutover with no domain at the name. |
+| `completed` | appended only after **both** later phases have run. |
+
+A restart resumes whichever phases are outstanding, from the manifest — never by
+re-running the transition, and never by reading the reused name, which now belongs to the
+replacement. Every runtime action checks the **recorded domain UUID** first, including the
+already-done shortcut, and a read that merely FAILED is neither "ours" nor "absent" — only
+a verified not-found is absence, so a transient libvirt error cannot authorize acting on a
+name whose real occupant is unknown: the temporary name is free the moment the transition commits, so a
+delayed recovery acting by name alone would undefine whatever VM has since taken it. The
+desired runtime state is read from the database at the moment the handoff acts, so an
+operator stop accepted mid-cutover is not undone by replaying a stale snapshot, and the
+whole operation — handler and recovery alike — is serialized against lifecycle calls on
+both names. A phase is recorded only when its step actually succeeded; a failed redefine or
+start leaves it owed. A firmware VM's failure is surfaced in its `state_detail`,
+never as `state=error` — operation failure and running intent are different facts, and
+overwriting the state made the retry read the row as "not asked to run" and finish with the
+VM shut off. For the same reason the running intent is taken from the JOURNAL rather than
+the row: an unfinished handoff looks exactly like a VM that stopped out of band, so a
+reconciler pass would otherwise sync it to `stopped` and erase the start still owed. Nor
+from the manifest, which is older still — captured before the first attempt's teardown and
+adopted verbatim by every retry, so a start the operator asked for between two attempts is
+not in it; the manifest is the fallback only for an operation journaled before the intent
+was recorded. Only an explicit operator stop overrides either, and the reconciler leaves a
+VM with an owed handoff alone in the first place. That marker is never overwritten by failure
+reporting either — it is the only override there is, so replacing it with diagnostic text
+would let the next retry start a VM the operator stopped. A failure goes to the VM's event
+feed and leaves the operation owed in the journal. The firmware file moves only while the temporary name is still the
+replacement's, and the destination definition is derived independently of whether this
+attempt performed that move, so a retry after a failed redefine does not point the VM at a
+vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
+the two names: both are reused by the next deployment, and an identity built from names
+alone collides with the previous cutover's header. A retry of the same cutover therefore
+finds its own header and **adopts the manifest already journaled there** rather than taking
+a second one. It has to: a manifest can only be captured while the replaced VM's rows are
+intact, and an attempt retrying past its own teardown reads live-only rows that no longer
+describe the VM it is finishing. Only the recorded owner **epoch** may not have moved —
+every phase is keyed on it, and continuing at another one would write the authorization
+where no resume can read it back. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
+contested name still holds the incarnation this operation transitioned, judged from a read
+that sees **tombstones** as well as live rows. A name that has since been deleted and
+recreated belongs to a different VM, and so do its files — including when that newer VM was
+itself deleted with its disks retained, which deliberately keeps its firmware and reads as
+"nobody owns this name" to any live-only lookup. This operation's own tombstone still
+counts as its own, so a cutover whose result was later deleted is still cleaned up. The
+swtpm tree is keyed by the replaced VM's own UUID and is freed regardless. Destruction
+exempts **no** VM from the
+shared-reference check, because the temporary name is free and reusable — a VM created
+after a crash can legitimately reference a captured volume. IPAM allocations move by their
+own primary key and their **complete owner tuple** — `(owner_kind, owner_host, vm_name)`,
+which is what stops a same-named container's address being taken by a VM cutover, and the guard carries a digest of the leases both
+names hold: an address the receiver released and reallocated to an unrelated VM declines
+the whole transition rather than being quietly taken. The release phase applies the same
+rule to what it destroys. The allocation at that key is read **owner-blind**, because an
+owner-scoped read answers a foreign live row and a genuinely absent one with the same
+nothing — and those license opposite actions, since absence is what permits finishing a
+remote delete alone. An allocation another workload now holds vetoes both halves, and is
+left for the orphan sweep rather than retried, so it cannot wedge the phases behind it.
+One that is still this operation's has to also carry the same MAC and back the **same
+external object** the manifest captured — name, MAC and key agreeing prove nothing once
+the contested name belongs to the replacement and the MAC may have been reused. A row that is already gone is
+finished remotely only after the external object is read back **by identity** and still
+answers to the one the replaced VM claimed it under: the object id is a name, not a claim,
+and an address reallocated elsewhere keeps the id while the identity moves. That read is
+also what makes the phase idempotent — an object that is no longer there reads as absent,
+which is a completed release, so a crash between a successful delete and its record resumes
+instead of retrying into a permanent not-found. A read that FAILS is neither, and leaves the
+phase owed.
+
+That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
+
+That is new receiver behaviour, which nothing in the historical ledger can retrofit onto an
+older peer, so it is gated:
+
+- **`enforcement.operation_protocol`** must be active too — the manifest lives in the
+  operation journal. Cutover treats a missing journal as not-available, checked before any
+  side effect.
+- **`enforcement.vm_replace`** (config flag, default false) gates **advertisement** of
+  `vm_replace_v1`, so the cluster-wide latch requires config uniformity rather than just a
+  uniform build — the same rule as `operation_protocol`.
+- **`lv cutover` REFUSES** while the flag is off or the token has not latched, and it
+  refuses as its first act, before stopping a domain or writing to either VM. A cluster
+  that has not opted in has a cutover that declines, not one that half-applies.
+- A receiver that has not latched **rejects** the batch's statements rather than applying
+  them under a disposition never designed for them, which is why the sender is gated too.
+
+Rollout: upgrade every node (flag off, behavior-neutral — cutover simply refuses), then set
+`enforcement.vm_replace: true` everywhere and rolling-restart; the latch closes once every
+voting-eligible member advertises the token. Kill switch: set it `false` and restart;
+cutover goes back to refusing. Acceptance of an already-emitted batch is NOT revoked by the flag — it reads the
+durable latch, because a batch in flight must not become unacceptable across a restart.
+
 ### `canonical_registry` — registry-credential migration
 
 Registry logins mint a **new random `id` per login** and write via a tombstone+insert

@@ -440,6 +440,17 @@ type EnforcementConfig struct {
 	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
 	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
+	// VMReplace: allow `lv cutover` to give a replacement VM the name a replaced VM
+	// still holds (capabilities.VMReplaceV1). The transition needs a receiver-side
+	// guarantee the pre-existing statement shapes cannot express — one decision for
+	// the whole batch, over both VMs' incarnations and authority — so it ships behind
+	// a new guard protocol that only an upgraded peer understands.
+	//
+	// Cutover REFUSES while this is off or the token has not latched cluster-wide, and
+	// it refuses BEFORE stopping a domain or writing to either VM, so a cluster that
+	// has not opted in is left with a cutover that declines rather than one that
+	// half-applies. Default false; the flag is the reversible kill switch.
+	VMReplace bool `yaml:"vm_replace,omitempty"`
 	// ProjectAuthority: route the PROJECT-QUOTA half of an admission to the project's
 	// D1 authority holder instead of deciding from this node's replica
 	// (capabilities.ProjectAuthorityV1). One decider per project closes the window

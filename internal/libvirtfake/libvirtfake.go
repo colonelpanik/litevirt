@@ -126,8 +126,11 @@ type Fake struct {
 	// shut-off reclaim path), symmetric with FailDetachHostdev for the live path.
 	FailDetachHostdevConfig func(domain, pciAddress string) error
 	FailShutdownDomain      func(name string) error
-	FailUndefineDomain      func(name string, removeStorage bool) error
-	FailUndefinePreserv     func(name string) error
+	// FailDestroyDomain injects a forced-stop failure, so a scenario can reach the
+	// path where a domain cannot be taken off a name at all.
+	FailDestroyDomain   func(name string) error
+	FailUndefineDomain  func(name string, removeStorage bool) error
+	FailUndefinePreserv func(name string) error
 	// FailDumpXML injects a live-domain read failure so a scenario can exercise a
 	// fail-closed path that must NOT proceed when the live membership is unreadable
 	// (e.g. PCI detach recovery refusing to release without confirming the hostdev
@@ -309,10 +312,62 @@ func (f *Fake) DefineDomain(xmlConfig string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// libvirt refuses a definition whose UUID is already held by an ACTIVE domain
+	// under a different name. That is exactly what happens after undefining a
+	// RUNNING domain — it survives as a transient one, still holding its UUID — so
+	// a caller that undefines a running VM and then redefines it under a new name
+	// gets a failure here, not a rename. The fake modelled the rename, which hid a
+	// live defect in the cutover handoff.
+	if uuid := domainUUIDFromXML(xmlConfig); uuid != "" {
+		for other, st := range f.domains {
+			if other == name || (st != StateRunning && st != StatePaused) {
+				continue
+			}
+			if domainUUIDFromXML(f.liveXMLLocked(other)) == uuid {
+				return fmt.Errorf("libvirtfake: domain %q is already active with uuid %s", other, uuid)
+			}
+		}
+		// libvirt also refuses a definition that reuses an existing domain's NAME
+		// with a DIFFERENT uuid — a name is not a slot you can overwrite. A caller
+		// whose undefine of the old occupant failed therefore cannot quietly
+		// replace it, which is what this fake used to model.
+		//
+		// Read through the LIVE view, not the persistent one: undefining an active
+		// domain leaves it transient, at which point its identity lives only in the
+		// active XML — and a transient domain holds its name just as firmly.
+		if _, ok := f.domains[name]; ok {
+			if cur := domainUUIDFromXML(f.liveXMLLocked(name)); cur != "" && cur != uuid {
+				return fmt.Errorf("libvirtfake: domain %q already exists with uuid %s", name, cur)
+			}
+		}
+	}
 	f.domains[name] = StateDefined
 	f.xml[name] = xmlConfig
 	f.record("define", name, "")
 	return nil
+}
+
+// liveXMLLocked is the live view of a domain, caller holds f.mu.
+func (f *Fake) liveXMLLocked(name string) string {
+	if x, ok := f.activeXML[name]; ok {
+		return x
+	}
+	return f.xml[name]
+}
+
+// domainUUIDFromXML extracts <uuid>…</uuid>.
+func domainUUIDFromXML(xmlConfig string) string {
+	const open, close = "<uuid>", "</uuid>"
+	i := strings.Index(xmlConfig, open)
+	if i < 0 {
+		return ""
+	}
+	rest := xmlConfig[i+len(open):]
+	j := strings.Index(rest, close)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:j])
 }
 
 func (f *Fake) StartDomain(name string) error {
@@ -367,6 +422,11 @@ func (f *Fake) ShutdownDomain(name string) error {
 }
 
 func (f *Fake) DestroyDomain(name string) error {
+	if f.FailDestroyDomain != nil {
+		if err := f.FailDestroyDomain(name); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {
@@ -404,6 +464,18 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// An ACTIVE domain survives an undefine as a TRANSIENT one: it keeps running,
+	// keeps its UUID, and loses only its persistent definition. Deleting it
+	// outright — as this fake used to — is what made the cutover handoff look like
+	// it could undefine a running replacement and redefine it under a new name.
+	if st := f.domains[name]; st == StateRunning || st == StatePaused {
+		if _, ok := f.activeXML[name]; !ok {
+			f.activeXML[name] = f.xml[name]
+		}
+		delete(f.xml, name)
+		f.record("undefine", name, "keep_state=true transient=true")
+		return nil
+	}
 	delete(f.domains, name)
 	delete(f.xml, name)
 	delete(f.activeXML, name)
@@ -411,6 +483,23 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.stats, name)
 	f.record("undefine", name, "keep_state=true")
 	return nil
+}
+
+// DomainIsActive mirrors libvirt's activity question. StateRunning and
+// StatePaused are both ACTIVE; only an undefined or shut-off domain is not.
+func (f *Fake) DomainIsActive(name string) (bool, error) {
+	if f.FailDomainState != nil {
+		if err := f.FailDomainState(name); err != nil {
+			return false, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return false, fmt.Errorf("libvirtfake: domain %q not found", name)
+	}
+	return st == StateRunning || st == StatePaused, nil
 }
 
 func (f *Fake) DomainState(name string) (string, error) {
@@ -434,6 +523,14 @@ func (f *Fake) DomainState(name string) (string, error) {
 		return "stopped", nil
 	}
 	return string(s), nil
+}
+
+// SetPaused puts a domain into the ACTIVE-but-not-running state, which
+// DomainState cannot distinguish from shut off. Scenario helper.
+func (f *Fake) SetPaused(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.domains[name] = StatePaused
 }
 
 func (f *Fake) DomainExists(name string) bool {
@@ -544,7 +641,7 @@ func (f *Fake) synthesizeXMLLocked(name string) (string, error) {
 		return `<domain type='kvm'><name>` + name +
 			`</name><memory unit='MiB'>1024</memory><vcpu>1</vcpu><devices></devices></domain>`, nil
 	}
-	return "", fmt.Errorf("libvirtfake: no XML for %q", name)
+	return "", fmt.Errorf("libvirtfake: domain %q not found", name)
 }
 
 // DumpXMLInactive returns the domain's PERSISTENT (inactive) view — what a cold boot

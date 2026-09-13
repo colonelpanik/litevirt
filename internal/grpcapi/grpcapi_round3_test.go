@@ -561,6 +561,7 @@ func TestR3_CutoverVM_MissingNameR3(t *testing.T) {
 
 func TestR3_CutoverVM_NextNotFoundR3(t *testing.T) {
 	s := testServerR2(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 
 	insertTestVMR2(t, ctx, s.db, "old-vm", "test-host", "running")

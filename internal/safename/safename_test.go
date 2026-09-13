@@ -10,13 +10,13 @@ import (
 )
 
 func TestValidateName(t *testing.T) {
-	good := []string{"vm1", "my-vm", "my_vm.qcow2", "A.B-C_1", "_default", strings.Repeat("a", maxNameLen)}
+	good := []string{"vm1", "my-vm", "my_vm.qcow2", "A.B-C_1", "_default", strings.Repeat("a", MaxNameLen)}
 	for _, s := range good {
 		if err := ValidateName(s); err != nil {
 			t.Errorf("ValidateName(%q) = %v, want nil", s, err)
 		}
 	}
-	bad := []string{"", ".", "..", "a/b", "../x", "/abs", "a\x00b", "a b", "café", "a:b", strings.Repeat("a", maxNameLen+1)}
+	bad := []string{"", ".", "..", "a/b", "../x", "/abs", "a\x00b", "a b", "café", "a:b", strings.Repeat("a", MaxNameLen+1)}
 	for _, s := range bad {
 		if err := ValidateName(s); err == nil {
 			t.Errorf("ValidateName(%q) = nil, want error", s)

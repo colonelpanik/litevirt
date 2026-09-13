@@ -475,6 +475,20 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			if vm.StateDetail == operatorStopDetail {
 				break
 			}
+			// A cutover whose RUNTIME HANDOFF has not finished has, by definition,
+			// no domain installed under this name yet. Syncing it to "stopped"
+			// would erase the running intent the journaled retry reads, and the
+			// retry would then finish the operation with the VM down — the exact
+			// shape of a VM that silently never comes back from a cutover.
+			if pending, pErr := corrosion.VMReplaceHandoffPending(ctx, r.db, r.hostName, vm.Name); pErr != nil {
+				slog.Warn("reconciler: cannot tell whether a cutover handoff is owed — leaving the VM alone",
+					"vm", vm.Name, "error", pErr)
+				break
+			} else if pending {
+				slog.Info("reconciler: VM is shut off with a cutover handoff still owed — not syncing",
+					"vm", vm.Name)
+				break
+			}
 			newState, detail, sync := classifyStop(st.State, st.Reason)
 			if !sync {
 				break // paused / migrated / not genuinely down — leave alone

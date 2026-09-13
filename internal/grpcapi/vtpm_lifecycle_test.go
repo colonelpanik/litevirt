@@ -151,6 +151,7 @@ func cutoverNextServer(t *testing.T, vmName, host string) (*Server, *libvirtfake
 			t.Fatalf("write nvram: %v", err)
 		}
 	}
+	enableVMReplace(s)
 	return s, fake, ctx
 }
 
@@ -172,9 +173,15 @@ func TestCutover_FirmwareRemoteHostForwards(t *testing.T) {
 	}
 }
 
-// A redefine failure during a firmware cutover is HARD — mark the VM errored and
-// return, don't report success and rely on the reconciler (a fresh redefine would
-// mint new firmware).
+// A redefine failure during a firmware cutover is HARD — surface it and return,
+// don't report success and rely on the reconciler (a fresh redefine would mint new
+// firmware).
+//
+// The failure lands in state_DETAIL, and the state itself is left alone. It used
+// to be written as state=error, which is what made a failed handoff
+// unrecoverable: the journaled retry reads the row for the desired runtime state,
+// and "error" reads as "not asked to run", so it completed the operation with the
+// VM shut off. Operation failure and running intent are different facts.
 func TestCutover_FirmwareRedefineFailureMarksError(t *testing.T) {
 	s, fake, ctx := cutoverNextServer(t, "cv", "test-host")
 	fake.FailDefineDomain = func(string) error { return errors.New("redefine boom") }
@@ -182,8 +189,12 @@ func TestCutover_FirmwareRedefineFailureMarksError(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal on firmware cutover redefine failure, got %v", err)
 	}
-	if vm, _ := corrosion.GetVM(ctx, s.db, "cv"); vm == nil || vm.State != "error" {
-		t.Fatalf("expected cv state=error after cutover redefine failure, got %+v", vm)
+	vm, _ := corrosion.GetVM(ctx, s.db, "cv")
+	if vm == nil || !strings.Contains(vm.StateDetail, "redefine") {
+		t.Fatalf("expected the redefine failure in cv's state_detail, got %+v", vm)
+	}
+	if vm.State == "error" {
+		t.Fatal("the failure overwrote the running intent, which strands the journaled retry")
 	}
 }
 
@@ -195,8 +206,14 @@ func TestCutover_FirmwareStartFailureMarksError(t *testing.T) {
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("expected Internal on firmware cutover start failure, got %v", err)
 	}
-	if vm, _ := corrosion.GetVM(ctx, s.db, "cv"); vm == nil || vm.State != "error" {
-		t.Fatalf("expected cv state=error after cutover start failure, got %+v", vm)
+	vm, _ := corrosion.GetVM(ctx, s.db, "cv")
+	if vm == nil || !strings.Contains(vm.StateDetail, "start") {
+		t.Fatalf("expected the start failure in cv's state_detail, got %+v", vm)
+	}
+	// The running intent has to survive, or the journaled retry reads "error" as
+	// "not asked to run" and completes the operation with the VM shut off.
+	if vm.State != "running" {
+		t.Fatalf("cv state = %q, want the running intent preserved", vm.State)
 	}
 }
 
@@ -434,5 +451,5 @@ type fakeBackupStream struct {
 	ctx context.Context
 }
 
-func (f *fakeBackupStream) Context() context.Context  { return f.ctx }
+func (f *fakeBackupStream) Context() context.Context   { return f.ctx }
 func (f *fakeBackupStream) Send(*pb.BackupChunk) error { return nil }

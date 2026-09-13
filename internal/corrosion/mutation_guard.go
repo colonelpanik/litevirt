@@ -14,8 +14,13 @@ const (
 	workloadCreateBeginGuardV1 = "workload_create_begin_v1"
 	workloadDeleteGuardV1      = "workload_delete_v1"
 	workloadRekeyGuardV1       = "workload_rekey_v1"
-	legacyVMDeleteSQL          = `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`
-	legacyContainerDeleteSQL   = `UPDATE containers SET deleted_at = ?, updated_at = ?
+	// workloadReplaceGuardV1 is the ONE receiver decision behind a guarded VM-name
+	// replacement (`lv cutover`). Every statement in the batch carries it, so the
+	// transition applies whole or not at all — see vm_replace.go for why nothing
+	// built from the pre-existing shapes can provide that.
+	workloadReplaceGuardV1   = "workload_replace_v1"
+	legacyVMDeleteSQL        = `UPDATE vms SET deleted_at = ?, updated_at = ? WHERE name = ?`
+	legacyContainerDeleteSQL = `UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ?`
 	legacyContainerStrictDeleteSQL = `UPDATE containers SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`
@@ -47,6 +52,32 @@ type MutationGuard struct {
 	IdentityHash        string `json:"identity_hash,omitempty"`
 	OperationClaimHash  string `json:"operation_claim_hash,omitempty"`
 	RequireOperation    bool   `json:"require_operation,omitempty"`
+
+	// The rest are workload_replace_v1 only (vm_replace.go). ResourceID/OwnerEpoch/
+	// SpecGeneration/IdentityHash/HostName describe the SOURCE — the replacement —
+	// and these describe the name it is taking, the incarnations on both sides, and
+	// the authority the batch writes.
+	//
+	// TargetResourceID is the contested name. Incarnation is the SOURCE's created_at,
+	// which the transition PRESERVES into the new row, so a delayed tombstone of the
+	// replaced VM names an older incarnation and cannot kill the replacement.
+	// TargetIncarnation/TargetOwnerEpoch/TargetSpecGeneration are the tombstone being
+	// displaced (empty/zero when the name was free). NewOwnerEpoch/NewSpecGeneration
+	// are what the batch writes, required to exceed BOTH inputs so no stale copy of
+	// either VM can win the authority comparison at the contested name.
+	TargetResourceID     string `json:"target_resource_id,omitempty"`
+	Incarnation          string `json:"incarnation,omitempty"`
+	TargetIncarnation    string `json:"target_incarnation,omitempty"`
+	TargetOwnerEpoch     int64  `json:"target_owner_epoch,omitempty"`
+	TargetSpecGeneration int64  `json:"target_spec_generation,omitempty"`
+	NewOwnerEpoch        int64  `json:"new_owner_epoch,omitempty"`
+	NewSpecGeneration    int64  `json:"new_spec_generation,omitempty"`
+	// LeaseDigest fingerprints the IPAM allocations the replacement holds, by key
+	// AND identity. The batch moves each of them onto the contested name, and a
+	// receiver that released one and reallocated the address to an unrelated VM
+	// must not have it taken: recomputing this digest locally makes that a declined
+	// transition rather than a silently skipped statement.
+	LeaseDigest string `json:"lease_digest,omitempty"`
 }
 
 func vmCreateMutationGuard(opID string, ownerEpoch int64, vm VMRecord, requireOperation bool) (*MutationGuard, error) {
@@ -148,6 +179,9 @@ func (c *Client) mutationGuardMatches(ctx context.Context, tx *sql.Tx, guard *Mu
 	}
 	if guard.Protocol == workloadRekeyGuardV1 {
 		return workloadRekeyGuardMatches(ctx, tx, guard)
+	}
+	if guard.Protocol == workloadReplaceGuardV1 {
+		return workloadReplaceGuardMatches(ctx, tx, guard)
 	}
 	if guard.OperationID == "" || guard.ResourceID == "" {
 		return false, fmt.Errorf("invalid mutation guard protocol or identity")

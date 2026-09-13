@@ -21,6 +21,17 @@ const (
 	OpDeviceDetach          OperationKind = "device_detach"
 	OpWorkloadCreate        OperationKind = "workload_create"
 	OpWorkloadStart         OperationKind = "workload_start"
+	// OpVMReplace journals `lv cutover`: giving a replacement VM the name a
+	// replaced VM still holds, and then freeing what the replaced VM owned.
+	//
+	// It exists because the two halves cannot be one commit. The replacement
+	// transition is a database write; freeing the replaced VM's volumes, firmware
+	// state and cloud-init ISO is filesystem and storage-driver work that must
+	// happen AFTER it (a failure before the transition must destroy nothing) — and
+	// the transition itself displaces the rows that say what to free. So the
+	// manifest is journaled first, and the step that AUTHORIZES the destruction is
+	// written in the same batch as the transition.
+	OpVMReplace OperationKind = "vm_replace"
 )
 
 // Step names. The happy-path steps differ per kind; the terminal + rollback
@@ -40,6 +51,7 @@ const (
 	OpStepBound            = "bound"
 	OpStepAttached         = "attached"
 	OpStepPrepared         = "prepared"
+	OpStepReleased         = "released"
 	OpStepRuntimeStarted   = "runtime_started"
 
 	// Shared, cross-kind steps.
@@ -79,6 +91,51 @@ var opHappyPath = map[OperationKind][]string{
 	},
 	OpWorkloadStart: {
 		OpStepPlanned, OpStepReserved, OpStepRuntimeStarted, OpStepObserved,
+	},
+
+	// OpVMReplace has exactly two happy-path steps, and the boundary between them
+	// is the whole point of the journal:
+	//
+	//   planned           the cleanup manifest is recorded, and NOTHING is
+	//                     authorized. An operation left here — a crash before the
+	//                     transition committed — must destroy nothing, because the
+	//                     replaced VM still owns everything the manifest lists.
+	//   desired_persisted the replacement transition landed. Written in the SAME
+	//                     batch as that transition, so it cannot be observed
+	//                     without it, and it is what authorizes the destruction.
+	//
+	//   released          the replaced VM's IPAM addresses are given back. AFTER the
+	//                     transition, not before: releasing first means a delete
+	//                     that then declines leaves a LIVE VM whose address has
+	//                     already gone back to the pool, locally and in the
+	//                     external IPAM. Journaled because the release can fail on
+	//                     its remote half, and a best-effort attempt that did would
+	//                     strand the address with the cutover reporting success.
+	//   config_applied    the replaced VM's resources are freed. It also CLOSES the
+	//                     cleanup phase: past this point the replacement's own
+	//                     firmware has moved onto the contested name, so re-running
+	//                     a name-keyed wipe would destroy the replacement's state.
+	//   journaled         the replacement's exact domain definition is DURABLY
+	//                     recorded, before anything undefines it. Without this a
+	//                     transient redefine failure leaves neither name defined and
+	//                     no way to obtain the XML again — the recovery is stuck.
+	//   stopped           the replacement's domain is confirmed INACTIVE. libvirt
+	//                     cannot rename a domain, and undefining an ACTIVE one
+	//                     leaves it running as a TRANSIENT domain still holding its
+	//                     UUID — after which defining that UUID under the new name
+	//                     is refused. So a running replacement is stopped first, and
+	//                     the fact is journaled because the restart that follows is
+	//                     owed even if the process dies here.
+	//   redefined         the replacement's libvirt domain and firmware answer to
+	//                     the new name. The transition alone does not do this, and
+	//                     a restart that only finished the cleanup would leave a
+	//                     committed cutover with no domain at the name.
+	//
+	// OpStepCompleted is appended only after BOTH later phases have run, so a crash
+	// anywhere between them leaves work a restart can find and finish.
+	OpVMReplace: {
+		OpStepPlanned, OpStepDesiredPersisted, OpStepReleased, OpStepConfigApplied,
+		OpStepJournaled, OpStepStopped, OpStepRedefined,
 	},
 }
 

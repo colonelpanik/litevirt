@@ -1155,6 +1155,7 @@ func TestRebuildVM_Validation(t *testing.T) {
 
 func TestCutoverVM_Validation(t *testing.T) {
 	s := testServer(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 
 	_, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{})

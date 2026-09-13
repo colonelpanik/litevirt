@@ -252,6 +252,11 @@ type Server struct {
 	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
 	// revoke an already-formed latch.
 	enfCanonicalRegistry bool
+	// enfVMReplace gates ADVERTISEMENT of vm_replace_v1 and, with the latch, whether
+	// `lv cutover` may run at all. The guarded replace transition installs receiver
+	// semantics an older peer does not have, so the latch must require CONFIG
+	// uniformity — not just a uniform build.
+	enfVMReplace bool
 	// enfProjectAuthority is this node's kill-switch for DELEGATED project-quota
 	// admission; gated by this flag AND the ProjectAuthorityV1 latch. Advertised
 	// CONDITIONALLY on the flag (like operation_protocol): a peer still admitting from
@@ -260,6 +265,8 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
+	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
 	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
 	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
@@ -643,6 +650,14 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfCanonicalRegistry {
 		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
 	}
+	// vm_replace_v1 is likewise conditional on its flag. The guarded replace batch
+	// carries a protocol an un-upgraded receiver cannot evaluate, so emitting it to a
+	// cluster that has not opted in would back-pressure that peer's stream. Withholding
+	// advertisement keeps the latch — and therefore any cutover at all — from happening
+	// until every node has opted in.
+	if !s.enfVMReplace {
+		caps = withoutCapability(caps, capabilities.VMReplaceV1)
+	}
 	// project_authority_v1 is likewise advertised CONDITIONALLY on its config flag. A
 	// single decider only serializes admissions that all ROUTE through it; a peer with
 	// the flag off keeps deciding from its own replica and races the holder anyway. So
@@ -797,6 +812,33 @@ func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name 
 // `flag && Enforced` model as the rest of the family.
 func (s *Server) operationProtocolActive(ctx context.Context) bool {
 	return s.enfOperationProtocol && s.gate != nil && s.gate.Enforced(ctx, capabilities.OperationProtocolV1)
+}
+
+// SetVMReplaceEnforce opts this node into the guarded VM-name replacement
+// (enforcement.vm_replace): it drives the latch via conditional advertisement and,
+// with the latch, permits `lv cutover`.
+func (s *Server) SetVMReplaceEnforce(on bool) { s.enfVMReplace = on }
+
+// vmReplaceActive reports whether a cutover may run at all: the operation journal
+// must be active, this node must have opted in, and vm_replace_v1 must be
+// enforced cluster-wide.
+//
+// operation_protocol_v1 is checked FIRST and short-circuits, the same way
+// hardwareV2Latched does, because it is a hard dependency rather than an
+// additional safety check. The replacement transition and the destruction of what
+// the replaced VM owned cannot be one commit, and the journal is what carries the
+// manifest across that gap — without it a crash in between leaks the replaced
+// VM's volumes with nothing left in the database naming them. A missing journal
+// therefore means not-active, whatever vm_replace_v1's own marker says.
+//
+// The other two halves are both required for the usual reason: the flag alone
+// would emit a guard protocol this node's peers cannot evaluate, and the latch
+// alone would emit one its own operator never enabled.
+func (s *Server) vmReplaceActive(ctx context.Context) bool {
+	if !s.operationProtocolActive(ctx) {
+		return false
+	}
+	return s.enfVMReplace && s.gate != nil && s.gate.Enforced(ctx, capabilities.VMReplaceV1)
 }
 
 // hardwareV2Latched reports whether the hardware_v2 source-of-truth cutover (VM
@@ -956,6 +998,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfNetBoxIPAM
 	case capabilities.NetBoxMirrorV1:
 		return s.enfNetBoxMirror
+	case capabilities.VMReplaceV1:
+		return s.enfVMReplace
 	default:
 		return false
 	}

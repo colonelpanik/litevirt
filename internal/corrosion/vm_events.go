@@ -38,7 +38,15 @@ func InsertVMEvent(ctx context.Context, c *Client, r VMEventRecord) error {
 		r.ID = hex.EncodeToString(b[:])
 	}
 	if r.TS == "" {
-		r.TS = time.Now().UTC().Format(time.RFC3339Nano)
+		// nowTSLayout, not time.RFC3339Nano. ts is compared as TEXT — ListVMEvents
+		// orders by (ts DESC, id DESC) and the per-VM prune partitions by the same
+		// expression — so the stamp's text order has to be its time order.
+		// RFC3339Nano trims trailing zeros, and a trimmed ".12Z" sorts after the
+		// later ".125Z". Fixed width keeps the promise this comment already made.
+		//
+		// Unlike audit rows there is no seq here to fall back on, so the stamp is
+		// the only ordering vm_events has.
+		r.TS = c.now().Format(nowTSLayout)
 	}
 	if r.Result == "" {
 		r.Result = "ok"
@@ -109,7 +117,12 @@ func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, sinc
 func PruneVMEvents(ctx context.Context, c *Client, hostName string, infoDays, errDays, maxPerVM int) error {
 	now := time.Now().UTC()
 	if infoDays > 0 {
-		cutoff := now.AddDate(0, 0, -infoDays).Format(time.RFC3339Nano)
+		// nowTSLayout, like the stamps it is compared against. The cutoff is
+		// compared as TEXT, and a trimmed bound does not line up with a
+		// fixed-width stamp: "…00:00:00Z" sorts AFTER "…00:00:00.000000000Z",
+		// because '.' precedes 'Z', so a bare-second cutoff sweeps up the whole
+		// second it was meant to stop at.
+		cutoff := now.AddDate(0, 0, -infoDays).Format(nowTSLayout)
 		if err := c.Execute(ctx,
 			`DELETE FROM vm_events WHERE host_name = ? AND result != 'error' AND ts < ?`,
 			hostName, cutoff); err != nil {
@@ -117,7 +130,7 @@ func PruneVMEvents(ctx context.Context, c *Client, hostName string, infoDays, er
 		}
 	}
 	if errDays > 0 {
-		cutoff := now.AddDate(0, 0, -errDays).Format(time.RFC3339Nano)
+		cutoff := now.AddDate(0, 0, -errDays).Format(nowTSLayout)
 		if err := c.Execute(ctx,
 			`DELETE FROM vm_events WHERE host_name = ? AND result = 'error' AND ts < ?`,
 			hostName, cutoff); err != nil {

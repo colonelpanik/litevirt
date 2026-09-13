@@ -12,10 +12,14 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,21 +64,99 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 	return resp, nil
 }
 
+// exportPageDefault / exportPageMax bound one page of an audit export.
+//
+// The export is a unary RPC against the daemon's 64 MiB send cap, so a chain
+// worth attesting to does not fit in one message. Without paging the only
+// workaround is a since/until window, and that produces a fragment whose first
+// row links to a row outside it — silently converting a complete attestation
+// into one that cannot be verified at all, exactly on the clusters where it
+// matters most.
+const (
+	exportPageDefault = 5000
+	exportPageMax     = 50000
+)
+
+// exportCursor is the position of the last row a page emitted, in the verifier's
+// own order. All four parts travel: seq alone is not unique on a host once a row
+// that InsertAuditLog did not write is present, and such a row is precisely what
+// an attestation exists to reveal.
+type exportCursor struct {
+	Host string `json:"h"`
+	Seq  int64  `json:"s"`
+	TS   string `json:"t"`
+	ID   string `json:"i"`
+}
+
+func (c exportCursor) encode() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeExportCursor(raw string) (exportCursor, error) {
+	var c exportCursor
+	if raw == "" {
+		return c, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return c, fmt.Errorf("malformed cursor: %w", err)
+	}
+	if err := json.Unmarshal(b, &c); err != nil {
+		return c, fmt.Errorf("malformed cursor: %w", err)
+	}
+	return c, nil
+}
+
 func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainRequest) (*pb.ExportAuditChainResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
+	after, err := decodeExportCursor(req.Cursor)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = exportPageDefault
+	}
+	if limit > exportPageMax {
+		limit = exportPageMax
+	}
+
+	// Ordered and projected to match VerifyAuditChain, because that is what the
+	// export is for: docs/audit-log.md tells operators to ship this to WORM
+	// storage so an external system can re-verify without the daemon. A host's
+	// sub-chain is walked by seq, so a file ordered by stamp replays a chain the
+	// daemon calls intact and reports a break on it, and one with no seq column
+	// leaves the external checker no way to recover the order itself.
+	//
+	// The cursor predicate is the ORDER BY written out longhand rather than a row
+	// value, which not every SQLite build accepts.
 	rows, err := s.db.Query(ctx,
-		`SELECT id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash
+		`SELECT id, timestamp, username, host_name, action, target, detail, result,
+		        prev_hash, content_hash, key_id, signature, seq
 		 FROM audit_log
 		 WHERE (? = '' OR timestamp >= ?)
 		   AND (? = '' OR timestamp <= ?)
-		 ORDER BY timestamp ASC, id ASC`,
-		req.Since, req.Since, req.Until, req.Until)
+		   AND (? = '' OR host_name > ? OR (host_name = ? AND (seq > ? OR (seq = ? AND (timestamp > ? OR (timestamp = ? AND id > ?))))))
+		 ORDER BY host_name ASC, seq ASC, timestamp ASC, id ASC
+		 LIMIT ?`,
+		req.Since, req.Since, req.Until, req.Until,
+		req.Cursor, after.Host, after.Host, after.Seq, after.Seq, after.TS, after.TS, after.ID,
+		limit+1)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list audit_log: %v", err)
 	}
+	more := len(rows) > limit
+	if more {
+		rows = rows[:limit]
+	}
 	out := make([]map[string]string, 0, len(rows))
+	var last exportCursor
 	for _, r := range rows {
 		out = append(out, map[string]string{
 			"id":           r.String("id"),
@@ -87,16 +169,84 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 			"result":       r.String("result"),
 			"prev_hash":    r.String("prev_hash"),
 			"content_hash": r.String("content_hash"),
+			"key_id":       r.String("key_id"),
+			"signature":    r.String("signature"),
+			"seq":          strconv.FormatInt(r.Int64("seq"), 10),
 		})
+		last = exportCursor{
+			Host: r.String("host_name"), Seq: r.Int64("seq"),
+			TS: r.String("timestamp"), ID: r.String("id"),
+		}
 	}
-	body, mErr := json.Marshal(map[string]any{"rows": out})
+
+	doc := map[string]any{"rows": out}
+	if req.Cursor == "" {
+		if err := s.addExportEvidence(ctx, doc); err != nil {
+			return nil, err
+		}
+	}
+	body, mErr := json.Marshal(doc)
 	if mErr != nil {
 		return nil, status.Errorf(codes.Internal, "marshal: %v", mErr)
 	}
-	return &pb.ExportAuditChainResponse{
+	resp := &pb.ExportAuditChainResponse{
 		Json:     string(body),
 		RowCount: int32(len(out)),
-	}, nil
+	}
+	if more {
+		resp.NextCursor = last.encode()
+	}
+	return resp, nil
+}
+
+// addExportEvidence attaches the state VerifyAuditChain reasons over. It rides
+// on the first page only: these tables are a handful of rows per host, and
+// repeating them per page would be noise in a document assembled by the client.
+//
+// Nothing here filters deleted_at, and that is the point. A chain head is the
+// only construct that detects a truncated tail — the chain links backward, so
+// cutting the last N rows leaves every surviving link verifying — which makes
+// deleting the heads the efficient attack. The daemon's answer is that a
+// tombstone is INERT: VerifyAuditChain does not filter deleted_at on any of
+// these tables (see TestAuditEvidence_ATombstoneIsInert). An export that
+// honoured the tombstone would hand that attack straight back, reporting clean
+// on precisely the cluster the daemon reports as tampered.
+func (s *Server) addExportEvidence(ctx context.Context, doc map[string]any) error {
+	for key, query := range map[string]string{
+		"chain_heads":   `SELECT host_name, epoch, seq, head_hash, key_id, signature, created_at, deleted_at FROM audit_chain_heads ORDER BY host_name ASC, epoch ASC, seq ASC`,
+		"signing_keys":  `SELECT key_id, host_name, cert_pem, created_at, deleted_at FROM audit_signing_keys ORDER BY host_name ASC, key_id ASC`,
+		"key_lifecycle": `SELECT host_name, key_id, event, at_seq, by_key_id, signature, created_at, deleted_at FROM audit_key_lifecycle ORDER BY host_name ASC, at_seq ASC`,
+	} {
+		rows, err := s.db.Query(ctx, query)
+		if err != nil {
+			return status.Errorf(codes.Internal, "list %s: %v", key, err)
+		}
+		table := make([]map[string]string, 0, len(rows))
+		for _, r := range rows {
+			row := map[string]string{}
+			for _, col := range r.Columns {
+				row[col] = r.String(col)
+			}
+			table = append(table, row)
+		}
+		doc[key] = table
+	}
+
+	// The cluster CA, without which a replay can read a cert_pem but cannot tell
+	// whether this cluster issued it — VerifyRow requires each certificate to
+	// chain to the CA, and the daemon reads that from local disk. The CA
+	// CERTIFICATE is public by construction: every node and CLI already holds it.
+	// Absence is reported, not silently tolerated, because an export missing it
+	// cannot reproduce the UnknownKeyID class of finding.
+	ca, err := os.ReadFile(filepath.Join(s.pkiDir, "ca.crt"))
+	if err != nil {
+		slog.Warn("audit export: cluster CA unreadable; the export cannot be checked against it",
+			"pki_dir", s.pkiDir, "error", err)
+		doc["ca_pem"] = ""
+		return nil
+	}
+	doc["ca_pem"] = string(ca)
+	return nil
 }
 
 // verifyChain bridges to corrosion.VerifyAuditChain — kept in this

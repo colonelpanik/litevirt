@@ -103,8 +103,11 @@ lv audit verify
 ```
 
 `verify` walks **each host's sub-chain** (rows ordered by `host_name`, then
-timestamp, then id) and recomputes each row's hash against the previous
-same-host row. On top of that it checks each row's signature, its per-host
+`seq`, then timestamp and id) and recomputes each row's hash against the
+previous same-host row. `seq` is the per-host counter assigned when the row
+was appended, in the same locked section as `prev_hash`, so it is the append
+order — a timestamp is only the writer's clock reading, and a clock can go
+backwards. On top of that it checks each row's signature, its per-host
 sequence number, and the signed chain heads — a hash can be recomputed by
 whoever edited the row, a signature cannot.
 
@@ -435,8 +438,44 @@ lv audit export --since 2026-06-01T00:00:00Z --until 2026-06-30T23:59:59Z --out 
 offload (S3 Object Lock, immutable filesystem snapshot, tape archive).
 `--out <file>` writes the JSON to a file (default stdout); `--since` /
 `--until` bound the export window (both RFC3339, inclusive).
-The export includes every chain field so an external system can
-re-verify without contacting the daemon.
+The export includes every `audit_log` chain field — `seq`, `key_id` and
+`signature` among them — ordered the same way `verify` walks, so an external
+system can recompute each host's hash chain in the right order without
+contacting the daemon.
+
+Alongside them it carries the replicated state `verify` reasons over, under
+the keys `chain_heads`, `signing_keys` and `key_lifecycle`, plus the cluster
+CA as `ca_pem`: the signed chain heads that make a truncated tail detectable,
+the certificates a `key_id` resolves through, the adoption and retirement
+events that bound each host's signing contract, and the root those
+certificates have to chain to. Without the heads a truncated chain replays
+clean — a backward-linked chain has nothing pointing forward, so cutting the
+last N rows leaves every surviving link valid. Without the contracts an
+unsigned row cannot be told from one written before the host committed to
+signing. Without the CA a certificate can be read but not attributed to this
+cluster.
+
+Rows in those three tables are exported **including** any marked deleted.
+That is deliberate and matches the verifier, which does not filter
+`deleted_at` on them either. Deleting a chain head is the efficient attack on
+truncation detection, so a tombstone has to be inert in both places — an
+export that honoured one would report clean on exactly the cluster the daemon
+reports as tampered.
+
+The export is paginated, and every way of asking for it assembles the pages for
+you: `lv audit export`, the web UI's Export button, and `GET
+/api/v1/audit/export` each follow the cursor to the end and hand back one
+document. None of them can return a partial chain — a caller that stopped at
+page one would produce a file that is complete in form and truncated in fact,
+which is the one failure an attestation must not have. The page size exists
+because the response is a unary gRPC message against a 64 MiB server cap, and a
+chain worth attesting to is larger than that.
+
+One limit remains, and it is inherent: `--since` / `--until` bound the window
+by timestamp, so a window starting mid-chain exports a fragment whose first
+row links to a row outside it. Narrow the window to answer a question about a
+period; export the whole chain to attest to it. Size is no longer a reason to
+narrow it.
 
 Pair with the cluster's storage offload (Ceph snapshot, ZFS send to a
 WORM target, periodic rsync to glacier) for a tamper-evident regulator
@@ -451,13 +490,18 @@ sign the resulting JSON with a separate signing key.
   computed on the writer host at insert time and replicated as normal
   column values, but each row's `prev_hash` links only to the previous row
   written by the **same** host — so each host has an independent sub-chain.
-  `verify` walks the rows ordered by `host_name` and validates each host's
-  sub-chain against a per-host running tail. Because a host only authors its
+  `verify` walks the rows ordered by `host_name`, then `seq`, and validates
+  each host's sub-chain against a per-host running tail. Because a host only authors its
   own rows, concurrent inserts on different hosts can't fork a single chain,
   and a missing or altered row still breaks that host's sub-chain.
-- A clock skew that violates HLC's `MaxSkewMS` is clamped, so a wildly
-  wrong host clock cannot reorder audit rows in a way that breaks the
-  chain.
+- Audit stamps come from each host's wall clock, not from the HLC, so
+  `MaxSkewMS` does not bound them. Two other things stop a wrong clock
+  reordering a sub-chain: the walk orders by `seq`, which is assigned under
+  the chain lock and so cannot disagree with `prev_hash`; and a stamp the
+  daemon generates is clamped to the host's own tail, so it never goes
+  backwards. After a backward step that clamp makes a stamp as much as the
+  step too high — a row can read slightly late, but the order is real. A
+  timestamp supplied by a caller is stored exactly as given.
 - Verification is O(N) over chain length, and the daemon runs it hourly on
   its own rather than waiting to be asked: a check that only happens when an
   operator types `lv audit verify` finds an intrusion after whatever prompted

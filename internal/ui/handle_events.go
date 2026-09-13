@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auditexport"
 )
 
 // handleEvents renders the unified cluster Events page: recent cluster-wide
@@ -201,10 +203,19 @@ func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
 
 // handleAuditExport streams the audit chain as a downloadable JSON blob suitable
 // for WORM offload. Mirrors `lv audit export [--since --until]`.
+//
+// The RPC pages, so the whole chain is assembled here before a single byte goes
+// to the browser. Writing page one would produce a download that is complete in
+// form and truncated in fact — the one failure this file must not have, since
+// the operator's next step is to archive it and treat it as the record.
 func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
-	resp, err := s.grpc.ExportAuditChain(s.uiBearerCtx(r), &pb.ExportAuditChainRequest{
-		Since: r.URL.Query().Get("since"),
-		Until: r.URL.Query().Get("until"),
+	since, until := r.URL.Query().Get("since"), r.URL.Query().Get("until")
+	ctx := s.uiBearerCtx(r)
+
+	body, _, err := auditexport.Assemble(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		return s.grpc.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
+			Since: since, Until: until, Cursor: cursor,
+		})
 	})
 	if err != nil {
 		http.Error(w, "Export failed: "+err.Error(), http.StatusInternalServerError)
@@ -212,5 +223,5 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", "attachment; filename=audit-export.json")
-	_, _ = w.Write([]byte(resp.Json))
+	_, _ = w.Write(body)
 }

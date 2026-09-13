@@ -11,6 +11,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auditexport"
 )
 
 func newAuditCmd() *cobra.Command {
@@ -210,19 +211,26 @@ func newAuditExportCmd() *cobra.Command {
 		Short: "Export the audit log as a WORM-suitable JSON blob",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				resp, err := c.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
-					Since: since, Until: until,
+				// The server pages, so the whole chain is assembled into one
+				// document before anything is written. A per-page file would be
+				// useless for the job the docs give this command: a verifier needs
+				// one artifact whose rows are contiguous, and a chain split across
+				// files can only be checked by reassembling it anyway.
+				body, total, err := auditexport.Assemble(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+					return c.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
+						Since: since, Until: until, Cursor: cursor,
+					})
 				})
 				if err != nil {
-					return fmt.Errorf("export audit chain: %w", err)
+					return err
 				}
 				if outPath == "" || outPath == "-" {
-					fmt.Println(resp.Json)
+					fmt.Println(string(body))
 				} else {
-					if err := os.WriteFile(outPath, []byte(resp.Json), 0o600); err != nil {
+					if err := os.WriteFile(outPath, body, 0o600); err != nil {
 						return fmt.Errorf("write %s: %w", outPath, err)
 					}
-					fmt.Fprintf(os.Stderr, "wrote %d rows to %s\n", resp.RowCount, outPath)
+					fmt.Fprintf(os.Stderr, "wrote %d rows to %s\n", total, outPath)
 				}
 				return nil
 			})

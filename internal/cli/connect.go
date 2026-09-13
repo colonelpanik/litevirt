@@ -143,12 +143,25 @@ func tokenDialOption() grpc.DialOption {
 	return nil
 }
 
-// withTokenOption appends the token dial option if a token is available.
+// cliMaxRecvMsgSize is the largest response the CLI will accept.
+//
+// gRPC defaults to 4 MiB, which is ample for a VM list and too small for one
+// page of `lv audit export`: a page carries the server's default row count plus
+// the evidence tables and the CA, and on a cluster with a year of history that
+// runs past 4 MiB on its own. Paging bounds the chain, not the page. The failure
+// is also the worst shape available — the call fails outright at the client,
+// after the daemon has done all the work, and the operator's obvious workaround
+// is to narrow --since/--until, which produces a chain fragment that cannot be
+// re-verified at all.
+const cliMaxRecvMsgSize = 256 << 20
+
+// withTokenOption appends the token dial option if a token is available, and
+// the receive limit every CLI call shares.
 func withTokenOption(opts []grpc.DialOption) []grpc.DialOption {
 	if opt := tokenDialOption(); opt != nil {
 		opts = append(opts, opt)
 	}
-	return opts
+	return append(opts, grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(cliMaxRecvMsgSize)))
 }
 
 func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {

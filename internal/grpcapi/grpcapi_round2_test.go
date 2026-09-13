@@ -939,6 +939,7 @@ func TestSetVMIP_DefaultNetwork(t *testing.T) {
 
 func TestCutoverVM_ResourceExhausted(t *testing.T) {
 	s := testServerR2(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 
 	// Insert local host with very small capacity.

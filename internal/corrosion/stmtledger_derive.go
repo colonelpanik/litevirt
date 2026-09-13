@@ -204,6 +204,25 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// capability-gated — it auto-derives to DispPlainInsert and stays accepted; rejecting it is part
 	// of the deferred operator-run writer-activation contract, not this reversible core.)
 	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
+	// Guarded VM-name replacement (`lv cutover`): REJECT until vm_replace_v1 is
+	// active on this receiver, then apply verbatim under the shared
+	// workload_replace_v1 guard. Rejecting before activation is what makes the
+	// rollout safe in both directions — a peer that has not latched refuses the
+	// shape instead of applying it under a disposition that was never designed for
+	// it, and a sender only emits it once the token is latched cluster-wide, so no
+	// un-upgraded receiver is ever handed one. See vm_replace.go.
+	{SQL: vmReplaceTargetSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceInterfaceSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceDiskSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplacePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplacePCIRealizationSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireInterfaceSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireDiskSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIRealSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceLeaseSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()

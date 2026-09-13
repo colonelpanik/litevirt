@@ -268,6 +268,35 @@ const (
 	// latch/enforcement machinery itself. Additive: changes no existing token's
 	// value or behavior.
 	HardwareV2 = "hardware_v2"
+	// VMReplaceV1 gates the guarded VM-name replacement `lv cutover` needs: giving a
+	// replacement VM the name a REPLACED VM still holds.
+	//
+	// The name is a PRIMARY KEY and DeleteVM soft-deletes, so the replaced VM's
+	// tombstone still occupies it. Nothing expressible in the pre-existing statement
+	// shapes makes that transition safe on a RECEIVER. A purge of the obstruction is
+	// applied unconditionally while the write meant to replace it is only LWW-gated,
+	// so a delayed replay erases a tombstone and puts nothing in its place. Splitting
+	// it into a relocation plus a rekey does not help: each statement is gated
+	// independently, so a receiver can commit one leg and skip the other, leaving no
+	// row at the name — or move a still-live VM aside when its own newer ownership
+	// made the sender's delete decline there. And the merge rules decide a both-live
+	// conflict at the contested name on owner/generation authority alone, so a stale
+	// higher-authority copy of the replaced VM overwrites its replacement no matter
+	// where the tombstone was put.
+	//
+	// What the operation actually needs is ONE receiver decision covering the whole
+	// batch: validate the source and target incarnations and authority together, then
+	// either apply every statement or none. That is a new guard protocol
+	// (workload_replace_v1) plus a parent shape that preserves the REPLACEMENT's
+	// incarnation while advancing authority beyond BOTH inputs — new receiver
+	// semantics, which no historical-ledger entry can retrofit onto an older peer.
+	//
+	// So it is advertised CONDITIONALLY on the local config flag
+	// (enforcement.vm_replace), like OperationProtocolV1: the latch must require
+	// CONFIG uniformity, and `lv cutover` REFUSES until the token is active — before
+	// it stops a domain or touches either VM. A cluster that has not opted in keeps a
+	// cutover that declines, rather than one that half-applies.
+	VMReplaceV1 = "vm_replace_v1"
 	// ProjectAuthorityV1 gates DELEGATED project-quota admission: a node that does not
 	// hold a project's D1 admission authority asks the holder to decide, instead of
 	// deciding from its own replica. Reserve-then-verify alone makes two racers agree
@@ -470,6 +499,10 @@ var supported = []string{
 	// leadership. Withholding advertisement while the flag is off keeps the
 	// cluster from latching until every node has opted in.
 	NetBoxMirrorV1,
+	// VMReplaceV1 is advertised CONDITIONALLY on enforcement.vm_replace (see the
+	// grpcapi advertisement filter): the transition installs new receiver semantics,
+	// so the latch must require CONFIG uniformity, not just a uniform build.
+	VMReplaceV1,
 	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
 	// the node.s backfill readiness (no owned workload at epoch 0) — see the
 	// grpcapi advertisement filter.
@@ -497,7 +530,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

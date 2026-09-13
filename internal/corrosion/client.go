@@ -261,6 +261,14 @@ type Client struct {
 	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
 	canonicalRegistryAccept func() bool
 
+	// vmReplaceAccept, when non-nil and returning true, means vm_replace_v1 is DURABLY
+	// LATCHED cluster-wide, so a replicated guarded VM-name replacement may be applied.
+	// It reads the DURABLE latch, not the reversible config flag: once a replace batch
+	// is in flight, acceptance must never be revoked — a flag-off restart would
+	// otherwise stall replication on an entry that is already out there. Nil/false ⇒
+	// reject the shape, which is every node that has not latched.
+	vmReplaceAccept func() bool
+
 	// auditChain holds the in-flight tail of each audit sub-chain this client
 	// appends to, keyed by host_name. Per-client, not package-global: a global
 	// is only correct while one Client exists per process, which is false in
@@ -331,6 +339,16 @@ func (c *Client) canonicalRegistryAcceptOn() bool {
 	return c.canonicalRegistryAccept != nil && c.canonicalRegistryAccept()
 }
 
+// SetVMReplaceAccept injects the predicate reporting vm_replace_v1 DURABLY LATCHED
+// (wired to checker.DurablyLatched, NOT the reversible config flag — see the field
+// comment). Nil-safe: unset ⇒ reject the guarded replace shape.
+func (c *Client) SetVMReplaceAccept(fn func() bool) { c.vmReplaceAccept = fn }
+
+// vmReplaceAcceptOn reports whether a replicated guarded VM-name replacement may be applied.
+func (c *Client) vmReplaceAcceptOn() bool {
+	return c.vmReplaceAccept != nil && c.vmReplaceAccept()
+}
+
 // capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
 // receiver, so the apply path can resolve a capability-gated shape's effective disposition.
 // canonical_registry_v1 = the durable accept gate (apply a replicated canonical upsert). An unknown
@@ -341,6 +359,8 @@ func (c *Client) capabilityActive(name string) bool {
 		return c.canonicalRegistryAcceptOn()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
+	case capabilities.VMReplaceV1:
+		return c.vmReplaceAcceptOn()
 	default:
 		return false
 	}

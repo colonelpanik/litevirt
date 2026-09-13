@@ -146,6 +146,39 @@ lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
 lv stats <vm>                                # VM resource statistics
 ```
 
+`lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The replaced
+VM is deleted first, and a delete is a SOFT delete, so its rows still hold the primary
+keys the replacement needs. Taking them is a single guarded transition rather than a
+purge or a two-step move: a purge is applied unconditionally by a lagging peer while the
+write meant to replace the row is not, and two steps can apply independently there. The
+row installed at the name keeps the REPLACEMENT's `created_at` and carries authority
+above both VMs, which is what stops a lagging peer's pre-delete copy of the replaced VM
+from reappearing on top of it.
+
+A cutover of a RUNNING replacement restarts it, and `lv cutover` prints that before it
+starts. libvirt has no operation that moves a live domain to another name, so the
+replacement is stopped — a PAUSED one too, since a paused domain is still active — then
+redefined under the new name and started again. The cutover's journal makes that restart
+survive an interruption.
+
+That needs receiver behaviour an older peer does not have, so cutover **refuses** until
+`enforcement.vm_replace` is set on every node and `vm_replace_v1` has latched — refusing
+before it stops a domain or writes to either VM. See docs/diagnostics.md.
+
+A cutover retires the replaced VM's domain only on the node it runs on. If the replaced
+VM is hosted elsewhere, cutover asks that node instead, and **refuses** unless it reports
+no domain left at the name — a domain still defined there, an incomplete survey, or a
+node it cannot reach all refuse, before anything is written. Stop and remove the original
+on its own host first.
+
+The database transition runs before the replaced VM's disks and firmware state are
+freed, so a cutover that fails partway leaves the original intact and can simply be
+retried. Because that transition also displaces the rows describing what the replaced
+VM owned, the cleanup is journaled as a `vm_replace` operation whose manifest is
+recorded first and whose authorizing step is committed with the transition — so a
+daemon that dies in between finishes the cleanup when it restarts. Cutover therefore
+requires `enforcement.operation_protocol` alongside `enforcement.vm_replace`.
+
 ## Secure Boot + vTPM (Windows 11)
 
 ```bash

@@ -39,6 +39,7 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfIsolationEpoch = true
 	s.enfNetBoxIPAM = true
 	s.enfNetBoxMirror = true
+	s.enfVMReplace = true
 	s.hwV2Ready.Store(true)
 
 	for _, tok := range capabilities.Supported() {

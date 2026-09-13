@@ -124,3 +124,52 @@ func TestFakeSetDomainOwnerEpoch_RefusesAPreEpochValue(t *testing.T) {
 		t.Fatalf("epoch 1 is the first legal generation and must be accepted: %v", err)
 	}
 }
+
+// Undefining an ACTIVE domain does not remove it: it survives as a TRANSIENT
+// domain, keeps running and keeps its UUID — so it still holds its name, and a
+// definition reusing that name with a different UUID must be refused.
+//
+// The contract matters because the production cutover depends on it: a handoff
+// that undefined a running replacement and then redefined it under the new name
+// would look like a rename here and fail against a real daemon.
+func TestFake_TransientDomainStillHoldsItsName(t *testing.T) {
+	f := New()
+	if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-one</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.StartDomain("vm1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.UndefineDomainPreservingState("vm1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Still there, still active, still holding the UUID.
+	active, err := f.DomainIsActive("vm1")
+	if err != nil || !active {
+		t.Fatalf("an undefined ACTIVE domain must survive as transient: active=%v err=%v", active, err)
+	}
+	// Its name is not a free slot.
+	if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-two</uuid></domain>`); err == nil {
+		t.Error("a different UUID was accepted at a transient domain's name")
+	}
+	// Nor is its UUID available under another name.
+	if err := f.DefineDomain(`<domain><name>vm2</name><uuid>uuid-one</uuid></domain>`); err == nil {
+		t.Error("a transient domain's UUID was accepted under another name")
+	}
+	// Redefining it as ITSELF is how a transient domain is made persistent again.
+	if err := f.DefineDomain(`<domain><name>vm1</name><uuid>uuid-one</uuid></domain>`); err != nil {
+		t.Errorf("redefining a transient domain as itself must be allowed: %v", err)
+	}
+
+	// An INACTIVE domain, by contrast, is really gone after an undefine.
+	if err := f.DefineDomain(`<domain><name>vm3</name><uuid>uuid-three</uuid></domain>`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.UndefineDomainPreservingState("vm3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DefineDomain(`<domain><name>vm3</name><uuid>uuid-four</uuid></domain>`); err != nil {
+		t.Errorf("a freed name must be reusable: %v", err)
+	}
+}

@@ -505,11 +505,34 @@ func (c *Client) ClearIPAssignment(ctx context.Context, ipID int) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(ipAddressesPath+"%d/", ipID), body, nil)
 }
 
-// FindDeviceByName resolves a DCIM device id by name, returning 0 when absent.
-// Absence is NOT an error: the host link is best-effort by design, and an
-// operator who does not model hosts in NetBox must still get a working mirror.
-func (c *Client) FindDeviceByName(ctx context.Context, name string) (int, error) {
-	return c.firstIDByName(ctx, devicesPath, name)
+// FindDeviceInCluster resolves a DCIM device id by name SCOPED TO clusterID,
+// returning 0 when the device is absent or belongs to some other cluster.
+// Neither is an error: the host link is best-effort by design, and an operator
+// who does not model hosts in NetBox must still get a working mirror.
+//
+// THE SCOPE IS LOAD-BEARING, not an optimisation. NetBox validates that a
+// virtual_machine's device belongs to that VM's own cluster, so a device outside
+// it is not a weaker link — it is a 400 on the write. Resolving by name alone
+// therefore turned the optional link into a sweep-ending refusal for the most
+// ordinary NetBox there is: one whose hosts were already inventoried by
+// something else and belong to no virtualization cluster at all. Nothing was
+// mirrored, cluster-wide, for as long as that host stayed in the inventory,
+// because the create phase aborts on the first refusal.
+//
+// Folding the constraint into the QUERY makes "not modelled" and "modelled
+// outside this cluster" the same answer — no link — which is what best-effort
+// has to mean for a link the server may reject.
+//
+// clusterID 0 means the caller has not resolved a cluster yet. Nothing can be
+// scoped to it, so the answer is 0: no link, never an unscoped lookup that would
+// reintroduce the refusal this exists to prevent.
+func (c *Client) FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error) {
+	if clusterID == 0 {
+		return 0, nil
+	}
+	scope := url.Values{}
+	scope.Set("cluster_id", strconv.Itoa(clusterID))
+	return c.firstIDByNameFiltered(ctx, devicesPath, name, scope)
 }
 
 // FindCluster resolves a cluster id by exact name, returning 0 when absent.
@@ -564,7 +587,19 @@ func (c *Client) ensureNamed(ctx context.Context, path, name string, body map[st
 // than leaving an unbounded request that silently stops at NetBox's default page
 // size.
 func (c *Client) firstIDByName(ctx context.Context, path, name string) (int, error) {
+	return c.firstIDByNameFiltered(ctx, path, name, nil)
+}
+
+// firstIDByNameFiltered is firstIDByName with additional filters ANDed in, for
+// a lookup whose answer is only usable within some scope. `name` and `limit`
+// are set last so a caller cannot accidentally widen either.
+func (c *Client) firstIDByNameFiltered(ctx context.Context, path, name string, extra url.Values) (int, error) {
 	q := url.Values{}
+	for k, vs := range extra {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
 	q.Set("name", name)
 	q.Set("limit", "1")
 	var out struct {

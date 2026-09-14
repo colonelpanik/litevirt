@@ -793,10 +793,25 @@ named after the local cluster or after `netbox.cluster_name`) and mirrors:
 - each address litevirt claimed from NetBox as an `ip_address` assigned to the
   interface that holds it.
 
-If a host is modelled as a DCIM device whose name matches the litevirt host, the
-VM links to it; if not, the VM is mirrored without a device link, so an operator
-who does not model hosts still gets a working mirror. Templates are never
-mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
+If a host is modelled as a DCIM device whose name matches the litevirt host **and
+that device belongs to the NetBox cluster litevirt mirrors into**, the VM links
+to it. Otherwise — the host is not modelled, or its device sits in another
+cluster or in none — the VM is mirrored without a device link, so an operator who
+does not model hosts still gets a working mirror.
+
+Both halves of that condition are required by NetBox, not by litevirt: it refuses
+a `virtual_machine` whose `device` is outside the VM's own cluster. A device
+resolved by name alone is therefore not a weaker link but a rejected write, and
+because the mirror's create phase stops at the first refusal, one host
+inventoried by something else would stop the mirror for the whole cluster. The
+lookup is scoped to the cluster so that case is simply "no link".
+
+To get the link, assign each litevirt host's DCIM device to the NetBox cluster
+named by `netbox.cluster_name` (or the local cluster name when that is unset).
+Hosts inventoried by a bare-metal provisioner typically carry no cluster at all,
+which is why the unlinked shape is the default rather than an error.
+
+Templates are never mirrored — a template is a disk image, not a machine. A VM deleted in litevirt is
 deleted from NetBox, as is a detached NIC; NetBox's changelog retains the history.
 
 **Removals need evidence.** The mirror computes them from a read of the local

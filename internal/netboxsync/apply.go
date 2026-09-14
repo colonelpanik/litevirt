@@ -55,7 +55,7 @@ type netboxWriter interface {
 	AssignIPToInterface(ctx context.Context, ipID, ifaceID int) error
 	ClearIPAssignment(ctx context.Context, ipID int) error
 
-	FindDeviceByName(ctx context.Context, name string) (int, error)
+	FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error)
 
 	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
 	// halves are here because a cluster cannot be created without its type, and
@@ -728,15 +728,19 @@ func (r *Reconciler) recordRef(ctx context.Context, kind, identity, netboxKind s
 // has no prior link to preserve. The UPDATE path must not use it, or it writes
 // back a link the diff decided to clear; see updateVM.
 //
-// Best-effort in BOTH directions: a lookup failure and a host that is simply not
-// modelled both mean "no link", and the write body then sends device: null. An
-// operator who does not model hosts in NetBox must still get a working mirror,
-// so this can never return an error.
+// Best-effort in THREE directions: a lookup failure, a host that is simply not
+// modelled, and a host whose device belongs to another cluster all mean "no
+// link", and the write body then sends device: null. An operator who does not
+// model hosts in NetBox — or models them outside this cluster — must still get a
+// working mirror, so this can never return an error.
+//
+// The cluster scope is what makes the third case a non-link rather than a 400
+// that fails the sweep; see netbox.FindDeviceInCluster.
 func (r *Reconciler) deviceID(ctx context.Context, d DesiredVM) int {
 	if d.DeviceID != 0 || d.Host == "" {
 		return d.DeviceID
 	}
-	id, err := r.nb.FindDeviceByName(ctx, d.Host)
+	id, err := r.nb.FindDeviceInCluster(ctx, d.Host, r.clusterID)
 	if err != nil {
 		slog.Debug("netbox: host device lookup failed; mirroring without the link", "error", err)
 		return 0

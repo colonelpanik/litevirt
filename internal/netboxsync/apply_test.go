@@ -984,7 +984,7 @@ func (s *stubVirt) ClearIPAssignment(_ context.Context, ipID int) error {
 	return nil
 }
 
-func (s *stubVirt) FindDeviceByName(_ context.Context, name string) (int, error) {
+func (s *stubVirt) FindDeviceInCluster(_ context.Context, name string, clusterID int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deviceLookups = append(s.deviceLookups, name)

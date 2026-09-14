@@ -1398,13 +1398,24 @@ func (r *Reconciler) desiredState(ctx context.Context) ([]DesiredVM, int, error)
 	return out, skipped, nil
 }
 
-// lookupDevice resolves one host's DCIM device id, or 0.
+// lookupDevice resolves one host's DCIM device id WITHIN this sweep's cluster,
+// or 0.
 //
-// Best-effort in BOTH directions: a lookup failure and a host that is simply
-// not modelled both mean "no link". An operator who does not model hosts in
-// NetBox must still get a working mirror, so this never fails a sweep.
+// Best-effort in THREE directions: a lookup failure, a host that is simply not
+// modelled, and a host whose device belongs to another cluster all mean "no
+// link". An operator who does not model hosts in NetBox must still get a working
+// mirror, so this never fails a sweep.
+//
+// That third case is the one this originally got wrong. NetBox refuses a
+// virtual_machine whose device is outside its cluster, so a device resolved by
+// name alone is not a weaker link but a 400 — and since the create phase aborts
+// on the first refusal, one host inventoried by something else stopped the
+// mirror for the entire cluster. See netbox.FindDeviceInCluster.
+//
+// r.clusterID is resolved by sweep() before any of this is read, so the scope is
+// always the cluster this pass is actually writing into.
 func (r *Reconciler) lookupDevice(ctx context.Context, host string) int {
-	id, err := r.nb.FindDeviceByName(ctx, host)
+	id, err := r.nb.FindDeviceInCluster(ctx, host, r.clusterID)
 	if err != nil {
 		slog.Debug("netbox mirror: host device lookup failed; mirroring without the link",
 			"host", host, "error", err)

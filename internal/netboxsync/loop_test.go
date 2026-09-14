@@ -363,9 +363,11 @@ func (f *recordingNetBox) CreateInterface(_ context.Context, i netbox.VMInterfac
 }
 func (f *recordingNetBox) UpdateInterface(context.Context, int, netbox.VMInterface) error { return nil }
 func (f *recordingNetBox) DeleteInterface(context.Context, int) error                     { return nil }
-func (f *recordingNetBox) FindDeviceByName(context.Context, string) (int, error)          { return 0, nil }
-func (f *recordingNetBox) EnsureClusterType(context.Context, string) (int, error)         { return 1, nil }
-func (f *recordingNetBox) EnsureCluster(context.Context, string, int) (int, error)        { return 2, nil }
+func (f *recordingNetBox) FindDeviceInCluster(context.Context, string, int) (int, error) {
+	return 0, nil
+}
+func (f *recordingNetBox) EnsureClusterType(context.Context, string) (int, error)  { return 1, nil }
+func (f *recordingNetBox) EnsureCluster(context.Context, string, int) (int, error) { return 2, nil }
 
 func (f *recordingNetBox) ListVMsByCluster(context.Context, int) ([]netbox.VirtualMachine, error) {
 	return nil, nil

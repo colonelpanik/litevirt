@@ -335,3 +335,121 @@ func TestRun_DoesNotResumeRecoveryForAStaleFence(t *testing.T) {
 			"a reschedule with no fresh fence behind it is the split-brain the fence exists to prevent", vm.HostName)
 	}
 }
+
+// handoffFixture drives one fence to the exact point the lease is lost: "bad" is
+// powered off and recorded, its VM is still assigned to it, and the lease now
+// belongs to "good". It returns both coordinators plus the injected clock, so a
+// test can decide which of them takes the lease next.
+func handoffFixture(t *testing.T) (*corrosion.Client, *Coordinator, *Coordinator, *time.Time) {
+	t.Helper()
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, name := range []string{"bad", "good"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fenceQuorum(t, ctx, db, []string{"first", "good"}, "bad")
+
+	first := NewCoordinator("first", db)
+	second := NewCoordinator("good", db)
+	first.Now = func() time.Time { return now }
+	second.Now = first.Now
+	first.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		seedLease(t, db, "good", now.Add(leaseDuration))
+		return fence.Result{Method: "ipmi", Detail: "powered off", Success: true}
+	})
+	second.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		t.Error("a host that is already provably off was powered off a second time")
+		return fence.Result{Method: "ipmi", Success: true}
+	})
+
+	first.RunOnce(ctx)
+	if vm, err := corrosion.GetVM(ctx, db, "vm1"); err != nil || vm == nil || vm.HostName != "bad" {
+		t.Fatalf("fixture failed: vm1 should still be on bad after the handoff (err=%v)", err)
+	}
+	return db, first, second, &now
+}
+
+// TestRun_OriginalLeaderResumesItsOwnUnfinishedRecovery pins that the resume
+// path is reachable by the coordinator that performed the fence, not only by a
+// different one.
+//
+// Abandoning the recovery used to leave c.fenced[host] set, which run()'s cached
+// "already handled this down-episode" check reads BEFORE it can ever reach
+// resumableFence. With the host now sitting in 'fenced' state,
+// clearRecoveredFromFenced (which clears only hosts back to 'active') could not
+// clear it either — so the coordinator that knew most about the fence was the
+// one permanently unable to finish it, for the life of the process.
+func TestRun_OriginalLeaderResumesItsOwnUnfinishedRecovery(t *testing.T) {
+	db, first, _, now := handoffFixture(t)
+	ctx := context.Background()
+
+	// The successor never runs; the lease simply expires back to whoever asks.
+	*now = now.Add(leaseDuration + time.Second)
+	if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ?`, now.Format(time.RFC3339)); err != nil {
+		t.Fatalf("refresh health: %v", err)
+	}
+	first.RunOnce(ctx)
+
+	if got := leaseHolder(t, db); got != "first" {
+		t.Fatalf("fixture failed: lease holder = %q, want first", got)
+	}
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "good" {
+		t.Errorf("vm1 is still on %q — the coordinator that fenced the host cached itself out of "+
+			"finishing the recovery, and nothing else clears that cache while the host stays fenced", vm.HostName)
+	}
+}
+
+// TestRecoverHosts_OriginalLeaderDoesNotAutoUndrainASuccessorsRelocation pins
+// the other stale claim. c.fenceRelocated[host]=false means "I fenced this host
+// and no VM moved off it", which recoverHosts treats as safe to bring back to
+// 'active' on its own. Seeded before the fence and left behind on abdication, it
+// outlived the knowledge it encoded: the successor relocated the VMs, and the
+// original leader would later auto-undrain the host on that obsolete basis —
+// skipping the manual undrain a relocating fence is supposed to require.
+func TestRecoverHosts_OriginalLeaderDoesNotAutoUndrainASuccessorsRelocation(t *testing.T) {
+	db, first, second, now := handoffFixture(t)
+	ctx := context.Background()
+
+	second.RunOnce(ctx)
+	if vm, err := corrosion.GetVM(ctx, db, "vm1"); err != nil || vm == nil || vm.HostName != "good" {
+		t.Fatalf("fixture failed: the successor did not relocate vm1 (err=%v)", err)
+	}
+
+	// "bad" is reachable again and the lease is up for grabs.
+	*now = now.Add(leaseDuration + time.Second)
+	if err := db.Execute(ctx,
+		`UPDATE host_health SET status = 'healthy', consecutive_failures = 0, updated_at = ?`,
+		now.Format(time.RFC3339)); err != nil {
+		t.Fatalf("refresh health: %v", err)
+	}
+	first.RunOnce(ctx)
+
+	if got := leaseHolder(t, db); got != "first" {
+		t.Fatalf("fixture failed: lease holder = %q, want first", got)
+	}
+	h, err := corrosion.GetHost(ctx, db, "bad")
+	if err != nil || h == nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if h.State != "fenced" {
+		t.Errorf("host state = %q, want \"fenced\": a fence whose VMs were relocated must wait for "+
+			"`lv host undrain`, and the original leader's cached \"nothing moved\" is not evidence "+
+			"about what the successor did", h.State)
+	}
+}

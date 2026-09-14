@@ -949,12 +949,15 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	span.SetAttribute("host.name", h.Name)
 	defer span.End()
 
-	c.fenced[h.Name] = true
-	// Track whether this fence actually relocates any VM. A fence that moves
-	// nothing (e.g. a spurious fence of a host whose VMs all stayed put) is safe
-	// to auto-recover later; one that relocated VMs must stay manual to avoid
-	// split-brain. See recoverHosts.
-	c.fenceRelocated[h.Name] = false
+	// NOTE: c.fenced and c.fenceRelocated are deliberately NOT seeded here. Both
+	// are claims about a recovery THIS coordinator is driving, and every return
+	// below abandons that drive — a lease too short to fence, or a lease lost
+	// while fencing. Seeding them up front left a coordinator that had abdicated
+	// still asserting "I handled this host" and "nothing moved off it": the
+	// first suppressed its own resume (the cached-state skip in run runs before
+	// resumableFence can look), and the second let it auto-undrain a host whose
+	// VMs the SUCCESSOR had since relocated. They are seeded at the point of
+	// commitment instead, just before recoverFenced.
 
 	// Re-validate the lease immediately before the destructive fence call, and
 	// require enough of it left to FINISH that call. Checking only that the
@@ -1044,6 +1047,14 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 		return
 	}
+
+	// Committed: this coordinator fenced the host and is driving its recovery, so
+	// it can say whether any VM moved. A fence that moves nothing (a spurious
+	// fence of a host whose VMs all stayed put) is safe to auto-recover later;
+	// one that relocated VMs must stay manual to avoid split-brain. Absent
+	// entirely — the resuming-leader case — means "not mine to judge", which
+	// recoverHosts reads as manual-undrain-only. See recoverHosts.
+	c.fenceRelocated[h.Name] = false
 
 	c.recoverFenced(ctx, h, fr)
 }

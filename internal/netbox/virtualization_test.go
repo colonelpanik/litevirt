@@ -396,7 +396,7 @@ func TestEnsureClusterReusesExisting(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"results":[{"id":5,"name":"lab"}]}`))
 	})
-	id, err := c.EnsureCluster(context.Background(), "lab", 2)
+	id, err := c.EnsureCluster(context.Background(), "lab", 2, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

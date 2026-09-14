@@ -453,3 +453,63 @@ func TestRecoverHosts_OriginalLeaderDoesNotAutoUndrainASuccessorsRelocation(t *t
 			"about what the successor did", h.State)
 	}
 }
+
+// TestRun_ResumesOnceAFenceLogRowArrivesLate pins that "no proof yet" is a wait,
+// not a verdict.
+//
+// hosts.state and fencing_log are separate replicated tables, so a successor can
+// see the host recorded 'fenced' a cycle or more before the row that authorises
+// the resume reaches it. The terminal-state fallback used to cache the skip on
+// that first look, and the cache is cleared only for hosts back to 'active' — so
+// the proof arriving a moment later was never read, and the workloads stayed on
+// the dead host for the life of the process.
+func TestRun_ResumesOnceAFenceLogRowArrivesLate(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	for _, h := range []corrosion.HostRecord{
+		{Name: "bad", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "fenced", FenceStrategy: "ipmi"},
+		{Name: "good", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", FenceStrategy: "ipmi"},
+	} {
+		if err := corrosion.InsertHost(ctx, db, h); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.Name, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fenceQuorum(t, ctx, db, []string{"good"}, "bad")
+
+	c := NewCoordinator("good", db)
+	c.Now = func() time.Time { return now }
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		t.Error("a host recorded 'fenced' was powered off again instead of waiting for its proof")
+		return fence.Result{Method: "ipmi", Success: true}
+	})
+
+	// Cycle one: the state has replicated, the proof has not. Waiting is correct.
+	c.RunOnce(ctx)
+	if vm, err := corrosion.GetVM(ctx, db, "vm1"); err != nil || vm == nil || vm.HostName != "bad" {
+		t.Fatalf("vm1 moved with no fence on record — an unproven 'fenced' state is not authority (err=%v)", err)
+	}
+
+	// The fencing_log row lands.
+	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{
+		ID: "f1", HostName: "bad", Method: "ipmi", Result: "fenced", Detail: "verified off",
+	}); err != nil {
+		t.Fatalf("InsertFenceLog: %v", err)
+	}
+	c.RunOnce(ctx)
+
+	vm, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if vm.HostName != "good" {
+		t.Errorf("vm1 is still on %q — the first look decided the host was settled and nothing "+
+			"re-read the proof that arrived after it", vm.HostName)
+	}
+}

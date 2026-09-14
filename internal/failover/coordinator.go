@@ -434,7 +434,19 @@ func (c *Coordinator) run(ctx context.Context) {
 				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail})
 				continue
 			}
-			c.fenced[target] = true
+			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
+			// hosts.state and fencing_log replicate independently, so the state
+			// can land here a cycle or more before the row that authorises the
+			// resume. Caching the skip would decide the question before the
+			// evidence arrived and never look again — the cache is cleared only
+			// for hosts back to 'active', which a fenced host is not. Leave it
+			// eligible and re-read next cycle; the resume caches once it runs, so
+			// the standing cost is one fencing_log read per cycle per host that
+			// stays fenced. 'offline' and 'maintenance' have no resume path at
+			// all, so for those the cached skip is still the right answer.
+			if h.State != "fenced" {
+				c.fenced[target] = true
+			}
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrTerminalState)
 			continue
 		}

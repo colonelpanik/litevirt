@@ -72,8 +72,18 @@ func (r *LocalRealm) Authenticate(ctx context.Context, creds Credentials) (*Prin
 	}
 
 	// 2FA gate: if the user has any enrolled factor, require it.
+	//
+	// A read failure here FAILS THE LOGIN rather than falling through. This flag
+	// is the only 2FA gate — the login handler branches on it and on nothing else
+	// — so treating an unreadable user_2fa as "no factors enrolled" would let a
+	// transient database error downgrade an enrolled account to password-only, in
+	// exactly the conditions an attacker holding only the password benefits from.
+	// Every other failure in this function already returns rather than continuing.
 	factors, err := corrosion.ListUser2FA(ctx, r.db, user.Username)
-	if err == nil && len(factors) > 0 {
+	if err != nil {
+		return nil, fmt.Errorf("check enrolled 2FA factors for %q: %w", user.Username, err)
+	}
+	if len(factors) > 0 {
 		p.Requires2FA = true
 	}
 

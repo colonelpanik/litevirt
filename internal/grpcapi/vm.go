@@ -1088,14 +1088,35 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 			IsTemplate:   vm.IsTemplate,
 		}
 
-		// Surface labels (tags) for the list view without shipping the whole
-		// spec — a cheap labels-only unmarshal so the table can render chips.
+		// A PROJECTION of the stored spec, not the whole thing: the list must
+		// not carry every VM's cloud-init user-data. A cheap scalar unmarshal
+		// covers the fields list-level callers actually read.
+		//
+		// Set whenever a stored spec EXISTS, even when every projected field is
+		// empty. Populating it only when some field was non-empty conflated two
+		// different facts — "this VM has no stored spec" and "this VM's spec has
+		// no value for the field I asked about" — and a caller reading a scalar
+		// off the projection cannot tell those apart. Both doctor reports were
+		// exactly inverted by it: an unlabelled VM was skipped as spec-less
+		// while a labelled one read as carrying every empty value.
+		//
+		// Anything added here ships for every VM in the cluster on every list,
+		// so it has to be a scalar a list-level caller reads. Labels render the
+		// table's tag chips and the ansible inventory's litevirt_label_* vars;
+		// Uuid and Machine are what `lv doctor vm-uuids` and
+		// `lv doctor machine-types` report on.
 		if vm.Spec != "" {
 			var lite struct {
-				Labels map[string]string `json:"labels"`
+				Labels  map[string]string `json:"labels"`
+				UUID    string            `json:"uuid"`
+				Machine string            `json:"machine"`
 			}
-			if json.Unmarshal([]byte(vm.Spec), &lite) == nil && len(lite.Labels) > 0 {
-				pbVM.Spec = &pb.VMSpec{Labels: lite.Labels}
+			if json.Unmarshal([]byte(vm.Spec), &lite) == nil {
+				pbVM.Spec = &pb.VMSpec{
+					Labels:  lite.Labels,
+					Uuid:    lite.UUID,
+					Machine: lite.Machine,
+				}
 			}
 		}
 

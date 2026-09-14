@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -135,6 +136,40 @@ func MachineTypeFromXML(domXML string) string {
 	}
 	return d.OS.Machine
 }
+
+// UUIDFromXML extracts a domain's <uuid> from its libvirt XML, lower-cased and
+// trimmed, or "" when absent or not a UUID.
+//
+// libvirt mints a UUID for every domain it defines, so the persistent XML is the
+// authority for a VM whose stored spec predates litevirt recording one. It is
+// read on the OWNING host, which is the only place that XML exists.
+//
+// Trimmed because libvirt pretty-prints its persistent XML, so the element body
+// arrives wrapped in whitespace; lower-cased because a UUID is compared as a
+// STRING everywhere it matters — most consequentially inside the NetBox identity
+// (`lv:<fingerprint>:<uuid>:<mac>`), where a differently-cased or padded value is
+// a different identity and would orphan the object it was meant to name.
+//
+// VALIDATED, not merely trimmed: a body that is not a UUID yields "" rather than
+// being written into a spec as though it were one. A wrong uuid is worse than an
+// absent one — absence is visible and skipped, while a bogus value mints a
+// confident, permanently wrong identity.
+func UUIDFromXML(domXML string) string {
+	var d struct {
+		UUID string `xml:"uuid"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return ""
+	}
+	u := strings.ToLower(strings.TrimSpace(d.UUID))
+	if !uuidRe.MatchString(u) {
+		return ""
+	}
+	return u
+}
+
+// uuidRe is the canonical 8-4-4-4-12 hex form libvirt emits.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // MaxVCPUFromXML returns a domain's MAXIMUM vCPU count from its XML — the <vcpu>
 // element's body (which is the hotplug ceiling when a current= attr is present, or

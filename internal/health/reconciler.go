@@ -528,6 +528,14 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			r.maybeBackfillUUID(ctx, vm)
 
 		case "error":
+			// An errored VM is still a DEFINED domain, so its uuid is readable —
+			// and it is no less invisible to the inventory mirror for being in
+			// error. Leaving it out stranded exactly the VMs most likely to be
+			// legacy, and one unreadable record withholds every mirror delete
+			// cluster-wide, so the gap was not confined to the VM itself.
+			// Unconditional like the other two sites: the backfill's own checks
+			// make an undefined domain a no-op (DumpXMLInactive errors → "").
+			r.maybeBackfillUUID(ctx, vm)
 			// Check if an errored VM is actually running in libvirt (e.g. after
 			// daemon crash mid-operation). If so, update state to running.
 			if r.virt != nil && r.virt.DomainExists(vm.Name) {

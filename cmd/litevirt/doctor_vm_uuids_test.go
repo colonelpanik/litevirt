@@ -12,6 +12,12 @@ import (
 // unreadable record and withholds EVERY delete while one exists. So a single
 // VM in this report stops the whole mirror converging, and this is how an
 // operator finds them.
+//
+// SELECTION ONLY. These pb.VM values are hand-built, so this test says nothing
+// about whether the RPC actually populates the field it reads — and that gap is
+// exactly where the original defect lived: the selector was right while
+// ListVMs projected labels alone, so the live report was inverted with this
+// test green. TestListVMsProjectsTheUUID is what pins the data source.
 func TestUUIDlessVMs(t *testing.T) {
 	vms := []*pb.VM{
 		{Name: "has-uuid", HostName: "h1", Spec: &pb.VMSpec{Uuid: "5113ced7-9006-4086-b7dd-9d1840181e03"}},

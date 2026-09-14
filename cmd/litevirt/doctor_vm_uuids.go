@@ -22,6 +22,15 @@ type uuidlessVM struct {
 // record and the mirror ignores it anyway. A VM with no spec at all is skipped —
 // there is nothing to fill in and nothing an operator could act on.
 //
+// IT DEPENDS ON ListVMs PROJECTING `uuid`, and on that projection setting Spec
+// whenever a stored spec exists. Both halves are load-bearing and neither is
+// visible here: while the projection carried labels alone, a nil Spec meant
+// "unlabelled" rather than "spec-less" and every scalar read off it came back
+// empty, so this report was exactly inverted — unlabelled legacy VMs skipped,
+// labelled healthy ones named. See TestListVMsProjectsTheUUID, which pins the
+// data source through the real RPC; the selection test below cannot, because a
+// hand-built pb.VMSpec asserts against a value the RPC never produces.
+//
 // Pure so the selection is testable without a cluster.
 func uuidlessVMs(vms []*pb.VM) []uuidlessVM {
 	var out []uuidlessVM

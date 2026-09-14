@@ -112,6 +112,48 @@ func TestMaybeBackfillUUID_NeverRewritesAnExistingUUID(t *testing.T) {
 	}
 }
 
+// TestSweepBacksFillUUIDForAnErroredVM: an errored VM is still a defined domain
+// with a readable uuid, and it is no less invisible to the mirror for being in
+// error — its unreadable record blocks every mirror delete cluster-wide exactly
+// as a running one's would.
+//
+// Driven through the SWEEP rather than by calling the backfill directly,
+// because the defect this pins is a missing CALL SITE: the backfill itself was
+// correct and its direct-call tests passed while an errored VM was never
+// offered to it. A test that invoked maybeBackfillUUID by hand could not see
+// that, which is the same vacuity the projection tests exist to avoid.
+func TestSweepBacksFillUUIDForAnErroredVM(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+
+	spec := `{"name":"vm-err","cpu":2}`
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm-err", HostName: "node-a", Spec: spec, State: "error"},
+		nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	fake := libvirtfake.New()
+	// Defined and NOT running: the domain persists, so its XML — and its uuid —
+	// are readable.
+	if err := fake.DefineDomain(
+		`<domain><name>vm-err</name><uuid>5113ced7-9006-4086-b7dd-9d1840181e03</uuid></domain>`); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+
+	r.ReconcileOnce(ctx)
+
+	got, err := corrosion.GetVM(ctx, db, "vm-err")
+	if err != nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	if u := specUUID(t, got.Spec); u != "5113ced7-9006-4086-b7dd-9d1840181e03" {
+		t.Fatalf("uuid = %q after a sweep, want the domain's — an errored VM "+
+			"stays invisible to the mirror and blocks every delete", u)
+	}
+}
+
 // TestMaybeBackfillUUID_WritesNothingWithoutAUsableUUID: a domain whose XML
 // carries no usable uuid leaves the spec alone. An absent uuid is visible and
 // skipped; a bogus one mints a confident, permanently wrong identity.

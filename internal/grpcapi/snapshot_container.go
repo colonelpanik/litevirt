@@ -33,6 +33,22 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
+	if !validRestoreName(req.Name) || !validRestoreName(req.Snapshot) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid container/snapshot name: allowed [A-Za-z0-9_.-], not '.' or '..'")
+	}
+	// Both names are joined into ctSnapshotPath and the daemon runs as root, so
+	// both are validated here — before any path is built from them. Without this
+	// a `../` in the snapshot name escapes the snapshot directory: create
+	// truncates whatever it lands on, delete removes it. The VM twin validates
+	// its snapshot name for the same reason (snapshot.go). The container name is
+	// additionally protected in practice by the record lookup below failing, but
+	// that is incidental to another function's behaviour, so it is checked here
+	// too rather than relied upon.
+	if !validRestoreName(req.Name) || !validRestoreName(req.Snapshot) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid container/snapshot name: allowed [A-Za-z0-9_.-], not '.' or '..'")
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.create", "operator"); err != nil {
 		s.audit(ctx, "ct.snapshot.create", req.Name, "project="+project, "denied")
@@ -154,6 +170,10 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
+	if !validRestoreName(req.Name) || !validRestoreName(req.Snapshot) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid container/snapshot name: allowed [A-Za-z0-9_.-], not '.' or '..'")
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.restore", "operator"); err != nil {
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "denied")
@@ -224,6 +244,10 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 	}
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
+	}
+	if !validRestoreName(req.Name) || !validRestoreName(req.Snapshot) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid container/snapshot name: allowed [A-Za-z0-9_.-], not '.' or '..'")
 	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.delete", "operator"); err != nil {

@@ -17,9 +17,11 @@ import (
 	"time"
 )
 
-// maxNameLen caps a single name component. Long enough for any real VM/disk/
+// MaxNameLen caps a single name component. Long enough for any real VM/disk/
 // image/snapshot/container/pool/stack name, short enough to keep paths sane.
-const maxNameLen = 200
+// Exported because a caller that DERIVES a name from another one has to trim
+// the base to fit its suffix, and must not carry its own copy of this number.
+const MaxNameLen = 200
 
 // nameRe is the safe charset for a single name component. Slashes are excluded
 // by the charset; "." and ".." pass the charset but are rejected separately
@@ -28,13 +30,13 @@ const maxNameLen = 200
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 // ValidateName is the base check: a non-empty, non-traversing, safe-charset
-// name no longer than maxNameLen. Every typed wrapper delegates here.
+// name no longer than MaxNameLen. Every typed wrapper delegates here.
 func ValidateName(name string) error {
 	if name == "" {
 		return errors.New("name must not be empty")
 	}
-	if len(name) > maxNameLen {
-		return fmt.Errorf("name %q too long (max %d chars)", name, maxNameLen)
+	if len(name) > MaxNameLen {
+		return fmt.Errorf("name %q too long (max %d chars)", name, MaxNameLen)
 	}
 	if name == "." || name == ".." {
 		return fmt.Errorf("name %q is a path traversal", name)
@@ -86,7 +88,7 @@ func CanonicalProjectName(in string) (string, error) {
 		if seg == "." || seg == ".." {
 			return "", fmt.Errorf("project %q has a traversal segment %q", in, seg)
 		}
-		if len(seg) > maxNameLen || !nameRe.MatchString(seg) {
+		if len(seg) > MaxNameLen || !nameRe.MatchString(seg) {
 			return "", fmt.Errorf("project %q has an invalid segment %q", in, seg)
 		}
 	}

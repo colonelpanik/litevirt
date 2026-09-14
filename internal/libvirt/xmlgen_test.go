@@ -27,6 +27,36 @@ func TestMachineTypeFromXML(t *testing.T) {
 	}
 }
 
+func TestUUIDFromXML(t *testing.T) {
+	cases := []struct {
+		name string
+		xml  string
+		want string
+	}{
+		{"normal", `<domain><uuid>5113ced7-9006-4086-b7dd-9d1840181e03</uuid></domain>`,
+			"5113ced7-9006-4086-b7dd-9d1840181e03"},
+		// libvirt pretty-prints its persistent XML, so the element body arrives
+		// surrounded by whitespace. An untrimmed value is not merely untidy: it
+		// is carried verbatim into the NetBox identity, where it would never
+		// match the same domain read any other way.
+		{"pretty-printed", "<domain>\n  <uuid>\n    5113ced7-9006-4086-b7dd-9d1840181e03\n  </uuid>\n</domain>",
+			"5113ced7-9006-4086-b7dd-9d1840181e03"},
+		{"upper-cased", `<domain><uuid>5113CED7-9006-4086-B7DD-9D1840181E03</uuid></domain>`,
+			"5113ced7-9006-4086-b7dd-9d1840181e03"},
+		{"absent", `<domain><name>vm-1</name></domain>`, ""},
+		{"not a uuid", `<domain><uuid>hello</uuid></domain>`, ""},
+		{"malformed", `not xml`, ""},
+		{"empty", ``, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UUIDFromXML(tc.xml); got != tc.want {
+				t.Errorf("UUIDFromXML = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsPinnedMachineType(t *testing.T) {
 	pinned := []string{"pc-q35-9.0", "pc-q35-8.2", "pc-i440fx-7.1", "virt-9.0"}
 	notPinned := []string{"", "q35", "pc", "pc-q35", "virt", "pc-q35-"}

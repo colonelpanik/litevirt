@@ -348,6 +348,33 @@ func ListLeasesByNetwork(ctx context.Context, c *Client, network string) ([]Leas
 	return out, nil
 }
 
+// GetLeaseByIP reads one LIVE lease by its (network, ip) PRIMARY KEY, whoever
+// owns it, or nil.
+//
+// Owner-BLIND on purpose, and that is the whole difference from
+// GetLeaseByIPForOwner below. That one answers "may I retire this owner's row?",
+// and hides a foreign row behind a nil so the caller treats it as nothing to do.
+// This one answers "is anything holding this address?" — a question whose only
+// safe negative is a row that is genuinely absent. A caller that is about to
+// destroy something OUTSIDE this database on the strength of an address being
+// free has to ask it this way round: a foreign owner and an absent row are the
+// same nil to an owner-scoped read, and they authorize opposite actions.
+func GetLeaseByIP(ctx context.Context, c *Client, network, ip string) (*LeaseRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT `+leaseCols+`
+		 FROM ip_allocations
+		 WHERE network = ? AND ip = ? AND deleted_at IS NULL`,
+		network, ip)
+	if err != nil {
+		return nil, fmt.Errorf("query lease: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	lease := scanLease(rows[0])
+	return &lease, nil
+}
+
 // GetLeaseByIPForOwner reads one lease by its (network, ip) PRIMARY KEY, scoped
 // to the owner that must hold it, or nil.
 //

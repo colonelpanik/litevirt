@@ -38,6 +38,13 @@ type VirtualMachine struct {
 	DiskMB   int
 	Status   string
 	Identity string
+	// PrimaryIP4ID is virtual_machine.primary_ip4: NetBox's "this machine's
+	// main address", which is SEPARATE from assigning an ip_address to a
+	// vminterface. Everything downstream reads the primary — NetBox's own UI
+	// column, its DNS integrations, nb_inventory's ansible_host — so a VM with
+	// an assigned address but no primary reads to all of them as a machine with
+	// no address at all. 0 = none.
+	PrimaryIP4ID int
 }
 
 // bytesPerMB is NetBox's megabyte: DECIMAL, 1 MB = 1,000,000 bytes — not the
@@ -143,6 +150,9 @@ type vmJSON struct {
 	Device *struct {
 		ID int `json:"id"`
 	} `json:"device"`
+	PrimaryIP4 *struct {
+		ID int `json:"id"`
+	} `json:"primary_ip4"`
 	CustomFields map[string]any `json:"custom_fields"`
 }
 
@@ -163,6 +173,9 @@ func (j vmJSON) toVM() VirtualMachine {
 	}
 	if j.Device != nil {
 		out.DeviceID = j.Device.ID
+	}
+	if j.PrimaryIP4 != nil {
+		out.PrimaryIP4ID = j.PrimaryIP4.ID
 	}
 	if v, ok := j.CustomFields[IdentityField].(string); ok {
 		out.Identity = v
@@ -293,6 +306,21 @@ func (c *Client) CreateVM(ctx context.Context, vm VirtualMachine) (VirtualMachin
 // unconditional PATCH every sweep buries NetBox's changelog in noise.
 func (c *Client) UpdateVM(ctx context.Context, id int, vm VirtualMachine) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", id), vmBody(vm), nil)
+}
+
+// SetPrimaryIP4 sets (or, with ipID 0, clears) a virtual machine's primary_ip4.
+//
+// A TARGETED patch rather than a field on vmBody, because the two writes have
+// different preconditions: NetBox requires the address to already be assigned to
+// an interface of this VM, which is only true AFTER the interface phase — while
+// vmBody is also what CREATE sends, when the VM has no interfaces at all. Fold
+// them together and every create carries a field the server must reject.
+func (c *Client) SetPrimaryIP4(ctx context.Context, vmID, ipID int) error {
+	body := map[string]any{"primary_ip4": nil}
+	if ipID != 0 {
+		body["primary_ip4"] = ipID
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", vmID), body, nil)
 }
 
 // DeleteVM removes one virtual machine. Its interfaces and their IP assignments

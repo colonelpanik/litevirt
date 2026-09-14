@@ -166,6 +166,15 @@ const opReplace = "replace"
 // the permanent stall the park exists to end.
 const opPark = "park"
 
+// opPrimaryIP sets (or clears) a mirrored VM's primary_ip4.
+//
+// Its own op, in its own phase, rather than a field on the VM upsert, because
+// NetBox will only accept a primary that is ALREADY assigned to an interface of
+// that VM — which is not true until the interface phase has run, and is never
+// true during a create. Folding it into vmBody would put a field on every create
+// that the server must reject.
+const opPrimaryIP = "primary-ip"
+
 // parkedNamePrefix heads every temporary name the cycle-breaker writes.
 //
 // Self-describing on purpose: it is read by an operator looking at NetBox during
@@ -481,6 +490,30 @@ func Diff(desired []DesiredVM, actual Actual, fingerprint string) []Action {
 					NetBoxID: an.ID, ParentNetBoxID: a.ID, IPID: id,
 				})
 			}
+		}
+
+		// THE PRIMARY ADDRESS, which is not the same fact as an assigned one.
+		//
+		// NetBox keeps "this machine's main address" in virtual_machine.
+		// primary_ip4, separately from the ip_address -> vminterface assignment
+		// above, and it is the primary that everything downstream reads: the UI
+		// column, the DNS integrations, nb_inventory's ansible_host. A VM whose
+		// address is assigned but never made primary is, to all of them, a
+		// machine with no address — which is how a correctly mirrored VM came to
+		// be invisible to DNS.
+		//
+		// Emitted only on a DIFFERENCE, so a converged sweep writes nothing —
+		// the primary is one PATCH per VM and a mirror that re-sent it every
+		// pass would be a write storm on a 15-minute timer.
+		//
+		// ParentNetBoxID carries the id from ACTUAL state and is 0 for a VM
+		// created this sweep, exactly as the NIC actions do; the applier falls
+		// back to the mapping row the VM phase wrote. See parentVMID.
+		if want := desiredPrimaryIP(d); want != a.PrimaryIP4ID {
+			out = append(out, Action{
+				Kind: "vm", Op: opPrimaryIP, Key: vmID,
+				ParentNetBoxID: a.ID, IPID: want,
+			})
 		}
 	}
 
@@ -901,6 +934,25 @@ func vmDiffers(d DesiredVM, a netbox.VirtualMachine) bool {
 		d.DeviceID != a.DeviceID
 }
 
+// desiredPrimaryIP is the address a mirrored VM should carry as its primary: the
+// first NIC that holds one, or 0 when none does.
+//
+// FIRST, over an order the caller already fixed — desiredNICs sorts by ordinal
+// then MAC — because "primary" has to be stable across sweeps. Picking by map or
+// API order would let two sweeps over identical state disagree and PATCH the
+// value back and forth forever.
+//
+// eth0 is what that ordering makes it in practice, which is also the one a guest
+// configures first and the one an operator means by "the VM's address".
+func desiredPrimaryIP(d DesiredVM) int {
+	for _, n := range d.NICs {
+		if n.NetBoxIPID != 0 {
+			return n.NetBoxIPID
+		}
+	}
+	return 0
+}
+
 // nicDiffers compares the mirrored interface fields. The MAC comparison is
 // case-insensitive because NetBox echoes it upper-cased.
 func nicDiffers(d DesiredNIC, a netbox.VMInterface) bool {
@@ -940,8 +992,12 @@ const (
 	PhaseIPClear     = 2 // release addresses before anyone claims them
 	PhaseNICUpsert   = 3 // create/update interfaces and assign addresses
 	PhaseNICDelete   = 4 // detach children before their parent goes
-	PhaseVMDelete    = 5 // last; it cascades
-	phaseCount       = 6
+	// PhaseVMPrimaryIP runs after BOTH interface phases: the address must be
+	// assigned (phase 3) before it may be primary, and a NIC being detached
+	// (phase 4) must be gone before its address could be chosen as one.
+	PhaseVMPrimaryIP = 5
+	PhaseVMDelete    = 6 // last; it cascades
+	phaseCount       = 7
 )
 
 // Phase reports which phase one action belongs to.
@@ -957,6 +1013,8 @@ func Phase(a Action) int {
 		return PhaseNICUpsert
 	case a.Kind == "nic" && a.Op == "delete":
 		return PhaseNICDelete
+	case a.Kind == "vm" && a.Op == opPrimaryIP:
+		return PhaseVMPrimaryIP
 	default:
 		// Everything left is a VM delete, and anything unrecognised lands here
 		// too — the last phase is the only bucket where an action nobody

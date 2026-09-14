@@ -363,6 +363,7 @@ func (f *recordingNetBox) CreateInterface(_ context.Context, i netbox.VMInterfac
 }
 func (f *recordingNetBox) UpdateInterface(context.Context, int, netbox.VMInterface) error { return nil }
 func (f *recordingNetBox) DeleteInterface(context.Context, int) error                     { return nil }
+func (f *recordingNetBox) SetPrimaryIP4(context.Context, int, int) error                  { return nil }
 func (f *recordingNetBox) FindDeviceInCluster(context.Context, string, int) (int, error) {
 	return 0, nil
 }

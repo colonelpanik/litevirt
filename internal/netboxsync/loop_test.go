@@ -367,8 +367,11 @@ func (f *recordingNetBox) SetPrimaryIP4(context.Context, int, int) error        
 func (f *recordingNetBox) FindDeviceInCluster(context.Context, string, int) (int, error) {
 	return 0, nil
 }
-func (f *recordingNetBox) EnsureClusterType(context.Context, string) (int, error)  { return 1, nil }
-func (f *recordingNetBox) EnsureCluster(context.Context, string, int) (int, error) { return 2, nil }
+func (f *recordingNetBox) EnsureClusterType(context.Context, string) (int, error) { return 1, nil }
+func (f *recordingNetBox) FindSiteByName(context.Context, string) (int, error)    { return 0, nil }
+func (f *recordingNetBox) EnsureCluster(context.Context, string, int, int) (int, error) {
+	return 2, nil
+}
 
 func (f *recordingNetBox) ListVMsByCluster(context.Context, int) ([]netbox.VirtualMachine, error) {
 	return nil, nil
@@ -658,10 +661,10 @@ type sweepSignal struct {
 	fired chan struct{}
 }
 
-func (s *sweepSignal) EnsureCluster(ctx context.Context, name string, typeID int) (int, error) {
+func (s *sweepSignal) EnsureCluster(ctx context.Context, name string, typeID, siteID int) (int, error) {
 	select {
 	case s.fired <- struct{}{}:
 	default: // already announced; the waiter only needs the first
 	}
-	return s.stubVirt.EnsureCluster(ctx, name, typeID)
+	return s.stubVirt.EnsureCluster(ctx, name, typeID, siteID)
 }

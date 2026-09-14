@@ -770,6 +770,8 @@ type stubVirt struct {
 	// primaryIPs records every SetPrimaryIP4 call as {vmID, ipID}, so a test
 	// can assert the mirror set one and did not re-send it.
 	primaryIPs [][2]int
+	// sites is the NetBox site name -> id table FindSiteByName resolves against.
+	sites map[string]int
 
 	// dropMACOnCreate models a NetBox whose vminterface serializer does not know
 	// mac_address: DRF ignores an unknown write field silently, so the object
@@ -1036,7 +1038,16 @@ func (s *stubVirt) ListOwnedIPsForInterfaces(context.Context, []int) ([]netbox.I
 // exercises that against a real NetBox surface.
 func (s *stubVirt) EnsureClusterType(context.Context, string) (int, error) { return 1, nil }
 
-func (s *stubVirt) EnsureCluster(context.Context, string, int) (int, error) {
+func (s *stubVirt) FindSiteByName(_ context.Context, name string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sites == nil {
+		return 0, nil
+	}
+	return s.sites[name], nil
+}
+
+func (s *stubVirt) EnsureCluster(context.Context, string, int, int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweeps++

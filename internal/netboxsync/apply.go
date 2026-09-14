@@ -66,7 +66,10 @@ type netboxWriter interface {
 	// halves are here because a cluster cannot be created without its type, and
 	// NetBox does not create one implicitly.
 	EnsureClusterType(ctx context.Context, name string) (int, error)
-	EnsureCluster(ctx context.Context, name string, typeID int) (int, error)
+	EnsureCluster(ctx context.Context, name string, typeID, siteID int) (int, error)
+
+	// FindSiteByName resolves the operator-configured site name to an id.
+	FindSiteByName(ctx context.Context, name string) (int, error)
 }
 
 // The operation vocabulary of litevirt_netbox_mirror_objects_total, in the PAST
@@ -130,6 +133,11 @@ type Reconciler struct {
 	// `netbox.cluster_name`); empty means the local cluster name. See
 	// Options.ClusterName.
 	clusterName string
+
+	// site is the NetBox site NAME the cluster is scoped to (config
+	// `netbox.site`); empty leaves the scope unmanaged. See Options.Site and
+	// resolveSite.
+	site string
 
 	// clusterID is the NetBox cluster every mirrored VM belongs to, resolved
 	// once per sweep before any action runs. It is not on Action because every

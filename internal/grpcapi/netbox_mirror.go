@@ -43,6 +43,7 @@ func (s *Server) netboxMirror(interval time.Duration) *netboxsync.Reconciler {
 		// queue poll acts only on a lease already held. See Options.SweepPhase.
 		SweepPhase:  interval / 2,
 		ClusterName: s.netboxClusterName,
+		Site:        s.netboxSite,
 		// The TTL is sized from the cadence this node actually runs at, exactly
 		// as the sweeper's is, so a cluster on a slower cadence does not hand
 		// leadership away between its own passes.

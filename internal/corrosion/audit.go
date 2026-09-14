@@ -64,8 +64,9 @@ type chainState struct {
 // chainTail is one host's in-flight sub-chain position.
 type chainTail struct {
 	hash  string
-	seq   int64 // highest seq this host has written; the next row is seq+1
-	known bool  // true once the tail has been read back from the DB
+	seq   int64  // highest seq this host has written; the next row is seq+1
+	ts    string // the stamp on that row; the ceiling a generated stamp clamps to
+	known bool   // true once the tail has been read back from the DB
 }
 
 // tail returns hostName's tail state, creating it on first use.
@@ -82,19 +83,68 @@ func (cs *chainState) tail(hostName string) *chainTail {
 	return t
 }
 
+// maxClampSkew is how far ahead of this node's clock a ceiling may sit and still
+// be treated as one. Beyond it the ceiling is assumed to come from a clock that
+// is wrong, a caller that supplied its own timestamp, or a row that was not
+// written by a daemon at all.
+const maxClampSkew = 5 * time.Minute
+
+// stampAfter renders now at the chain's fixed width, never earlier than ceiling.
+//
+// The width is the first half: the stamp is compared as TEXT wherever rows are
+// ordered by it, so its text order has to be its time order, and
+// time.RFC3339Nano trims trailing zeros — a trimmed ".12Z" sorts after a later
+// ".125Z". nowTSLayout pads instead.
+//
+// The clamp is the second. A wall clock goes backwards: NTP corrects a drift, a
+// hypervisor restores a snapshot, an operator sets the date. Ordering the chain
+// by seq means such a stamp no longer reads as tampering, but it still puts rows
+// out of order in `lv audit ls` and in any export, and it invites every future
+// reader to assume an order the data does not have. client.go's NowTS already
+// made this trade for replication keys, clamping to lastTS+1ns against a durable
+// ceiling; this is the same trade for audit stamps, with the host's own tail as
+// the ceiling.
+//
+// The cost is explicit: after a backward step, a generated stamp is as much as
+// that step too high, and it says a row was written later than it was. A stamp
+// that is slightly late is a smaller lie than a log that claims an order it does
+// not have.
+//
+// Only GENERATED stamps are clamped. A caller-supplied timestamp is stored
+// verbatim — rewriting it would alter data this node did not author.
+func stampAfter(now time.Time, ceiling string) string {
+	ts := now.UTC()
+	if ceiling == "" {
+		return ts.Format(nowTSLayout)
+	}
+	prev, err := time.Parse(time.RFC3339Nano, ceiling)
+	if err != nil {
+		return ts.Format(nowTSLayout)
+	}
+	// A ceiling far in the FUTURE is not a clock reading to respect. The clamp
+	// only ever raises, so honouring one would move every later stamp with it
+	// until wall time caught up — and a stamp a year ahead is not a smaller
+	// problem than one a millisecond behind: it breaks timestamp-window exports
+	// and makes `lv audit ls` lie about when things happened, with nothing to
+	// correct it. Past maxClampSkew the wall clock wins and the row is stamped
+	// honestly. Ordering within the host is carried by seq regardless, which is
+	// what makes that the safe way to lose this particular tie.
+	if prev.After(ts.Add(maxClampSkew)) {
+		return ts.Format(nowTSLayout)
+	}
+	if !ts.After(prev) {
+		ts = prev.Add(time.Nanosecond)
+	}
+	return ts.Format(nowTSLayout)
+}
+
 // InsertAuditLog appends an entry to the audit_log table and stamps
 // the prev_hash / content_hash chain fields. Idempotent on ID: if
 // a row with the same ID already exists (e.g. arrived via Crescent
 // replication), the INSERT is silently skipped — the replicator's
 // LWW guard does the right thing for the replicated path.
 func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
-	if r.Timestamp == "" {
-		// Nanosecond precision so two rows inserted in the same second
-		// still sort deterministically. The verifier orders by
-		// (timestamp ASC, id ASC) — a tie would break the chain when
-		// the secondary id-sort doesn't match insert order.
-		r.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
-	}
+	generated := r.Timestamp == ""
 	c.auditChain.mu.Lock()
 	defer c.auditChain.mu.Unlock()
 	tail := c.auditChain.tail(r.HostName)
@@ -108,6 +158,9 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 		tail.known = true
 	}
 
+	if generated {
+		r.Timestamp = stampAfter(c.now(), tail.ts)
+	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1
 	r.ContentHash = HashAuditRow(r)
@@ -156,25 +209,39 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 		return err
 	}
 	tail.hash, tail.seq = r.ContentHash, r.Seq
+	// Only a stamp this node generated raises the ceiling. A caller-supplied one
+	// is stored verbatim but is not a reading of this node's clock, and letting
+	// it set the floor for every later row hands any caller a lever on the whole
+	// host's timeline.
+	if generated && r.Timestamp > tail.ts {
+		tail.ts = r.Timestamp
+	}
 	return nil
 }
 
 // loadHostTail reads back hostName's current chain position: the content hash
 // of its last row and the highest seq it has issued.
 //
-// Ordering matches the verifier's (timestamp, id), so the tail this returns is
-// the row the verifier will also treat as last. seq is taken as a MAX rather
-// than from that row, because a legacy row carries seq 0 and must not drag the
-// counter backwards onto a value already in use.
+// Ordering matches the verifier's (seq, then timestamp and id), so the tail this
+// returns is the row the verifier will also treat as last. A tail picked by
+// stamp alone is the wrong row to chain onto the moment a clock steps back, and
+// the broken link that follows is WRITTEN into the table rather than merely read
+// out of it.
+//
+// The stamp on that row comes back with it: it is the ceiling the next generated
+// stamp clamps to, so a backward clock step cannot put an older stamp on a newer
+// row. seq is taken as a MAX rather than from that row so a row inserted outside
+// InsertAuditLog cannot drag the counter onto a value already in use.
 func loadHostTail(ctx context.Context, c *Client, hostName string, tail *chainTail) error {
 	rows, err := c.Query(ctx,
-		`SELECT content_hash FROM audit_log WHERE host_name = ?
-		 ORDER BY timestamp DESC, id DESC LIMIT 1`, hostName)
+		`SELECT content_hash, timestamp FROM audit_log WHERE host_name = ?
+		 ORDER BY seq DESC, timestamp DESC, id DESC LIMIT 1`, hostName)
 	if err != nil {
 		return fmt.Errorf("read audit chain tail for %s: %w", hostName, err)
 	}
 	if len(rows) == 1 {
 		tail.hash = rows[0].String("content_hash")
+		tail.ts = rows[0].String("timestamp")
 	}
 	seqRows, err := c.Query(ctx,
 		`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM audit_log WHERE host_name = ?`, hostName)
@@ -466,7 +533,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		`SELECT id, timestamp, username, host_name, action, target, detail, result,
 		        prev_hash, content_hash, key_id, signature, seq
 		 FROM audit_log
-		 ORDER BY host_name ASC, timestamp ASC, id ASC`)
+		 ORDER BY host_name ASC, seq ASC, timestamp ASC, id ASC`)
 	if err != nil {
 		return res, fmt.Errorf("list audit_log: %w", err)
 	}
@@ -592,11 +659,10 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// excused for free — and to place it below the start honestly they
 			// would have to link it into the legacy region, which breaks the hash
 			// of every row after it.
-			pos := seq
-			if pos == 0 {
-				pos = seqByHost[host]
-			}
-			if contract, underContract := contracted[host]; underContract && pos > contract.startSeq {
+			// seq 0 is not a numbering. InsertAuditLog assigns seq >= 1 to
+			// every row it writes, so a row carrying 0 was not written by a
+			// daemon at all — it was inserted straight into the table.
+			if contract, underContract := contracted[host]; underContract && (seq == 0 || seq > contract.startSeq) {
 				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
 					"%s: row %s carries no signature, but this host has a published signing "+
 						"certificate and no retirement", host, rec.ID))
@@ -717,18 +783,23 @@ func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, err
 const auditResealGuardedSQL = `UPDATE audit_log SET prev_hash = ?, content_hash = ?
 	 WHERE id = ? AND (signature IS NULL OR signature = '')`
 
-// resealHostChainLocked walks hostName's rows oldest-first, recomputes the
+// resealHostChainLocked walks hostName's rows in authored (seq) order, recomputes the
 // per-host prev_hash/content_hash chain, and UPDATEs any row whose stored
-// content_hash differs. Returns the resealed tail hash + rows rewritten.
+// content_hash differs.
+//
+// The order has to be the verifier's. Reseal WRITES the chain it computes, and
+// the write replicates, so walking these rows in an order the verifier does not
+// share does not repair a chain — it rewrites a correct one into a shape every
+// peer then reports as broken. Returns the resealed tail hash + rows rewritten.
 // Caller must hold auditChainState.mu. A host authors all its own rows
 // locally, so the local DB has the complete sub-chain even right after a
 // restart (replication only brings OTHER hosts' rows).
 func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature, seq
 		 FROM audit_log
 		 WHERE host_name = ?
-		 ORDER BY timestamp ASC, id ASC`, hostName)
+		 ORDER BY seq ASC, timestamp ASC, id ASC`, hostName)
 	if err != nil {
 		return "", 0, fmt.Errorf("list host audit rows: %w", err)
 	}

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -123,4 +124,47 @@ func TestAuditExport_RPCError(t *testing.T) {
 	s := newTestUIServer(t, mock)
 	w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/audit/export")))
 	assertStatus(t, w, http.StatusInternalServerError)
+}
+
+// The export is what an operator ships to WORM storage. The server pages it, so
+// a handler that sends one request returns page one — which is a well-formed
+// document that looks complete and is not. Asserting on the rows rather than on
+// the number of RPCs is deliberate: the defect is the missing rows, and a
+// handler could make the calls and still drop them.
+func TestAuditExport_FollowsTheCursorToTheEndOfTheChain(t *testing.T) {
+	mock := newDefaultMock()
+	mock.exportAuditPages = map[string]*pb.ExportAuditChainResponse{
+		"": {
+			Json:       `{"rows":[{"id":"r1"},{"id":"r2"}],"chain_heads":[{"host":"h1"}],"ca_pem":"CA"}`,
+			RowCount:   2,
+			NextCursor: "c1",
+		},
+		"c1": {
+			Json:       `{"rows":[{"id":"r3"}]}`,
+			RowCount:   1,
+			NextCursor: "c2",
+		},
+		"c2": {
+			Json:     `{"rows":[{"id":"r4"}]}`,
+			RowCount: 1,
+		},
+	}
+	s := newTestUIServer(t, mock)
+	w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/audit/export")))
+	assertStatus(t, w, http.StatusOK)
+
+	body := w.Body.String()
+	for _, id := range []string{"r1", "r2", "r3", "r4"} {
+		if !strings.Contains(body, `"id":"`+id+`"`) {
+			t.Errorf("downloaded export is missing row %s; it stopped before the end of the chain", id)
+		}
+	}
+	// Evidence rides on the first page. Without the heads a truncated chain
+	// replays clean, so an export that loses them cannot do its job either.
+	if !strings.Contains(body, `"chain_heads"`) {
+		t.Error("downloaded export dropped chain_heads")
+	}
+	if !strings.Contains(body, `"ca_pem"`) {
+		t.Error("downloaded export dropped ca_pem")
+	}
 }

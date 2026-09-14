@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -229,6 +230,13 @@ func (s *Server) readContainerMarker(name string) (int64, string) {
 
 func classifyMarker(epoch int64, found bool, err error) (int64, string) {
 	switch {
+	// Keyed off the sentinel and the wrapper text, not the text alone. A
+	// pre-epoch marker must classify as CORRUPT: MarkerUnreadable makes
+	// collectRuntimeInventory fail the whole host's inventory as
+	// not-decision-complete, which suppresses owner-assert for every workload on
+	// it — a host-wide outage of the checks, from one VM's bad marker.
+	case errors.Is(err, health.ErrPreEpochMarker):
+		return 0, MarkerCorrupt
 	case err != nil && strings.Contains(err.Error(), "corrupt"):
 		return 0, MarkerCorrupt
 	case err != nil:

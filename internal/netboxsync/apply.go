@@ -57,6 +57,11 @@ type netboxWriter interface {
 
 	FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error)
 
+	// SetPrimaryIP4 points a VM at its main address. Separate from UpdateVM
+	// because NetBox only accepts a primary already assigned to an interface of
+	// that VM, which is never true at create time.
+	SetPrimaryIP4(ctx context.Context, vmID, ipID int) error
+
 	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
 	// halves are here because a cluster cannot be created without its type, and
 	// NetBox does not create one implicitly.
@@ -283,6 +288,8 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
 		return r.nb.ClearIPAssignment(ctx, a.IPID)
+	case a.Kind == kindVM && a.Op == opPrimaryIP:
+		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
 		return r.deleteObject(ctx, a)
 	default:
@@ -683,6 +690,31 @@ func (r *Reconciler) parentVMID(ctx context.Context, a Action, dn desiredNIC) (i
 		return 0, nil
 	}
 	return ref.NetBoxID, nil
+}
+
+// setPrimaryIP points a mirrored VM's primary_ip4 at the address on its own
+// first NIC, or clears it.
+//
+// The VM id is resolved exactly as a NIC's parent is — ACTUAL state first, then
+// the mapping row the VM phase wrote this sweep — because a VM created this pass
+// was absent from actual state and carries no id on its actions. See parentVMID.
+//
+// A VM with no resolvable id is SKIPPED, not an error: the only way to reach it
+// is a VM whose create failed earlier in this same sweep, which already failed
+// the pass, and turning it into a second error would bury the first.
+func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
+	vmID := a.ParentNetBoxID
+	if vmID == 0 {
+		ref, err := corrosion.GetObjectRef(ctx, r.db, kindVM, a.Key)
+		if err != nil {
+			return fmt.Errorf("netboxsync: read mapping for VM %s: %w", a.Key, err)
+		}
+		if ref == nil {
+			return nil
+		}
+		vmID = ref.NetBoxID
+	}
+	return r.nb.SetPrimaryIP4(ctx, vmID, a.IPID)
 }
 
 // keepOldest resolves a search result to the one object to adopt.

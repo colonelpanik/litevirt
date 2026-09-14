@@ -791,7 +791,18 @@ named after the local cluster or after `netbox.cluster_name`) and mirrors:
   field ignored. NetBox stores a MAC upper-cased; comparisons are
   case-insensitive, so that is not drift;
 - each address litevirt claimed from NetBox as an `ip_address` assigned to the
-  interface that holds it.
+  interface that holds it;
+- the VM's **`primary_ip4`**, pointed at the address on its first NIC.
+
+That last one is a separate fact from the assignment above it, and it is the one
+most things downstream actually read: NetBox's own UI column, its DNS
+integrations, and `nb_inventory`'s `ansible_host`. A VM whose address is assigned
+to an interface but not made primary reads to all of them as a machine with no
+address. NetBox will only accept a primary that is already assigned to an
+interface of that VM, so the mirror sets it after the interface phase rather than
+at create time, and clears it when the NIC that held it is detached. "First NIC"
+is by NIC ordinal then MAC — the same order the guest sees — so the choice is
+stable across sweeps rather than drifting with API ordering.
 
 If a host is modelled as a DCIM device whose name matches the litevirt host **and
 that device belongs to the NetBox cluster litevirt mirrors into**, the VM links

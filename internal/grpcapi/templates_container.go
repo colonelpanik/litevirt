@@ -92,6 +92,13 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	if req.Project == "" {
 		project = tenancy.NormalizeProject(src.Project)
 	}
+	// Authorize the SOURCE as well as the destination — see CloneVM. A container
+	// clone copies the source rootfs, so the destination check alone leaves the
+	// read of another tenant's filesystem unguarded.
+	if err := s.RequirePerm(ctx, ctRBACPathFor(src.Project, src.Name), "backup.create", "operator"); err != nil {
+		s.audit(ctx, "ct.clone", req.Source, "source project="+src.Project, "denied")
+		return nil, err
+	}
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Target), "ct.create", "operator"); err != nil {
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
 		return nil, err

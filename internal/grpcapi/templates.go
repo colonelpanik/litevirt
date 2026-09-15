@@ -43,6 +43,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if req.Project == "" {
 		project = tenancy.NormalizeProject(src.Project)
 	}
+	// Authorize the SOURCE as well as the destination. A clone READS the source
+	// VM's disks and writes a full copy into the caller's project, so checking
+	// only the destination authorizes the write and leaves the read unguarded —
+	// a tenant who may create VMs in their own project could otherwise lift
+	// another tenant's data into it. Same rule and same verb as BuildImage
+	// (imageops.go), which calls this out as "a cross-project data-exposure
+	// surface"; cloning is that operation with a VM as the destination instead
+	// of an image.
+	if err := s.RequirePerm(ctx, vmRBACPath(src), "backup.create", "operator"); err != nil {
+		return nil, err
+	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, req.Target), "vm.create", "operator"); err != nil {
 		return nil, err
 	}

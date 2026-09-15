@@ -147,3 +147,60 @@ func CurrentLedgerHas(fp string) bool {
 // stmtLedger is populated in stmtledger_entries.go (generated from the builders via
 // `stmtshapecheck -report`, then annotated). Kept in a separate file so the entry list can
 // be regenerated without touching this logic.
+
+// relayStatement reports whether a committed statement should be written to
+// mutation_log, i.e. replayed by every peer.
+//
+// Everything is relayed except ONE case: a create-only statement that changed
+// no row here. `changed` is that statement's own RowsAffected from the
+// transaction that just committed.
+//
+// Why that case is different. mutation_log carries statements, not rows, so a
+// peer REPLAYS what it is given. An INSERT OR IGNORE that matched an existing
+// primary key was rejected locally — the row already here won — and relaying it
+// asks every peer to apply content this node just declined. A peer that has not
+// yet received the genuine row applies the relayed one, and then INSERT OR
+// IGNORE drops the genuine row on the primary key when it does arrive. The two
+// nodes now disagree permanently, because DispAppendOnly means exactly that
+// there is no LWW rule to heal them.
+//
+// That is the hole a caller could drive with a forged, caller-supplied id: the
+// local write is safely a no-op and looks refused, while the forgery replicates.
+// It is reachable from ~50 INSERT OR IGNORE sites, several of them audit tables.
+//
+// Suppressing the relay is safe because a row that exists locally got here by a
+// path that already replicates — its own mutation_log entry, or a merge from the
+// peer that created it — and anti-entropy is the backstop for any gap. The
+// statement being dropped would add nothing a converged cluster does not have.
+//
+// Scoped deliberately to create-only shapes. A zero-row UPDATE or DELETE is
+// still relayed: those dispositions are LWW-gated or per-category, so the
+// receiver decides for itself, and the row the statement targets may be one
+// this node simply does not hold. An UNCLASSIFIED shape is relayed too —
+// unknown means "not known to be create-only", and silently withholding a
+// statement whose semantics we cannot name is the more dangerous default.
+func relayStatement(s Statement, changed bool) bool {
+	if changed {
+		return true
+	}
+	return !createOnlyStatement(s.SQL)
+}
+
+// createOnlyStatement reports whether sql's registered shape is append-only —
+// INSERT OR IGNORE with no LWW rule.
+//
+// DispositionAfter counts as well as Disposition. A capability-gated shape
+// reads DispReject until its token is active and its real disposition after, so
+// consulting only the first field would miss the append-only shapes during
+// exactly the rollout window when peers are most likely to be missing rows.
+func createOnlyStatement(sql string) bool {
+	fp, err := FingerprintSQL(sql)
+	if err != nil {
+		return false
+	}
+	e, ok := LedgerLookup(fp)
+	if !ok {
+		return false
+	}
+	return e.Disposition == DispAppendOnly || e.DispositionAfter == DispAppendOnly
+}

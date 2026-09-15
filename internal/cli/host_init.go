@@ -578,6 +578,12 @@ func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
 		if err := os.WriteFile(dst, data, file.mode); err != nil {
 			return fmt.Errorf("write CLI %s: %w", file.name, err)
 		}
+		// WriteFile only applies its mode when it CREATES the file, so re-running
+		// over a bundle whose client.key was left loose would rewrite the key and
+		// silently keep the old mode. Same reasoning as the key material above.
+		if err := os.Chmod(dst, file.mode); err != nil {
+			return fmt.Errorf("tighten CLI %s permissions: %w", file.name, err)
+		}
 		if target.chown {
 			if err := chownPath(dst, target.uid, target.gid); err != nil {
 				return fmt.Errorf("chown CLI %s: %w", file.name, err)

@@ -318,11 +318,15 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 			pidFile := dnsmasqPidFile(bridge)
 			StopDHCP(pidFile) //nolint:errcheck
 			// Remove the gateway IP that StartDHCP added to the bridge.
-			if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil {
-				prefix := strings.SplitN(def.Subnet, "/", 2)
-				if len(prefix) == 2 {
-					execCommand("ip", "addr", "del", gw+"/"+prefix[1], "dev", bridge) //nolint:errcheck
-				}
+			//
+			// SubnetRange already returns the gateway WITH its prefix (see
+			// dnsmasq.go: "10.0.1.128/25" -> gateway "10.0.1.129/25"), so it is
+			// used as-is. Appending the subnet's prefix again produced
+			// "10.0.1.1/24/24", which iproute2 rejects — and because the error is
+			// deliberately discarded here, the address silently stayed on the
+			// bridge for good, including through SafeProvision's rollback.
+			if gw, _, _, _, err := SubnetRange(def.Subnet); err == nil && gw != "" {
+				execCommand("ip", "addr", "del", gw, "dev", bridge) //nolint:errcheck
 			}
 			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
 		}

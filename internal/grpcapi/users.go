@@ -395,9 +395,24 @@ func (s *Server) CreateToken(ctx context.Context, req *pb.CreateTokenRequest) (*
 	}
 
 	id := randid.New()
+	// Parse and normalise the expiry to bare UTC RFC3339.
+	//
+	// Expiry is enforced by ONE thing — the SQL string comparison
+	// `t.expires_at > ?` against a bare RFC3339 now (corrosion/users.go). Storing
+	// the caller's string verbatim made that a control that fails OPEN on a typo:
+	// `--expires 30d` sorts above every "2..." timestamp, so the token never
+	// expires, while the CLI reports success and `token-ls` shows an expiry that
+	// means nothing. Normalising to UTC matters for the same reason — an
+	// offset-bearing value parses but compares wrong by its offset.
 	var expiresAt string
 	if req.Expires != "" {
-		expiresAt = req.Expires
+		t, perr := time.Parse(time.RFC3339, req.Expires)
+		if perr != nil {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"invalid --expires %q: want an RFC3339 timestamp such as 2026-12-31T00:00:00Z (%v)",
+				req.Expires, perr)
+		}
+		expiresAt = t.UTC().Format(time.RFC3339)
 	}
 
 	if err := corrosion.InsertToken(ctx, s.db, corrosion.TokenRecord{

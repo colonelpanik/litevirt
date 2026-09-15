@@ -12,6 +12,35 @@ make ci-guards          # schema bump, writecheck, stmtshapecheck, docs truth
 couple that only exist there — notably `stmtshapecheck`, which fails any
 replicated SQL builder whose statement shape is not in the compatibility ledger.
 
+**`-race` on `internal/corrosion` or `internal/grpcapi` needs an explicit
+`-timeout`.** Both run past Go's 10-minute default under the race detector —
+`internal/corrosion` takes ~18½ minutes on a current laptop — so the plain
+command fails like this:
+
+```
+FAIL	github.com/litevirt/litevirt/internal/corrosion	600.588s
+```
+
+600s is the timeout, not a race. Nothing is wrong with the package; the run was
+killed. Reach for a real budget:
+
+```bash
+go test -race -timeout 30m ./internal/corrosion/
+```
+
+Or, for a change confined to a few files, run the race detector over just the
+tests that cover them — seconds instead of twenty minutes, and the same signal
+for the code you touched:
+
+```bash
+go test -race -timeout 5m ./internal/corrosion/ -run 'TestStmtShape|TestLex_'
+```
+
+This trips people because a timeout and a detected race look identical at a
+glance, and the honest reading of a 600s FAIL on a package you just edited is
+"I broke something". Confirm which it is before chasing it: a real race prints a
+`WARNING: DATA RACE` block, a timeout prints `panic: test timed out`.
+
 Commits follow conventional-commit style (`fix(cluster):`, `test(fleet):`,
 `docs:`). Scope names match the package or subsystem.
 

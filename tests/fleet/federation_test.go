@@ -108,11 +108,12 @@ func TestFleet_FederationAndAnycast(t *testing.T) {
 	// package looks up service_endpoints by exact service_name; the
 	// trailing-dot from miekg/dns gets stripped in lookupService.
 	dnsPort := freeUDPPort(t)
-	srv := litedns.NewServer("litevirt.local", dnsPort, ny1.DB)
+	const dnsZone = "litevirt.local"
+	srv := litedns.NewServer(dnsZone, dnsPort, ny1.DB)
 	dnsCtx, cancelDNS := context.WithCancel(ctx)
 	defer cancelDNS()
 	go srv.Start(dnsCtx)
-	if err := waitUDP("127.0.0.1", dnsPort, 1*time.Second); err != nil {
+	if err := waitUDP("127.0.0.1", dnsPort, dnsZone, 1*time.Second); err != nil {
 		t.Fatalf("dns server didn't start: %v", err)
 	}
 
@@ -197,7 +198,23 @@ func freeUDPPort(t *testing.T) int {
 // waitUDP polls until something is listening on the UDP port. The
 // litedns server starts inside a goroutine so the test races the
 // listener without this.
-func waitUDP(host string, port int, timeout time.Duration) error {
+//
+// The probe MUST name something inside `zone`. It used to ask for the
+// root-level name "probe.", which the server's mux routes to handleForward —
+// so readiness depended on a round trip to whatever resolvConfUpstream()
+// picked. That function deliberately skips loopback nameservers, so on any
+// host whose /etc/resolv.conf lists only a stub resolver (systemd-resolved,
+// i.e. default Ubuntu/Fedora/Debian) it falls through to 8.8.8.8, and a
+// public NXDOMAIN for a nonexistent TLD measures ~215ms against the 200ms
+// budget below. The probe then failed every attempt inside its 1s deadline
+// and the test reported "dns server didn't start" while the server was up
+// and serving. Offline it can never pass at all: forwardTimeout is 3s, so
+// the SERVFAIL that would satisfy the probe is written long after the whole
+// deadline has expired.
+//
+// An in-zone name is answered by handleLocal straight from the DB, which is
+// both instant and the thing readiness actually needs to establish.
+func waitUDP(host string, port int, zone string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, fmt.Sprint(port))
 	for time.Now().Before(deadline) {
@@ -207,7 +224,7 @@ func waitUDP(host string, port int, timeout time.Duration) error {
 			// UDP "dial" succeeds even when nothing listens; send a
 			// tiny query and look for a response.
 			m := new(dns.Msg)
-			m.SetQuestion("probe.", dns.TypeA)
+			m.SetQuestion(dns.Fqdn("probe."+zone), dns.TypeA)
 			cl := &dns.Client{Timeout: 200 * time.Millisecond}
 			if _, _, derr := cl.Exchange(m, addr); derr == nil {
 				return nil

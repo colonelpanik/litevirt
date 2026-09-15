@@ -71,6 +71,22 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 	}, nil
 }
 
+// UsersEverExisted reports whether this node's local database carries any user
+// row at all, tombstoned or not.
+//
+// ListUsers filters `deleted_at IS NULL`, so it answers "are there live users",
+// which is NOT the same fact as "has this cluster ever had an admin". Only the
+// second one justifies minting one: InsertUser reactivates a soft-deleted row
+// (`SET deleted_at = NULL`), so treating a tombstone as absence resurrects a
+// deliberately revoked account and replicates it to every peer.
+func UsersEverExisted(ctx context.Context, c *Client) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT username FROM users LIMIT 1`)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
 // ListUsers returns all active users.
 func ListUsers(ctx context.Context, c *Client) ([]UserRecord, error) {
 	rows, err := c.Query(ctx,

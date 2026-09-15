@@ -469,6 +469,10 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// One-shot machine-type backfill: pin the concrete machine type for VMs created
 			// before pinning existed. No-op once pinned (cheap stored-spec check).
 			r.maybePinMachineType(ctx, vm)
+			// One-shot uuid backfill, same shape and same reason: a VM created
+			// before litevirt recorded a domain uuid cannot be named in NetBox,
+			// and its unreadable record blocks every mirror delete cluster-wide.
+			r.maybeBackfillUUID(ctx, vm)
 			// The domain is defined but may have been stopped out-of-band (a
 			// crash, an external `virsh destroy`, or a fence that powered it
 			// off). Reconcile the cluster state to libvirt reality so it doesn't
@@ -536,8 +540,20 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// machine type from its persistent domain. No-op once pinned, and a
 			// no-op if the domain isn't defined (DumpXMLInactive errors → "").
 			r.maybePinMachineType(ctx, vm)
+			// A stopped VM is still defined, so its domain uuid is readable and
+			// worth recording — a legacy VM is no less invisible to the mirror
+			// for being powered off.
+			r.maybeBackfillUUID(ctx, vm)
 
 		case "error":
+			// An errored VM is still a DEFINED domain, so its uuid is readable —
+			// and it is no less invisible to the inventory mirror for being in
+			// error. Leaving it out stranded exactly the VMs most likely to be
+			// legacy, and one unreadable record withholds every mirror delete
+			// cluster-wide, so the gap was not confined to the VM itself.
+			// Unconditional like the other two sites: the backfill's own checks
+			// make an undefined domain a no-op (DumpXMLInactive errors → "").
+			r.maybeBackfillUUID(ctx, vm)
 			// Check if an errored VM is actually running in libvirt (e.g. after
 			// daemon crash mid-operation). If so, update state to running.
 			if r.virt != nil && r.virt.DomainExists(vm.Name) {
@@ -650,6 +666,87 @@ func (r *Reconciler) maybePinMachineType(ctx context.Context, vm corrosion.VMRec
 		return // spec changed underneath us / operation active; retry next tick off the fresh value
 	}
 	slog.Info("reconciler: pinned machine type (one-shot backfill)", "vm", vm.Name, "from", cur.Machine, "to", resolved)
+}
+
+// maybeBackfillUUID is the one-shot uuid backfill for VMs created before
+// litevirt recorded a domain uuid in the stored spec.
+//
+// WHY IT MATTERS beyond tidiness: the uuid is what makes an identity
+// incarnation-unique, so a VM without one cannot be named in NetBox at all. The
+// inventory mirror skips it AND counts it as an unreadable record — and an
+// unreadable record is indistinguishable from a destroyed VM, so the mirror
+// withholds EVERY delete for as long as one exists (see netboxsync's
+// deleteBlocker). One legacy VM therefore stops the whole mirror converging.
+//
+// libvirt minted a uuid for the domain whatever litevirt stored, so the
+// persistent XML on the OWNING host is the authority — which is why this runs in
+// the reconciler's per-VM sweep rather than in a cluster-wide command: no other
+// node can read that XML.
+//
+// It NEVER rewrites a uuid the spec already carries, even if libvirt reports a
+// different one (a restore or import can redefine a domain under a fresh uuid).
+// The stored value is the identity other systems already hold; replacing it
+// would orphan every object stamped with it and mint a duplicate under the new
+// one. Absence is the only state this fills in.
+//
+// Fires at most once per VM — the stored-spec pre-check makes every subsequent
+// tick a no-op — and preserves every other spec field via the same raw edit
+// maybePinMachineType uses.
+func (r *Reconciler) maybeBackfillUUID(ctx context.Context, vm corrosion.VMRecord) {
+	if r.virt == nil || vm.Spec == "" {
+		return
+	}
+	var cur struct {
+		UUID string `json:"uuid"`
+	}
+	if err := json.Unmarshal([]byte(vm.Spec), &cur); err != nil {
+		return
+	}
+	if cur.UUID != "" {
+		return // already recorded — the steady-state case
+	}
+	xmlDesc, err := r.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return
+	}
+	resolved := lv.UUIDFromXML(xmlDesc)
+	if resolved == "" {
+		return // no usable uuid; a bogus one is worse than none
+	}
+	// Same sanctioned writer as the machine-type pin: MutateDesiredSpec re-reads
+	// the FRESH spec and replaces only "uuid", so a concurrent UpdateVM is not
+	// clobbered, and it defers while an operation holds the VM's mutation
+	// barrier.
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, r.db, vm.Name, func(old string) (string, error) {
+		var freshU struct {
+			UUID string `json:"uuid"`
+		}
+		if err := json.Unmarshal([]byte(old), &freshU); err == nil && freshU.UUID != "" {
+			return old, nil // filled in underneath us → no-op (no generation bump)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(old), &raw); err != nil {
+			return "", err
+		}
+		uj, err := json.Marshal(resolved)
+		if err != nil {
+			return "", err
+		}
+		raw["uuid"] = uj
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	})
+	if err != nil {
+		slog.Warn("reconciler: uuid backfill failed", "vm", vm.Name, "uuid", resolved, "error", err)
+		return
+	}
+	if !applied {
+		return // spec moved underneath us / operation active; retry next tick
+	}
+	slog.Info("reconciler: recorded the domain uuid (one-shot backfill)", "vm", vm.Name, "uuid", resolved)
 }
 
 func (r *Reconciler) selfFence(ctx context.Context) {

@@ -607,6 +607,33 @@ nothing until the capability has latched cluster-wide, so no host is fencing
 whatever the table shows. Without that line a mid-rollout fleet — every operator
 having already set the flag — prints a column of `enforcing` that reads as
 covered.
+## `lv doctor vm-uuids`
+
+Read-only. Lists VMs whose **persisted spec** carries no domain uuid.
+
+```
+lv doctor vm-uuids
+```
+
+The uuid is what makes a NetBox identity incarnation-unique
+(`lv:<fingerprint>:<uuid>:<mac>`), so a VM without one cannot be named in NetBox
+at all. The inventory mirror skips it **and** counts it as an unreadable record —
+and an unreadable record is indistinguishable from a destroyed VM, so the mirror
+withholds *every* delete while one exists. A single VM listed here stops the
+whole mirror converging, which is why this matters even on a cluster that does
+not care about the individual VM.
+
+libvirt mints a uuid for every domain it defines regardless of what litevirt
+stored, so the reconciler adopts it from the persistent domain XML as it sweeps
+each VM on its **owning host** — running or stopped. No other node can read that
+XML, which is why there is no cluster-wide repair command. A VM listed here has
+not been swept yet, or its host is down.
+
+The backfill never overwrites a uuid the spec already has, even if libvirt
+reports a different one: the stored value is the identity other systems already
+hold, and replacing it would orphan every object stamped with it.
+
+To fill one in: make sure its host is up and wait for the next reconciler sweep.
 
 ## Persisted LWW clock & backward-clock protection
 

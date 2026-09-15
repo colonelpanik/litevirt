@@ -28,8 +28,10 @@
 package fleet
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -47,6 +49,11 @@ type fakeVM struct {
 	Disk      int
 	Status    string
 	Identity  string
+	// PrimaryIP4ID is virtual_machine.primary_ip4. NetBox validates it: the
+	// address must be assigned to an interface of THIS VM. Modelled because a
+	// fake that accepted any id would let a mirror set a primary the real
+	// server refuses — the same hole the device/cluster constraint fell through.
+	PrimaryIP4ID int
 }
 
 // fakeIface is one virtualization.vminterface.
@@ -120,13 +127,138 @@ func (f *NetBoxFake) namedCollection(w http.ResponseWriter, r *http.Request, sto
 	}
 }
 
-// AddDevice registers a DCIM device, so a scenario can model a host that IS
-// modelled in NetBox. Absent devices resolve to 0, which is the untested-by-
-// default case every existing scenario runs in.
+// deviceParams is every query parameter the DCIM device list understands.
+// cluster_id is the scope the mirror's lookup depends on, so an unsupported
+// spelling has to be a 400 here exactly as NetBox makes it one — a fake that
+// ignored it would answer an UNSCOPED lookup and hand back a device the real
+// server would refuse on the write.
+var deviceParams = map[string]bool{
+	"name": true, "cluster_id": true, "limit": true, "offset": true,
+}
+
+// deviceCollection serves the DCIM device lookup, honouring cluster_id.
+func (f *NetBoxFake) deviceCollection(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "%s not allowed on the device collection", r.Method)
+		return
+	}
+	q := r.URL.Query()
+	for k := range q {
+		if !deviceParams[k] {
+			writeErr(w, http.StatusBadRequest, `{"%s":["Unknown filter field"]}`, k)
+			return
+		}
+	}
+	wantCluster, scoped := 0, false
+	if raw := q.Get("cluster_id"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, `{"cluster_id":["Enter a number."]}`)
+			return
+		}
+		wantCluster, scoped = n, true
+	}
+
+	name := q.Get("name")
+	f.mu.Lock()
+	id, ok := f.devices[name]
+	if ok && scoped && f.deviceCluster[id] != wantCluster {
+		ok = false
+	}
+	f.mu.Unlock()
+
+	out := struct {
+		Count   int     `json:"count"`
+		Next    string  `json:"next"`
+		Results []idRef `json:"results"`
+	}{Results: []idRef{}}
+	if ok && name != "" {
+		out.Count, out.Results = 1, []idRef{{ID: id}}
+	}
+	writeJSON(w, out)
+}
+
+// AddDevice registers a DCIM device that belongs to NO cluster, so a scenario
+// can model a host that IS modelled in NetBox. Absent devices resolve to 0,
+// which is the untested-by-default case every existing scenario runs in.
+//
+// Cluster-less is the REAL default, not a corner case: a host inventoried by
+// something other than litevirt — a bare-metal provisioner, a hand-built DCIM
+// record — carries no virtualization cluster at all. NetBox refuses to put a
+// virtual_machine on such a device (see deviceClusterLocked), so this is the
+// shape that proves the mirror does not attach one.
 func (f *NetBoxFake) AddDevice(name string, id int) {
+	f.AddDeviceInCluster(name, id, 0)
+}
+
+// SeedCluster creates a virtualization cluster up front and returns its id, so
+// a scenario can model devices INSIDE it before any sweep has run. The mirror's
+// own EnsureCluster resolves by name and reuses this object, exactly as it
+// reuses a cluster a previous sweep created.
+func (f *NetBoxFake) SeedCluster(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id, ok := f.clusters[name]; ok {
+		return id
+	}
+	id := f.nextNamedID()
+	f.clusters[name] = id
+	return id
+}
+
+// AddDeviceInCluster registers a DCIM device that belongs to clusterID, which
+// is the only shape NetBox will accept as a virtual_machine's device.
+func (f *NetBoxFake) AddDeviceInCluster(name string, id, clusterID int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.devices[name] = id
+	f.deviceCluster[id] = clusterID
+}
+
+// deviceRefusalLocked mirrors NetBox's own validation: a virtual_machine may
+// only name a device that belongs to that VM's cluster. It returns the device
+// name and true when the write must be refused. Caller holds f.mu.
+//
+// deviceID 0 is "no link" and is ALWAYS allowed — that is the whole point of
+// the link being optional, and a guard that refused it would make every
+// unmodelled-host scenario fail for the wrong reason.
+//
+// Modelled here rather than assumed away because the fake NOT enforcing it is
+// precisely how a mirror that attaches an out-of-cluster device reached
+// production: every fleet scenario passed while the real NetBox answered 400.
+// primaryIPRefusalLocked mirrors NetBox's validation of primary_ip4: the address
+// must be assigned to an interface of THIS virtual machine. Returns true when
+// the write must be refused. Caller holds f.mu.
+//
+// id 0 is "no primary" and is always allowed — clearing it is legitimate.
+//
+// Modelled rather than assumed, for the same reason the device/cluster rule is:
+// a fake that accepted any id would let the mirror set a primary the real server
+// refuses, and every scenario built on it would be green while production 400s.
+func (f *NetBoxFake) primaryIPRefusalLocked(vmID, ipID int) bool {
+	if ipID == 0 {
+		return false
+	}
+	ip, known := f.byID[ipID]
+	if !known {
+		return true
+	}
+	// The address must hang off an interface, and that interface must belong to
+	// this VM.
+	iface, ok := f.ifaces[ip.AssignedObjectID]
+	return !ok || iface.VMID != vmID
+}
+
+func (f *NetBoxFake) deviceRefusalLocked(deviceID, clusterID int) (string, bool) {
+	if deviceID == 0 {
+		return "", false
+	}
+	// A device in no cluster (0) can never match a real cluster id, so the
+	// equality below is the whole rule.
+	if c, known := f.deviceCluster[deviceID]; known && c != 0 && c == clusterID {
+		return "", false
+	}
+	return f.deviceNameLocked(deviceID), true
 }
 
 // ── virtual machines ────────────────────────────────────────────────────────
@@ -210,6 +342,18 @@ func (f *NetBoxFake) createVM(w http.ResponseWriter, r *http.Request) {
 		writeValidationErr(w, "name", vmNameClashMsg)
 		return
 	}
+	if name, refuse := f.deviceRefusalLocked(vm.DeviceID, vm.ClusterID); refuse {
+		f.mu.Unlock()
+		writeValidationErr(w, "device", deviceOutsideClusterMsg(name))
+		return
+	}
+	// A create cannot name a primary: the VM has no interfaces yet, so no
+	// address can belong to it. NetBox refuses it and so does this.
+	if vm.PrimaryIP4ID != 0 {
+		f.mu.Unlock()
+		writeValidationErr(w, "primary_ip4", primaryIPNotOnVMMsg)
+		return
+	}
 	vm.ID = f.nextVMID()
 	f.vms[vm.ID] = vm
 	out := vmJSONOf(*vm)
@@ -240,13 +384,17 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		f.mu.Lock()
 		vm, known := f.vms[id]
 		var out vmView
-		var clash bool
+		var clash, badDevice, badPrimary bool
+		var badDeviceName string
 		if known {
 			// Applied to a COPY: a PATCH that would violate the constraint must
 			// leave the stored object untouched, exactly as a rejected write does.
 			next := *vm
 			applyVMBody(&next, body)
-			if clash = f.vmNameTakenLocked(next.Name, next.ClusterID, id); !clash {
+			clash = f.vmNameTakenLocked(next.Name, next.ClusterID, id)
+			badDeviceName, badDevice = f.deviceRefusalLocked(next.DeviceID, next.ClusterID)
+			badPrimary = f.primaryIPRefusalLocked(id, next.PrimaryIP4ID)
+			if !clash && !badDevice && !badPrimary {
 				*vm = next
 				out = vmJSONOf(*vm)
 			}
@@ -258,6 +406,14 @@ func (f *NetBoxFake) vmObject(w http.ResponseWriter, r *http.Request, id int) {
 		}
 		if clash {
 			writeValidationErr(w, "name", vmNameClashMsg)
+			return
+		}
+		if badDevice {
+			writeValidationErr(w, "device", deviceOutsideClusterMsg(badDeviceName))
+			return
+		}
+		if badPrimary {
+			writeValidationErr(w, "primary_ip4", primaryIPNotOnVMMsg)
 			return
 		}
 		writeJSON(w, out)
@@ -301,7 +457,9 @@ type vmBody struct {
 	Disk         *int               `json:"disk"`
 	Status       *string            `json:"status"`
 	CustomFields *map[string]string `json:"custom_fields"`
+	PrimaryIP4   *int               `json:"primary_ip4"`
 	hasDevice    bool
+	hasPrimary   bool
 }
 
 func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
@@ -313,6 +471,7 @@ func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
 	allowed := map[string]bool{
 		"name": true, "cluster": true, "device": true, "vcpus": true,
 		"memory": true, "disk": true, "status": true, "custom_fields": true,
+		"primary_ip4": true,
 	}
 	for k := range raw {
 		if !allowed[k] {
@@ -329,6 +488,7 @@ func decodeVMBody(w http.ResponseWriter, r *http.Request) (vmBody, bool) {
 		return vmBody{}, false
 	}
 	_, out.hasDevice = raw["device"]
+	_, out.hasPrimary = raw["primary_ip4"]
 	return out, true
 }
 
@@ -338,6 +498,13 @@ func applyVMBody(vm *fakeVM, b vmBody) {
 	}
 	if b.Cluster != nil {
 		vm.ClusterID = *b.Cluster
+	}
+	if b.hasPrimary {
+		// An explicit null clears the primary; the key being absent leaves it.
+		vm.PrimaryIP4ID = 0
+		if b.PrimaryIP4 != nil {
+			vm.PrimaryIP4ID = *b.PrimaryIP4
+		}
 	}
 	if b.hasDevice {
 		// An explicit null clears the link; the key being absent leaves it.
@@ -573,6 +740,28 @@ const (
 	ifaceNameClashMsg = "The fields virtual_machine, name must make a unique set."
 )
 
+// deviceOutsideClusterMsg is VirtualMachine.clean()'s third refusal, verbatim
+// from a real NetBox 4.4: a VM may only name a device that belongs to its own
+// cluster.
+// primaryIPNotOnVMMsg is NetBox's refusal when primary_ip4 names an address that
+// is not assigned to an interface of that virtual machine.
+const primaryIPNotOnVMMsg = "The specified IP address is not assigned to this VM."
+
+func deviceOutsideClusterMsg(device string) string {
+	return fmt.Sprintf("The selected device (%s) is not assigned to this cluster.", device)
+}
+
+// deviceNameLocked is the DCIM device's name, for the refusal message. Caller
+// holds f.mu.
+func (f *NetBoxFake) deviceNameLocked(id int) string {
+	for name, did := range f.devices {
+		if did == id {
+			return name
+		}
+	}
+	return fmt.Sprintf("device %d", id)
+}
+
 // vmNameTakenLocked reports whether some OTHER virtual machine in clusterID
 // already carries name. exclude is the id being written, so a PATCH that leaves
 // the name alone does not collide with itself. Caller holds f.mu.
@@ -622,6 +811,137 @@ func (f *NetBoxFake) VMCount(name string) int {
 		}
 	}
 	return n
+}
+
+// VMDeviceID is the DCIM device the named virtual_machine hangs off, or 0 for
+// no link (which is also what an absent VM reports — callers assert VMCount
+// first when the difference matters).
+func (f *NetBoxFake) VMDeviceID(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, vm := range f.vms {
+		if vm.Name == name {
+			return vm.DeviceID
+		}
+	}
+	return 0
+}
+
+// CreateVMDirect posts a virtual_machine through the fake's own HTTP surface,
+// bypassing the mirror. It exists so a scenario can prove the HARNESS enforces
+// a NetBox constraint — a fake that silently accepts what NetBox refuses makes
+// every scenario built on it vacuous.
+func (f *NetBoxFake) CreateVMDirect(name string, clusterID, deviceID int) error {
+	body := map[string]any{"name": name, "cluster": clusterID, "device": deviceID}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(f.URL()+vmsAPIPath, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, out)
+	}
+	return nil
+}
+
+// VMPrimaryIP4 is the named VM's primary_ip4 address id, or 0 for none.
+func (f *NetBoxFake) VMPrimaryIP4(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, vm := range f.vms {
+		if vm.Name == name {
+			return vm.PrimaryIP4ID
+		}
+	}
+	return 0
+}
+
+// InterfaceAddressID is the id of the address assigned to one VM's named
+// interface, or 0. It is what "primary_ip4 points at this VM's own address" is
+// asserted against — comparing against a hard-coded id would pass with the
+// primary pointing anywhere.
+func (f *NetBoxFake) InterfaceAddressID(vmName, ifaceName string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vmID := 0
+	for _, vm := range f.vms {
+		if vm.Name == vmName {
+			vmID = vm.ID
+		}
+	}
+	if vmID == 0 {
+		return 0
+	}
+	for _, iface := range f.ifaces {
+		if iface.VMID != vmID || iface.Name != ifaceName {
+			continue
+		}
+		for id, ip := range f.byID {
+			if ip.AssignedObjectID == iface.ID {
+				return id
+			}
+		}
+	}
+	return 0
+}
+
+// InterfaceMAC is the MAC on one VM's named interface, lower-cased, or "".
+func (f *NetBoxFake) InterfaceMAC(vmName, ifaceName string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vmID := 0
+	for _, vm := range f.vms {
+		if vm.Name == vmName {
+			vmID = vm.ID
+		}
+	}
+	for _, iface := range f.ifaces {
+		if iface.VMID == vmID && iface.Name == ifaceName {
+			return strings.ToLower(iface.MAC)
+		}
+	}
+	return ""
+}
+
+// SetVMPrimaryIP4Direct PATCHes primary_ip4 through the fake's own HTTP
+// surface, bypassing the mirror, so a scenario can prove the HARNESS enforces
+// NetBox's validation rather than trusting that it does.
+func (f *NetBoxFake) SetVMPrimaryIP4Direct(vmName string, ipID int) error {
+	f.mu.Lock()
+	id := 0
+	for _, vm := range f.vms {
+		if vm.Name == vmName {
+			id = vm.ID
+		}
+	}
+	f.mu.Unlock()
+	if id == 0 {
+		return fmt.Errorf("no virtual machine %q", vmName)
+	}
+	raw, err := json.Marshal(map[string]any{"primary_ip4": ipID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPatch, f.URL()+vmsAPIPath+strconv.Itoa(id)+"/", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, out)
+	}
+	return nil
 }
 
 // VMCountAll is every virtual_machine object.
@@ -909,7 +1229,15 @@ type vmView struct {
 	Status       *choiceRef        `json:"status"`
 	Cluster      *idRef            `json:"cluster"`
 	Device       *idRef            `json:"device"`
+	PrimaryIP4   *addrRef          `json:"primary_ip4"`
 	CustomFields map[string]string `json:"custom_fields"`
+}
+
+// addrRef is how NetBox nests an address reference: an id AND the address, so a
+// decoder that reads only one of them is still exercised.
+type addrRef struct {
+	ID      int    `json:"id"`
+	Address string `json:"address"`
 }
 
 func vmJSONOf(vm fakeVM) vmView {
@@ -928,6 +1256,9 @@ func vmJSONOf(vm fakeVM) vmView {
 	}
 	if vm.DeviceID != 0 {
 		out.Device = &idRef{ID: vm.DeviceID}
+	}
+	if vm.PrimaryIP4ID != 0 {
+		out.PrimaryIP4 = &addrRef{ID: vm.PrimaryIP4ID}
 	}
 	return out
 }

@@ -256,6 +256,11 @@ The new password is written to /etc/litevirt/admin-password.`,
 				if err := os.WriteFile("/etc/litevirt/admin-password", []byte(password+"\n"), 0600); err != nil {
 					return fmt.Errorf("write password file: %w", err)
 				}
+				// WriteFile applies its mode only on CREATE; an existing loose file
+				// would keep it and expose the plaintext cluster admin password.
+				if err := os.Chmod("/etc/litevirt/admin-password", 0600); err != nil {
+					return fmt.Errorf("tighten password file permissions: %w", err)
+				}
 				fmt.Println("Created admin user.")
 				fmt.Printf("Password written to /etc/litevirt/admin-password\n")
 				return nil
@@ -276,6 +281,11 @@ The new password is written to /etc/litevirt/admin-password.`,
 			}
 			if err := os.WriteFile("/etc/litevirt/admin-password", []byte(password+"\n"), 0600); err != nil {
 				return fmt.Errorf("write password file: %w", err)
+			}
+			// WriteFile applies its mode only on CREATE; an existing loose file
+			// would keep it and expose the plaintext cluster admin password.
+			if err := os.Chmod("/etc/litevirt/admin-password", 0600); err != nil {
+				return fmt.Errorf("tighten password file permissions: %w", err)
 			}
 			fmt.Println("Admin password reset.")
 			fmt.Printf("New password written to /etc/litevirt/admin-password\n")

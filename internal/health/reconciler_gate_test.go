@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -952,7 +953,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T00:00:00Z",
 	}); err != nil {
 		t.Fatalf("seed condition: %v", err)
@@ -978,7 +979,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T01:00:00Z",
 	}); err != nil {
 		t.Fatalf("resolve condition: %v", err)
@@ -987,5 +988,118 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	r.startPendingVM(ctx, *fresh)
 	if !startedOrDefined(fake, "vm1") {
 		t.Fatal("vm1 should start once the condition is resolved")
+	}
+}
+
+// pendingProofFixture stands up a VM with a pending reschedule proof, exactly
+// as the coordinator's decide site leaves it.
+func pendingProofFixture(t *testing.T, term int64, key, coordinator string) (*corrosion.Client, *libvirtfake.Fake, *Reconciler, corrosion.VMRecord) {
+	t.Helper()
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	proof := corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "node-a", Coordinator: coordinator,
+		LeaseTerm: term, LeaseKey: key,
+	}
+	if err := corrosion.WriteVMRescheduleProof(ctx, db, proof, "vm1", "node-a"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	return db, fake, r, *fresh
+}
+
+// TestStartPendingVM_LeaseTermGateRefusesAStaleTenure is the test whose ABSENCE
+// let the whole regime miss the failover path.
+//
+// A reschedule proof never travels over an RPC: the coordinator writes the row
+// with a pending marker and THIS code claims it off replication. Every
+// lease-term check in internal/grpcapi is therefore unreachable from here, and
+// a unit test that calls claimCarriedProof directly proves nothing about the
+// path production actually takes for a reschedule.
+func TestStartPendingVM_LeaseTermGateRefusesAStaleTenure(t *testing.T) {
+	ctx := context.Background()
+	db, fake, r, vm := pendingProofFixture(t, 5, corrosion.LeaseKeyFailover, "node-z")
+
+	var gotReason string
+	r.SetGateRefusedObserver(func(_, reason string) { gotReason = reason })
+	r.SetLeaseTermGate(func(context.Context, corrosion.ProofRecord) (*corrosion.TermFence, string, error) {
+		return nil, ReasonStaleLeaseTerm, errStaleForTest
+	})
+
+	r.startPendingVM(ctx, vm)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a VM was started from a proof the lease-term gate refused; the superseded " +
+			"coordinator's reschedule executed exactly as it would have before the feature")
+	}
+	if gotReason != ReasonStaleLeaseTerm {
+		t.Errorf("refusal reason = %q, want %q", gotReason, ReasonStaleLeaseTerm)
+	}
+	// And the proof stays unclaimed, so the legitimate coordinator can still use it.
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofPrepared {
+		t.Errorf("proof status = %q (ok=%v), want prepared — a refused proof must not be "+
+			"consumed", pr.Status, ok)
+	}
+}
+
+var errStaleForTest = errors.New("stale lease term")
+
+// TestStartPendingVM_LeaseTermGateAcceptsAndFences: the ordinary path still
+// starts the VM, and the claim carries the fence the gate returned — so a
+// second coordinator at the same term is refused by the claim itself.
+func TestStartPendingVM_LeaseTermGateAcceptsAndFences(t *testing.T) {
+	ctx := context.Background()
+	db, fake, r, vm := pendingProofFixture(t, 7, corrosion.LeaseKeyFailover, "node-a")
+
+	r.SetLeaseTermGate(func(_ context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error) {
+		return &corrosion.TermFence{
+			Key: pr.LeaseKey, Term: pr.LeaseTerm, Coordinator: pr.Coordinator,
+		}, "", nil
+	})
+
+	r.startPendingVM(ctx, vm)
+
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("the ordinary accepted path did not start the VM")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofCompleted {
+		t.Errorf("proof status = %q (ok=%v), want completed", pr.Status, ok)
+	}
+	// The claim recorded this host against term 7 for node-a, so a competing
+	// claimant's proof at the same term must now be refused by the fence.
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p-z", Action: corrosion.ActionReschedule, TargetKind: "vm", TargetName: "vm2",
+		DestHost: "node-a", Coordinator: "node-z", LeaseTerm: 7, LeaseKey: corrosion.LeaseKeyFailover,
+	}); err != nil {
+		t.Fatalf("seed competing proof: %v", err)
+	}
+	err := corrosion.ClaimActionProofFenced(ctx, db, "p-z", "node-a",
+		&corrosion.TermFence{Key: corrosion.LeaseKeyFailover, Term: 7, Coordinator: "node-z"})
+	if !errors.Is(err, corrosion.ErrTermClaimantConflict) {
+		t.Errorf("competing claimant at term 7 got %v, want ErrTermClaimantConflict — the "+
+			"reconciler's claim must have bound this host to node-a", err)
+	}
+}
+
+// TestStartPendingVM_NoLeaseTermGateIsInert: an unwired gate is the
+// pre-Phase-2 daemon, not a refusal. Failing closed on nil here would break
+// every failover on a node whose daemon predates the wiring.
+func TestStartPendingVM_NoLeaseTermGateIsInert(t *testing.T) {
+	ctx := context.Background()
+	_, fake, r, vm := pendingProofFixture(t, 0, "", "node-a")
+	// No SetLeaseTermGate call at all.
+	r.startPendingVM(ctx, vm)
+	if !startedOrDefined(fake, "vm1") {
+		t.Error("an unwired lease-term gate refused a start; nil must be inert, not closed")
 	}
 }

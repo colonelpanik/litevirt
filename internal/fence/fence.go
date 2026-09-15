@@ -5,11 +5,13 @@ package fence
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -137,27 +139,26 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 
 	slog.Info("fencing host via IPMI", "host", h.Name, "bmc", h.IPMIAddress)
 
-	args := []string{
-		"-I", "lanplus",
-		"-H", h.IPMIAddress,
-		"-U", h.IPMIUser,
-		"-P", h.IPMIPass,
-		"chassis", "power", "off",
-	}
-	cmd := exec.CommandContext(ctx, "ipmitool", args...)
+	cmd, cancel := ipmitoolCmd(ctx, h, "chassis", "power", "off")
 	out, runErr := cmd.CombinedOutput()
+	cancel()
 	detail := fmt.Sprintf("ipmitool chassis power off %s: %s", h.IPMIAddress, strings.TrimSpace(string(out)))
 
 	if runErr != nil {
-		return Result{Method: "ipmi", Detail: detail, Success: false}
+		return Result{Method: "ipmi", Detail: fmt.Sprintf("%s (%v)", detail, runErr), Success: false}
 	}
 
-	// Verify power is actually off (optional — give BMC up to 15s).
-	if verified := verifyIPMIPowerOff(ctx, h); !verified {
-		slog.Warn("IPMI fence sent but power-off not confirmed", "host", h.Name)
+	// The power-off command returning 0 means the BMC ACCEPTED the request, not
+	// that the chassis is down. Only the polled status proves the host cannot
+	// still be writing to shared storage, so an unconfirmed fence is a failure.
+	verified, verifyErr := verifyIPMIPowerOff(ctx, h)
+	if !verified {
+		slog.Warn("IPMI fence sent but power-off not confirmed",
+			"host", h.Name, "within", PowerOffVerifyTimeout, "error", verifyErr)
 		return Result{
-			Method:  "ipmi",
-			Detail:  detail + " (power-off not confirmed within 15s)",
+			Method: "ipmi",
+			Detail: fmt.Sprintf("%s (power-off not confirmed within %s: %v)",
+				detail, PowerOffVerifyTimeout, verifyErr),
 			Success: false,
 		}
 	}
@@ -165,28 +166,138 @@ func fenceIPMI(ctx context.Context, h HostConfig) Result {
 	return Result{Method: "ipmi", Detail: detail, Success: true}
 }
 
-// verifyIPMIPowerOff polls "chassis power status" up to 15 seconds.
-func verifyIPMIPowerOff(ctx context.Context, h HostConfig) bool {
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		args := []string{
-			"-I", "lanplus",
-			"-H", h.IPMIAddress,
-			"-U", h.IPMIUser,
-			"-P", h.IPMIPass,
-			"chassis", "power", "status",
+// ipmitoolPerCallTimeout bounds ONE ipmitool invocation. Without it a BMC that
+// accepts the TCP connection and then stops answering hangs the call for as
+// long as the caller's context allows — during a fence that is the whole
+// failover budget spent on a single unresponsive controller.
+const ipmitoolPerCallTimeout = 8 * time.Second
+
+// The power-off verification budget. These are vars rather than consts ONLY so
+// tests can shrink them; nothing in production reassigns them.
+var (
+	// PowerOffVerifyTimeout is the total wall-clock budget for confirming the
+	// chassis is off, across however many polls fit inside it.
+	PowerOffVerifyTimeout = 15 * time.Second
+	powerOffPollInterval  = 2 * time.Second
+)
+
+// chassisPowerOff is ipmitool's power-status line for a chassis that is off,
+// lowercased. Matched as a SUFFIX, never as a substring — see isChassisOff.
+const chassisPowerOff = "chassis power is off"
+
+// ipmitoolCmd builds one ipmitool invocation against h's BMC, with the password
+// passed through the environment instead of argv.
+//
+// `-P <pass>` puts the BMC password in the process table, where every local
+// user can read it off `ps` for the lifetime of the call. `-E` makes ipmitool
+// read it from the environment instead, which is not world-readable.
+//
+// Both IPMI_PASSWORD and IPMITOOL_PASSWORD are set to the same value on
+// purpose. Under `-E` ipmitool PREFERS IPMITOOL_PASSWORD, so setting only
+// IPMI_PASSWORD would let a value inherited from the daemon's own environment
+// silently override the per-host credential — every fence would then
+// authenticate with the wrong password and fail closed cluster-wide.
+//
+// `-N 1 -R 2` bounds the RMCP retry behaviour so an unreachable BMC fails in
+// about a second instead of sitting in ipmitool's default retry loop; the
+// returned CancelFunc must be called by the caller to release the timeout.
+func ipmitoolCmd(ctx context.Context, h HostConfig, ipmiArgs ...string) (*exec.Cmd, context.CancelFunc) {
+	cctx, cancel := context.WithTimeout(ctx, ipmitoolPerCallTimeout)
+	args := append([]string{
+		"-I", "lanplus",
+		"-H", h.IPMIAddress,
+		"-U", h.IPMIUser,
+		"-E",
+		"-N", "1",
+		"-R", "2",
+	}, ipmiArgs...)
+	cmd := exec.CommandContext(cctx, "ipmitool", args...)
+	cmd.Env = append(os.Environ(),
+		"IPMI_PASSWORD="+h.IPMIPass,
+		"IPMITOOL_PASSWORD="+h.IPMIPass,
+	)
+	// SIGTERM first so ipmitool can close its RMCP session; SIGKILL follows if
+	// it ignores that. Without WaitDelay a wedged child keeps the pipes open and
+	// Output() blocks past the timeout it was supposed to enforce.
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 2 * time.Second
+	return cmd, cancel
+}
+
+// verifyIPMIPowerOff polls "chassis power status" until the BMC reports the
+// chassis off, the budget expires, or ctx is done.
+//
+// It returns (true, nil) ONLY on a positive, anchored power-off reading. Any
+// other outcome returns false plus the last thing that went wrong, so the
+// caller can record WHY it could not confirm — "the BMC said the chassis is
+// still on" and "the BMC never answered" are very different facts about a host
+// that may still be writing to shared storage, and the old bool return
+// collapsed them into one indistinguishable false.
+func verifyIPMIPowerOff(ctx context.Context, h HostConfig) (bool, error) {
+	vctx, cancel := context.WithTimeout(ctx, PowerOffVerifyTimeout)
+	defer cancel()
+
+	lastErr := errors.New("no power-status reading was taken")
+	for {
+		// Checked at the top so an already-expired budget cannot slip one more
+		// ipmitool call past the deadline.
+		if vctx.Err() != nil {
+			return false, lastErr
 		}
-		out, err := exec.CommandContext(ctx, "ipmitool", args...).Output()
-		if err == nil && strings.Contains(string(out), "off") {
-			return true
+
+		started := time.Now()
+		cmd, cancelCall := ipmitoolCmd(vctx, h, "chassis", "power", "status")
+		out, err := cmd.Output()
+		cancelCall()
+
+		switch {
+		case err != nil:
+			lastErr = ipmitoolError(err)
+		case isChassisOff(out):
+			return true, nil
+		default:
+			lastErr = fmt.Errorf("chassis not off: %q", strings.TrimSpace(string(out)))
 		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(2 * time.Second):
+
+		// Pace from the START of the attempt, not its end: a call that already
+		// spent the interval should poll again immediately rather than adding
+		// another interval on top and wasting the budget.
+		if wait := powerOffPollInterval - time.Since(started); wait > 0 {
+			select {
+			case <-vctx.Done():
+				return false, lastErr
+			case <-time.After(wait):
+			}
 		}
 	}
-	return false
+}
+
+// isChassisOff reports whether out is ipmitool's power-status line for an off
+// chassis.
+//
+// The match is anchored at the end of the trimmed output. A substring search
+// for "off" — which is what this used to do — reads as confirmed power-off on
+// text that says nothing of the kind: an authentication failure mentioning
+// "Set Session Privilege Level failed", a "Powering off" transitional line, or
+// any BMC banner containing those three letters. Confirming a fence that never
+// happened is the one error this function must not make: it is the last check
+// between a live host and another node starting its VMs on the same disks.
+func isChassisOff(out []byte) bool {
+	return strings.HasSuffix(strings.ToLower(strings.TrimSpace(string(out))), chassisPowerOff)
+}
+
+// ipmitoolError folds a failed run's stderr into the returned error. exec's
+// ExitError prints only "exit status 1", which tells an operator reading the
+// fence log nothing about whether the BMC refused the credentials, was
+// unreachable, or rejected the command.
+func ipmitoolError(err error) error {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		if msg := strings.TrimSpace(string(ee.Stderr)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return err
 }
 
 // fenceManual logs an alert but does not attempt any automated action.

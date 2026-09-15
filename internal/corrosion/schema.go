@@ -355,7 +355,33 @@ import (
 //	     start on one rather than guessing at a migration, preserving the
 //	     evidence for a deliberate offline recovery — see
 //	     refusePrereleaseTrustDatabase in netbox_prerelease_boundary.go.
-const CurrentSchemaVersion = 51
+//	v52: leader-lease term ledger — leader_lease_terms, append-only with term in
+//	     the primary key, giving each lease acquisition a durable incarnation
+//	     number. leader_election is unchanged. Registered like audit_chain_heads
+//	     — append-only (immutable rows) plus the default content chain — because
+//	     concurrent minting of one (key, term) during a partition is the normal
+//	     path, not a fault, and a term's holder must never be rewritten. Nothing
+//	     enforces on a term. One new table.
+//	v53: leader-lease term enforcement — runtime_action_proofs gains lease_term,
+//	     the incarnation term of the coordinator that minted the proof. Gated by
+//	     lease_term_v1; 0 = minted without one. One additive column, appended
+//	     LAST in the CREATE TABLE so fresh and upgraded databases share one
+//	     physical column order (the v1 digest is positional).
+//	v54: the proof's lease KEY — runtime_action_proofs gains lease_key, naming
+//	     which of the three shared leases its lease_term was allocated under.
+//	     A term is meaningless without it: leader_lease_terms is shared by the
+//	     failover coordinator, the rebalancer and the dual-run detector, and
+//	     their term numbers collide by design, so an executor holding only a
+//	     term cannot tell which ledger to judge it against. Validated against
+//	     the keys a proof PRODUCER holds — not merely against the three names —
+//	     both on receipt and where a term is judged, since the reschedule path
+//	     reads this row rather than a carried proof and the row may come from a
+//	     peer that never narrowed it. An unknown key would read an empty ledger, find
+//	     MAX(term) = 0, and make anything naming it look current; a known but
+//	     unproduced key does the same thing against a real ledger that happens
+//	     to be idle.
+//	     One additive column, appended LAST for the same digest reason as v53.
+const CurrentSchemaVersion = 54
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -367,6 +393,36 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 	id         TEXT PRIMARY KEY,
 	applied_at TEXT NOT NULL,
 	checksum   TEXT NOT NULL
+)`
+
+// acknowledgedTiesDDL records which observed merge conflicts an operator has
+// stated they have seen, so the acknowledgement survives a daemon restart.
+//
+// Created by the framework rather than listed in schemaDDL, following
+// appliedMigrationsDDL above and for the same two reasons: it does not trip the
+// CI growth guard, so it costs no schema version, and it is LOCAL-ONLY. Every
+// write goes through execLocal (no mutation_log row) and the table is absent
+// from sync.go's tableNames, so peers never replicate it. That is deliberate,
+// not an oversight: an acknowledgement is a statement by one operator about
+// what ONE node's register showed, and replicating it would silence the same
+// conflict on nodes whose operator never looked at it.
+//
+// Durability is what makes the acknowledgement worth anything. Without it a
+// restart empties the in-memory register, the next anti-entropy sweep
+// re-registers the same tie — the two rows still disagree, which is the whole
+// point — and the operator is back where they started. The register alone is
+// not a remedy; the register plus this table is.
+//
+// content_pair is part of the identity, not just the payload: an acknowledgement
+// describes ONE observed divergence. A different divergence on the same row must
+// still surface, so a changed pair supersedes the row rather than matching it.
+const acknowledgedTiesDDL = `CREATE TABLE IF NOT EXISTS acknowledged_ties (
+	table_name      TEXT NOT NULL,
+	pk              TEXT NOT NULL,
+	content_pair    TEXT NOT NULL,
+	acknowledged_at TEXT NOT NULL,
+	acknowledged_by TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (table_name, pk)
 )`
 
 // InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
@@ -407,6 +463,16 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// The ledger meta-table itself.
 	if err := c.execLocal(ctx, appliedMigrationsDDL); err != nil {
 		return fmt.Errorf("create applied_migrations: %w", err)
+	}
+	// The local-only acknowledgement store, and the in-memory register it
+	// primes. Loaded here rather than lazily so a tie that arrives before
+	// anything asks about acknowledgements is still suppressed — the first
+	// anti-entropy sweep can land well before the first operator query.
+	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
+		return fmt.Errorf("create acknowledged_ties: %w", err)
+	}
+	if err := c.loadAcknowledgedTies(ctx); err != nil {
+		return fmt.Errorf("load acknowledged_ties: %w", err)
 	}
 	applied, err := loadAppliedMigrations(ctx, c)
 	if err != nil {
@@ -885,6 +951,64 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL
 	)`,
 
+	// Leader-lease TERM ledger (v52). APPEND-ONLY, with term in the primary key.
+	//
+	// leader_election says who holds a lease right now; it cannot say which
+	// INCARNATION of that lease, so a stale leader's writes are
+	// indistinguishable from a current leader's. This table supplies the
+	// incarnation number.
+	//
+	// The term is in the PK on purpose. A mutable `epoch INTEGER` on
+	// leader_election is exactly what LWW cannot protect: two nodes both write
+	// epoch=5, LWW picks by updated_at, one silently wins, and a lagging replica
+	// can resurrect a stale epoch. With every term retained as its own immutable
+	// row, a bump cannot be lost and a tombstoned-then-recreated row cannot
+	// restart the counter. Same argument as audit_chain_heads.
+	//
+	// Registered in customMergeTables with immutableMergeKeepLocalRow, NOT as an
+	// append-only table with the default content chain.
+	//
+	// It was registered that way first, by analogy to audit_chain_heads, and the
+	// analogy was wrong in the one way that mattered. audit_chain_heads has a
+	// per-host primary key, so two nodes never contend for one row; (key, term) is
+	// contended by construction, because two partitioned nodes both compute
+	// MAX(term)+1 and arrive at the same term with different holders. With that
+	// contention reachable, the two replication paths resolved it DIFFERENTLY: the
+	// WAL path applies an INSERT as INSERT OR IGNORE (first-writer-wins) while the
+	// anti-entropy dump path compares updated_at first (last-writer-wins). The same
+	// pair of claims therefore produced different holders on different nodes, and a
+	// WAL-converged node flipped its own answer on its next repair cycle — so the
+	// executor's (term, holder) check would refuse opposite claimants per node,
+	// which is a coin flip rather than fencing.
+	//
+	// immutableMergeKeepLocalRow keeps the local row on the anti-entropy path,
+	// which is precisely what INSERT OR IGNORE already does on the WAL path, so
+	// there is now ONE rule. It also gives tombstone dominance on both paths
+	// (tombstoneDominates runs first), which is what the GC prohibition at
+	// nextLeaseTerm depends on.
+	//
+	// What it deliberately does NOT do is converge a contested term. A genuine
+	// facts-conflict for one (key, term) is left unresolved and FLAGGED
+	// (lww_tie_unresolved, category immutable_conflict) rather than coin-flipped.
+	// Two nodes holding one tenure is the event this table exists to make visible;
+	// silently electing a winner would hand Phase-2 enforcement a confident answer
+	// to a question the cluster never agreed on. Enforcement must therefore treat
+	// an unresolved term as refuse, failing closed.
+	//
+	// This is NOT project_authority_epochs. That one converges deterministically
+	// because several nodes legitimately mint one project epoch, so freezing a
+	// conflict would strand it. Two holders for one lease term is not legitimate.
+	`CREATE TABLE IF NOT EXISTS leader_lease_terms (
+		key         TEXT NOT NULL,
+		term        INTEGER NOT NULL DEFAULT 0,
+		holder      TEXT NOT NULL DEFAULT '',
+		acquired_at TEXT NOT NULL,
+		created_at  TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT,
+		PRIMARY KEY (key, term)
+	)`,
+
 	// Per-VM startup leases held by health.reconciler so that during a failover
 	// race only one host actually issues libvirt.Start for a given VM.
 	`CREATE TABLE IF NOT EXISTS vm_locks (
@@ -933,7 +1057,18 @@ var schemaDDL = []string{
 		executor_host     TEXT NOT NULL DEFAULT '',
 		created_at        TEXT NOT NULL,
 		updated_at        TEXT NOT NULL,
-		deleted_at        TEXT
+		deleted_at        TEXT,
+		-- lease_term (v53) is LAST deliberately, after deleted_at, so this DDL
+		-- produces the SAME physical column order as the ALTER in
+		-- schemaMigrations. The v1 state digest hashes SELECT * positionally
+		-- (sync.go digestTableRows → encodeRowCells) and anti-entropy only prefers
+		-- the order-invariant v2 hash when BOTH peers emit one
+		-- (antientropy.go:181). A mid-DDL column would therefore make a
+		-- freshly-initialised v53 node and a v52→v53 upgraded node disagree
+		-- about this table's digest forever with identical rows, wherever
+		-- digest_v2 is off. Put every future additive column here, not above.
+		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
+		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -1685,11 +1820,20 @@ var schemaDDL = []string{
 		vm_name      TEXT NOT NULL,        -- the owner NAME (legacy column name); see owner_kind
 		owner_kind   TEXT NOT NULL DEFAULT 'vm',  -- 'vm' | 'ct' (v36)
 		owner_host   TEXT NOT NULL DEFAULT '',    -- '' for VMs (cluster-global names); host for CTs (v36)
-		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
-		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		allocated_at TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
+		-- The two NetBox join keys stay LAST, where their ALTERs append them.
+		-- The v1 state digest hashes SELECT * POSITIONALLY (digestTableRows ->
+		-- encodeRowCells), so a fresh node that CREATEs them mid-table and an
+		-- upgraded node that appends them after deleted_at produce different
+		-- digests for identical rows — permanently. digestMismatches then
+		-- reports ip_allocations as drifted on EVERY anti-entropy cycle, and
+		-- each one pulls a full cluster-state dump, while genuine divergence on
+		-- this table is masked because it is always already "drifted". Only
+		-- enforcement.digest_v2 on BOTH peers avoids it, and it defaults false.
+		netbox_ip_id      INTEGER,  -- NetBox join key: the IP object this lease claimed (v51)
+		netbox_prefix_id  INTEGER,  -- NetBox join key: the prefix this lease's network is bound to (v51)
 		PRIMARY KEY (network, ip)
 	)`,
 
@@ -2150,19 +2294,29 @@ var schemaDDL = []string{
 		observed_cidr       TEXT NOT NULL,
 		vrf_id              INTEGER NOT NULL,
 		cluster_fingerprint TEXT NOT NULL,
+		suspended           INTEGER NOT NULL DEFAULT 0,
+		suspend_reason      TEXT NOT NULL DEFAULT '',
+		validated_at        TEXT NOT NULL,
+		created_at          TEXT NOT NULL,
+		updated_at          TEXT NOT NULL,
+		deleted_at          TEXT,
 		-- The NetBox virtualization.cluster name the FIRST bind resolved, pinned
 		-- so a node whose netbox.cluster_name resolves to something else can
 		-- discover the disagreement and refuse to mirror. It has to be uniform
 		-- cluster-wide and, unlike an enforcement.* flag, has no latch to make it
 		-- so: a capability token cannot express a string. Defaulted rather than
 		-- NOT NULL-without-default so an older peer's writes still land.
-		netbox_cluster      TEXT NOT NULL DEFAULT '',
-		suspended           INTEGER NOT NULL DEFAULT 0,
-		suspend_reason      TEXT NOT NULL DEFAULT '',
-		validated_at        TEXT NOT NULL,
-		created_at          TEXT NOT NULL,
-		updated_at          TEXT NOT NULL,
-		deleted_at          TEXT
+		--
+		-- LAST, where its heal ALTER appends it. That ALTER exists precisely to
+		-- run on a real database — one created by an earlier v51 build, whose
+		-- table already exists so CREATE TABLE IF NOT EXISTS is a no-op — and
+		-- refusePrereleaseTrustDatabase does not refuse such a database, so it
+		-- boots and gets the column appended after deleted_at. netbox_bindings is
+		-- in sync.go's tableNames, so it is digested every anti-entropy tick, and
+		-- the v1 digest hashes SELECT * positionally: declaring this column 6th
+		-- while the ALTER appends it 12th made a freshly-created node and a healed
+		-- one disagree forever on identical rows.
+		netbox_cluster      TEXT NOT NULL DEFAULT ''
 	)`,
 
 	// Identity map: litevirt object -> NetBox object. Interfaces key on MAC, NOT
@@ -2282,6 +2436,13 @@ var schemaIndexes = []string{
 	// Partial-on-live so a logout (soft-delete) never blocks a subsequent login
 	// for the same triple; also backs the pull-time resolution lookup.
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_registry_creds_triple ON registry_credentials(scope, owner, registry) WHERE deleted_at IS NULL`,
+
+	// Leader-lease terms: PRIMARY KEY (key, term) covers the allocation read
+	// (MAX(term) per key) but neither of the per-holder lookups, and this table is
+	// retained forever by design — GC is refused at nextLeaseTerm — so an
+	// unindexed scan grows without bound on the renewal hot path, under the
+	// client read lock.
+	`CREATE INDEX IF NOT EXISTS idx_lease_terms_holder ON leader_lease_terms(key, holder, term) WHERE deleted_at IS NULL`,
 }
 
 // tablePrimaryKeys maps table names to their primary key column(s).
@@ -2369,6 +2530,7 @@ var tablePrimaryKeys = map[string][]string{
 	"vm_pci_realizations":     {"vm_name", "device_id", "member_id"},
 	"audit_signing_keys":      {"key_id"},
 	"audit_chain_heads":       {"host_name", "epoch", "seq"},
+	"leader_lease_terms":      {"key", "term"},
 	"audit_key_lifecycle":     {"host_name", "key_id", "event", "by_key_id"},
 	"netbox_bindings":         {"prefix_id"},
 	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
@@ -2601,6 +2763,15 @@ var schemaMigrations = []string{
 	// mark-only and this ALTER never runs. Same belt-and-braces shape as every
 	// other column here.
 	`ALTER TABLE netbox_bindings ADD COLUMN netbox_cluster TEXT NOT NULL DEFAULT ''`,
+	// v53: the proof's fencing term. Additive with a 0 default, so an existing
+	// row reads as "minted without a term" — the sentinel the executor refuses
+	// once lease_term_v1 is enforced, never a valid term.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_term INTEGER NOT NULL DEFAULT 0`,
+	// v54: which lease the term belongs to. lease_term alone is ambiguous —
+	// three subsystems share leader_lease_terms and their term numbers collide
+	// by design — so a term is only interpretable together with its key.
+	// Additive with a '' default, which pairs with lease_term 0.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2690,6 +2861,8 @@ var alterVersions = []int{
 	49, 49, // hosts.isolation_epoch/isolation_reason
 	51, 51, // ip_allocations.netbox_ip_id/netbox_prefix_id
 	51, // netbox_bindings.netbox_cluster
+	53, // runtime_action_proofs.lease_term
+	54, // runtime_action_proofs.lease_key
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2721,6 +2894,7 @@ var createTableUnits = []struct {
 	{50, "quota_reservations"},
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
+	{52, "leader_lease_terms"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

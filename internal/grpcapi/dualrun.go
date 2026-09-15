@@ -32,7 +32,10 @@ const (
 
 // dualRunLeaseKey elects the single node that runs the detector, so a fleet-wide
 // split-brain pages once (from the leader), not once per node.
-const dualRunLeaseKey = "dual_run_detector"
+// It aliases corrosion.LeaseKeyDualRun rather than re-spelling the string, so
+// this detector and anything that reasons about its lease ledger can never
+// disagree about which key it holds.
+const dualRunLeaseKey = corrosion.LeaseKeyDualRun
 
 // dualRunDebounce is the number of consecutive passes a finding must persist before it
 // pages: a real dual-run holds for >=1 interval; a migration/cutover clears within one.
@@ -199,30 +202,27 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 	}
 }
 
-// acquireDualRunLease takes/renews the dual_run_detector leader lease (mirrors the
-// rebalancer's lease: RFC3339 expiry compared bound-now-vs-stored so a dead leader's
-// lease looks expired without waiting for datetime('now')). TTL = 2x interval.
+// acquireDualRunLease takes/renews the dual_run_detector leader lease via the
+// shared corrosion helper, which carries the RFC3339 expiry compare that keeps a
+// dead leader's same-day lease from looking un-expired. TTL = 2x interval.
+//
+// time.Now() rather than an injectable clock is this detector's existing
+// behaviour: it is alert-only, has no virtual-time scenarios, and changing the
+// clock here is not part of wiring the term.
 func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration) bool {
-	now := time.Now().UTC().Format(time.RFC3339)
-	expires := time.Now().Add(2 * interval).UTC().Format(time.RFC3339)
-	if err := s.db.Execute(ctx,
-		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(key) DO UPDATE
-		   SET holder = excluded.holder,
-		       expires_at = excluded.expires_at,
-		       updated_at = excluded.updated_at
-		   WHERE leader_election.expires_at < ?
-		      OR leader_election.holder = excluded.holder`,
-		dualRunLeaseKey, s.hostName, expires, now, now); err != nil {
+	held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, s.db, dualRunLeaseKey, s.hostName, 2*interval, time.Now())
+	if err != nil {
 		slog.Warn("dual-run detector: lease write", "error", err)
+		s.dualRunLeaseTerm.Store(0)
 		return false
 	}
-	rows, err := s.db.Query(ctx, `SELECT holder FROM leader_election WHERE key = ?`, dualRunLeaseKey)
-	if err != nil || len(rows) == 0 {
+	if !held {
+		s.dualRunLeaseTerm.Store(0)
 		return false
 	}
-	return rows[0].String("holder") == s.hostName
+	s.dualRunLeaseTerm.Store(term)
+	return true
 }
 
 // detectDualRunPass runs one detector pass: gather runtime across workload-capable hosts,

@@ -110,6 +110,7 @@ message ClusterHealth {
     repeated HostCapacityAssessment capacity = 5;
     string generated_at = 6;   // RFC3339
 }
+
 message RescanHostRequest  { string name = 1; }
 message RescanHostResponse { int32 added = 1; int32 removed = 2;
     int32 total = 3; repeated PCIDevice devices = 4; }
@@ -296,6 +297,13 @@ message RuntimeInventory {
     bool complete = 5;
     repeated string errors = 6;
     string sampled_at = 7;          // RFC3339
+    // Unresolved ties restricted to the tables that carry an owner epoch. A
+    // subset of unresolved_tie_count, and the one an ownership reader cares
+    // about: a contested lease term is an unresolved tie but is not evidence
+    // about any workload's owner epoch. Absent from this message until v53,
+    // which meant a peer with several ownership ties decoded as a clean one —
+    // the fail-OPEN answer for a latch that never re-opens.
+    int32 ownership_tie_count = 8;
 }
 
 // OrphanProofRequest asks ONE host whether anything on it still claims an
@@ -1628,6 +1636,61 @@ message RuntimeActionProof {
     // advanced. Empty on a proof minted by a pre-owner_epoch node ⇒ the executor
     // skips the comparison until owner_epoch_v1 enforcement. Additive/wire-compatible.
     string owner_epoch      = 13;
+    // lease_term is the fencing term of the lease incarnation that minted this
+    // proof. The executor refuses a proof whose term is below the
+    // QUORUM-observed high-water mark for the key, or whose coordinator is not
+    // the holder this node recorded at that term. 0 = minted by a pre-v52 node
+    // ⇒ refused once lease_term_v1 is enforced, accepted before.
+    // Additive/wire-compatible.
+    int64  lease_term       = 14;
+    // lease_key names WHICH lease's ledger lease_term belongs to. Three
+    // subsystems share leader_lease_terms — the failover coordinator, the
+    // rebalancer and the dual-run detector — and their term numbers collide by
+    // design, so a term is not interpretable without it. The executor validates
+    // it against a CLOSED SET and refuses an unknown key: reading a nonexistent
+    // ledger yields MAX(term) = 0, which would pass every proof naming it.
+    // "" = minted by a pre-v53 node, and pairs with lease_term = 0.
+    // Additive/wire-compatible.
+    //
+    // Validation is NOT mere membership in those three. The key selects the
+    // ledger the threshold is computed from, so naming a quieter lease would
+    // move the bar; the executor accepts only a key a proof PRODUCER holds,
+    // which today is the failover lease alone. It is enforced both where a proof
+    // is received and where a term is judged — the reschedule path reads the
+    // replicated ROW rather than a carried proof, so the row cannot be trusted
+    // on the strength of some other node having checked it.
+    string lease_key        = 15;
+}
+
+message AcknowledgeLeaseTermTieRequest {
+    string key  = 1; // lease key, e.g. "failover"
+    int64  term = 2; // the contested term
+}
+message AcknowledgeLeaseTermTieResponse {
+    // acknowledged is false when no such tie was tracked on this node — an
+    // already-acknowledged term, a term that never contested, or a node that
+    // restarted since. Not an error: the command is idempotent.
+    bool acknowledged = 1;
+}
+
+message GetLeaseTermHighWaterRequest {
+    // key names which leader lease to answer about. Only the keys litevirt
+    // itself mints are accepted; an unknown key is InvalidArgument, NOT term 0,
+    // because 0 is the sentinel for "no term recorded" and would read as a
+    // legitimate answer.
+    string key = 1;
+}
+message GetLeaseTermHighWaterResponse {
+    // key echoes the request so a caller can detect a peer answering about a
+    // different ledger. A mismatch counts as no answer.
+    string key = 1;
+    // term is this node's newest LIVE term for key; 0 = none recorded, which is
+    // a legitimate answer and counts toward quorum. A node that cannot READ its
+    // ledger returns Unavailable instead, so it is counted as silent rather
+    // than as agreeing at 0.
+    int64 term = 2;
+    // holder is the holder recorded at that term; "" when term == 0.
+    string holder = 3;
 }
 
 message PromoteReplicaRequest {
@@ -1686,6 +1749,46 @@ message PingResponse {
   // recording the isolation (§A), because the quarantined node may not record
   // its own.
   bool wal_quarantined = 6;
+  // not_enforcing names capability tokens this node ADVERTISES but does not act
+  // on, because their `enforcement.*` / `auth.*` kill-switch is false locally.
+  //
+  // It exists because `capabilities` deliberately cannot answer this. A node
+  // advertises a token so the cluster can LATCH it while its own kill-switch is
+  // off, so a cluster can have a token fully latched while any subset of members
+  // silently does not enforce it — a state no peer and no operator could observe
+  // before this field. For the shared-storage fence that means a cross-host
+  // transfer of a shared-disk VM proceeding without the proof-grade fence anyone
+  // reading the latch would assume was in force.
+  //
+  // Like wal_quarantined, this is a SELF-REPORT OF DEGRADATION: the one
+  // direction worth trusting, since a node lying about its posture claims to
+  // enforce, not to skip. And like wal_quarantined it is DIAGNOSTIC ONLY —
+  // consumed by `lv doctor fence` to tell an operator what is not switched on.
+  //
+  // NOTHING in an enforcement decision path may read this field. The rule in
+  // advertisedCapabilities still stands in both directions: a peer's
+  // advertisement is not proof it enforces, and this list is not proof it does
+  // not. An empty list from a peer that predates the field means "unknown", NOT
+  // "everything is enforced" — a caller that cannot tell must say so rather than
+  // report all-clear.
+  repeated string not_enforcing = 7;
+  // posture_reported disambiguates an empty not_enforcing list, which otherwise
+  // has two very different meanings: "this node enforces everything it
+  // advertises" and "nothing was said". False means UNKNOWN, and a consumer must
+  // never read it as all-clear.
+  //
+  // False has TWO causes and they are not distinguishable on the wire, which is
+  // deliberate: the peer predates this field, or it declined to answer THIS
+  // caller. Posture is served only to a caller presenting a host certificate,
+  // because Ping bypasses the identity interceptor (skipAuth) and this list
+  // names which security kill-switches are off — the distributable lv-cli
+  // certificate would otherwise read it with no session and no role. Report the
+  // ambiguity rather than guessing: naming version skew would send an operator
+  // to upgrade a fleet over a credential property of the node they asked from.
+  //
+  // wall_clock got away without a companion flag because its zero value is not
+  // a legal reading; an empty token list is, so it needs one.
+  bool posture_reported = 8;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -2056,6 +2159,7 @@ service LiteVirt {
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
+    rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -2353,6 +2457,22 @@ service LiteVirt {
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);
+    // AcknowledgeLeaseTermTie records that an operator has seen a contested
+    // lease term on THIS node and drops it from the node's unresolved-tie
+    // register. Both claims stay in the ledger; only the evidence tracking is
+    // cleared, and the acknowledgement itself is written to the audit log.
+    //
+    // Per-node by design and deliberately NOT peer-callable: the register is
+    // node-local, and a node must not acknowledge its own contest. An operator
+    // acknowledges on each host the ha.lww.unresolved condition names.
+    rpc AcknowledgeLeaseTermTie(AcknowledgeLeaseTermTieRequest) returns (AcknowledgeLeaseTermTieResponse);
+
+    // GetLeaseTermHighWater reports this node's newest lease term for a key.
+    // Peer-callable, read-only, no side effects. It is the quorum read
+    // barrier's input: an executor fans this out before validating a proof, so
+    // its rejection threshold is quorum-observed rather than its own
+    // possibly-stale replica. It must never itself invoke the barrier.
+    rpc GetLeaseTermHighWater(GetLeaseTermHighWaterRequest) returns (GetLeaseTermHighWaterResponse);
     rpc GetStateDump(google.protobuf.Empty)         returns (StateDumpResponse);
     // StreamStateDump is the chunked replacement for GetStateDump: it streams
     // the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -2996,4 +3116,64 @@ message ReserveHostCapacityResponse {
 }
 message ReleaseHostCapacityRequest {
     string lease_id = 1;
+}
+
+// ── Shared-storage fence readiness (diagnostic) ──
+//
+// Declared at the END of this file deliberately: protoc-gen-go indexes messages
+// by declaration order, so inserting these beside ClusterHealth renumbered every
+// message after them and turned a two-message addition into a 4,300-line
+// generated diff. Appending keeps every existing index stable.
+// One host's shared-storage-fence posture, as it reported for itself.
+message FenceHostPosture {
+    string host = 1;
+    // reachable=false means the host did not answer a fresh Ping, so its posture
+    // is UNKNOWN and must not be read as either enforcing or not.
+    bool   reachable = 2;
+    // enforcing is meaningful only when reachable AND posture_known. A host
+    // running a binary that predates PingResponse.not_enforcing cannot report
+    // its kill-switch at all.
+    bool   enforcing = 3;
+    bool   posture_known = 4;
+    string detail = 5;
+}
+
+// FenceReadiness answers one question: if a shared-disk VM had to move hosts
+// right now, would the proof-grade fence actually run?
+//
+// It is a DIAGNOSTIC, never an input to a fencing decision. The reason it must
+// exist as its own read is that neither half of the answer was observable:
+// capability_latched is visible in the mesh, but the per-node kill-switch is
+// local config, so a cluster could show a fully latched token while members
+// silently skipped the fence.
+message FenceReadiness {
+    // capability_latched: shared_storage_fence_v1 is latched ON THE RESPONDING
+    // NODE. The latch is per-node state (internal/health.Checker's activated map
+    // plus its marker files), so this is NOT proof every peer has latched: during
+    // a rollout one node can latch before another finishes its own sweep. A peer
+    // that has not latched will take the legacy path however its config flag
+    // reads, and that is not visible from here — see FenceReadiness's
+    // known-limits note.
+    bool capability_latched = 1;
+    // enforced_everywhere: every host is reachable, reported its posture, and has
+    // its enforcement.shared_storage_fence flag ON. False when ANY host is not
+    // enforcing OR its posture is unknown — "we cannot tell" is never reported as
+    // all-clear.
+    //
+    // It covers the per-host CONFIG half only. The other half of
+    // sharedStorageFenceActive — each peer's own latch — has no wire
+    // representation, so true here means "nothing is switched off", not "every
+    // node will fence".
+    bool enforced_everywhere = 2;
+    // Workloads that would be exposed: a VM with a disk on shared storage
+    // (nfs/ceph/rbd/iscsi), which a second host can open and write.
+    //
+    // Counted from the RESPONDING NODE'S replicated vm_disks rows. A VM created
+    // on a peer whose disk rows have not replicated here yet is not counted, so
+    // a zero is "none that this node knows of", not "none exist".
+    int32 vms_with_shared_disk = 3;
+    // A few affected VM names, for the operator to recognise. Not exhaustive.
+    repeated string sample_vms = 4;
+    repeated FenceHostPosture hosts = 5;
+    string generated_at = 6;   // RFC3339
 }

@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -269,4 +270,131 @@ func TestChecker_TLSLoadFailureAnchorsWarmup(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("QuorumProof never reached Unknown despite the startedAt anchor (last=%v) — false quorum-loss on TLS failure", st)
+}
+
+// TestQuorumProof_PostFenceSlackAcrossClusterSizes pins the arithmetic that
+// grpcapi's leaseTermMinVotingHosts floor is chosen on — after the fence, not
+// before it.
+//
+// The floor's rationale used to invoke the single-host-outage case: two hosts are
+// unsafe because a majority is both of them, so three is "survivable". The flaw
+// is that it counted hosts BEFORE the loss. The coordinator persists the failed
+// host fenced/offline before it stamps the reschedule proof, and the barrier can
+// only ever gather self plus the SURVIVING peers, so what matters is the slack
+// between what it can gather and what it needs:
+//
+//	hosts  denom  needed  canAnswer  slack
+//	    2      1       1          1      0
+//	    3      2       2          2      0   <- every survivor mandatory
+//	    4      3       2          3      1   <- first size that tolerates one
+//	    5      4       3          4      1
+//
+// So at three hosts every survivor's answer is mandatory for every accepted
+// proof, and four is the smallest cluster where one slow or silent peer still
+// leaves a quorum. Three is kept anyway, deliberately — raising the floor would
+// leave the minimum supported cluster with no lease-term enforcement at all,
+// and a missed answer is a retry (the reconciler leaves the VM pending) rather
+// than a stranded workload.
+//
+// The second thing pinned here is that VotingEligible's exclusion of a fenced
+// host HELPS. It is tempting to read it as the cause of the tight three-host
+// case; it is not. Keeping the fenced host in the denominator would make FOUR
+// hosts slack-0 as well (denom 4, needed 3, canAnswer 3), pushing the first
+// tolerant size out to five. The exclusion is load-bearing in the safe
+// direction and must not be "corrected".
+func TestQuorumProof_PostFenceSlackAcrossClusterSizes(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		hosts             int
+		wantNeeded        int
+		wantCanAnswer     int
+		wantSlack         int
+		survivorMandatory bool
+	}{
+		{hosts: 3, wantNeeded: 2, wantCanAnswer: 2, wantSlack: 0, survivorMandatory: true},
+		{hosts: 4, wantNeeded: 2, wantCanAnswer: 3, wantSlack: 1},
+		{hosts: 5, wantNeeded: 3, wantCanAnswer: 4, wantSlack: 1},
+	} {
+		t.Run(fmt.Sprintf("%dhosts", tc.hosts), func(t *testing.T) {
+			db := testCheckHostDB(t)
+			names := make([]string, tc.hosts)
+			for i := range names {
+				names[i] = fmt.Sprintf("host-%d", i)
+				gateHost(t, db, names[i], "active", "worker")
+			}
+			self, doomed := names[0], names[tc.hosts-1]
+
+			c := NewChecker(self, "/etc/litevirt/pki", db)
+
+			// The last host dies and the coordinator fences it. Every other peer
+			// is probed healthy; the fenced one is not.
+			if err := corrosion.UpdateHostState(ctx, db, doomed, "fenced"); err != nil {
+				t.Fatalf("UpdateHostState(fenced): %v", err)
+			}
+			probes := map[string]bool{}
+			for _, n := range names[1:] {
+				probes[n] = n != doomed
+			}
+			warm(c, probes)
+
+			st, _, needed := c.QuorumProof(ctx)
+			if st != QuorumYes {
+				t.Fatalf("state = %d, want QuorumYes with every survivor healthy", st)
+			}
+			if needed != tc.wantNeeded {
+				t.Errorf("needed = %d, want %d", needed, tc.wantNeeded)
+			}
+
+			peers := c.HealthyPeers(ctx)
+			for _, p := range peers {
+				if p == doomed {
+					t.Errorf("HealthyPeers included the fenced host %q, which cannot answer "+
+						"the barrier and must not be counted as able to", doomed)
+				}
+			}
+			canAnswer := len(peers) + 1 // self reads its own ledger
+			if canAnswer != tc.wantCanAnswer {
+				t.Errorf("canAnswer = %d, want %d", canAnswer, tc.wantCanAnswer)
+			}
+
+			if slack := canAnswer - needed; slack != tc.wantSlack {
+				t.Errorf("slack = %d, want %d: this is the number of surviving peers that may "+
+					"miss leaseBarrierBudget while the barrier still reaches a quorum, and "+
+					"it is the number the enforcement floor is actually chosen on",
+					slack, tc.wantSlack)
+			}
+
+			if tc.survivorMandatory && canAnswer != needed {
+				t.Errorf("canAnswer=%d needed=%d: at this size every survivor's answer is "+
+					"supposed to be mandatory, and the equality is what makes it so",
+					canAnswer, needed)
+			}
+
+			// A fence does not require the box to stop answering. `lv host fence`
+			// on a responsive host, and a fence confirmed by IPMI while the BMC
+			// still serves the daemon, both leave a host that probes HEALTHY and
+			// is nonetheless out of the cluster. Only VotingEligible excludes it
+			// — the probe filter above does not — so pin it here, or the state
+			// filter in HealthyPeers can be deleted without any test noticing.
+			warm(c, func() map[string]bool {
+				p := map[string]bool{}
+				for _, n := range names[1:] {
+					p[n] = true // including the fenced one
+				}
+				return p
+			}())
+			for _, p := range c.HealthyPeers(ctx) {
+				if p == doomed {
+					t.Errorf("HealthyPeers included %q, which is fenced but still probing "+
+						"healthy; a fenced host must not answer the barrier for the "+
+						"cluster it was just evicted from", doomed)
+				}
+			}
+			if _, _, n := c.QuorumProof(ctx); n != tc.wantNeeded {
+				t.Errorf("needed = %d, want %d: a fenced host that still answers must not "+
+					"re-enter the denominator either", n, tc.wantNeeded)
+			}
+		})
+	}
 }

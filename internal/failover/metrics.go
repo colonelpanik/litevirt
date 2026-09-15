@@ -12,6 +12,18 @@ type Metrics interface {
 	VMAction(action, result, errorClass string)
 	// ContainerAction records a per-container failover action outcome (relocate).
 	ContainerAction(action, result, errorClass string)
+	// StrandedWorkloads reports how many workloads are still assigned to a host
+	// in state 'fenced' or 'offline' that failover would move off a dead host. A
+	// GAUGE, not a counter: it is a current condition an operator resolves, not
+	// an event rate.
+	//
+	// It is the LEASE HOLDER's view — every node calls this, and a node that is
+	// not driving failover reports 0 (see stepDownGauges), so a fleet-wide alert
+	// must take the max across instances or join on litevirt_failover_leader
+	// rather than averaging. Zero is the normal value; a sustained non-zero needs
+	// a human, and what they should do depends on WHY the host is down — see
+	// strandedWorkloads.
+	StrandedWorkloads(n int)
 }
 
 // Phases, results, actions, and error classes are a CLOSED vocabulary kept as
@@ -45,6 +57,7 @@ const (
 	ErrDestUngated       = "dest_ungated" // target no longer advertises the split-brain gate
 	ErrSelfFenced        = "self_fenced"  // this coordinator self-fenced; skips driving failover until reboot
 	ErrLeaseLost         = "lease_lost"
+	ErrStaleLeaseTerm    = "stale_lease_term" // still named holder locally, but a peer's term has superseded ours
 	ErrNotLeader         = "not_leader"
 	ErrTerminalState     = "terminal_state"
 	ErrAlreadyFenced     = "already_fenced"
@@ -84,5 +97,12 @@ func (c *Coordinator) mVM(action, result, errClass string) {
 func (c *Coordinator) mCt(action, result, errClass string) {
 	if c.Metrics != nil {
 		c.Metrics.ContainerAction(action, result, errClass)
+	}
+}
+
+// mStranded reports the stranded-workload gauge (nil-safe, like the rest).
+func (c *Coordinator) mStranded(n int) {
+	if c.Metrics != nil {
+		c.Metrics.StrandedWorkloads(n)
 	}
 }

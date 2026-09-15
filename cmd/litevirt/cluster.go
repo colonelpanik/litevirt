@@ -127,8 +127,8 @@ type digestVersion struct {
 }
 
 func digestVersions(dig *pb.ClusterStateDigestResponse) digestVersion {
-	seen := map[string]bool{}    // table -> reported by at least one host
-	allV2 := map[string]bool{}   // table -> every reporting host supplied hash_v2 (so far)
+	seen := map[string]bool{}  // table -> reported by at least one host
+	allV2 := map[string]bool{} // table -> every reporting host supplied hash_v2 (so far)
 	for _, h := range dig.GetHosts() {
 		for _, t := range h.GetTables() {
 			name := t.GetName()

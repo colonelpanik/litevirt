@@ -77,30 +77,30 @@ type mockGRPC struct {
 	// Track calls
 	lastListVMsReq        *pb.ListVMsRequest
 	lastListContainersReq *pb.ListContainersRequest
-	lastInspectVMName    string
-	lastInspectHostName  string
-	lastStartVMName      string
-	lastStopVMName       string
-	lastStopVMReq        *pb.StopVMRequest
-	lastRemoveHostReq    *pb.RemoveHostRequest
-	lastRestartVMName    string
-	lastDeleteVMName     string
-	lastDeleteVMReq      *pb.DeleteVMRequest
-	deleteVMCalled       bool
-	lastInspectLBName    string
-	lastUpdateLBReq      *pb.UpdateLBRequest
-	lastDeleteLBName     string
-	deleteLBCalled       bool
-	lastLBStatsName      string
-	lastDrainReq         *pb.DrainBackendRequest
-	lastDisableReq       *pb.DisableBackendRequest
-	lastEnableReq        *pb.EnableBackendRequest
-	lastGetNetworkName   string
-	lastDeleteNetworkReq *pb.DeleteNetworkRequest
-	deleteNetworkCalled  bool
-	lastCreateNetworkReq *pb.CreateNetworkRequest
-	lastCreateLBReq      *pb.CreateLBRequest
-	lastMigrateStackReq  *pb.MigrateStackVolumesRequest
+	lastInspectVMName     string
+	lastInspectHostName   string
+	lastStartVMName       string
+	lastStopVMName        string
+	lastStopVMReq         *pb.StopVMRequest
+	lastRemoveHostReq     *pb.RemoveHostRequest
+	lastRestartVMName     string
+	lastDeleteVMName      string
+	lastDeleteVMReq       *pb.DeleteVMRequest
+	deleteVMCalled        bool
+	lastInspectLBName     string
+	lastUpdateLBReq       *pb.UpdateLBRequest
+	lastDeleteLBName      string
+	deleteLBCalled        bool
+	lastLBStatsName       string
+	lastDrainReq          *pb.DrainBackendRequest
+	lastDisableReq        *pb.DisableBackendRequest
+	lastEnableReq         *pb.EnableBackendRequest
+	lastGetNetworkName    string
+	lastDeleteNetworkReq  *pb.DeleteNetworkRequest
+	deleteNetworkCalled   bool
+	lastCreateNetworkReq  *pb.CreateNetworkRequest
+	lastCreateLBReq       *pb.CreateLBRequest
+	lastMigrateStackReq   *pb.MigrateStackVolumesRequest
 
 	// Host action tracking
 	lastDrainHostName    string

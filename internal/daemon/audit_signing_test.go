@@ -143,7 +143,7 @@ func TestRotation_CompletesWithEnforcementOff(t *testing.T) {
 	}
 	if n := auditCount(t, d.db,
 		`SELECT count(*) AS n FROM audit_signing_keys WHERE key_id = ?`, newKR.KeyID()); n != 1 {
-		t.Fatalf("the new certificate was never published, so no peer can verify anything "+
+		t.Fatalf("the new certificate was never published, so no peer can verify anything " +
 			"this host signs from now on")
 	}
 	// The seal: a head signed by the NEW key over everything the old one wrote.

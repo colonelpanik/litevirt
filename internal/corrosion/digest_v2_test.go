@@ -86,9 +86,9 @@ func TestCanonicalCellValue_CrossPath(t *testing.T) {
 	eq(int64(42), float64(42))
 	eq(int64(42), json.Number("42"))
 	eq(int64(5000000000), float64(5000000000))
-	eq(int64(5000000000), json.Number("5e9"))     // exponent form normalizes
+	eq(int64(5000000000), json.Number("5e9"))                    // exponent form normalizes
 	eq(int64(9007199254740993), json.Number("9007199254740993")) // 2^53+1 lossless via big.Int
-	eq(float64(0), math.Copysign(0, -1))           // -0 == 0
+	eq(float64(0), math.Copysign(0, -1))                         // -0 == 0
 	eq("x", []byte("x"))
 	// non-finite is corruption
 	if _, err := canonicalCellValue(math.Inf(1)); err == nil {

@@ -147,10 +147,10 @@ func TestGeneratePoolXML_UnsupportedDriver(t *testing.T) {
 
 func TestSplitNFSSource(t *testing.T) {
 	tests := []struct {
-		input    string
-		host     string
-		path     string
-		wantOK   bool
+		input  string
+		host   string
+		path   string
+		wantOK bool
 	}{
 		{"nas:/export", "nas", "/export", true},
 		{"10.0.0.1:/mnt/data", "10.0.0.1", "/mnt/data", true},

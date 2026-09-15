@@ -17,7 +17,7 @@ type fakeDevice struct {
 	data []byte
 }
 
-func (f *fakeDevice) Size() int64                          { return int64(len(f.data)) }
+func (f *fakeDevice) Size() int64 { return int64(len(f.data)) }
 func (f *fakeDevice) ReadAt(p []byte, off int64) (int, error) {
 	if off >= int64(len(f.data)) {
 		return 0, io.EOF

@@ -33,55 +33,55 @@ type mockGRPC struct {
 
 	mu sync.Mutex
 	// Response fields
-	listHostsResp        *pb.ListHostsResponse
-	listHostNetworksResp *pb.ListHostNetworksResponse
+	listHostsResp         *pb.ListHostsResponse
+	listHostNetworksResp  *pb.ListHostNetworksResponse
 	lastUpsertHostNetwork *pb.UpsertHostNetworkRequest
 	lastApplyHostNetwork  *pb.ApplyHostNetworkRequest
 	lastDeleteHostNetwork *pb.DeleteHostNetworkRequest
 	planHostNetworkResp   *pb.PlanHostNetworkResponse
-	inspectHostResp      *pb.Host
-	inspectHostErr       error
-	listVMsResp          *pb.ListVMsResponse
-	inspectVMResp        *pb.VM
-	inspectVMErr         error
-	listStacksResp       *pb.ListStacksResponse
-	listImagesResp       *pb.ListImagesResponse
-	listContainersResp   *pb.ListContainersResponse
-	listSchedulesResp    *pb.ListBackupSchedulesResponse
-	listUsersResp        *pb.ListUsersResponse
-	listNetworksResp     *pb.ListNetworksResponse
-	listLBsResp          *pb.ListLBResponse
-	inspectLBResp        *pb.LoadBalancer
-	inspectLBErr         error
-	auditLogResp         *pb.ListAuditLogResponse
-	loginResp            *pb.LoginResponse
-	loginErr             error
-	vmStatsResp          *pb.VMStats
-	vmStatsErr           error
-	hostStatsResp        *pb.HostResourceStats
-	hostStatsErr         error
-	lbStatsResp          *pb.LBStatsResponse
-	lbStatsErr           error
-	fenceHostResp        *pb.FenceResult
-	listHostDevicesResp  *pb.ListHostDevicesResponse
-	configureHostResp    *pb.Host
-	listSnapshotsResp    *pb.ListSnapshotsResponse
-	createNetworkResp    *pb.NetworkInfo
-	diffStackResp        *pb.DiffStackResponse
-	diffStackErr         error
-	clusterStatusResp    *pb.ClusterStatus
-	listStoragePoolsResp *pb.ListStoragePoolsResponse
-	spiceInfoResp        *pb.GetSpiceInfoResponse
-	spiceInfoErr         error
-	lastSetLabelsVMReq   *pb.SetVMLabelsRequest
-	setLabelsVMErr       error
-	poolContentsResp     *pb.ListStoragePoolContentsResponse
-	poolContentsErr      error
-	lastPoolContentsReq  *pb.ListStoragePoolContentsRequest
-	listVMHardwareResp   *pb.ListVMHardwareResponse
-	listVMHardwareErr    error
-	uploadStream         *fakeUploadStream
-	uploadStreamErr      error
+	inspectHostResp       *pb.Host
+	inspectHostErr        error
+	listVMsResp           *pb.ListVMsResponse
+	inspectVMResp         *pb.VM
+	inspectVMErr          error
+	listStacksResp        *pb.ListStacksResponse
+	listImagesResp        *pb.ListImagesResponse
+	listContainersResp    *pb.ListContainersResponse
+	listSchedulesResp     *pb.ListBackupSchedulesResponse
+	listUsersResp         *pb.ListUsersResponse
+	listNetworksResp      *pb.ListNetworksResponse
+	listLBsResp           *pb.ListLBResponse
+	inspectLBResp         *pb.LoadBalancer
+	inspectLBErr          error
+	auditLogResp          *pb.ListAuditLogResponse
+	loginResp             *pb.LoginResponse
+	loginErr              error
+	vmStatsResp           *pb.VMStats
+	vmStatsErr            error
+	hostStatsResp         *pb.HostResourceStats
+	hostStatsErr          error
+	lbStatsResp           *pb.LBStatsResponse
+	lbStatsErr            error
+	fenceHostResp         *pb.FenceResult
+	listHostDevicesResp   *pb.ListHostDevicesResponse
+	configureHostResp     *pb.Host
+	listSnapshotsResp     *pb.ListSnapshotsResponse
+	createNetworkResp     *pb.NetworkInfo
+	diffStackResp         *pb.DiffStackResponse
+	diffStackErr          error
+	clusterStatusResp     *pb.ClusterStatus
+	listStoragePoolsResp  *pb.ListStoragePoolsResponse
+	spiceInfoResp         *pb.GetSpiceInfoResponse
+	spiceInfoErr          error
+	lastSetLabelsVMReq    *pb.SetVMLabelsRequest
+	setLabelsVMErr        error
+	poolContentsResp      *pb.ListStoragePoolContentsResponse
+	poolContentsErr       error
+	lastPoolContentsReq   *pb.ListStoragePoolContentsRequest
+	listVMHardwareResp    *pb.ListVMHardwareResponse
+	listVMHardwareErr     error
+	uploadStream          *fakeUploadStream
+	uploadStreamErr       error
 
 	// Error injection for actions
 	startVMErr         error

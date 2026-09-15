@@ -45,7 +45,7 @@ func TestProvision_Bridge(t *testing.T) {
 		Type:      "bridge",
 		Interface: "lv-test-br99",
 	}
-	bridge, err := Provision(ctx, db, "test-net", def,"10.0.0.1", "host1")
+	bridge, err := Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
 	if err != nil {
 		t.Fatalf("Provision bridge: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestProvision_VXLAN(t *testing.T) {
 		VNI:       500,
 		Underlay:  "eth0",
 	}
-	bridge, err := Provision(ctx, db, "test-net", def,"10.1.0.1", "host1")
+	bridge, err := Provision(ctx, db, "test-net", def, "10.1.0.1", "host1")
 	if err != nil {
 		t.Fatalf("Provision vxlan: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestProvision_WithSubnet(t *testing.T) {
 		Underlay:  "eth0",
 		Subnet:    "10.200.0.0/24",
 	}
-	_, err = Provision(ctx, db, "test-net", def,"10.1.0.2", "host1")
+	_, err = Provision(ctx, db, "test-net", def, "10.1.0.2", "host1")
 	if err != nil {
 		t.Fatalf("Provision with subnet: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestProvision_SRIOV(t *testing.T) {
 		Type: "sriov",
 		PF:   "ens3f0",
 	}
-	pf, err := Provision(ctx, db, "test-net", def,"10.0.0.1", "host1")
+	pf, err := Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
 	if err != nil {
 		t.Fatalf("Provision sriov: %v", err)
 	}

@@ -324,11 +324,11 @@ func TestRender_HostIsolationDropAndExceptions(t *testing.T) {
 
 func TestValidate_NATRejectsBadInput(t *testing.T) {
 	cases := []Plan{
-		{NAT: []NATRule{{Subnet: "", Bridge: "br0"}}},                                  // empty subnet
-		{NAT: []NATRule{{Subnet: "fd00::/64", Bridge: "br0"}}},                          // IPv6 subnet
-		{NAT: []NATRule{{Subnet: "10.0.0.0/24"}}},                                       // masquerade w/o bridge
-		{NAT: []NATRule{{Subnet: "10.0.0.0/24", SNATTo: "1.2.3.4"}}},                     // SNAT w/o out-iface
-		{HostIsolation: []IsolationChain{{Bridge: ""}}},                                 // empty bridge
+		{NAT: []NATRule{{Subnet: "", Bridge: "br0"}}},                                                                            // empty subnet
+		{NAT: []NATRule{{Subnet: "fd00::/64", Bridge: "br0"}}},                                                                   // IPv6 subnet
+		{NAT: []NATRule{{Subnet: "10.0.0.0/24"}}},                                                                                // masquerade w/o bridge
+		{NAT: []NATRule{{Subnet: "10.0.0.0/24", SNATTo: "1.2.3.4"}}},                                                             // SNAT w/o out-iface
+		{HostIsolation: []IsolationChain{{Bridge: ""}}},                                                                          // empty bridge
 		{HostIsolation: []IsolationChain{{Bridge: "br0", Exceptions: []IsolationException{{VIP: "fd00::1", Ports: []int{80}}}}}}, // IPv6 VIP
 	}
 	for i, p := range cases {

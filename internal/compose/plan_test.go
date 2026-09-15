@@ -372,17 +372,17 @@ func TestBuild_RunningStateIsNoChangeWhenSpecMatches(t *testing.T) {
 
 func TestIsTransientOrErrorState(t *testing.T) {
 	cases := map[string]bool{
-		"running":     false,
-		"stopped":     false,
-		"paused":      false,
-		"fenced":      false,
-		"migrating":   false, // intentionally not retried — interrupting a migration is worse
-		"creating":    true,
-		"starting":    true,
-		"stopping":    true,
-		"rebuilding":  true,
-		"error":       true,
-		"failed":      true,
+		"running":    false,
+		"stopped":    false,
+		"paused":     false,
+		"fenced":     false,
+		"migrating":  false, // intentionally not retried — interrupting a migration is worse
+		"creating":   true,
+		"starting":   true,
+		"stopping":   true,
+		"rebuilding": true,
+		"error":      true,
+		"failed":     true,
 	}
 	for state, want := range cases {
 		if got := isTransientOrErrorState(state); got != want {

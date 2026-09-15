@@ -141,7 +141,7 @@ func TestCheckVM_ThresholdCrossed_TriggersAction(t *testing.T) {
 	hspec := &pb.HealthCheckSpec{
 		Type:    "http",
 		Target:  srv.URL,
-		Retries: 2,        // low threshold
+		Retries: 2,         // low threshold
 		Action:  "restart", // needs virt — will short-circuit since virt is nil
 	}
 	specJSON, _ := json.Marshal(&pb.VMSpec{Healthcheck: hspec})

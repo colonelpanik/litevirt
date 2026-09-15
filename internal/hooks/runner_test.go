@@ -117,10 +117,10 @@ func TestBuildEnv_ContainsRequiredVars(t *testing.T) {
 	env := buildEnv(PostStart, vm)
 
 	check := map[string]bool{
-		"LV_EVENT=post_start":  false,
-		"LV_VM_NAME=test-vm":   false,
-		"LV_VM_HOST=node1":     false,
-		"LV_VM_STATE=running":  false,
+		"LV_EVENT=post_start": false,
+		"LV_VM_NAME=test-vm":  false,
+		"LV_VM_HOST=node1":    false,
+		"LV_VM_STATE=running": false,
 		"LV_VM_IP=10.0.0.5":   false,
 	}
 	for _, e := range env {

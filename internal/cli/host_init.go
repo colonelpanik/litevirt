@@ -573,15 +573,19 @@ func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
 		if err != nil {
 			return fmt.Errorf("read CLI %s: %w", file.name, err)
 		}
+		// Ownership rides along with the write, on the descriptor. A chown of the
+		// PATHNAME afterwards would be a local privilege escalation: root is writing
+		// into a directory the target user owns, os.Chown follows symlinks, and the
+		// window between publishing the file and chowning it is theirs to use.
+		//
 		// file.mode is a ceiling: an operator who tightened client.key to 0400 keeps
 		// 0400, and a re-run never widens ca.crt/client.crt back to 0644.
-		if err := secretfile.Write(dst, data, file.mode); err != nil {
-			return fmt.Errorf("write CLI %s: %w", file.name, err)
-		}
+		uid, gid := -1, -1
 		if target.chown {
-			if err := chownPath(dst, target.uid, target.gid); err != nil {
-				return fmt.Errorf("chown CLI %s: %w", file.name, err)
-			}
+			uid, gid = target.uid, target.gid
+		}
+		if err := secretfile.WriteOwned(dst, data, file.mode, uid, gid); err != nil {
+			return fmt.Errorf("write CLI %s: %w", file.name, err)
 		}
 	}
 	if target.chown {

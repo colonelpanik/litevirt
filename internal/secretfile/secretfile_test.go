@@ -141,3 +141,72 @@ func TestWrite_LeavesNoTempBehindAndKeepsTheDirClean(t *testing.T) {
 		t.Errorf("directory holds %v, want just the target; a temp file was left behind", names)
 	}
 }
+
+// WriteOwned sets ownership on the file it is about to publish, not on a
+// pathname afterwards.
+//
+// The pathname form is the bug: root writes into a directory the target user
+// owns, then calls os.Chown(path, ...), which follows symlinks. Between the
+// rename and the chown that user can replace the path with a symlink to any file
+// on the system, and root hands it to them. Doing it on the open descriptor,
+// before the file has a name anyone else can reach, removes the window entirely.
+//
+// Unprivileged tests cannot change ownership, so this pins the part that is
+// observable here: -1/-1 means "leave it alone" and must still produce a correct
+// file, and the call must not fail for an unprivileged caller.
+func TestWriteOwned_NoOpOwnershipStillWritesCorrectly(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "secret")
+	if err := WriteOwned(p, []byte("v\n"), 0o600, -1, -1); err != nil {
+		t.Fatalf("WriteOwned: %v", err)
+	}
+	if got := permOf(t, p); got != 0o600 {
+		t.Errorf("mode = %04o, want 0600", got)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "v\n" {
+		t.Errorf("content = %q", b)
+	}
+}
+
+// Write is WriteOwned with ownership left alone.
+func TestWrite_KeepsEveryPropertyWhenOwnershipIsUnset(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(p, []byte("old\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := Write(p, []byte("new\n"), 0o600); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if got := permOf(t, p); got != 0o400 {
+		t.Errorf("mode = %04o, want 0400 preserved through the WriteOwned path", got)
+	}
+}
+
+// Ownership is really attempted, and a failure to set it is fatal.
+//
+// An unprivileged process cannot give a file away, so asking for an owner it
+// cannot set must fail — and must not publish the file anyway. Without this, a
+// dropped Chown is invisible: the bundle silently stays owned by root and the
+// user it was installed for cannot read it.
+func TestWriteOwned_FailsAndPublishesNothingWhenOwnershipCannotBeSet(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: every chown succeeds, so this proves nothing")
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "secret")
+
+	err := WriteOwned(p, []byte("v\n"), 0o600, 12345, 12345)
+	if err == nil {
+		t.Fatal("WriteOwned reported success after an ownership change it cannot possibly " +
+			"have made; a dropped Chown would look exactly like this")
+	}
+	if _, sErr := os.Stat(p); sErr == nil {
+		t.Error("the file was published even though its ownership could not be set")
+	}
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 0 {
+		t.Errorf("temp file left behind after a failed write: %d entries", len(ents))
+	}
+}

@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,6 +16,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 var auditSigningGenerationOID = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 61117, 1, 1}
@@ -173,14 +176,22 @@ func loadCert(path string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
+// writePEM mints every certificate and private key in the tree, so it gets the
+// same atomic, never-widening write as everything that later copies them around.
+//
+// It used to be os.OpenFile(..., O_CREATE|O_TRUNC, 0600), whose mode applies only
+// when it CREATES the file: regenerating a key over a PEM left 0644 by a restore
+// wrote the new private key into a world-readable file, and it could not rewrite
+// a 0400 key at all.
 func writePEM(path string, pemType string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := pem.Encode(&buf, &pem.Block{Type: pemType, Bytes: data}); err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	if err := secretfile.Write(path, buf.Bytes(), 0600); err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
-	defer f.Close()
-
-	return pem.Encode(f, &pem.Block{Type: pemType, Bytes: data})
+	return nil
 }
 
 // GenerateClientCert creates a client-only certificate signed by the CA.

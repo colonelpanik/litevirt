@@ -35,6 +35,19 @@ import (
 // never widens what it finds. internal/pki.TightenKeyMode established that rule
 // for key material; this extends it to every secret the daemon and CLI write.
 func Write(path string, data []byte, perm os.FileMode) error {
+	return WriteOwned(path, data, perm, -1, -1)
+}
+
+// WriteOwned is Write, additionally setting the file's owner. uid or gid of -1
+// leaves that half alone, as os.Chown does.
+//
+// Ownership is applied to the open DESCRIPTOR, before the file has a name any
+// other process can reach — not to the pathname afterwards. The pathname form is
+// a local privilege escalation wherever root writes into a directory another
+// user controls: os.Chown follows symlinks, so between publishing the file and
+// chowning it that user can swap the path for a symlink to anything on the
+// system and have root hand it to them. There is no window here to race.
+func WriteOwned(path string, data []byte, perm os.FileMode, uid, gid int) error {
 	perm = perm.Perm()
 	if fi, err := os.Stat(path); err == nil {
 		perm &= fi.Mode().Perm()
@@ -64,6 +77,11 @@ func Write(path string, data []byte, perm os.FileMode) error {
 	// Explicit, because CreateTemp's 0600 is itself umask-masked.
 	if err := f.Chmod(perm); err != nil {
 		return fmt.Errorf("set mode %04o on %s: %w", perm, tmp, err)
+	}
+	if uid >= 0 || gid >= 0 {
+		if err := f.Chown(uid, gid); err != nil {
+			return fmt.Errorf("set owner %d:%d on %s: %w", uid, gid, tmp, err)
+		}
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close %s: %w", tmp, err)

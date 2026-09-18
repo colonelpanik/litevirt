@@ -53,6 +53,7 @@ func newHostInitCmd() *cobra.Command {
 	var name string
 	var local bool
 	var address string
+	var force bool
 	cmd := &cobra.Command{
 		Use:   "init [user@host]",
 		Short: "Bootstrap first cluster host",
@@ -65,16 +66,20 @@ With --local, --address is what peers will dial. It goes into the host certifica
 so leaving it wrong means every peer handshake fails with "certificate is valid for
 127.0.0.1, not <addr>". It defaults to the default-route source IP, which is the
 wrong interface on a multi-homed host — pass the same value you will put in
-advertise_address.`,
+advertise_address.
+
+init refuses a target that is already a cluster member, because it rewrites the
+whole config.yaml and would reset join_peers to []. Use "lv host add" to add a
+node to an existing cluster; --force re-initialises a member anyway.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
-				return cli.HostInitLocal(cmd.Context(), name, address)
+				return cli.HostInitLocal(cmd.Context(), name, address, force)
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("SSH target required (or use --local for standalone setup)")
 			}
-			return cli.HostInit(cmd.Context(), args[0], name)
+			return cli.HostInit(cmd.Context(), args[0], name, force)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "Host name (required)")
@@ -83,6 +88,9 @@ advertise_address.`,
 		"with --local, the IP peers will dial this host on; it goes in the host "+
 			"certificate. Defaults to the default-route source IP, which is wrong on a "+
 			"multi-homed host — use the same value you will set as advertise_address")
+	cmd.Flags().BoolVar(&force, "force", false,
+		"re-initialize a host that is already a cluster member, overwriting its "+
+			"config.yaml and resetting join_peers to []")
 	cmd.MarkFlagRequired("name")
 	return cmd
 }

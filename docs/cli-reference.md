@@ -54,6 +54,11 @@ lv health [--resolved]             # Cluster health: overall + conditions + cove
 ```bash
 lv host init <user@host> --name <name>    # Bootstrap first host (remote)
 lv host init --local --name <name>        # Bootstrap on localhost (standalone)
+  [--force]                               # Re-init a host that is ALREADY a cluster
+                                          #   member. init rewrites the whole
+                                          #   config.yaml and resets join_peers to [],
+                                          #   which also makes the node look like a
+                                          #   founder — use `lv host add` instead
 lv host add <user@host> --name <name>     # Add host to cluster
 lv host ls                                # List hosts
 lv host ls --names                        # Print only host names, one per line (for scripts)

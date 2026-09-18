@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
+	"github.com/litevirt/litevirt/internal/secretfile"
 	"log/slog"
 	"net"
 	"os"
@@ -1841,7 +1842,7 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 		return fmt.Errorf("generate password: %w", err)
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
@@ -1854,15 +1855,12 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if pwFile == "" {
 		pwFile = adminPasswordFile
 	}
-	if err := os.WriteFile(pwFile, []byte(password+"\n"), 0600); err != nil {
+	// secretfile, not os.WriteFile: this is the cluster admin's plaintext
+	// password, and a WriteFile over a file left loose by a restore would keep the
+	// loose mode — while a Chmod afterwards is too late, the secret is already in
+	// the readable inode.
+	if err := secretfile.Write(pwFile, []byte(password+"\n"), 0600); err != nil {
 		return fmt.Errorf("write password file: %w", err)
-	}
-	// WriteFile only applies its mode when it CREATES the file, so writing over a
-	// file left loose by a restore or a config-management copy would put the
-	// cluster admin's plaintext password in a world-readable file. Same reasoning
-	// (and same fix) as the key material in internal/cli/host_init.go.
-	if err := os.Chmod(pwFile, 0600); err != nil {
-		return fmt.Errorf("tighten password file permissions: %w", err)
 	}
 
 	slog.Info("seeded admin user", "password_file", pwFile)

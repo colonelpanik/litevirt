@@ -13,9 +13,11 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
+	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 func newUserCmd() *cobra.Command {
@@ -237,59 +239,65 @@ The new password is written to /etc/litevirt/admin-password.`,
 
 			ctx := cmd.Context()
 
-			// Ensure admin user exists; create if missing.
-			existing, _ := corrosion.GetUser(ctx, db, "admin")
-			if existing == nil {
-				// No admin user — seed one.
-				b := make([]byte, 16)
-				if _, err := rand.Read(b); err != nil {
-					return err
-				}
-				password := hex.EncodeToString(b)
-				hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-				if err != nil {
-					return err
-				}
-				if err := corrosion.InsertUser(ctx, db, "admin", "admin", string(hash)); err != nil {
-					return fmt.Errorf("create admin user: %w", err)
-				}
-				if err := os.WriteFile("/etc/litevirt/admin-password", []byte(password+"\n"), 0600); err != nil {
-					return fmt.Errorf("write password file: %w", err)
-				}
-				// WriteFile applies its mode only on CREATE; an existing loose file
-				// would keep it and expose the plaintext cluster admin password.
-				if err := os.Chmod("/etc/litevirt/admin-password", 0600); err != nil {
-					return fmt.Errorf("tighten password file permissions: %w", err)
-				}
-				fmt.Println("Created admin user.")
-				fmt.Printf("Password written to /etc/litevirt/admin-password\n")
-				return nil
-			}
-
-			// Reset existing admin password.
-			b := make([]byte, 16)
-			if _, err := rand.Read(b); err != nil {
-				return err
-			}
-			password := hex.EncodeToString(b)
-			hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-			if err != nil {
-				return err
-			}
-			if err := corrosion.UpdateUserPassword(ctx, db, "admin", string(hash)); err != nil {
-				return fmt.Errorf("update password: %w", err)
-			}
-			if err := os.WriteFile("/etc/litevirt/admin-password", []byte(password+"\n"), 0600); err != nil {
-				return fmt.Errorf("write password file: %w", err)
-			}
-			// WriteFile applies its mode only on CREATE; an existing loose file
-			// would keep it and expose the plaintext cluster admin password.
-			if err := os.Chmod("/etc/litevirt/admin-password", 0600); err != nil {
-				return fmt.Errorf("tighten password file permissions: %w", err)
-			}
-			fmt.Println("Admin password reset.")
-			fmt.Printf("New password written to /etc/litevirt/admin-password\n")
-			return nil
+			return resetAdminPassword(ctx, db, adminPasswordPath)
 		},
 	}
+}
+
+// adminPasswordPath is where reset-admin writes the new credential.
+const adminPasswordPath = "/etc/litevirt/admin-password"
+
+// resetAdminPassword re-mints the local admin account's password.
+//
+// It RESETS only. It used to create an admin when GetUser returned nil, and that
+// was two bugs at once:
+//
+//   - GetUser filters `deleted_at IS NULL`, so a deliberately deleted admin read
+//     as absent — and InsertUser reactivates a soft-deleted row rather than
+//     inserting, so the "create" silently un-deleted a revoked account, gave it a
+//     fresh password and replicated it to every peer.
+//
+//   - On a node that has joined but not yet converged, `users` is legitimately
+//     empty. Minting there produces a row with a current updated_at that wins LWW
+//     and replaces the cluster's real admin credential — the same failure the
+//     daemon's own seed guard exists to prevent, reached through the CLI. It is
+//     the path an operator is pushed down, because a joining node deliberately
+//     writes no password file and this is the documented recovery command.
+//
+// Nothing is lost by refusing: founding a cluster mints the admin through
+// `lv host init` and the daemon's founder path, and a joined node receives it by
+// replication.
+func resetAdminPassword(ctx context.Context, db *corrosion.Client, pwPath string) error {
+	existing, err := corrosion.GetUser(ctx, db, "admin")
+	if err != nil {
+		// A read that fails must not read as absence.
+		return fmt.Errorf("look up the admin account: %w", err)
+	}
+	if existing == nil {
+		return fmt.Errorf("no live admin account in this node's local database — " +
+			"reset-admin resets an existing credential, it does not create one. " +
+			"On a node that has joined a cluster the admin credential replicates in; " +
+			"wait for this node to converge and try again. On a brand-new cluster the " +
+			"founder's `lv host init` mints it. If the admin account was deliberately " +
+			"deleted, it stays deleted")
+	}
+
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return err
+	}
+	password := hex.EncodeToString(b)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
+	if err != nil {
+		return err
+	}
+	if err := corrosion.UpdateUserPassword(ctx, db, "admin", string(hash)); err != nil {
+		return fmt.Errorf("update password: %w", err)
+	}
+	if err := secretfile.Write(pwPath, []byte(password+"\n"), 0600); err != nil {
+		return fmt.Errorf("write password file: %w", err)
+	}
+	fmt.Println("Admin password reset.")
+	fmt.Printf("New password written to %s\n", pwPath)
+	return nil
 }

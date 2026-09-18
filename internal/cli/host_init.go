@@ -18,6 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
 	"github.com/litevirt/litevirt/internal/systemdunit"
 )
@@ -455,14 +456,11 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", filepath.Base(src), err)
 		}
-		if err := os.WriteFile(dst, data, 0600); err != nil {
+		// The Chmod this used to do afterwards was too late: WriteFile truncates in
+		// place, so the key was already in the loose inode. secretfile renames a
+		// fresh 0600 file over it instead, and never widens an operator's mode.
+		if err := secretfile.Write(dst, data, 0600); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
-		}
-		// WriteFile only applies its mode when it CREATES the file, so a
-		// re-init over an existing loose-permissioned key would silently keep
-		// the old mode.
-		if err := os.Chmod(dst, 0600); err != nil {
-			return fmt.Errorf("chmod %s: %w", filepath.Base(dst), err)
 		}
 	}
 
@@ -575,7 +573,9 @@ func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
 		if err != nil {
 			return fmt.Errorf("read CLI %s: %w", file.name, err)
 		}
-		if err := os.WriteFile(dst, data, file.mode); err != nil {
+		// file.mode is a ceiling: an operator who tightened client.key to 0400 keeps
+		// 0400, and a re-run never widens ca.crt/client.crt back to 0644.
+		if err := secretfile.Write(dst, data, file.mode); err != nil {
 			return fmt.Errorf("write CLI %s: %w", file.name, err)
 		}
 		if target.chown {

@@ -73,6 +73,10 @@ func TestSeedAdminUser_AJoiningNodeMintsNoCredential(t *testing.T) {
 // into. `lv host init` leaves join_peers empty, and that first start is the one
 // moment an admin credential legitimately gets minted.
 //
+// Note for anyone reading this as documentation: `lv host init` does NOT print
+// the password, and after this change the file exists on exactly one node in the
+// cluster. Where to find it belongs in docs/, not in a comment here.
+//
 // This is the guard against over-fixing, so it is worth nothing unless it can
 // fail: deleting the seed, or widening the joiner check to skip unconditionally,
 // must turn it red.

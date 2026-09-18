@@ -370,6 +370,21 @@ func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
 		<-arrivedAll
 	}
 
+	// Arrival is not enough. Releasing the peer once everyone has ARRIVED still
+	// lets the winner finish its sweep and retire the flight before the slower
+	// callers reach the lock; each wave that misses then correctly starts its own
+	// generation, and the count below measures how the runner happened to
+	// schedule 20 goroutines. Waiting until the other 19 have JOINED the
+	// published flight makes the shared sweep a fact rather than a race: it is
+	// still in flight, by construction, when they attach to it.
+	joinedAll := make(chan struct{})
+	var joins int64
+	s.leaseBarrierJoined = func() {
+		if atomic.AddInt64(&joins, 1) == callers-1 {
+			close(joinedAll)
+		}
+	}
+
 	var wg sync.WaitGroup
 	verdicts := make([]leaseTermVerdict, callers)
 	for i := 0; i < callers; i++ {
@@ -381,21 +396,33 @@ func TestLeaseTermBarrier_ConcurrentCallersShareOneSweep(t *testing.T) {
 	}
 
 	<-arrivedAll // all 20 are past the arrival stamp; one will now publish a flight
+
+	// Wait for the other 19 to attach — but never forever. If sharing is broken
+	// nobody joins, and blocking here would turn a failed assertion into a hung
+	// package that CI reports as a timeout ten minutes later. Bounded, so the
+	// failure says what actually went wrong.
+	select {
+	case <-joinedAll:
+	case <-time.After(30 * time.Second):
+		close(release) // let the callers finish so wg.Wait below cannot hang too
+		wg.Wait()
+		t.Fatalf("only %d of %d callers joined the in-flight sweep; they are not sharing it, "+
+			"so each pays its own %s budget", atomic.LoadInt64(&joins), callers-1, leaseBarrierBudget)
+	}
 	close(release)
 	wg.Wait()
 
-	// Sharing is bounded by SWEEP GENERATIONS, not by callers, and a burst costs
-	// at most a small constant number of them. It is deliberately not exactly
-	// one: admission to a batch closes when that batch begins its reads, because
-	// a caller that arrived afterwards cannot be ACCEPTED on evidence gathered
-	// before it existed (see leaseBarrierSweep.startedAt). Callers that miss a
-	// batch queue up and are served by the NEXT one together — which is what
-	// keeps this O(generations) instead of O(callers).
-	const maxGenerations = 3
-	if got := atomic.LoadInt64(&served); got < 1 || got > maxGenerations {
-		t.Errorf("%d callers produced %d peer fan-outs, want between 1 and %d. Each unshared "+
+	// Exactly one, now that the premise is established rather than hoped for.
+	//
+	// Every caller stamped `arrived` before any flight was published, and all 19
+	// non-winners attached to that flight while it was still running, so none of
+	// them can find its evidence predates them and go round for another sweep.
+	// A range here would only be hiding the scheduling race this test used to
+	// have: sharing either happened or it did not.
+	if got := atomic.LoadInt64(&served); got != 1 {
+		t.Errorf("%d callers produced %d peer fan-outs, want exactly 1. Each unshared "+
 			"sweep pays the full %s budget when a peer is unreachable, which is exactly "+
-			"the failover case", callers, got, maxGenerations, leaseBarrierBudget)
+			"the failover case", callers, got, leaseBarrierBudget)
 	}
 	for i, v := range verdicts {
 		if v != leaseTermStale {

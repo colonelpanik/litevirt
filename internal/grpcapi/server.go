@@ -435,6 +435,17 @@ type Server struct {
 	// and each correctly runs its own sweep. See sweepLeaseTermHighWater.
 	leaseBarrierArrived func()
 
+	// leaseBarrierJoined is a test seam called once by each caller that attaches
+	// to an already-published sweep, before it blocks on that sweep's result.
+	//
+	// Sharing is only observable while the shared flight is still in flight. A
+	// test that releases the peer as soon as every caller has ARRIVED can still
+	// see the winner finish and retire its flight before the stragglers reach the
+	// lock; each straggler wave then correctly starts a new generation, and the
+	// cost assertion measures the scheduler. Waiting for the joins makes "they
+	// all shared one sweep" a fact the test establishes rather than races for.
+	leaseBarrierJoined func()
+
 	// peerClientOverride is a test seam for the PR-4 peer backup/restore streaming
 	// helpers (dialPeer): when non-nil it returns a fake LiteVirtClient + closer
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is

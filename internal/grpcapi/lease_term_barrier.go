@@ -246,6 +246,10 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 		s.leaseBarrierMu.Lock()
 		if fl, ok := s.leaseBarrierFlight[key]; ok {
 			s.leaseBarrierMu.Unlock()
+			// A seam for the sharing test, nil everywhere else.
+			if s.leaseBarrierJoined != nil {
+				s.leaseBarrierJoined()
+			}
 			select {
 			case <-fl.done:
 				if !fl.startedAt.Before(arrived) {

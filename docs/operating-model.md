@@ -54,6 +54,33 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.
+- **A VM created through `CreateVM` is normally provable immediately.** It is
+  assigned its first ownership generation and both runtime markers (libvirt
+  domain metadata and the host-local marker file) are stamped before the call
+  returns. Previously the row was born at the pre-epoch default and carried no
+  marker until the reconciler's next backfill sweep, so for up to that interval
+  a running VM could not prove which generation it belonged to.
+  **This narrows that window; it does not close it**, and it covers only that
+  one path. The row is still published as `running` before the markers are
+  written, so a crash or a failure in between still leaves a running VM that
+  cannot prove its generation — now for the width of a few calls inside one RPC
+  rather than a sweep interval. The dual-run detector's newborn grace remains
+  the backstop for that residue, and closing it needs the create path reordered
+  to record the row before the runtime exists. VMs that arrive by template
+  instantiation, import, restore or promote, and all containers, are unchanged:
+  they graduate on the backfill sweep as before.
+- **A marker value of `0` is not a generation.** It is refused wherever it would
+  be written — the marker file and the domain metadata alike — and reported as a
+  corrupt marker wherever it is read, with one deliberate exception: the
+  superseded-runtime check that decides whether a rejoined host may restart a VM
+  from local state reads it as generation `0` rather than as unreadable. That
+  check does not fail closed on an unreadable marker (which would strand a
+  legitimately-owned VM), so treating a `0` as unreadable there would turn its
+  refusal into a permission — the dual-run the marker exists to prevent. A
+  NEGATIVE marker gets no such treatment: it is garbage, and no decision is
+  derived from it. One consequence is visible on upgrade: a VM already running
+  with a `0` marker was never provable, and now reports as such rather than
+  passing silently.
 
 ### Time
 - HLC rejects remote timestamps more than **5 minutes ahead** of local wall

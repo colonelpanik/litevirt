@@ -1342,6 +1342,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			// checked against. Best-effort — the VM is already running, and the
 			// convergence pass repairs a missed write; failing the start over a
 			// marker would be strictly worse than a temporarily absent marker.
+			// No pre-epoch guard here on purpose: the epoch cannot be 0 at this
+			// point. This block runs only where CompleteVMStartProof APPLIED, and
+			// its second statement is `vm_owner_epoch = vm_owner_epoch + 1` under
+			// the same guard, so the row re-read below is at 1 or more by
+			// construction. A `fresh.OwnerEpoch < 1` branch would be unreachable,
+			// and unreachable branches can only be tested vacuously. The writers
+			// refuse a pre-epoch value anyway, which is where that rule belongs.
 			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
 				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
 					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
@@ -1513,13 +1520,32 @@ func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
 // and convergence passes are what graduate them), and failing closed on an
 // unreadable marker would strand a legitimately-owned VM.
 func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
-	// Prefer the HOST-LOCAL marker: this check runs when libvirt has no domain,
-	// and undefining a domain destroys its metadata, so a metadata-only read is
-	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
-	// the domain metadata for a VM whose file marker has not been written yet.
+	// The HOST-LOCAL FILE MARKER IS THE ONLY INPUT, deliberately and by
+	// necessity. The sole caller sits inside `!DomainExists`, so by the time this
+	// runs libvirt has no domain for the VM — and undefining a domain destroys
+	// its metadata with it, which is the whole reason the durable file marker
+	// exists (lab-proven 2026-08-02).
+	//
+	// There used to be a domain-metadata fallback here "for a VM whose file
+	// marker has not been written yet". It could not fire: DomainExists IS a
+	// DomainLookupByName, the same lookup GetDomainOwnerEpoch performs first, so
+	// at this point that call can only ever return a lookup error. It read as a
+	// second line of defence that did not exist.
+	//
+	// So: a host with no readable file marker is never treated as superseded.
+	// That is fail-open, which is the intended direction for an unreadable
+	// marker, but it is the actual coverage — do not add a metadata read back
+	// without moving the call site to somewhere a domain still exists.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
-	if err != nil || !ok {
-		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
+	if errors.Is(err, ErrPreEpochMarker) {
+		// A marker asserting generation 0 is not an unreadable marker, and must not
+		// be treated as one. It is this host's own statement that its runtime
+		// belongs to NO generation — so any row at a real generation has superseded
+		// it, and the comparison below reaches that conclusion with marker = 0.
+		// Collapsing it into the unreadable case instead would license exactly the
+		// resurrection this check exists to refuse, for precisely the population
+		// most likely to carry such a marker: a node returning from an older build.
+		marker, ok, err = 0, true, nil
 	}
 	if err != nil || !ok {
 		return false

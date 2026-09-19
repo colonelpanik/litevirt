@@ -186,3 +186,44 @@ func TestLeaseTermBarrier_TheRepairPassIsNotStarvedByAnotherPeersHang(t *testing
 			"term on evidence it chose not to collect.", highest)
 	}
 }
+
+// Both barrier memos are keyed by host name, and every access — the TTL prune
+// included — iterates the CURRENT peer list. An entry for a host that leaves the
+// fleet is therefore never visited again, so the TTL that looks like it bounds
+// these maps only ever runs for peers still present.
+//
+// It is unowned state that grows with fleet churn: every decommission, rename or
+// re-IP leaves a key behind for the process lifetime.
+func TestLeaseTermBarrier_MemosForDepartedPeersAreForgotten(t *testing.T) {
+	ctx := context.Background()
+	shrinkBarrierKnobs(t, 300*time.Millisecond, 20*time.Millisecond)
+
+	// node-b is the only peer the fleet still has.
+	s := barrierNode(t, 4, 2, "node-b")
+	s.peerClientOverride = mixedPeers(map[string]int64{"node-b": 4}, nil)
+
+	// node-gone was decommissioned while memoised in BOTH maps.
+	s.leaseBarrierMu.Lock()
+	s.leaseBarrierSilent = map[string]time.Time{"node-gone": time.Now()}
+	s.leaseBarrierFullProbe = map[string]time.Time{"node-gone": time.Now()}
+	s.leaseBarrierMu.Unlock()
+
+	if _, ok := s.sweepLeaseTermHighWater(ctx, corrosion.LeaseKeyFailover); !ok {
+		t.Fatal("sweep refused although node-b answered")
+	}
+
+	s.leaseBarrierMu.Lock()
+	_, stillSilent := s.leaseBarrierSilent["node-gone"]
+	_, stillProbed := s.leaseBarrierFullProbe["node-gone"]
+	s.leaseBarrierMu.Unlock()
+
+	if stillSilent {
+		t.Error("leaseBarrierSilent still holds a departed host; the TTL never runs for " +
+			"a peer that is no longer in HealthyPeers, so the entry outlives the fleet " +
+			"member forever")
+	}
+	if stillProbed {
+		t.Error("leaseBarrierFullProbe still holds a departed host — the same unowned-state " +
+			"shape, introduced alongside the repair bound")
+	}
+}

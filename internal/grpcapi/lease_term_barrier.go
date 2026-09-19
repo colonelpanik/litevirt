@@ -328,6 +328,10 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	// breaker: a peer that has recovered still answers, because answering takes
 	// milliseconds. The one thing it can cost is an answer from a peer that
 	// recovered but is slow, which is repaired below rather than left to a retry.
+	// Drop memo entries for hosts that have left the fleet before consulting
+	// them; nothing else ever visits those keys again.
+	s.forgetDepartedPeers(peers)
+
 	silent := s.recentlySilentPeers(peers)
 
 	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
@@ -488,6 +492,43 @@ func (s *Server) recentlySilentPeers(peers []string) map[string]bool {
 // stop. With it, a peer gets exactly one full-price chance per window: a slow
 // but living peer answers it and is un-memoised, while a dead one is charged
 // once and then stays cheap.
+
+// forgetDepartedPeers drops memo entries for hosts that are no longer in the
+// fleet.
+//
+// Both memos are keyed by host name, and every other access — the TTL prune in
+// recentlySilentPeers included — iterates the CURRENT peer list. An entry for a
+// host that has left is therefore never visited again, so the TTL that looks
+// like it bounds these maps only ever runs for peers still present. That makes
+// them unowned state that grows with fleet churn: every decommission, rename or
+// re-IP leaves a key behind for the life of the process.
+//
+// Pruning on absence is also correct, not merely tidy. HealthyPeers already
+// excludes a peer this node cannot reach, and such a peer is not asked at all —
+// so there is nothing for a memo about it to optimise. When it returns it pays
+// one full-budget ask, which is exactly what a peer with no history should pay.
+func (s *Server) forgetDepartedPeers(peers []string) {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	if len(s.leaseBarrierSilent) == 0 && len(s.leaseBarrierFullProbe) == 0 {
+		return
+	}
+	present := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		present[p] = true
+	}
+	for p := range s.leaseBarrierSilent {
+		if !present[p] {
+			delete(s.leaseBarrierSilent, p)
+		}
+	}
+	for p := range s.leaseBarrierFullProbe {
+		if !present[p] {
+			delete(s.leaseBarrierFullProbe, p)
+		}
+	}
+}
+
 func (s *Server) repairWouldAskSomeoneNew(peers []string, answered map[string]bool) bool {
 	s.leaseBarrierMu.Lock()
 	defer s.leaseBarrierMu.Unlock()

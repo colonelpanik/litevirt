@@ -347,7 +347,22 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	// sctx still bounds the whole sweep, so this cannot exceed the budget a
 	// single-pass sweep would have spent anyway.
 	if len(silent) > 0 && s.repairWouldAskSomeoneNew(peers, answered) {
-		highest, answers, answered = s.fanOutHighWater(sctx, key, local, peers, nil)
+		// The repair gets its OWN budget, derived from the caller's context
+		// rather than from sctx.
+		//
+		// Sharing sctx made the repair a no-op precisely when it was most needed:
+		// a peer we did NOT memoise can hang for the entire budget, and the
+		// repair — which exists solely to undo our short-deadlining of a
+		// DIFFERENT peer — then inherits an already-expired context and asks
+		// nobody. The sweep accepted on evidence it had chosen not to collect.
+		//
+		// Worst-case cost is now two budgets rather than one, and that is bounded
+		// on both sides: repairWouldAskSomeoneNew gives each unanswered peer only
+		// one full-price chance per memo window, so a dead peer cannot buy a
+		// second budget on every sweep.
+		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
+		highest, answers, answered = s.fanOutHighWater(rctx, key, local, peers, nil)
+		rcancel()
 		s.noteFullyProbed(peers, answered)
 	}
 

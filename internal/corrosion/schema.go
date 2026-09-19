@@ -13,11 +13,18 @@ import (
 )
 
 // CurrentSchemaVersion is the schema version this binary expects. Bump this
-// every time `schemaMigrations` grows. The daemon refuses to start if the
-// local DB's persisted schema_version is HIGHER than this — that means
-// someone is trying to downgrade onto a forward-migrated DB, which produces
-// silent corruption (new columns the old binary doesn't know about, indexes
-// it doesn't maintain, etc.).
+// every time `schemaMigrations` grows.
+//
+// A DB forward-migrated PAST this binary (persisted version higher than this)
+// is ALLOWED. It used to be refused; reconcileSchemaVersion below is the
+// authority and explains why. Migrations are additive-only (CI-enforced), so an
+// old binary tolerates a newer DB's extra columns, and that tolerance is what
+// makes a version bump reversible and a rolling upgrade a steady state rather
+// than a cliff.
+//
+// Do not restate a downgrade refusal here. Two operator docs described one long
+// after it was removed, which told operators a rollback was guarded when it was
+// not.
 //
 // Schema versions are NOT replicated via CRDT — each host's local
 // schema_state.version reflects its own binary's view.

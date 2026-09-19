@@ -140,3 +140,49 @@ func TestLeaseTermBarrier_ACompleteSweepIsNotCounted(t *testing.T) {
 		t.Errorf("a complete sweep reported %d incomplete accepts", fired)
 	}
 }
+
+// The repair pass shares the ONE budget the first fan-out already spent, so it
+// is a no-op precisely when some other peer is the thing that hung.
+//
+// node-d carries the quorum, so the sweep accepts. node-c is not memoised and
+// hangs, burning the whole budget. node-b IS memoised, holds the superseding
+// term, and is alive — it just needs more than the 250ms probe. The repair
+// exists for exactly node-b, and it cannot run, because the context it inherits
+// is already expired.
+//
+// The accept is at the stale term and is byte-identical to a correct one.
+func TestLeaseTermBarrier_TheRepairPassIsNotStarvedByAnotherPeersHang(t *testing.T) {
+	ctx := context.Background()
+	shrinkBarrierKnobs(t, 300*time.Millisecond, 20*time.Millisecond)
+
+	s := barrierNode(t, 4, 2, "node-b", "node-c", "node-d")
+	s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
+		switch host {
+		case "node-b":
+			// Alive, slower than the probe, and holds the superseding term.
+			return &fakeHighWaterPeer{term: 9, delay: 100 * time.Millisecond}, func() {}, nil
+		case "node-c":
+			// Takes the connection and never replies: burns the whole budget.
+			return hangingHighWaterPeer{}, func() {}, nil
+		case "node-d":
+			return &fakeHighWaterPeer{term: 4}, func() {}, nil
+		}
+		return nil, nil, context.DeadlineExceeded
+	}
+
+	s.leaseBarrierMu.Lock()
+	s.leaseBarrierSilent = map[string]time.Time{"node-b": time.Now()}
+	s.leaseBarrierMu.Unlock()
+
+	highest, ok := s.sweepLeaseTermHighWater(ctx, corrosion.LeaseKeyFailover)
+	if !ok {
+		t.Fatal("sweep refused although node-d carried the quorum")
+	}
+	if highest != 9 {
+		t.Errorf("highest term = %d, want 9\n"+
+			"node-b holds the superseding term and is alive. It was short-deadlined by "+
+			"our own memo, and the repair that exists to undo that could not run because "+
+			"node-c had already spent the shared budget. The barrier accepted a stale "+
+			"term on evidence it chose not to collect.", highest)
+	}
+}

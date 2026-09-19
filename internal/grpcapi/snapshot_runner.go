@@ -115,14 +115,19 @@ func (r *backupRunner) runBackupInner(ctx context.Context, sched corrosion.Backu
 
 	// Retention runs after a successful push so a failed push doesn't
 	// drop older recovery points.
-	if hasRetention(sched) {
-		policy := pbsstore.RetentionPolicy{
-			KeepLast:    sched.KeepLast,
-			KeepDaily:   sched.KeepDaily,
-			KeepWeekly:  sched.KeepWeekly,
-			KeepMonthly: sched.KeepMonthly,
-			KeepYearly:  sched.KeepYearly,
-		}
+	// Built first so "is there a policy at all?" is asked of the policy itself.
+	// A local copy of that predicate over the schedule row was the same test
+	// twice across two types, and the drift is silent in the worst direction: it
+	// saying yes while PlanPrune refuses turns a scheduled prune into a Warn
+	// that the best-effort return below swallows.
+	policy := pbsstore.RetentionPolicy{
+		KeepLast:    sched.KeepLast,
+		KeepDaily:   sched.KeepDaily,
+		KeepWeekly:  sched.KeepWeekly,
+		KeepMonthly: sched.KeepMonthly,
+		KeepYearly:  sched.KeepYearly,
+	}
+	if !policy.KeepsNothing() {
 		plan, perr := pbsstore.PlanPrune(repo, policy)
 		if perr != nil {
 			slog.Warn("snapshot runner: plan prune", "vm", sched.VMName, "error", perr)
@@ -133,8 +138,4 @@ func (r *backupRunner) runBackupInner(ctx context.Context, sched corrosion.Backu
 		}
 	}
 	return nil
-}
-
-func hasRetention(s corrosion.BackupScheduleRecord) bool {
-	return s.KeepLast > 0 || s.KeepDaily > 0 || s.KeepWeekly > 0 || s.KeepMonthly > 0 || s.KeepYearly > 0
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/crypto/ssh"
@@ -105,6 +106,34 @@ func (c *Client) CopyFileMode(localPath, remotePath string, mode os.FileMode) er
 	return c.WriteFile(remotePath, data, mode)
 }
 
+// shellQuote renders s as a single-quoted POSIX shell word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// writeFileCmd builds the remote shell command that materialises a file.
+//
+// The content is staged in a mktemp file beside the destination, chmod'd there,
+// and only then moved into place. The obvious `cat > path && chmod mode path`
+// leaves the file complete and world-readable at the remote umask for the whole
+// transfer — and permanently if the connection drops between the two commands.
+// The payload here is host.key.
+//
+// Staging also fixes the case a leading chmod would not: redirecting into an
+// EXISTING file truncates it but keeps its old mode, so re-provisioning over a
+// loose file would write the new key at the old permissions. mv replaces the
+// destination wholesale, mode included, and does so atomically.
+//
+// mktemp in the destination's own directory keeps the rename on one filesystem.
+func writeFileCmd(remotePath string, mode os.FileMode) string {
+	q := shellQuote(remotePath)
+	return fmt.Sprintf(
+		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
+			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
+			"mv -f \"$t\" %s; trap - EXIT",
+		q, mode.Perm(), q)
+}
+
 // WriteFile writes data to a remote file.
 func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) error {
 	session, err := c.conn.NewSession()
@@ -113,10 +142,8 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 	}
 	defer session.Close()
 
-	// Use cat to write file — simple and reliable
 	session.Stdin = bytesReader(data)
-	cmd := fmt.Sprintf("cat > %s && chmod %o %s", remotePath, mode, remotePath)
-	return session.Run(cmd)
+	return session.Run(writeFileCmd(remotePath, mode))
 }
 
 // Interactive runs a command on the remote host with a PTY attached,

@@ -31,7 +31,12 @@ func TestInstallCLIClientBundle_DoesNotChownFilesByPathname(t *testing.T) {
 	chownPath = func(p string, uid, gid int) error { chowned = append(chowned, p); return nil }
 	t.Cleanup(func() { chownPath = orig })
 
-	if err := installCLIClientBundle(src, cliPKITarget{dir: dst, uid: 1000, gid: 1000, chown: true}); err != nil {
+	// The CALLER's own uid/gid. Any process may "change" ownership to what it
+	// already is; a hardcoded uid only works on a machine where that uid happens
+	// to be the test runner, which is a test that passes for a reason unrelated
+	// to the code.
+	uid, gid := os.Getuid(), os.Getgid()
+	if err := installCLIClientBundle(src, cliPKITarget{dir: dst, uid: uid, gid: gid, chown: true}); err != nil {
 		t.Fatalf("installCLIClientBundle: %v", err)
 	}
 

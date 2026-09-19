@@ -21,6 +21,54 @@ func seedLease(t *testing.T, db *corrosion.Client, holder string, expiresAt time
 		holder, exp, exp); err != nil {
 		t.Fatalf("seed lease: %v", err)
 	}
+	seedHandoffTerm(t, db, holder)
+}
+
+// seedHandoffTerm records the new holder's fencing term, which a real handoff
+// writes in the SAME transaction as the election row above.
+//
+// A lease never changes hands by moving leader_election alone:
+// AcquireLeaseWithTerm takes the row and mints the new holder's term
+// atomically. Seeding only the election row builds a state a cluster cannot
+// reach — the successor holds the lease while the newest recorded term still
+// names its PREDECESSOR — and that is exactly the shape AcquireLeaseWithTerm
+// refuses, classifying the successor as a superseded holder and returning
+// held=false. The coordinator's run() then bails before it reaches the resume
+// path, and the workloads this file asserts get recovered stay on the fenced
+// host instead.
+//
+// The term ledger arrives with the lease-term branch. On a build without it
+// there is no term to mint and no such state to model, so this is a no-op
+// rather than a failure — the fixture has to be honest on both sides of that
+// merge, because the tests it feeds live here and the table lives there.
+func seedHandoffTerm(t *testing.T, db *corrosion.Client, holder string) {
+	t.Helper()
+	ctx := context.Background()
+	present, err := db.Query(ctx,
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'leader_lease_terms'`)
+	if err != nil {
+		t.Fatalf("look up the lease-term ledger: %v", err)
+	}
+	if len(present) == 0 {
+		return
+	}
+	rows, err := db.Query(ctx,
+		`SELECT MAX(term) AS term FROM leader_lease_terms WHERE key = 'failover'`)
+	if err != nil {
+		t.Fatalf("read the newest lease term: %v", err)
+	}
+	// One above the highest term on record, which is what a real mint allocates.
+	var next int64 = 1
+	if len(rows) > 0 {
+		next = rows[0].Int64("term") + 1
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := db.Execute(ctx,
+		`INSERT OR IGNORE INTO leader_lease_terms (key, term, holder, acquired_at, created_at, updated_at)
+		 VALUES ('failover', ?, ?, ?, ?, ?)`,
+		next, holder, ts, ts, db.NowTS()); err != nil {
+		t.Fatalf("mint the handoff term: %v", err)
+	}
 }
 
 func leaseHolder(t *testing.T, db *corrosion.Client) string {

@@ -660,9 +660,15 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// growth before any metric exposed it, leaving raw SQL as the only access
 	// path. The key label is bounded by the rows that exist, and only three keys
 	// are ever written (failover, the rebalancer's, dual_run_detector).
+	//
+	// NO deleted_at filter, matching nextLeaseTerm. The allocator computes
+	// MAX(term) over every row because a tombstoned tenure still consumed its
+	// number and reusing it would mint a duplicate. Filtering here made the gauge
+	// step BACKWARDS when the top term was GC'd, while the cluster's real
+	// high-water kept rising — and this is the gauge operators are told to alert
+	// on, so it must answer the allocator's question, not a different one.
 	if termRows, terr := c.db.Query(ctx,
-		`SELECT key, MAX(term) AS term FROM leader_lease_terms
-		 WHERE deleted_at IS NULL GROUP BY key`); terr == nil {
+		`SELECT key, MAX(term) AS term FROM leader_lease_terms GROUP BY key`); terr == nil {
 		for _, r := range termRows {
 			ch <- prometheus.MustNewConstMetric(c.leaseTerm, prometheus.GaugeValue,
 				float64(r.Int64("term")), r.String("key"))

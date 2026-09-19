@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -329,18 +332,49 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 
 	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
 
-	// A shortfall must never be caused by our own shortcut. If the quorum was
-	// missed and any peer was short-deadlined, pay full price before refusing —
+	// A MISSING ANSWER must never be caused by our own shortcut. This used to
+	// repair only on a quorum shortfall (`answers < needed`), which left the one
+	// case the shortcut can actually corrupt: quorum met by the other peers
+	// WITHOUT the short-deadlined one. The barrier's whole job is to find a term
+	// higher than this node's replica, and the peer we chose not to wait for is
+	// exactly as likely to hold it as any other — more so, because a superseding
+	// coordinator is often the node busiest with the same incident.
+	//
+	// noteSilentPeers re-stamps on every miss, so without this a healthy peer
+	// that is merely slower than the probe stays pinned in the silent set and
+	// the shortcut recurs on every later sweep, never repaired.
+	//
 	// sctx still bounds the whole sweep, so this cannot exceed the budget a
 	// single-pass sweep would have spent anyway.
-	if answers < needed && len(silent) > 0 {
+	if len(silent) > 0 && s.repairWouldAskSomeoneNew(peers, answered) {
 		highest, answers, answered = s.fanOutHighWater(sctx, key, local, peers, nil)
+		s.noteFullyProbed(peers, answered)
 	}
 
 	s.noteSilentPeers(peers, answered)
 
 	if answers < needed {
 		return 0, false
+	}
+
+	// An accept reached on INCOMPLETE evidence is byte-identical to one reached
+	// on a complete sweep, and it is the shape that can miss a superseding term.
+	// The accept criterion itself is deliberately left at quorum — tightening it
+	// to a complete sweep is an availability trade that belongs in its own
+	// change — but it must not also be invisible.
+	if len(answered) < len(peers) {
+		s.noteLeaseBarrierIncomplete(key, len(answered), len(peers))
+		missing := make([]string, 0, len(peers)-len(answered))
+		for _, p := range peers {
+			if !answered[p] {
+				missing = append(missing, p)
+			}
+		}
+		sort.Strings(missing)
+		slog.Warn("lease-term barrier: accepting on an INCOMPLETE sweep — these peers gave no "+
+			"answer, so a term higher than the one accepted could be held by one of them",
+			"key", key, "accepted_term", highest, "answered", len(answered),
+			"peers", len(peers), "unanswered", strings.Join(missing, ","))
 	}
 	return highest, true
 }
@@ -428,6 +462,50 @@ func (s *Server) recentlySilentPeers(peers []string) map[string]bool {
 // answered. Keyed by peer rather than by (peer, key) on purpose: silence here is
 // a property of reaching the peer at all, and the three keys are served by one
 // RPC on one connection.
+
+// repairWouldAskSomeoneNew reports whether a full-price repair pass has anyone
+// left to learn from: some peer gave no answer on the short probe AND has not
+// already been given the full budget within the memo window.
+//
+// Without the second half, the repair undoes the very cost bound the silent memo
+// exists to provide — a permanently dead peer would buy a full budget on every
+// sweep, which is the 40-workload serial burst the shortcut was introduced to
+// stop. With it, a peer gets exactly one full-price chance per window: a slow
+// but living peer answers it and is un-memoised, while a dead one is charged
+// once and then stays cheap.
+func (s *Server) repairWouldAskSomeoneNew(peers []string, answered map[string]bool) bool {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	now := time.Now()
+	for _, p := range peers {
+		if answered[p] {
+			continue
+		}
+		at, ok := s.leaseBarrierFullProbe[p]
+		if !ok || now.Sub(at) > leaseBarrierSilentTTL {
+			return true
+		}
+	}
+	return false
+}
+
+// noteFullyProbed records that a peer has had its full-budget chance. A peer
+// that ANSWERED is cleared, so a recovered peer is never charged again.
+func (s *Server) noteFullyProbed(peers []string, answered map[string]bool) {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	for _, p := range peers {
+		if answered[p] {
+			delete(s.leaseBarrierFullProbe, p)
+			continue
+		}
+		if s.leaseBarrierFullProbe == nil {
+			s.leaseBarrierFullProbe = make(map[string]time.Time, len(peers))
+		}
+		s.leaseBarrierFullProbe[p] = time.Now()
+	}
+}
+
 func (s *Server) noteSilentPeers(peers []string, answered map[string]bool) {
 	s.leaseBarrierMu.Lock()
 	defer s.leaseBarrierMu.Unlock()

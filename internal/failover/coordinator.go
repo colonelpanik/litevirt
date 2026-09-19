@@ -840,6 +840,12 @@ func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
 		// acquired one, or holdLease cleared it on a loss path — and acting as
 		// leader without one produces exactly the unfenced write the term exists
 		// to prevent.
+		// Its two neighbouring arms below both log; this one did not, so the one
+		// cause an operator cannot infer from the refusal itself was the one with
+		// no line naming it.
+		slog.Warn("failover: this coordinator holds no usable lease term — refusing to stamp "+
+			"(never acquired one, or holdLease cleared it on a loss path)",
+			"term", term, "coordinator", c.hostName)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrLeaseLost)
 		return false
 	}
@@ -889,6 +895,32 @@ func (c *Coordinator) leaseTermStampAllowed(ctx context.Context) bool {
 // precisely the assertion the fencing term exists to stop trusting. leaseSnapshot
 // returns empty on a read error, so this field can be blank on a perfectly valid
 // proof; blank is correct and self-reporting was a fabrication.
+// noteLeaseTermRefusal records a lease-term stamp refusal the way every other
+// abandonment branch in these loops records one: a log line and a failover.skip
+// audit row naming the workload.
+//
+// It is not deferred work. strandedWorkloads' own doc says a fenced host is
+// processed only once, and run() short-circuits the host on every later cycle,
+// so a refusal here is a permanent per-workload outage. It used to leave only
+// two counters — and it fires immediately after "failover: rescheduling VM", so
+// the journal read as a reschedule that simply ended.
+//
+// Counters cannot answer the question an operator has at 3am, which is WHICH
+// workloads were stranded: one superseded term strands every workload on the
+// host at once and the metric just reaches 40.
+func (c *Coordinator) noteLeaseTermRefusal(ctx context.Context, kind, name, from string) {
+	slog.Error("failover: refusing to stamp an action proof — this coordinator's lease term is "+
+		"unusable, so the workload is ABANDONED (a fenced host is processed only once)",
+		kind, name, "from", from, "term", c.LeaseTerm(), "coordinator", c.hostName)
+	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
+		ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName,
+		Action: "failover.skip", Target: name,
+		Detail: "refused to stamp an action proof: this coordinator's lease term is unusable " +
+			"(never acquired, cleared on a loss path, or superseded by a newer holder)",
+		Result: "refused",
+	})
+}
+
 func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, ok bool) {
 	if !c.leaseTermStampAllowed(ctx) {
 		return "", "", 0, false
@@ -1552,6 +1584,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if !ok {
 				c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
 				c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
+				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
 			proof := corrosion.ActionProof{
@@ -1687,6 +1720,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 			if !ok {
 				c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
 				c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+				c.noteLeaseTermRefusal(ctx, "container", ct.Name, ct.HostName)
 				return
 			}
 			proof := corrosion.ActionProof{
@@ -1846,6 +1880,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		if !ok {
 			c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
 			c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
+			c.noteLeaseTermRefusal(ctx, "container", ct.Name, ct.HostName)
 			return
 		}
 		relocToken = randid.New()

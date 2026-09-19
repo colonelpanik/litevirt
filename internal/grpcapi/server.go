@@ -590,6 +590,17 @@ type Server struct {
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate          serverGate
 	onGateRefused func(action, reason string)
+
+	// onLeaseBarrierIncomplete feeds the incomplete-sweep metric (nil-safe). A
+	// lease-term accept reached without every peer answering is byte-identical to
+	// one reached on a complete sweep, and it is the shape that can miss a
+	// superseding term — so it is counted rather than left to a log line.
+	onLeaseBarrierIncomplete func(key string, answered, peers int)
+
+	// leaseBarrierFullProbe remembers which peers have already been given the
+	// full budget in a repair pass and still said nothing, so a dead peer is
+	// charged once per window instead of on every sweep.
+	leaseBarrierFullProbe map[string]time.Time
 	// onStateWriteFail observes an authoritative state/image write that failed
 	// (nil-safe); the daemon wires it to litevirt_state_write_failures_total.
 	onStateWriteFail func(op, class string)
@@ -1142,6 +1153,11 @@ func (s *Server) tokenEnabled(token string) bool {
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }
 
+// SetLeaseBarrierIncompleteObserver wires the incomplete-sweep metric hook (nil-safe).
+func (s *Server) SetLeaseBarrierIncompleteObserver(fn func(key string, answered, peers int)) {
+	s.onLeaseBarrierIncomplete = fn
+}
+
 // SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
 func (s *Server) SetStateWriteFailObserver(fn func(op, class string)) { s.onStateWriteFail = fn }
 
@@ -1177,6 +1193,13 @@ func (s *Server) persistVMState(ctx context.Context, name, state, detail, op str
 func (s *Server) noteGateRefused(action, reason string) {
 	if s.onGateRefused != nil {
 		s.onGateRefused(action, reason)
+	}
+}
+
+// noteLeaseBarrierIncomplete records an accept reached without a complete sweep.
+func (s *Server) noteLeaseBarrierIncomplete(key string, answered, peers int) {
+	if s.onLeaseBarrierIncomplete != nil {
+		s.onLeaseBarrierIncomplete(key, answered, peers)
 	}
 }
 

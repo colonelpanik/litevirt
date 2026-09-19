@@ -735,6 +735,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
+	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,

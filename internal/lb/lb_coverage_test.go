@@ -31,12 +31,13 @@ func TestParseVIP_NoSlash_DefaultsTo32(t *testing.T) {
 }
 
 func TestParseVIP_IPv6Style_WithPrefix(t *testing.T) {
-	ip, prefix, err := ParseVIP("fd00::1/64")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ip != "fd00::1" || prefix != 64 {
-		t.Errorf("got %q/%d", ip, prefix)
+	// Used to be accepted. It cannot work: internal/firewall refuses any
+	// exception VIP containing ":" and fails the WHOLE plan, so an IPv6 VIP does
+	// not degrade gracefully — it breaks every later firewall reconcile on the
+	// host. Accepting it here only moved the failure one layer down, past the
+	// point where anyone could connect it to the address they typed.
+	if ip, prefix, err := ParseVIP("fd00::1/64"); err == nil {
+		t.Errorf("ParseVIP(\"fd00::1/64\") = %q/%d, want an error", ip, prefix)
 	}
 }
 
@@ -48,19 +49,21 @@ func TestParseVIP_InvalidPrefix_Letters(t *testing.T) {
 }
 
 func TestParseVIP_InvalidPrefix_Decimal(t *testing.T) {
-	// "3.5" should fail Sscanf with %d.
-	_, _, err := ParseVIP("10.0.0.1/3.5")
-	// Sscanf("%d") will parse "3" and succeed, so prefix=3. This is not an error.
-	if err != nil {
-		t.Logf("got error (acceptable): %v", err)
+	// This asserted nothing: it only t.Logf'd, so it passed whether ParseVIP
+	// rejected "3.5", silently truncated it to 3, or was deleted. It was the one
+	// case with no assertion behind it, in the file testing the parser whose
+	// Sscanf truncation is the defect.
+	if ip, prefix, err := ParseVIP("10.0.0.1/3.5"); err == nil {
+		t.Errorf("ParseVIP(\"10.0.0.1/3.5\") = %q/%d, want an error rather than a "+
+			"prefix truncated to 3", ip, prefix)
 	}
 }
 
 func TestParseVIP_SlashOnly(t *testing.T) {
-	_, _, err := ParseVIP("/24")
-	// parts[0] = "", parts[1] = "24" — no error, ip = "", prefix = 24.
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	// Used to succeed with an EMPTY ip and prefix 24, because only the prefix
+	// half was ever parsed. A CIDR with no address is not a VIP.
+	if _, _, err := ParseVIP("/24"); err == nil {
+		t.Error("ParseVIP(\"/24\") was accepted with no address")
 	}
 }
 
@@ -73,14 +76,12 @@ func TestParseVIP_TrailingSlash(t *testing.T) {
 }
 
 func TestParseVIP_MultipleSlashes(t *testing.T) {
-	// SplitN with n=2: "10.0.0.1/24/extra" → parts[0]="10.0.0.1", parts[1]="24/extra".
-	// Sscanf("%d") parses "24" and stops.
-	ip, prefix, err := ParseVIP("10.0.0.1/24/extra")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ip != "10.0.0.1" || prefix != 24 {
-		t.Errorf("got %q/%d", ip, prefix)
+	// Sscanf("%d") stopped at the first non-digit and reported success, so
+	// "24/extra" was silently read as 24 and the rest discarded. An operator who
+	// typed something malformed got a VIP on a prefix they did not write.
+	if ip, prefix, err := ParseVIP("10.0.0.1/24/extra"); err == nil {
+		t.Errorf("ParseVIP(\"10.0.0.1/24/extra\") = %q/%d, want an error rather "+
+			"than a silently truncated prefix", ip, prefix)
 	}
 }
 

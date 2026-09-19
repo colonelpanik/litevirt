@@ -1406,6 +1406,16 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
+	// A changed VIP is validated HERE, at ingress, the way CreateLoadBalancer
+	// does it. This RPC used to persist req.Vip unchecked and then call ParseVIP
+	// with the error discarded, so a malformed VIP became an EMPTY one: the
+	// firewall exception carried "" and internal/firewall then failed the whole
+	// plan, taking every later reconcile on that host with it.
+	if req.Vip != "" {
+		if _, _, err := lb.ParseVIP(req.Vip); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid vip: %v", err)
+		}
+	}
 	// Validate any newly-added backends before persisting — they render into
 	// the root-run HAProxy/keepalived configs (same as CreateLoadBalancer).
 	for _, b := range req.AddBackends {
@@ -1633,7 +1643,20 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
-	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
+	// Stored value, so ParseStoredVIP: a row written by an older build may hold
+	// a form this parser refuses, and refusing to apply it would silently strand
+	// a working LB. Ingress above rejects a NEW bad VIP, so anything repaired
+	// here came from an earlier release.
+	vipIP, vipPrefix, vipRepaired, err := lb.ParseStoredVIP(vip)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"load balancer %q has an unusable stored VIP %q: %v", req.Name, vip, err)
+	}
+	if vipRepaired {
+		slog.Warn("load balancer has a malformed stored VIP; applying the recovered value. "+
+			"Re-set it with `lv lb update --vip` to clear this",
+			"lb", req.Name, "stored", vip, "applied", fmt.Sprintf("%s/%d", vipIP, vipPrefix))
+	}
 	// hosts is the LB's durable holder set — CreateLoadBalancer records a concrete
 	// holder, and a legacy no-holder row was either repaired to its proven
 	// participant above or the update was refused. So the local apply loop runs on
@@ -2584,10 +2607,22 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 // reapplyExplicitLB rebuilds an explicit (non-stack) LB's lb.Config from its stored row +
 // backends and re-applies it locally (idempotent; the Phase-1 exec gate still guards it).
 func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRecord) {
-	vipIP, vipPrefix, err := lb.ParseVIP(cfg.VIP)
+	// ParseStoredVIP, not ParseVIP. This is a read path over rows an older build
+	// wrote, and a stricter parser here does not reject bad input — it stops
+	// re-applying a load balancer that has been working for months. Tightening
+	// ParseVIP without this turned an upgrade into a silent outage: the LB is
+	// never restored after a restart or a failover, and one Warn line is the
+	// only trace.
+	vipIP, vipPrefix, vipRepaired, err := lb.ParseStoredVIP(cfg.VIP)
 	if err != nil {
-		slog.Warn("reapplyExplicitLB: parse vip", "lb", cfg.Name, "error", err)
+		slog.Error("reapplyExplicitLB: stored VIP is unusable; this load balancer will NOT be re-applied "+
+			"until it is corrected with `lv lb update --vip`", "lb", cfg.Name, "stored", cfg.VIP, "error", err)
 		return
+	}
+	if vipRepaired {
+		slog.Warn("reapplyExplicitLB: stored VIP is malformed; re-applying the recovered value. "+
+			"Re-set it with `lv lb update --vip` to clear this",
+			"lb", cfg.Name, "stored", cfg.VIP, "applied", fmt.Sprintf("%s/%d", vipIP, vipPrefix))
 	}
 	hosts, ok := parseHostsJSON(cfg.Hosts)
 	if !ok {

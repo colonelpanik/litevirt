@@ -27,6 +27,25 @@ import (
 
 const reconcileInterval = 15 * time.Second
 
+// reconcileWalkBudget bounds the pending-VM walk inside ONE pass.
+//
+// The walk is serial and every per-VM step is bounded only on its own — the
+// lease-term barrier, for instance, has a budget per call. Nothing bounded the
+// SUM, so a large failover, or a partition where peers time out, could spend
+// unbounded time in the walk. selfFence and assertRuntimeOwnership run after it
+// on this same goroutine, and selfFence is how a doomed node stops driving
+// decisions while it waits for the watchdog — it must not be pushed arbitrarily
+// past the tick it is supposed to run on.
+//
+// Cutting the walk short costs a delayed VM start: it is idempotent and the next
+// tick picks the row up again. Not cutting it short costs a delayed self-fence.
+// That asymmetry is the whole reason for this value.
+//
+// Kept below reconcileInterval so a pass that spends its whole budget still
+// leaves room for the two sweeps before the next tick. A var, not a const, so
+// tests can shrink it.
+var reconcileWalkBudget = 10 * time.Second
+
 // Reconciler watches for VMs in "pending" state on the local host
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
@@ -234,7 +253,17 @@ func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
 // periodic loop, exported for the fleet harness (and one-shot ops) to drive a
 // deterministic pass without waiting on the ticker.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) {
-	r.reconcile(ctx)
+	r.reconcilePass(ctx)
+}
+
+// reconcilePass is one tick's work: the bounded pending-VM walk, then the two
+// safety sweeps. The sweeps deliberately take the UNBOUNDED ctx — they are what
+// the walk's budget exists to protect, not things to cut short.
+func (r *Reconciler) reconcilePass(ctx context.Context) {
+	wctx, cancel := context.WithTimeout(ctx, reconcileWalkBudget)
+	r.reconcile(wctx)
+	cancel()
+
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
 }
@@ -248,9 +277,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.reconcile(ctx)
-			r.selfFence(ctx)
-			r.assertRuntimeOwnership(ctx)
+			r.reconcilePass(ctx)
 		}
 	}
 }

@@ -73,6 +73,26 @@ func (c *Client) Run(cmd string) error {
 	return session.Run(cmd)
 }
 
+// RunWithInput runs a command with data on its stdin.
+//
+// This is how a provisioning script should reach a remote host: `bash -s` with
+// the script on stdin never creates a file, so there is no path for a local
+// user on the target to pre-create, no window between writing and executing,
+// and nothing to clean up if the process dies in between.
+func (c *Client) RunWithInput(cmd string, input []byte) error {
+	session, err := c.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session: %w", err)
+	}
+	defer session.Close()
+
+	session.Stdin = bytesReader(input)
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	return session.Run(cmd)
+}
+
 // RunOutput executes a command and returns stdout.
 func (c *Client) RunOutput(cmd string) ([]byte, error) {
 	session, err := c.conn.NewSession()
@@ -125,12 +145,20 @@ func shellQuote(s string) string {
 // destination wholesale, mode included, and does so atomically.
 //
 // mktemp in the destination's own directory keeps the rename on one filesystem.
+//
+// -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
+// DIRECTORY moves src INSIDE it — so a local user who can see the destination
+// path (process command lines are world-readable on a default Linux) can
+// mkdir it first, let the staged file land inside, then rename their directory
+// away and leave their own file at the path root is about to read. -T makes
+// that case an error instead. -- stops a path that begins with "-" being read
+// as options.
 func writeFileCmd(remotePath string, mode os.FileMode) string {
 	q := shellQuote(remotePath)
 	return fmt.Sprintf(
 		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
 			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
-			"mv -f \"$t\" %s; trap - EXIT",
+			"mv -fT -- \"$t\" %s; trap - EXIT",
 		q, mode.Perm(), q)
 }
 

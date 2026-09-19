@@ -51,3 +51,23 @@ func TestWriteFileCmd_QuotesThePath(t *testing.T) {
 		t.Errorf("unquoted path with a space:\n  %s", cmd)
 	}
 }
+
+// `mv src dest` where dest is a DIRECTORY moves src INSIDE it rather than
+// failing. Process command lines are world-readable on a default Linux, so a
+// local user on the target can read the destination path out of the running
+// command, mkdir it first, let the staged file land inside, then rename their
+// directory away and leave their own file at the path root is about to read.
+//
+// Randomising the destination name does not help: the attacker does not have
+// to guess it, they can see it. -T makes the directory case an error.
+func TestWriteFileCmd_RefusesToMoveIntoADirectory(t *testing.T) {
+	cmd := writeFileCmd("/etc/litevirt/pki/host.key", 0600)
+
+	if !strings.Contains(cmd, "mv -fT") && !strings.Contains(cmd, "mv -Tf") {
+		t.Errorf("mv is not given -T, so a pre-created directory at the destination "+
+			"silently captures the staged file:\n  %s", cmd)
+	}
+	if !strings.Contains(cmd, "--") {
+		t.Errorf("mv is not given --, so a destination starting with '-' parses as options:\n  %s", cmd)
+	}
+}

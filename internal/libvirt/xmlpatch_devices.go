@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // ErrDeviceCardinality is returned when a hostdev alias referenced in the desired
@@ -393,13 +394,42 @@ func replaceAttrIfPresent(s, attr, val string) string {
 	})
 }
 
-var attrRegexCache = map[string]*regexp.Regexp{}
+// attrRegexCache memoises the per-attribute patterns. It is guarded because
+// PatchInactiveDevices holds only a PER-VM lock, so two reconciles on two
+// different VMs reach here at the same time.
+//
+// An unguarded map is not just a benign race: the Go runtime detects concurrent
+// map writes and calls fatal error, which no recover() can catch. It kills the
+// whole PROCESS, immediately.
+//
+// PatchInactiveDevices itself is a pure transform that finishes before its
+// caller touches libvirt, so the crash cannot leave THIS VM half-applied. The
+// damage is to everyone else: a process-wide abort takes down every other
+// reconcile in flight, including any that is between
+// UndefineDomainPreservingState and DefineDomain for a different VM — and that
+// one is left undefined.
+var (
+	attrRegexMu    sync.RWMutex
+	attrRegexCache = map[string]*regexp.Regexp{}
+)
 
 func attrRegex(attr string) *regexp.Regexp {
-	if re, ok := attrRegexCache[attr]; ok {
+	attrRegexMu.RLock()
+	re, ok := attrRegexCache[attr]
+	attrRegexMu.RUnlock()
+	if ok {
 		return re
 	}
-	re := regexp.MustCompile(`(\b` + regexp.QuoteMeta(attr) + `=)(['"])[^'"]*(['"])`)
+
+	re = regexp.MustCompile(`(\b` + regexp.QuoteMeta(attr) + `=)(['"])[^'"]*(['"])`)
+
+	attrRegexMu.Lock()
+	defer attrRegexMu.Unlock()
+	// Another goroutine may have compiled it while we were unlocked. Keep the
+	// first one so the pointer stays stable for a given attr.
+	if existing, raced := attrRegexCache[attr]; raced {
+		return existing
+	}
 	attrRegexCache[attr] = re
 	return re
 }

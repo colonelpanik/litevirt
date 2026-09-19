@@ -98,22 +98,48 @@ func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Cl
 	}
 }
 
+// metricsRequestTimeout bounds one scrape end to end, and metricsIdleTimeout
+// bounds a kept-alive connection between scrapes.
+//
+// The endpoint is unauthenticated and every scrape drives DB queries, so a
+// server with no timeouts lets one slow or hostile client hold a connection for
+// the life of the process, and a stuck collection outlives the scrape that asked
+// for it while later ones queue behind it.
+//
+// Generous relative to a healthy scrape (single-digit ms) — the point is a
+// ceiling, not a tight SLA.
+const (
+	metricsRequestTimeout = 30 * time.Second
+	metricsIdleTimeout    = 60 * time.Second
+)
+
+// newHTTPServer builds the metrics HTTP server. Split out from Start so its
+// timeout configuration is reachable from a test: an unset timeout is invisible
+// at a glance and is exactly the kind of omission that persists.
+func (s *Server) newHTTPServer() *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/api/v1/status", s.handleStatus)
+
+	return &http.Server{
+		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
+		// not get them twice. See normalizeBind.
+		Addr:              s.Addr(),
+		Handler:           mux,
+		ReadHeaderTimeout: metricsRequestTimeout,
+		ReadTimeout:       metricsRequestTimeout,
+		WriteTimeout:      metricsRequestTimeout,
+		IdleTimeout:       metricsIdleTimeout,
+	}
+}
+
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/api/v1/status", s.handleStatus)
-
-	srv := &http.Server{
-		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
-		// not get them twice. See normalizeBind.
-		Addr:    s.Addr(),
-		Handler: mux,
-	}
+	srv := s.newHTTPServer()
 
 	s.mu.Lock()
 	if s.stopped {
@@ -533,7 +559,11 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
-	ctx := context.Background()
+	// Bounded, not context.Background(). Collect runs per scrape and drives many
+	// DB queries; an unbounded one lets a stuck query outlive the scrape that
+	// asked for it, and Prometheus will have given up and started another.
+	ctx, cancel := context.WithTimeout(context.Background(), metricsRequestTimeout)
+	defer cancel()
 
 	// Host-level metrics
 	host, err := corrosion.GetHost(ctx, c.db, c.hostName)

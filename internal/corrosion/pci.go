@@ -2,6 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"time"
 )
 
 // pciSelectCols is the common column list for PCI device queries.
@@ -224,6 +227,76 @@ func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address, expecte
 		`UPDATE host_pci_devices SET vm_name = '', updated_at = ?
 		 WHERE host_name = ? AND address = ? AND vm_name = ?`,
 		c.NowTS(), hostName, address, expectedVM)
+}
+
+// DefaultPCIOwnershipSweepAge is how long a PCI assignment must have sat
+// untouched before the sweeper is willing to call it stranded. It exists for
+// the replication race: a VM created on another node may not have reached this
+// node's vms replica yet, and a fresh assignment must never be reclaimed just
+// because the row naming its owner has not arrived.
+const DefaultPCIOwnershipSweepAge = 15 * time.Minute
+
+// SweepStrandedPCIOwnership clears the assignment on hostName's LIVE
+// host_pci_devices rows whose owning VM no longer exists, and returns the
+// addresses it freed.
+//
+// Why this is needed at all: SoftDeletePCIDevice tombstones a vanished device
+// WITHOUT clearing vm_name, and ObservePCIDevice preserves vm_name when it
+// revives the row. Both are deliberate — a device can drop out of a scan
+// transiently (driver reload, rescan race) while the VM is still using it, and
+// clearing the owner there would let a second VM claim hardware that is in use.
+// But nothing then reclaims the assignment once the VM is genuinely gone, and
+// ClaimPCIDevice matches only `vm_name IS NULL OR vm_name = ”`, so such a
+// device matches zero rows forever.
+//
+// The existence test is deliberately per-row and in Go rather than a NOT EXISTS
+// subquery: a replicated statement is applied verbatim on every peer, so one
+// whose effect depends on another table's LOCAL contents would decide
+// differently on each node. Each clear goes through ReleasePCIDevice, whose
+// UPDATE is CAS-on-owner — an assignment that changed underneath the scan is a
+// safe no-op — and which is an already-registered statement shape.
+//
+// Scoped to one host: only that host's daemon can see its own hardware.
+func SweepStrandedPCIOwnership(ctx context.Context, c *Client, hostName string, minAge time.Duration) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT address, COALESCE(vm_name, '') AS vm_name, COALESCE(updated_at, '') AS updated_at
+		 FROM host_pci_devices
+		 WHERE host_name = ? AND deleted_at IS NULL
+		   AND vm_name IS NOT NULL AND vm_name != ''`, hostName)
+	if err != nil {
+		return nil, fmt.Errorf("list owned pci devices: %w", err)
+	}
+	cutoff := time.Now().UTC().Add(-minAge)
+	var cleared []string
+	for _, r := range rows {
+		addr, owner := r.String("address"), r.String("vm_name")
+		if minAge > 0 {
+			// ParseUpdatedAt, not time.Parse: updated_at is HLC on most rows and
+			// RFC3339 on others, and an RFC3339-only parse would fail on every
+			// HLC row — making the guard skip everything and the sweep a no-op.
+			ts, ok := ParseUpdatedAt(r.String("updated_at"))
+			// An unparseable or missing timestamp is not evidence of age, so
+			// leave the row alone rather than reclaim a device on a guess.
+			if !ok || ts.After(cutoff) {
+				continue
+			}
+		}
+		vm, gErr := GetVM(ctx, c, owner)
+		if gErr != nil {
+			// A read that failed is not an absent VM. Fail closed on this row.
+			return cleared, fmt.Errorf("look up owner %q of %s: %w", owner, addr, gErr)
+		}
+		if vm != nil {
+			continue
+		}
+		if rErr := ReleasePCIDevice(ctx, c, hostName, addr, owner); rErr != nil {
+			return cleared, fmt.Errorf("release stranded %s (owner %q): %w", addr, owner, rErr)
+		}
+		slog.Warn("pci: cleared an assignment whose VM no longer exists",
+			"host", hostName, "address", addr, "stale_owner", owner)
+		cleared = append(cleared, addr)
+	}
+	return cleared, nil
 }
 
 // SoftDeletePCIDevice marks a device as deleted (disappeared from host).

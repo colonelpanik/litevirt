@@ -124,6 +124,21 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 		}
 	}
 
+	// Reclaim assignments whose VM no longer exists. A device that vanished and
+	// came back keeps its vm_name deliberately (a transient scan drop must not
+	// let a second VM claim hardware still in use), but nothing else ever clears
+	// it once the VM is gone — and ClaimPCIDevice matches only an empty vm_name,
+	// so such a device would be unassignable forever (#218). The age guard keeps
+	// a not-yet-replicated VM from having its device taken.
+	if freed, sErr := corrosion.SweepStrandedPCIOwnership(ctx, s.db, s.hostName,
+		corrosion.DefaultPCIOwnershipSweepAge); sErr != nil {
+		slog.Warn("rescan: stranded-ownership sweep failed", "error", sErr)
+	} else {
+		for _, addr := range freed {
+			s.publish("device.reclaimed", s.hostName, addr+" freed: owning VM no longer exists")
+		}
+	}
+
 	// Build response.
 	devices, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	resp := &pb.RescanHostResponse{

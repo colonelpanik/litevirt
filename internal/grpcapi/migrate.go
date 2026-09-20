@@ -92,9 +92,17 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return err
 	}
 
-	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27).
+	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27). It is
+	// released here UNLESS the migration outlives this request, in which case it
+	// travels with the adopter — dropping it while libvirt is still moving the
+	// guest is what lets a snapshot or delete run against a VM mid-flight.
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	adopted := false
+	defer func() {
+		if !adopted {
+			unlock()
+		}
+	}()
 
 	send := func(phase pb.MigratePhase, memPct, diskPct float32) error {
 		return stream.Send(&pb.MigrateProgress{
@@ -503,10 +511,9 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	}
 
 	// Run migration in background; poll progress.
-	type result struct{ err error }
-	done := make(chan result, 1)
+	done := make(chan error, 1)
 	go func() {
-		done <- result{s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
+		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
 			BandwidthMiB:  bandwidthMiB,
@@ -516,7 +523,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			// into a tcp:// migrate_uri authority but must not import corrosion.
 			TargetAddress: corrosion.URIHost(targetHost.Address),
 			DiskTargets:   diskTargets,
-		})}
+		})
 	}()
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -526,21 +533,32 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
-			return migrateCtx.Err()
-		case res := <-done:
-			if res.err != nil {
+			// libvirt is still migrating. MigrateToTarget takes no context, so
+			// cancelling this request does not stop the guest moving — it only
+			// stops us watching. Returning bare here left the VM at
+			// host_name=source/state=migrating while it ran on the target, and
+			// the reconciler skips `migrating`, so nothing ever healed it.
+			adopted = true
+			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
+				withStorage, disks, done, unlock)
+			return status.Errorf(codes.DeadlineExceeded,
+				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
+					"libvirt and will be completed in the background — watch `lv events %s`",
+				vm.Name, req.TargetHost, migrateCtx.Err(), vm.Name)
+		case migrateErr := <-done:
+			if migrateErr != nil {
 				// Migration failed — VM is still on the source host.
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
 				if state, sErr := s.virt.DomainState(vm.Name); sErr == nil && state == "running" {
 					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
-						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err)); werr != nil {
+						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr)); werr != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 					slog.Warn("migration failed but VM still running on source",
-						"vm", vm.Name, "target", req.TargetHost, "error", res.err)
+						"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
 				} else {
-					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error()); werr != nil {
+					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", migrateErr.Error()); werr != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 				}
@@ -567,7 +585,7 @@ poll:
 
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
-				return status.Errorf(codes.Internal, "migration failed: %v", res.err)
+				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
 			}
 			break poll
 		case <-ticker.C:
@@ -673,6 +691,74 @@ poll:
 //     cancelled ctx would recreate the very divergence we are closing.
 //   - A source disk is deleted ONLY after the commit lands. A failed commit returns
 //     an error (loud divergence) and deletes nothing.
+//
+// adoptAbandonedMigration takes over a live migration the request context
+// stopped waiting for.
+//
+// MigrateToTarget takes no context and blocks in libvirt regardless, so a
+// cancelled request or an expired migrate timeout does not stop the migration —
+// it only stops us watching. The handler used to return bare at that point: no
+// state update, no artifact cleanup, no ownership finalize, and the per-VM lock
+// dropped mid-flight. libvirt then completed with
+// MigratePersistDest|MigrateUndefineSource, so the guest ran on the TARGET
+// while corrosion still said host_name=source, state=migrating — and nothing
+// heals that, because the reconciler explicitly skips `migrating`.
+//
+// Abandoning the WAIT is fine. Abandoning the OUTCOME is not. The lock travels
+// with the adoption: releasing it while libvirt is still moving the guest is
+// what lets a concurrent snapshot or delete run against a VM mid-flight.
+func (s *Server) adoptAbandonedMigration(
+	ctx context.Context,
+	vm *corrosion.VMRecord,
+	targetHost string,
+	withStorage bool,
+	disks []corrosion.DiskRecord,
+	done <-chan error,
+	unlock func(),
+) {
+	go func() {
+		defer unlock()
+		defer func() {
+			if p := recover(); p != nil {
+				slog.Error("migrate: adopted migration panicked", "vm", vm.Name, "panic", p)
+			}
+		}()
+
+		err := <-done
+		if err != nil {
+			// The migration failed after we stopped watching; the guest is still
+			// on the source. Anything but `migrating` — that is the state nothing
+			// heals.
+			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
+			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
+				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
+			}
+			if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail); werr != nil {
+				s.noteStateWriteFail(corrosion.OpVMState, werr)
+			}
+			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
+			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
+			return
+		}
+
+		// libvirt cut over. The commit is the only thing that makes the cluster
+		// agree with reality, and it cannot be skipped just because nobody is
+		// listening any more.
+		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
+			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
+				"the guest is on the target and the cluster does not know",
+				"vm", vm.Name, "target", targetHost, "error", ferr)
+			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error",
+				"abandoned request; cut over to "+targetHost+" but ownership commit failed: "+ferr.Error())
+			return
+		}
+		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
+		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
+			"abandoned request; completed to "+targetHost)
+		s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+	}()
+}
+
 func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.VMRecord, targetHost string, withStorage bool, disks []corrosion.DiskRecord) error {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()

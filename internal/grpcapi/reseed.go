@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	"google.golang.org/grpc/codes"
@@ -166,6 +168,22 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Unavailable, "pull state from %s: %v", source, err)
 	}
+	// The sensitive lane travels with the operator one. The discard below clears
+	// the secret-bearing tables too (they used to survive a reseed, which is how
+	// a quarantined credential reached the whole fleet), so they have to be
+	// repopulated here and not left to anti-entropy: a node with no 2FA rows has
+	// no 2FA at all, because the API reads "no factors" as "no 2FA". Fetching
+	// BEFORE the discard keeps the no-state window as short as it already was.
+	//
+	// A source on an older build has no sensitive RPC. Refuse rather than reseed
+	// into a node with its secrets deleted and nothing to restore them.
+	sensitiveDump, err := s.fetchPeerSensitiveDump(ctx, peer)
+	if err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Unavailable,
+			"pull sensitive state from %s: %v", source, err)
+	}
+
 	// DISCARD, then merge — with the dump already in hand. A merge alone is
 	// additive, so the rows this node produced outside the regime (precisely
 	// what the quarantine contains) would survive and be re-injected once the
@@ -181,6 +199,12 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	if err := s.db.MergeStateBytesLWW(dump); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal, "merge state from %s: %v", source, err)
+	}
+	if err := s.db.MergeSensitiveStateBytesLWW(sensitiveDump); err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"merge sensitive state from %s (this node's secret-bearing tables are now "+
+				"EMPTY and it needs a repeat reseed before it can serve): %v", source, err)
 	}
 
 	// VERIFY convergence before clearing anything. Only a verified reseed earns
@@ -310,18 +334,93 @@ var reseedConvergenceExempt = map[string]bool{
 // axes the design names: schema version, capability set, and state digest.
 // Returns the number of tables verified and a human-readable mismatch (” when
 // converged).
-func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtClient) (int, string, error) {
-	local, err := s.db.StateDigest(ctx)
+// fetchPeerSensitiveDump pulls the source's secret-bearing tables over the
+// peer-mTLS lane, the same one anti-entropy repairs them on. It is a hard
+// requirement of a reseed: the discard now empties these tables, so a node that
+// cannot refill them would come back with no credentials, no 2FA factors and no
+// recovery codes.
+func (s *Server) fetchPeerSensitiveDump(ctx context.Context, peer pb.LiteVirtClient) ([]byte, error) {
+	stream, err := peer.StreamSensitiveStateDump(ctx, &pb.SensitiveStateRequest{Sender: s.hostName})
 	if err != nil {
-		return 0, "", err
+		if status.Code(err) == codes.Unimplemented {
+			return nil, fmt.Errorf("the source has no sensitive state dump RPC (older build); " +
+				"reseeding from it would delete this node's secret-bearing tables with " +
+				"nothing to restore them")
+		}
+		return nil, err
 	}
+	var buf []byte
+	for {
+		chunk, rerr := stream.Recv()
+		if errors.Is(rerr, io.EOF) {
+			return buf, nil
+		}
+		if rerr != nil {
+			return nil, rerr
+		}
+		buf = append(buf, chunk.GetData()...)
+	}
+}
+
+// reseedLocalDigests returns every table digest a reseed must converge on:
+// the operator set AND the peer-only sensitive set.
+//
+// The sensitive tables were missing, so a reseed compared the operator lane,
+// declared itself verified and cleared the isolation epoch while the
+// quarantined credentials, 2FA factors, recovery codes, notification targets
+// and runtime action proofs were still sitting in it — and a healthy peer then
+// pulled them fleet-wide. A reseed that cannot show those tables match its
+// source has not converged with it.
+func (s *Server) reseedLocalDigests(ctx context.Context) ([]corrosion.TableDigest, error) {
+	digests, err := s.db.StateDigest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sensitive, err := s.db.SensitiveStateDigest(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("sensitive digest: %w", err)
+	}
+	return append(digests, sensitive...), nil
+}
+
+// reseedRemoteDigests reads the same two sets from the source.
+//
+// A source on an older build without the sensitive RPC returns Unimplemented.
+// That is not fatal — reseedDigestsConverged skips any table the source does
+// not report, which is the existing rule for a version difference — but it is
+// logged, because it means the sensitive half went unverified.
+func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient) (map[string]string, error) {
+	remote := map[string]string{}
 	resp, err := peer.GetStateDigest(ctx, &emptypb.Empty{})
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	remote := map[string]string{}
 	for _, t := range resp.GetTables() {
 		remote[t.GetName()] = t.GetHash()
+	}
+	sens, err := peer.GetSensitiveStateDigest(ctx, &pb.SensitiveStateRequest{Sender: s.hostName})
+	if err != nil {
+		if status.Code(err) != codes.Unimplemented {
+			return nil, fmt.Errorf("sensitive digest from source: %w", err)
+		}
+		slog.Warn("reseed: source has no sensitive state digest RPC; the sensitive " +
+			"tables cannot be verified against it")
+		return remote, nil
+	}
+	for _, t := range sens.GetTables() {
+		remote[t.GetName()] = t.GetHash()
+	}
+	return remote, nil
+}
+
+func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtClient) (int, string, error) {
+	local, err := s.reseedLocalDigests(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	remote, err := s.reseedRemoteDigests(ctx, peer)
+	if err != nil {
+		return 0, "", err
 	}
 	verified, mismatch := reseedDigestsConverged(local, remote)
 	return verified, mismatch, nil

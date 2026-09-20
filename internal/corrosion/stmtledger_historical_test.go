@@ -90,7 +90,13 @@ import (
 // supported: that is the cost of additive columns on a replicated table in
 // consecutive versions, not a sign either is redundant. No previously accepted
 // historical identity was removed or changed.
-const compatibilityDigest = "cd2639959dd96ef59d619518f747dd5c51749a33bc55bbddbe4fc7f69234fe69"
+// Updated again for the UpsertBinding tombstone guard: the pre-guard shape
+// (WHERE prefix_id = ? alone, which let `deleted_at = NULL` resurrect a
+// released binding) moved from the current ledger to the
+// upsert_binding_pre_tombstone_guard family. It is an ADDITION — a shape this
+// tree stopped emitting but a supported peer still sends — and no previously
+// accepted historical identity was removed or changed.
+const compatibilityDigest = "29a8bdab50aaf373dcb84f26d10267a3325d7d391b9006d9b0d28684f7272acc"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -155,6 +161,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"lease_term_mint_or_ignore_v51":         1,   // lease-term mint's original INSERT OR IGNORE form, before the writer needed local constraint errors
 	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
 	"proof_insert_pre_lease_key_v52":        1,   // proof insert with lease_term but before lease_key (v52)
+	"upsert_binding_pre_tombstone_guard":    1,   // UpsertBinding before `AND deleted_at IS NULL` stopped it resurrecting a released prefix
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

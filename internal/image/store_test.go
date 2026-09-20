@@ -97,7 +97,7 @@ func TestStore_DeleteVMDisks(t *testing.T) {
 	}
 
 	// Delete
-	if err := s.DeleteVMDisks("test-vm"); err != nil {
+	if err := s.DeleteVMDisks("test-vm", nil); err != nil {
 		t.Fatalf("DeleteVMDisks: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestStore_DeleteVMDisks_NonExistent(t *testing.T) {
 	s := NewStore(dir)
 
 	// Should not error on non-existent VM
-	err := s.DeleteVMDisks("nonexistent")
+	err := s.DeleteVMDisks("nonexistent", nil)
 	if err != nil {
 		t.Errorf("DeleteVMDisks on nonexistent: %v", err)
 	}

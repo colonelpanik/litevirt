@@ -371,7 +371,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
 	// incomplete delete, even if the libvirt domain is already gone.
-	s.images.DeleteVMDisks(spec.Name)
+	s.images.DeleteVMDisks(spec.Name, s.protectedDiskPaths(ctx, spec.Name))
 	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
@@ -1182,6 +1182,26 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q is a template and cannot be started; clone it first (lv vm clone %s <new-name>)", req.Name, req.Name)
 	}
+	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
+	// non-template VM as a linked-clone source, so a plain VM can be backing
+	// overlays; starting it lets qemu write into the backing file underneath
+	// every one of them, corrupting each overlay silently.
+	//
+	// Fails CLOSED on a read error, like ConvertToTemplate's guard: "we cannot
+	// tell whether anything is layered on this disk" is not permission to write
+	// to it.
+	clones, cErr := s.linkedClonesOf(ctx, req.Name)
+	if cErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether %q still backs linked clones: %v", req.Name, cErr)
+	}
+	if len(clones) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q still backs %d linked clone(s) (%s); starting it would let qemu write "+
+				"into the backing file under each overlay. Delete the clones, or promote "+
+				"them with `lv vm clone --full`, first",
+			req.Name, len(clones), strings.Join(clones, ", "))
+	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {
 		return nil, err
 	}
@@ -1847,7 +1867,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-		s.images.DeleteVMDisks(req.Name)
+		s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
@@ -2753,7 +2773,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
 	// then glob the default dir. Must run before the tombstone below.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-	s.images.DeleteVMDisks(req.Name)
+	s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)

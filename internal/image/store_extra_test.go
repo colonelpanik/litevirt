@@ -114,7 +114,7 @@ func TestStore_DeleteVMDisks_FlatFiles(t *testing.T) {
 	}
 
 	// Delete
-	if err := s.DeleteVMDisks("multi-disk-vm"); err != nil {
+	if err := s.DeleteVMDisks("multi-disk-vm", nil); err != nil {
 		t.Fatalf("DeleteVMDisks: %v", err)
 	}
 
@@ -194,7 +194,7 @@ func TestStore_MultipleVMDisks_Independent(t *testing.T) {
 	os.WriteFile(s.DiskPath("vm-b", "root"), []byte("disk"), 0644)
 
 	// Delete vm-a disks
-	s.DeleteVMDisks("vm-a")
+	s.DeleteVMDisks("vm-a", nil)
 
 	// vm-b disk should still exist
 	if _, err := os.Stat(s.DiskPath("vm-b", "root")); err != nil {

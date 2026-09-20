@@ -271,6 +271,13 @@ func scanDeviceElements(doc string) ([]deviceElement, int, error) {
 				}
 				endOff := int(dec.InputOffset())
 				raw := doc[lt:endOff]
+				// A cdrom/floppy/lun is a <disk> element the reconciler does not
+				// own. Leaving it unrecorded is what "not reconciled" means: it
+				// can be neither deleted as unwanted nor matched against a
+				// desired data disk that happens to share its target dev.
+				if name == "disk" && !isReconciledDisk(raw) {
+					continue
+				}
 				elems = append(elems, deviceElement{
 					kind:  name,
 					key:   deviceKey(name, raw),
@@ -300,7 +307,30 @@ var (
 	reDiskTargetDev = regexp.MustCompile(`<target\b[^>]*\bdev=(['"])([^'"]*)['"]`)
 	reIfaceMAC      = regexp.MustCompile(`<mac\b[^>]*\baddress=(['"])([^'"]*)['"]`)
 	reHostdevAlias  = regexp.MustCompile(`<alias\b[^>]*\bname=(['"])([^'"]*)['"]`)
+	// The <disk device=…> attribute, read off the OPENING tag only — a nested
+	// <source>/<target> never carries one, and `[^>]*` cannot cross the tag.
+	reDiskDeviceAttr = regexp.MustCompile(`\A\s*<disk\b[^>]*\bdevice=(['"])([^'"]*)['"]`)
 )
+
+// isReconciledDisk reports whether a <disk> element is one the device
+// reconciler owns.
+//
+// scanDeviceElements classifies by element NAME, and a CDROM is a <disk> too —
+// so a cloud-init or installer ISO was collected as a "disk", looked up in a
+// want set that deliberately excludes CDROMs, missed, and DELETED. The caller
+// that builds the want set skips any DeviceKind != "disk" and says so:
+// "cdrom/etc. are not reconciled". Not reconciled has to mean left alone.
+//
+// Neither ISO is a vm_disks row at all — the cloud-init ISO travels as
+// VMConfig.CloudInitISO and the installer ISO as spec.Iso — so no want set can
+// ever describe them and no amount of matching would have saved them.
+//
+// libvirt defaults a missing device attribute to "disk", so an element without
+// one is still ours. Anything else (cdrom, floppy, lun) is not.
+func isReconciledDisk(raw string) bool {
+	m := reDiskDeviceAttr.FindStringSubmatch(raw)
+	return m == nil || m[2] == "disk"
+}
 
 // deviceKey extracts the stable match key from a device element's raw XML.
 //

@@ -178,7 +178,18 @@ func ReseedKeepsTable(name string) bool { return reseedKeepTables[name] }
 // cluster state, and a fetch failure there would strand it.
 func (c *Client) DiscardReplicatedStateForReseed(ctx context.Context) (int, error) {
 	cleared := 0
-	for _, table := range tableNames {
+	// The sensitive tables are discarded too. They used to be skipped — the loop
+	// walked tableNames only — so a node reseeding out of quarantine kept every
+	// registry credential, notification target, 2FA factor, recovery code and
+	// runtime action proof it had written while it was incompatible, and a
+	// healthy peer pulled them fleet-wide the moment the epoch cleared. Those
+	// rows are exactly what a reseed exists to discard.
+	//
+	// The caller MUST repopulate them in the same operation (reseed fetches the
+	// sensitive dump alongside the operator one). Leaving them to anti-entropy
+	// would open a window in which this node has no 2FA factors at all, and the
+	// API reads "no factors" as "no 2FA" — a discard that fails OPEN.
+	for _, table := range append(append([]string{}, tableNames...), sensitiveTableNames...) {
 		if reseedKeepTables[table] {
 			continue
 		}

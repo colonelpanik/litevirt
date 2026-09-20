@@ -181,6 +181,20 @@ var (
 	powerOffPollInterval  = 2 * time.Second
 )
 
+// WorstCasePowerOff is the longest a single fenceIPMI call can legitimately
+// take: the power-off command's own per-call budget plus the full verification
+// budget, which runs after it. A caller that bounds a fence by less than this
+// converts a slow-but-successful power-off into an UNCONFIRMED one — the
+// chassis goes down, the context expires mid-verify, and the result is reported
+// as a failed fence, so the VMs on that host are never rescheduled.
+//
+// A function, not a constant, because PowerOffVerifyTimeout is a var that tests
+// shrink; anything deriving a budget from it must see the same value the fence
+// will actually spend.
+func WorstCasePowerOff() time.Duration {
+	return ipmitoolPerCallTimeout + PowerOffVerifyTimeout
+}
+
 // chassisPowerOff is ipmitool's power-status line for a chassis that is off,
 // lowercased. Matched as a SUFFIX, never as a substring — see isChassisOff.
 const chassisPowerOff = "chassis power is off"

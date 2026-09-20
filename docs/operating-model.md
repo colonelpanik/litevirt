@@ -46,8 +46,10 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   observers report `consecutive_failures ≥ 5` for it (where N is non-offline
   active hosts). Stale observer rows (older than 30 s) are excluded.
 - **Leader-gated recovery.** Only one coordinator at a time drives recovery.
-  The lease is held in a CRDT row with a 30 s TTL and re-validated before
-  every destructive action.
+  The lease is held in a CRDT row with a 45 s TTL and re-validated before
+  every destructive action. A fence additionally requires 30 s of the lease
+  still to run before it may start, because an IPMI power-off plus its
+  verification can take 23 s and a fence cut short is reported as unconfirmed.
 - **No double-fencing.** Once a successful fence is recorded in `fencing_log`
   (or operator confirmation under manual strategy), no coordinator will
   re-fence the same host within a 5-minute window.

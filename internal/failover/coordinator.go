@@ -28,23 +28,43 @@ const (
 	// offlineThreshold is the number of consecutive failures before a host
 	// is considered offline by the coordinator.
 	offlineThreshold = 5
-	// leaseDuration is the TTL for the failover-leader lease. Must be
-	// comfortably larger than pollInterval so a slow tick doesn't lose the
-	// lease, and comfortably larger than the worst-case fence latency
-	// (IPMI verify ≤ 15 s + SSH 10 s + jitter) plus a renewal margin.
-	leaseDuration = 30 * time.Second
+	// leaseDuration is the TTL for the failover-leader lease. It has to clear
+	// minFenceLease with room to spare: holdLeaseAtLeast requires STRICTLY more
+	// than the floor, so a lease whose full term only just reaches it could
+	// never authorise a fence at all.
+	//
+	// Raising it past the old 30 s costs takeover latency — a leader that dies
+	// holds its row for up to this long before anyone else can act. That is the
+	// deliberate trade: a delayed takeover is recoverable, a fence cut off
+	// mid-verification is reported as a failure and strands the VMs it was
+	// supposed to move.
+	leaseDuration = 45 * time.Second
 	// leaseRenewBefore is how much head-room the leader has to renew before
 	// the lease expires. Failover renews when remaining time drops below this.
+	// It must stay below minFenceLease, or holdLease and holdLeaseAtLeast would
+	// disagree about when a lease is healthy enough to act on.
 	leaseRenewBefore = 10 * time.Second
 	// minFenceLease is the lease head-room required before a fence may START.
-	// leaseRenewBefore (10 s) is NOT enough: an IPMI fence spends up to
-	// fence.PowerOffVerifyTimeout (15 s) on verification alone, so a fence begun
-	// with only the renewal margin left outlives the lease that authorised it —
-	// the row expires mid-call, a second coordinator takes it, and two nodes
-	// fence and reschedule the same host concurrently. This is a floor, not a
-	// budget: the actual deadline comes from the lease time this node really
-	// holds, which is usually the full leaseDuration.
-	minFenceLease = 20 * time.Second
+	//
+	// It must cover the whole call it gates, not part of it. An IPMI fence
+	// spends up to fence.ipmitoolPerCallTimeout (8 s) sending the power-off and
+	// then up to fence.PowerOffVerifyTimeout (15 s) confirming the chassis is
+	// actually down — 23 s, which fence.WorstCasePowerOff() states once so this
+	// floor and that budget cannot drift apart.
+	//
+	// Two failures sit either side of this number. Too low and the deadline
+	// derived from it (minFenceLease - leaseFenceMargin) cuts a slow but
+	// SUCCESSFUL power-off off part-way through verification: fenceIPMI
+	// correctly refuses to call an unconfirmed power-off confirmed, the
+	// coordinator logs "partial", and a host that is genuinely off keeps its
+	// VMs stopped. Too low in the other direction — below the call's length —
+	// and the fence outlives the lease that authorised it, a second coordinator
+	// takes the row mid-call, and two nodes fence and reschedule the same host.
+	//
+	// This is a floor, not a budget: the actual deadline comes from the lease
+	// time this node really holds, which is usually the full leaseDuration.
+	// TestFailover_AFreshLeaseSatisfiesTheFenceFloor pins the arithmetic.
+	minFenceLease = 30 * time.Second
 	// leaseFenceMargin is withheld from the fence deadline so the call returns
 	// while this node is still demonstrably the leader, leaving room for the
 	// post-fence re-check to read the lease row before it expires.

@@ -561,3 +561,86 @@ func TestRun_ResumesOnceAFenceLogRowArrivesLate(t *testing.T) {
 			"re-read the proof that arrived after it", vm.HostName)
 	}
 }
+
+// TestFailover_FenceDeadlineCoversTheIPMIWorstCase is the #202 regression.
+//
+// The deadline handed to the fencer is leaseLeft - leaseFenceMargin, and
+// holdLeaseAtLeast returns as soon as leaseLeft is strictly more than
+// minFenceLease. At that floor the fencer gets minFenceLease - leaseFenceMargin
+// = 15s, against an IPMI fence whose own budget is up to 8s for the power-off
+// call plus a further 15s of verification: 23s.
+//
+// This is not a corner: the lease is renewed at leaseRenewBefore, so in steady
+// state leaseLeft sits anywhere in (minFenceLease, leaseDuration] and most
+// fences start with less than the worst case available.
+//
+// The failure mode is the one fencing exists to prevent. The BMC accepts the
+// power-off and the chassis goes down; the context expires part-way through
+// verifyIPMIPowerOff; fenceIPMI reports Success=false because an unconfirmed
+// power-off must never be treated as confirmed; the coordinator logs "partial"
+// and does NOT reschedule. A host that is genuinely, verifiably off keeps its
+// VMs stopped, which is exactly the outage failover was supposed to end.
+//
+// The fix belongs on the requirement, not the deadline: a fence must not START
+// without enough lease left to finish it.
+func TestFailover_FenceDeadlineCoversTheIPMIWorstCase(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "h1", Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "ipmi",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+
+	c := NewCoordinator("me", db)
+	c.Now = func() time.Time { return now }
+	// The LEAST head-room a fence is allowed to begin with: just over
+	// minFenceLease, which holdLeaseAtLeast accepts without renewing. This is
+	// the budget the coordinator's own floor promises is enough.
+	seedLease(t, db, "me", now.Add(minFenceLease+time.Second))
+
+	var budget time.Duration
+	var hadDeadline bool
+	c.SetFencer(func(fctx context.Context, h fence.HostConfig) fence.Result {
+		var dl time.Time
+		dl, hadDeadline = fctx.Deadline()
+		budget = time.Until(dl)
+		return fence.Result{Method: "ipmi", Detail: "stub", Success: true}
+	})
+
+	h, _ := corrosion.GetHost(ctx, db, "h1")
+	c.failover(ctx, h)
+
+	if !hadDeadline {
+		t.Fatal("the fencer ran with no deadline at all")
+	}
+	if worst := fence.WorstCasePowerOff(); budget < worst {
+		t.Errorf("fence budget %s is shorter than an IPMI fence's own worst case %s "+
+			"(power-off %s + verify %s): a slow power-off is cut off mid-verification "+
+			"and reported as unconfirmed, so the host's VMs are never rescheduled",
+			budget.Round(time.Second), worst, 8*time.Second, fence.PowerOffVerifyTimeout)
+	}
+}
+
+// The floor must be reachable: a freshly renewed lease has to satisfy it, or no
+// fence can ever start. This is the other half of raising minFenceLease.
+func TestFailover_AFreshLeaseSatisfiesTheFenceFloor(t *testing.T) {
+	if leaseDuration <= minFenceLease {
+		t.Fatalf("leaseDuration (%s) <= minFenceLease (%s): holdLeaseAtLeast requires "+
+			"strictly more than the floor, so even a just-renewed lease would be "+
+			"refused and fencing would be impossible", leaseDuration, minFenceLease)
+	}
+	if got := minFenceLease - leaseFenceMargin; got < fence.WorstCasePowerOff() {
+		t.Errorf("minFenceLease - leaseFenceMargin = %s, which is less than "+
+			"fence.WorstCasePowerOff() (%s); the floor does not cover the call it gates",
+			got, fence.WorstCasePowerOff())
+	}
+	if leaseRenewBefore >= minFenceLease {
+		t.Errorf("leaseRenewBefore (%s) >= minFenceLease (%s): the renewal margin must "+
+			"stay below the fence floor or holdLease and holdLeaseAtLeast disagree "+
+			"about when a lease is healthy", leaseRenewBefore, minFenceLease)
+	}
+}

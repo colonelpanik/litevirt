@@ -48,6 +48,13 @@ var (
 // rowView exposes a local/incoming row pair by column name, aligned to the
 // incoming dump's declared columns (which may be a vN/v(N-1) subset).
 type rowView struct {
+	// cols is the column list both row images are aligned to. It is the
+	// INCOMING dump's declared order, not this node's physical order, so it
+	// differs between the two directions of the same conflict — which is why
+	// anything that compares whole rows has to be order-invariant. Retained
+	// (not just inverted into colIdx) because encodeRowCellsV2 needs the names
+	// paired with their values.
+	cols     []string
 	colIdx   map[string]int
 	local    []interface{}
 	incoming []interface{}
@@ -58,7 +65,7 @@ func newRowView(cols []string, local, incoming []interface{}) rowView {
 	for i, c := range cols {
 		idx[c] = i
 	}
-	return rowView{colIdx: idx, local: local, incoming: incoming}
+	return rowView{cols: cols, colIdx: idx, local: local, incoming: incoming}
 }
 
 func (rv rowView) has(col string) bool { _, ok := rv.colIdx[col]; return ok }
@@ -237,9 +244,30 @@ func ruleLBGeneration(col string) tieRule {
 // encoding is lexically greater wins. Deterministic and identical on both nodes,
 // so it converges. Only tables with no authorization/isolation/runtime/auth
 // meaning may end here (explicit assignment, enforced by coverage tests).
+//
+// The encoding MUST be the order-invariant encodeRowCellsV2, which pairs each
+// value with its column NAME and sorts by name. The positional encodeRowCells
+// is not a total order across the fleet: the rows here are aligned to the
+// incoming dump's declared column order, so the two directions of one conflict
+// encode the same pair differently, and the lexical winner can differ between
+// them. Each node then keeps its own row while BOTH record a resolved
+// content_max tie-break — so lww_tie_unresolved never fires and the permanent
+// digest mismatch has nothing pointing at it. The equality short-circuit in
+// resolveTie already uses V2 for exactly this reason; winner selection needs it
+// just as much.
 func ruleContentMax() tieRule {
 	return func(rv rowView) tieDecision {
-		if encodeRowCells(rv.local) >= encodeRowCells(rv.incoming) {
+		a, aErr := encodeRowCellsV2(rv.cols, rv.local)
+		b, bErr := encodeRowCellsV2(rv.cols, rv.incoming)
+		if aErr != nil || bErr != nil {
+			// No order-invariant encoding exists for this row image (duplicate
+			// column names, which V2 treats as corruption, or a col/val length
+			// mismatch). Falling back to the positional compare would be the
+			// non-convergent thing this rule exists to avoid, and there is no
+			// deterministic winner to pick, so hand it to a human.
+			return decideUnresolved("content_max_encode")
+		}
+		if a >= b {
 			return decideKeepLocal("content_max")
 		}
 		return decideTakeIncoming("content_max")

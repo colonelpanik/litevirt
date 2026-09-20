@@ -72,9 +72,10 @@ func liveNICRows(t *testing.T, ctx context.Context, s *Server, table, vmName str
 // applied" invariant (§12) without touching real nftables.
 type failingFWReconciler struct{ err error }
 
-func (f failingFWReconciler) Reconcile(context.Context) error { return f.err }
-func (f failingFWReconciler) LastError() error                { return f.err }
-func (f failingFWReconciler) LastTick() time.Time             { return time.Time{} }
+func (f failingFWReconciler) Reconcile(context.Context) error      { return f.err }
+func (f failingFWReconciler) ReconcileForce(context.Context) error { return f.err }
+func (f failingFWReconciler) LastError() error                     { return f.err }
+func (f failingFWReconciler) LastTick() time.Time                  { return time.Time{} }
 
 // ── attach: stopped realizes (hardware_v2 latched) ───────────────────────────
 

@@ -1169,6 +1169,11 @@ func (s *Server) lbGateRefused(ctx context.Context) (string, bool) { return s.ex
 // importing internal/firewall at the test level.
 type FirewallReconciler interface {
 	Reconcile(ctx context.Context) error
+	// ReconcileForce clears the applier's change-detection cache first, so the
+	// ruleset reaches nft even when the rendered bytes are unchanged. An
+	// operator-driven reload must use it: the cache tracks what the daemon last
+	// SENT, which is not evidence about what the kernel currently holds.
+	ReconcileForce(ctx context.Context) error
 	LastError() error
 	LastTick() time.Time
 }

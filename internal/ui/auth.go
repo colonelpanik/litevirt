@@ -62,15 +62,58 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return false
 	}
-	if _, err := s.grpc.Whoami(s.uiBearerCtx(r), &emptypb.Empty{}); err != nil {
+
+	// A mutating request is held to the same bar as the equivalent RPC. The UI's
+	// write handlers reach the replicated DB in-process rather than through
+	// gRPC, so they never passed the operator check the RPC applies
+	// (firewall_rules.go) — and this gate, the only one in front of them, looked
+	// at the cookie and never at the role. A VIEWER could flip the cluster
+	// default firewall policy, delete security-group rules for every VM, and
+	// repoint cluster notifications.
+	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+
+	who, err := s.grpc.Whoami(s.uiBearerCtx(r), &emptypb.Empty{})
+	if err != nil {
 		if status.Code(err) == codes.Unauthenticated {
 			clearSessionCookie(w)
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return false
 		}
-		slog.Warn("ui: session validation hit a transient error; allowing through", "error", err)
+		// Fail OPEN for a read and CLOSED for a write. Letting a read through a
+		// brief daemon blip avoids locking an operator out of the dashboard, and
+		// that trade is deliberate. Letting a WRITE through means the one
+		// component that knows the caller's role is unreachable and the write
+		// lands anyway, which is not a trade — it is the check being optional.
+		if mutating {
+			slog.Warn("ui: refusing a mutation because the caller's role could not be verified",
+				"method", r.Method, "path", r.URL.Path, "error", err)
+			http.Error(w, "cannot verify your permissions right now; try again shortly",
+				http.StatusServiceUnavailable)
+			return false
+		}
+		slog.Warn("ui: session validation hit a transient error; allowing the READ through", "error", err)
+		return true
+	}
+
+	if mutating && !uiRoleAtLeast(who.GetRole(), "operator") {
+		slog.Warn("ui: refusing a mutation from an under-privileged session",
+			"user", who.GetUsername(), "role", who.GetRole(), "method", r.Method, "path", r.URL.Path)
+		http.Error(w, "your role does not permit this change", http.StatusForbidden)
+		return false
 	}
 	return true
+}
+
+// uiRoleLevels mirrors the daemon's admin > operator > viewer ordering. It is a
+// local copy because internal/grpcapi does not export one; the two must agree,
+// and the UI is deliberately the more permissive of the pair only in that it
+// never grants more than the RPC behind it would.
+var uiRoleLevels = map[string]int{"viewer": 1, "operator": 2, "admin": 3}
+
+// uiRoleAtLeast reports whether role meets minRole. An unknown or empty role
+// scores 0, so it never satisfies anything.
+func uiRoleAtLeast(role, minRole string) bool {
+	return uiRoleLevels[role] >= uiRoleLevels[minRole] && uiRoleLevels[role] > 0
 }
 
 // clearSessionCookie expires the session cookie in the browser.

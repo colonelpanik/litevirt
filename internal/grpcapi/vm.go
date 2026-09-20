@@ -1198,8 +1198,9 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	if len(clones) > 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q still backs %d linked clone(s) (%s); starting it would let qemu write "+
-				"into the backing file under each overlay. Delete the clones, or promote "+
-				"them with `lv vm clone --full`, first",
+				"into the backing file under each overlay. Delete those clones, or "+
+				"re-create them as independent copies with `lv clone <source> <name> "+
+				"--mode full`, first",
 			req.Name, len(clones), strings.Join(clones, ", "))
 	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {

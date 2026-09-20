@@ -282,16 +282,18 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	c.mu.Lock()
 	prev, exists := c.peers[host.Name]
 	if !exists {
+		// Deliberately NOT bootstrapped from the host_health row. A failure
+		// count is evidence THIS run gathered, and seeding it from the DB let a
+		// just-restarted daemon publish prev+1 with a current updated_at on its
+		// very first probe — a fence-quorum-eligible "suspect" verdict carrying
+		// a count it never observed. The healthy direction already refuses that
+		// credit (gate.go only counts a peer whose lastHealthyAt this run set);
+		// the failing direction is the same claim and gets the same rule.
+		//
+		// The cost is bounded and correct: after a restart a node must re-earn
+		// suspectThreshold consecutive failures — about 6 s at checkInterval —
+		// before it votes to fence again.
 		prev = &peerState{status: "", failures: 0}
-		// Bootstrap from DB so we pick up pre-existing failure counts
-		// (e.g. from a previous run of the checker).
-		rows, qerr := c.db.Query(ctx,
-			`SELECT consecutive_failures, status FROM host_health WHERE observer = ? AND target = ?`,
-			c.hostName, host.Name)
-		if qerr == nil && len(rows) == 1 {
-			prev.failures = rows[0].Int("consecutive_failures")
-			prev.status = rows[0].String("status")
-		}
 		c.peers[host.Name] = prev
 	}
 

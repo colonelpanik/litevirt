@@ -265,7 +265,16 @@ func ruleContentMax() tieRule {
 			// mismatch). Falling back to the positional compare would be the
 			// non-convergent thing this rule exists to avoid, and there is no
 			// deterministic winner to pick, so hand it to a human.
-			return decideUnresolved("content_max_encode")
+			//
+			// "uncategorized" is the resolver's own fallback category, already
+			// emitted by resolveTie for the unreachable no-capability path. A
+			// bespoke category here would be a better operator signal, but the
+			// category vocabulary is enumerated elsewhere and a value absent
+			// from that enumeration is a build failure — deliberately, because
+			// the consumer is a monotone latch. Inventing one would couple this
+			// fix to whichever change owns the enumeration. The alarm that
+			// matters is lww_tie_unresolved, which fires either way.
+			return decideUnresolved("uncategorized")
 		}
 		if a >= b {
 			return decideKeepLocal("content_max")

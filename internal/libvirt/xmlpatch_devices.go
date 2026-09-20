@@ -467,11 +467,14 @@ func attrRegex(attr string) *regexp.Regexp {
 // ── new-device fragment generation (added devices carry NO <address>) ──
 
 func marshalNewDisk(childIndent string, d WantDisk) (string, error) {
+	// Same rule as the generator: a zvol, an LV or an rbd image is not a qcow2
+	// file, and a disk added here goes straight into a live domain.
+	diskType, source, driverType := diskBacking(d.Path)
 	disk := diskDevice{
-		Type:   "file",
+		Type:   diskType,
 		Device: "disk",
-		Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
-		Source: diskSource{File: d.Path},
+		Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache},
+		Source: source,
 		Target: diskTarget{Dev: d.TargetDev, Bus: d.Bus},
 	}
 	return marshalFragment(childIndent, disk)

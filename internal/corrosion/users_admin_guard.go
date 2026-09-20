@@ -37,7 +37,8 @@ import (
 //     would block `lv user create --role admin`, which is a legitimate operation
 //     and is the remediation the last-admin delete guard tells operators to use.
 //   - It does not refuse a promotion. Changing an existing account's role to
-//     admin is `lv user promote`, and it preserves created_at.
+//     admin preserves created_at, so it is not a re-mint. (No `lv user`
+//     subcommand does this today — `--role` only applies at create.)
 //   - It does not use customMergeTables, which is what #224 proposed. That map
 //     re-classifies every statement for its table to DispCustomMerge, and the
 //     users shapes are recorded in the compatibility ledger as DispPlainInsert

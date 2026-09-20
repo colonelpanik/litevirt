@@ -191,7 +191,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if ctQuota := (corrosion.QuotaAmount{
 		VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib), NIC: len(plan.ifaces),
 	}); !ctQuota.IsZero() {
-		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
+		// Normalize before admission. project_quotas is keyed "_default", and
+		// UpsertContainer normalizes the stored row the same way — so passing the
+		// raw "" that `lv ct create` sends without --project found no quota row,
+		// skipped quotaVerdict entirely, and then counted the container against a
+		// budget that had never admitted it. It also wrote the reservation with
+		// Project "", where a concurrent VM create in _default cannot see it.
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, tenancy.NormalizeProject(req.Project),
 			corrosion.WorkloadContainer, req.Name, ctQuota, ctQuota, intentContainerResident)
 		if aerr != nil {
 			_ = s.releaseContainerNICs(ctx, req.Name)

@@ -83,11 +83,20 @@ func renderInterface(b *strings.Builder, r corrosion.HostNetworkRecord) error {
 		if mode == "" {
 			mode = "active-backup" // the safe default: works with any switch
 		}
+		if err := validEnum("bond mode", mode, bondModes); err != nil {
+			return fmt.Errorf("bond %q: %w", r.Name, err)
+		}
 		fmt.Fprintf(b, "      parameters:\n        mode: %s\n", yamlScalar(mode))
 		if r.LACPRate != "" {
+			if err := validEnum("lacp-rate", r.LACPRate, lacpRates); err != nil {
+				return fmt.Errorf("bond %q: %w", r.Name, err)
+			}
 			fmt.Fprintf(b, "        lacp-rate: %s\n", yamlScalar(r.LACPRate))
 		}
 		if r.HashPolicy != "" {
+			if err := validEnum("transmit-hash-policy", r.HashPolicy, hashPolicies); err != nil {
+				return fmt.Errorf("bond %q: %w", r.Name, err)
+			}
 			fmt.Fprintf(b, "        transmit-hash-policy: %s\n", yamlScalar(r.HashPolicy))
 		}
 	case "bridge":
@@ -215,4 +224,81 @@ func validScalar(s string) error {
 
 // yamlScalar double-quotes a pre-validated scalar so YAML type sniffing can't
 // reinterpret it (e.g. a bare `no` or `3.10`).
-func yamlScalar(s string) string { return `"` + s + `"` }
+// yamlScalar renders s as a YAML double-quoted scalar.
+//
+// It used to wrap the value in quotes and escape nothing, which is not quoting
+// at all: a value containing a double quote closed the scalar, and a newline
+// then opened whatever YAML followed. That reached a netplan file written as
+// root and handed to `netplan apply`, via bond parameters no validator was
+// looking at.
+//
+// Double-quoted style is the one YAML flavour that can carry every byte, using
+// C-style escapes. Callers should still validate — see bondMode et al — but
+// this function has to be safe on its own, because the next caller will not
+// know that it wasn't.
+func yamlScalar(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\x%02x`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// The bond parameters netplan accepts. They are enumerations, not free text,
+// so an allow-list is both the tightest and the most honest validation: it
+// rejects an injection payload and a typo alike, at the point the value would
+// otherwise be written to disk.
+//
+// UpsertHostNetwork says "The renderer is the deep validator (names, injection,
+// kind invariants)" — so this is where it belongs. Neither downstream guard
+// would catch it: SelfCutoffRisk inspects only name, members and addressing,
+// and ForeignConflicts only compares against OTHER files.
+var (
+	bondModes = map[string]bool{
+		"balance-rr": true, "active-backup": true, "balance-xor": true,
+		"broadcast": true, "802.3ad": true, "balance-tlb": true, "balance-alb": true,
+	}
+	lacpRates    = map[string]bool{"slow": true, "fast": true}
+	hashPolicies = map[string]bool{
+		"layer2": true, "layer2+3": true, "layer3+4": true,
+		"encap2+3": true, "encap3+4": true, "vlan+srcmac": true,
+	}
+)
+
+// validEnum checks value against an allow-list, naming the field so the
+// operator sees which one they got wrong.
+func validEnum(field, value string, allowed map[string]bool) error {
+	if !allowed[value] {
+		return fmt.Errorf("%s %q is not one of %s", field, value, sortedKeys(allowed))
+	}
+	return nil
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}

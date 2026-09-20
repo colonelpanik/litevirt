@@ -33,7 +33,7 @@ Note: SPICE traffic is NOT proxied through the litevirt daemon today; the
 client must be able to reach the host directly. Use SSH tunneling if your
 host's SPICE port isn't externally reachable:
 
-    lv host ssh <host> -- -L 5901:127.0.0.1:<port>
+    ssh -L 5901:127.0.0.1:<port> <ssh-user>@<host>
     remote-viewer spice://127.0.0.1:5901
 `,
 		Args: cobra.ExactArgs(1),

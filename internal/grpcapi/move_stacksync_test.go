@@ -13,7 +13,7 @@ import (
 )
 
 // Moving a disk for a VM that belongs to a stack must update the stack's stored
-// compose YAML so `lv stack export` reflects the new pool (and re-deploy is
+// compose YAML so `lv compose export` reflects the new pool (and re-deploy is
 // idempotent). Offline path (stopped VM).
 func TestMoveVolume_SyncsStackComposeYAML(t *testing.T) {
 	s := testServer(t)

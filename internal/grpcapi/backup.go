@@ -37,9 +37,11 @@ func (s *Server) BackupVM(req *pb.BackupVMRequest, stream pb.LiteVirt_BackupVMSe
 }
 
 // RestoreVM is DEPRECATED alongside BackupVM. Use the repo-backed restore paths:
-// `lv restore-from` (materialize a disk from a manifest) or `lv restore-live`
+// `lv backup restore-from` (materialize a disk from a manifest) or
+// `lv backup restore-live`
 // (boot against an NBD-backed overlay). The RPC now returns Unimplemented.
 func (s *Server) RestoreVM(stream pb.LiteVirt_RestoreVMServer) error {
 	return status.Error(codes.Unimplemented,
-		"raw full-disk restore is deprecated; use `lv restore-from` or `lv restore-live` (from a backup repo) instead")
+		"raw full-disk restore is deprecated; use `lv backup restore-from` or "+
+			"`lv backup restore-live` (from a backup repo) instead")
 }

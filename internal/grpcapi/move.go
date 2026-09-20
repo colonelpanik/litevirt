@@ -613,7 +613,7 @@ func (s *Server) deleteCapturedVMDiskVolumes(ctx context.Context, disks []corros
 }
 
 // syncStackComposeForMovedDisk keeps a stack's stored compose YAML in sync with
-// a disk's new pool after a move, so `lv stack export` / the UI Export reflect
+// a disk's new pool after a move, so `lv compose export` / the UI Export reflect
 // the change and a re-deploy is idempotent (rather than reverting the disk).
 // No-op for VMs not in a stack. Best-effort: failures are logged, not fatal —
 // the disk move itself already succeeded.

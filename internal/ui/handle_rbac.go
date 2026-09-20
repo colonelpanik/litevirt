@@ -30,7 +30,7 @@ func (s *Server) handleRBACBindingModal(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleGrantRole creates a role binding via the auth gRPC. Mirrors
-// `lv auth grant`.
+// `lv role grant`.
 func (s *Server) handleGrantRole(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
@@ -57,7 +57,7 @@ func (s *Server) handleGrantRole(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleRevokeRole removes a role binding by id. Mirrors `lv auth revoke`.
+// handleRevokeRole removes a role binding by id. Mirrors `lv role revoke`.
 func (s *Server) handleRevokeRole(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := s.grpc.RevokeRole(s.uiBearerCtx(r), &pb.RevokeRoleRequest{Id: id}); err != nil {

@@ -19,7 +19,9 @@ import (
 //
 // Unlike VNC, we do not currently proxy SPICE through the daemon — clients
 // must reach the host's SPICE port directly. SPICE has a TCP-tunnel mode
-// (`-T` in remote-viewer) that pairs well with `lv host ssh`. Bundling a
+// (`-T` in remote-viewer) that pairs well with an ordinary SSH port-forward
+// to the host — there is no `lv` command for that, since the tunnel is to the
+// HOST rather than to a VM (`lv ssh` connects to a VM). Bundling a
 // browser-based SPICE client (spice-html5) is a future enhancement; this
 // RPC is the minimum viable surface to make SPICE usable today.
 func (s *Server) GetSpiceInfo(ctx context.Context, req *pb.GetSpiceInfoRequest) (*pb.GetSpiceInfoResponse, error) {

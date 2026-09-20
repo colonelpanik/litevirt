@@ -64,26 +64,17 @@ func TestOperatorMessagesReferenceRealCLICommands(t *testing.T) {
 	}
 }
 
-// staleMessageCommands is the debt this guard found the day it was written:
-// operator-facing messages and comments naming commands that do not exist,
-// every one of them predating the guard and none of them in the subsystem it
-// was added for.
+// staleMessageCommands records operator-facing messages and comments that name
+// a command which does not exist, where the right replacement is not obvious
+// enough to apply without guessing.
 //
-// Recorded rather than fixed, because renaming a command in someone else's error
-// message is a guess about what they meant, and a guess is what put these here.
-// Each is a real defect for whoever owns that path: an operator following the
-// message gets "unknown command". Delete an entry as its message is corrected;
-// the guard fails on anything new.
-var staleMessageCommands = map[string]string{
-	"stack export":    "internal/compose/patch.go, internal/grpcapi/move.go — no `export` under `lv stack`",
-	"firewall status": "internal/firewall/reconciler.go — the command is `lv firewall show`",
-	"restore-from":    "internal/grpcapi/backup.go — no such root command",
-	"restore-live":    "internal/grpcapi/backup.go — no such root command",
-	"host ssh":        "internal/grpcapi/spice.go — no `ssh` under `lv host`",
-	"user promote":    "internal/grpcapi/users.go — no `promote` under `lv user`",
-	"auth grant":      "internal/ui/handle_rbac.go — no `lv auth` command group",
-	"auth revoke":     "internal/ui/handle_rbac.go — no `lv auth` command group",
-}
+// It is EMPTY. The eight entries it was created with — every one of them
+// predating this guard — have since been corrected against the cobra tree
+// rather than recorded, so each message now names a command an operator can
+// actually run. The map stays as the mechanism: add an entry when a message is
+// wrong and the intended command is genuinely ambiguous, and delete it when the
+// message is fixed.
+var staleMessageCommands = map[string]string{}
 
 // goSourceFiles lists the production Go files to scan. Tests are excluded: a
 // test asserting on a message is not itself operator-facing, and it names the

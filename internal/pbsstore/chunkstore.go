@@ -333,12 +333,33 @@ func (r *Repo) LatestManifestFor(vm, disk string) (*Manifest, bool, error) {
 	return latest, true, nil
 }
 
-// ListManifests returns every manifest in the repo, sorted by timestamp
-// ascending. Used by GC, retention, and the UI's snapshot list.
+// ListManifests returns every VALID manifest in the repo, sorted by timestamp
+// ascending. Used by retention and the UI's snapshot list.
+//
+// GC must NOT use this. An invalid manifest is omitted here, and a reader that
+// treats "omitted" as "references nothing" will delete the chunks it points at
+// — see listParsedManifests.
 func (r *Repo) ListManifests() ([]Manifest, error) {
-	var out []Manifest
+	valid, _, err := r.listParsedManifests()
+	return valid, err
+}
+
+// listParsedManifests returns every manifest file that PARSED, split into those
+// that validate and those that do not.
+//
+// The split exists because the two groups answer different questions. "Which
+// backups can I restore or prune?" is the valid set. "Which chunks are still
+// referenced?" is BOTH: a manifest with one damaged field still names real
+// chunks, and it is repairable by hand — an operator can put the value back and
+// the backup is whole again, provided the data it points at is still there.
+// Dropping it from the reachability set is what made GC delete that data and
+// turn a repairable backup into a lost one.
+//
+// A file that does not parse at all is still fatal: its references are unknown,
+// so no caller can reason about reachability and the error propagates.
+func (r *Repo) listParsedManifests() (valid, invalid []Manifest, err error) {
 	root := filepath.Join(r.root, "snapshots")
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -356,21 +377,24 @@ func (r *Repo) ListManifests() ([]Manifest, error) {
 		if err := json.Unmarshal(data, &m); err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		// A structurally-invalid manifest is skipped (not fatal) so one bad file
-		// can't deny listing every other backup, and it's never offered for a
-		// restore/prune.
+		// A structurally-invalid manifest is not offered for restore or prune,
+		// so one bad file cannot deny listing every other backup — but it is
+		// still returned, separately, so reachability can account for it.
 		if verr := ValidateManifest(&m); verr != nil {
-			slog.Warn("pbsstore: skipping invalid manifest", "path", path, "error", verr)
+			slog.Warn("pbsstore: invalid manifest (not restorable; its chunks stay referenced)",
+				"path", path, "error", verr)
+			invalid = append(invalid, m)
 			return nil
 		}
-		out = append(out, m)
+		valid = append(valid, m)
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if walkErr != nil {
+		return nil, nil, walkErr
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
-	return out, nil
+	sort.Slice(valid, func(i, j int) bool { return valid[i].Timestamp < valid[j].Timestamp })
+	sort.Slice(invalid, func(i, j int) bool { return invalid[i].Timestamp < invalid[j].Timestamp })
+	return valid, invalid, nil
 }
 
 // AllChunks returns every chunk a manifest references — the disk chunks plus

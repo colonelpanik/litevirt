@@ -1368,9 +1368,16 @@ const vmLockTTL = 10 * time.Minute
 // lock then discovered the VM moved, and we release without acting", not
 // "two hosts both started the VM."
 func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
+	return acquireVMLockFor(ctx, r.db, r.hostName, vmName, r.now())
+}
+
+// acquireVMLockFor is acquireVMLock without a Reconciler. The restart-policy
+// path in VMChecker needs the same lease and is not a Reconciler, and a second
+// copy of this CRDT-tolerant upsert would be a second thing to get wrong.
+func acquireVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string, nowT time.Time) bool {
 	// Read the clock ONCE so `now` and `expires` derive from the same instant
 	// (a per-call test clock could otherwise advance between two reads).
-	base := r.now().UTC()
+	base := nowT.UTC()
 	now := base.Format(time.RFC3339)
 	expires := base.Add(vmLockTTL).Format(time.RFC3339)
 	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
@@ -1378,7 +1385,7 @@ func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
 	// breaks on a date match ('T' > ' ') and a same-day lock NEVER looks expired —
 	// a crashed holder's vm_lock would then block another host from reconciling
 	// that VM until the UTC date rolls.
-	if err := r.db.Execute(ctx,
+	if err := db.Execute(ctx,
 		`INSERT INTO vm_locks (vm_name, holder, expires_at, updated_at)
 		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(vm_name) DO UPDATE
@@ -1387,25 +1394,30 @@ func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
 		       updated_at = excluded.updated_at
 		   WHERE vm_locks.expires_at < ?
 		      OR vm_locks.holder = excluded.holder`,
-		vmName, r.hostName, expires, now, now); err != nil {
-		slog.Warn("reconciler: vm_lock write failed", "vm", vmName, "error", err)
+		vmName, hostName, expires, now, now); err != nil {
+		slog.Warn("vm_lock write failed", "vm", vmName, "holder", hostName, "error", err)
 		return false
 	}
-	rows, err := r.db.Query(ctx,
+	rows, err := db.Query(ctx,
 		`SELECT holder FROM vm_locks WHERE vm_name = ?`, vmName)
 	if err != nil || len(rows) == 0 {
 		return false
 	}
-	return rows[0].String("holder") == r.hostName
+	return rows[0].String("holder") == hostName
 }
 
 // releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
 // is recoverable (next acquire after vmLockTTL succeeds).
 func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
-	if err := r.db.Execute(ctx,
+	releaseVMLockFor(ctx, r.db, r.hostName, vmName)
+}
+
+// releaseVMLockFor is releaseVMLock without a Reconciler. See acquireVMLockFor.
+func releaseVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string) {
+	if err := db.Execute(ctx,
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
-		vmName, r.hostName); err != nil {
-		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
+		vmName, hostName); err != nil {
+		slog.Debug("vm_lock release failed", "vm", vmName, "holder", hostName, "error", err)
 	}
 }
 

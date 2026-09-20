@@ -2662,6 +2662,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
 	}
+	// Serialize with every other mutator of this VM, and read the row UNDER the
+	// lock so the guards below cannot be invalidated between the read and the
+	// destruction. Rebuild destroys the domain, deletes every disk and wipes
+	// firmware state — it was the only destructive VM-lifecycle RPC in this file
+	// without the lock, so it could run straight through a concurrent start,
+	// resize or migrate of the same VM. Same placement as DeleteVM.
+	unlock := s.lockVM(req.Name)
+	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2677,6 +2685,31 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.RebuildVM(ctx, req)
+	}
+
+	// The same three barriers DeleteVM carries, for the same reason: this is a
+	// destructive operation and each of these states means something else owns
+	// the VM's disks right now.
+	if vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot rebuild %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+	}
+	if vm.State == "backing-up" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being backed up — wait for the backup to complete", req.Name)
+	}
+	// Rebuild always deletes the disks (there is no --keep-disks here), so a VM
+	// that still backs live linked clones would take their backing file with it.
+	// Unlike DeleteVM's guard this one fails CLOSED on a read error: there is no
+	// variant of rebuild that spares the disks, so a clone list we could not read
+	// is not evidence there are none.
+	if clones, gErr := s.linkedClonesOf(ctx, req.Name); gErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot confirm %q backs no linked clones: %v", req.Name, gErr)
+	} else if len(clones) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q still backs %d linked clone(s) (%s); delete or full-clone them first",
+			req.Name, len(clones), strings.Join(clones, ", "))
 	}
 
 	// BEFORE anything destructive: a VM holding an address on a NetBox-bound

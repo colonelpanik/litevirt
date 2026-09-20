@@ -169,6 +169,18 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		return client.AttachDevice(ctx, req)
 	}
 	// Mutation barrier: don't hot-plug while a resource operation holds the VM.
+	// Serialize the LEGACY (non-address-selector) path with every other mutator
+	// of this VM. The journaled paths take this lock inside attachPCIOwner /
+	// detachPCIOwner; this one never did, so two concurrent attaches raced —
+	// and beginDeviceLease keys the durable crash anchor per-VM, so the second
+	// overwrote the only record recovery has of the first's claimed devices.
+	//
+	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
+	// operation barrier and running-state checks below are read under it too;
+	// unlocked, those are a read-then-act both callers pass.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot attach a device to %q: an operation is in progress", req.VmName)
 	}
@@ -252,6 +264,18 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		return client.DetachDevice(ctx, req)
 	}
 	// Mutation barrier: don't hot-unplug while a resource operation holds the VM.
+	// Serialize the LEGACY (non-address-selector) path with every other mutator
+	// of this VM. The journaled paths take this lock inside attachPCIOwner /
+	// detachPCIOwner; this one never did, so two concurrent attaches raced —
+	// and beginDeviceLease keys the durable crash anchor per-VM, so the second
+	// overwrote the only record recovery has of the first's claimed devices.
+	//
+	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
+	// operation barrier and running-state checks below are read under it too;
+	// unlocked, those are a read-then-act both callers pass.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot detach a device from %q: an operation is in progress", req.VmName)
 	}

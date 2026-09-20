@@ -23,6 +23,14 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	// Serialize with every other mutator of this VM: a snapshot rewrites the
+	// disk chain, so it must not interleave with a resize, a migrate, a restore
+	// or another snapshot. The container twins in snapshot_container.go already
+	// take this lock; the VM ones did not. Taken before the row read so the
+	// state guards below cannot go stale underneath the work.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
@@ -245,6 +253,14 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	// Serialize with every other mutator of this VM: a snapshot rewrites the
+	// disk chain, so it must not interleave with a resize, a migrate, a restore
+	// or another snapshot. The container twins in snapshot_container.go already
+	// take this lock; the VM ones did not. Taken before the row read so the
+	// state guards below cannot go stale underneath the work.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
@@ -339,6 +355,14 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	// Serialize with every other mutator of this VM: a snapshot rewrites the
+	// disk chain, so it must not interleave with a resize, a migrate, a restore
+	// or another snapshot. The container twins in snapshot_container.go already
+	// take this lock; the VM ones did not. Taken before the row read so the
+	// state guards below cannot go stale underneath the work.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)

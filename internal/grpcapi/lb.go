@@ -728,18 +728,22 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			proof := s.mintLBProof(ctx, req.Name, host)
-			if s.gateActive(ctx) && proof == nil {
+			proof := s.mintLBProof(fctx, req.Name, host)
+			if s.gateActive(fctx) && proof == nil {
 				slog.Error("CreateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
 					"host", host, "lb", req.Name)
 				return
 			}
-			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
+			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
 				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts, Proof: proof,
 			}); aerr != nil {
@@ -1697,13 +1701,17 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			proof := s.mintLBProof(ctx, req.Name, host)
-			if s.gateActive(ctx) && proof == nil {
+			proof := s.mintLBProof(fctx, req.Name, host)
+			if s.gateActive(fctx) && proof == nil {
 				slog.Error("UpdateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
 					"host", host, "lb", req.Name)
 				return
@@ -1717,7 +1725,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			// failover for the VIP was gone — the same "upgrade becomes a silent
 			// outage" regression ParseStoredVIP exists to prevent (see the note
 			// on the read path below), relocated to the peer fan-out.
-			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
+			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: vipForWire(vip), Algorithm: algorithm,
 				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
 			}); aerr != nil {
@@ -1800,12 +1808,16 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			client.RemoveLB(ctx, &pb.RemoveLBRequest{LbName: req.Name})
+			client.RemoveLB(fctx, &pb.RemoveLBRequest{LbName: req.Name})
 		}(h)
 	}
 
@@ -2470,12 +2482,16 @@ func (s *Server) refreshLBForStack(ctx context.Context, stackName string) {
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			client.RefreshLB(ctx, &pb.RefreshLBRequest{StackName: stackName})
+			client.RefreshLB(fctx, &pb.RefreshLBRequest{StackName: stackName})
 		}(h)
 	}
 }

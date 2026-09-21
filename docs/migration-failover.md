@@ -105,7 +105,7 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 When a host goes offline, the failover coordinator:
 
 1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1)
-2. **Acquires leader lease** — only one host coordinates failover (30s TTL lease)
+2. **Acquires leader lease** — only one host coordinates failover (45s TTL lease; a fence needs 30s of it still to run before it may begin)
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
@@ -329,7 +329,7 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions

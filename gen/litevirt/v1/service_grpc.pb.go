@@ -214,6 +214,7 @@ const (
 	LiteVirt_EnsureDisks_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureDisks"
 	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
+	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
@@ -544,6 +545,7 @@ type LiteVirtClient interface {
 	EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error)
@@ -2840,6 +2842,16 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 	return out, nil
 }
 
+func (c *liteVirtClient) CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckCPUCompatibilityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CheckCPUCompatibility_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDigestResponse)
@@ -3609,6 +3621,7 @@ type LiteVirtServer interface {
 	EnsureDisks(context.Context, *EnsureDisksRequest) (*emptypb.Empty, error)
 	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
+	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
 	GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error)
@@ -4336,6 +4349,9 @@ func (UnimplementedLiteVirtServer) EnsureFirmwareState(context.Context, *EnsureF
 }
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
+}
+func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckCPUCompatibility not implemented")
 }
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
@@ -7735,6 +7751,24 @@ func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_CheckCPUCompatibility_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckCPUCompatibilityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CheckCPUCompatibility(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CheckCPUCompatibility_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CheckCPUCompatibility(ctx, req.(*CheckCPUCompatibilityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -9179,6 +9213,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CleanupMigrationArtifacts",
 			Handler:    _LiteVirt_CleanupMigrationArtifacts_Handler,
+		},
+		{
+			MethodName: "CheckCPUCompatibility",
+			Handler:    _LiteVirt_CheckCPUCompatibility_Handler,
 		},
 		{
 			MethodName: "GetStateDigest",

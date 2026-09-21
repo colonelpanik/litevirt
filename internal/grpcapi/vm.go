@@ -80,7 +80,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	spec, err := normalizeCreateVMSpec(req.GetSpec())
+	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -3257,7 +3257,8 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 // the shape eligible for the live vCPU hot-add fast path.
 func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 	return req.Cpu > 0 &&
-		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
@@ -3352,7 +3353,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
-	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
+	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
@@ -3364,7 +3365,8 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// full regeneration.
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
-	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+	cpuMemOnly := redefine && req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	restartAfter := false
@@ -3522,9 +3524,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if req.MemoryMib > 0 {
 			spec.MemoryMib = req.MemoryMib
 		}
-		if req.CpuMode != "" {
-			spec.CpuMode = req.CpuMode
+		cpuMode, cpuModel, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel)
+		if cerr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
 		}
+		spec.CpuMode, spec.CpuModel = cpuMode, cpuModel
 		if req.Machine != "" {
 			spec.Machine = req.Machine
 		}

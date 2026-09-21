@@ -518,6 +518,37 @@ homogeneous cluster — every host resolving the alias identically is why this i
 a warning and not an error — but it should be cleared before introducing a host
 with a different qemu version.
 
+## `lv doctor cpu-mode`
+
+Read-only. Lists VMs whose **persisted spec** has an empty `cpu_mode`.
+
+```
+lv doctor cpu-mode
+```
+
+Such a VM is defined with no `<cpu>` element, so libvirt passes no `-cpu` to QEMU
+and the guest runs on QEMU's x86_64 default, `qemu64` — a model with no `sse4.1`,
+no `sse4.2` and no `xsave`, and therefore neither AVX nor AVX2, however capable
+the host is. Guest software that assumes a modern baseline will not start, and the
+fault presents as a broken binary rather than a hypervisor setting.
+
+New VMs default to `host-model` (see `vm.default_cpu_mode` in
+[configuration](configuration.md)). VMs listed here were created before that
+default existed. Their stored spec is honored verbatim and deliberately not
+rewritten: changing the CPU a running guest sees is not something an upgrade
+should do behind the operator's back.
+
+To move one forward, with the VM **stopped**:
+
+```
+lv update <vm> --cpu-mode host-model
+```
+
+That changes the guest-visible CPU, so it needs a full stop/start rather than a
+guest reboot, and it narrows live migration for that VM to hosts with an
+equal-or-richer CPU — which is the trade the modern instruction set costs. On a
+homogeneous cluster there is no trade to make.
+
 ## `lv doctor vm-uuids`
 
 Read-only. Lists VMs whose **persisted spec** carries no domain uuid.

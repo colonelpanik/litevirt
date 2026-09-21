@@ -33,10 +33,6 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	if !validRestoreName(req.Name) || !validRestoreName(req.Snapshot) {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"invalid container/snapshot name: allowed [A-Za-z0-9_.-], not '.' or '..'")
-	}
 	// Both names are joined into ctSnapshotPath and the daemon runs as root, so
 	// both are validated here — before any path is built from them. Without this
 	// a `../` in the snapshot name escapes the snapshot directory: create

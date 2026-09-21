@@ -1708,11 +1708,27 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 					"host", host, "lb", req.Name)
 				return
 			}
+			// The REPAIRED vip, not the raw stored one. ParseStoredVIP above
+			// accepts a form an older build persisted (e.g. a trailing extra
+			// field) and hands back the recovered address; sending `vip` sent
+			// that original string, and the peer parses with the tightened
+			// ParseVIP and answers InvalidArgument. The local host applied the
+			// LB and every other holder silently did not, so keepalived/VRRP
+			// failover for the VIP was gone — the same "upgrade becomes a silent
+			// outage" regression ParseStoredVIP exists to prevent (see the note
+			// on the read path below), relocated to the peer fan-out.
 			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
-				LbName: req.Name, Vip: vip, Algorithm: algorithm,
+				LbName: req.Name, Vip: vipForWire(vip), Algorithm: algorithm,
 				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
 			}); aerr != nil {
-				slog.Warn("UpdateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
+				// Error, not Warn. A holder that did not receive the config is
+				// not participating in VRRP for this VIP, so the LB is one host
+				// away from having no failover at all — and nothing else reports
+				// it. The fan-out stays best-effort by design; what changes here
+				// is that the consequence is legible in the log.
+				slog.Error("UpdateLoadBalancer: remote apply failed — this host is NOT serving the LB "+
+					"and will not participate in VRRP failover for its VIP; re-run `lv lb update`",
+					"host", host, "lb", req.Name, "error", aerr)
 			}
 		}(h)
 	}
@@ -2147,6 +2163,27 @@ func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.R
 	}
 }
 
+// vipForWire is the VIP to send a peer, given the one this node has stored.
+//
+// Split out and named so the two fan-out sites cannot drift, and so the rule is
+// testable without standing up a peer: ApplyLB parses with the STRICT
+// lb.ParseVIP, while a row persisted by an older Sscanf-era build can hold a
+// form only lb.ParseStoredVIP accepts. Sending the stored string meant the
+// coordinating host applied the LB and every other holder refused it with
+// InvalidArgument, which the fan-out only logged — silent config drift that
+// reads as a successful update.
+//
+// A well-formed value round-trips unchanged. One ParseStoredVIP cannot recover
+// is returned as-is, so the peer's own error names the real value rather than
+// this node inventing a substitute.
+func vipForWire(stored string) string {
+	ip, prefix, _, err := lb.ParseStoredVIP(stored)
+	if err != nil {
+		return stored
+	}
+	return fmt.Sprintf("%s/%d", ip, prefix)
+}
+
 // forwardLBApply asks a remote host to apply the LB. resolvedHosts is the RESOLVED
 // target host set (implicit stack LBs derive it from VM placement) — it MUST be passed
 // so the remote computes the same VRRP priority the local apply did; sending the raw
@@ -2196,9 +2233,15 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 			"host", hostName, "lb", lbName)
 		return
 	}
+	// Repair the VIP before it goes on the wire, for the same reason
+	// UpdateLoadBalancer's fan-out does: ApplyLB parses with the strict
+	// ParseVIP, so a legacy form an older build persisted is accepted locally
+	// and refused by the peer. A well-formed value round-trips unchanged, and a
+	// value ParseStoredVIP cannot recover is forwarded as-is so the peer's own
+	// error message is what the operator sees.
 	if _, err := client.ApplyLB(ctx, &pb.ApplyLBRequest{
 		LbName:    lbName,
-		Vip:       lbSpec.Vip,
+		Vip:       vipForWire(lbSpec.Vip),
 		Algorithm: lbSpec.Algorithm,
 		Backends:  pbBackends,
 		Ports:     pbPorts,

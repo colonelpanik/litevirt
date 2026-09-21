@@ -469,30 +469,68 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 		}
 		return nil
 	}
-	n, err := c.ExecuteRows(ctx, claimProofFencedSQL,
-		executor, now, now, id, executor,
-		fence.Term, fence.Key, executor, fence.Coordinator, id)
+	// The fence is decided LOCALLY, inside the claim's own transaction, and what
+	// goes on the wire is the row-local claimProofSQL — the same shape the
+	// unfenced path already replicates.
+	//
+	// It used to relay claimProofFencedSQL, whose fence was a NOT EXISTS over
+	// other rows of this table. A predicate about other rows is re-evaluated
+	// wherever the statement lands: relayStatement deliberately relays a
+	// zero-row UPDATE, and runtime_action_proofs is a custom-merge table whose
+	// UPDATEs applyStatementLWW applies verbatim. So a claim this node correctly
+	// REFUSED still shipped, and a peer that had not yet replicated the
+	// conflicting evidence satisfied the subquery and applied it — recording the
+	// proof in_progress on the very host that refused it. proofRank puts
+	// in_progress above prepared, so anti-entropy carried that back and it
+	// stuck; executor_host was then pinned to the refusing host and every other
+	// executor's claim of that proof failed permanently with ErrProofSpent.
+	//
+	// Both checks live in the guard so the two refusals stay distinguishable
+	// without a second read: claimable answers ErrProofSpent, fenced answers
+	// ErrTermClaimantConflict. The guard runs in the same transaction as the
+	// UPDATE, so "claimable" cannot go stale between the two — which is what
+	// lets the relayed statement be the plain claim and still be exact.
+	var fenced bool
+	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var claimable int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM runtime_action_proofs
+			  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+			    AND (executor_host = '' OR executor_host = ?)`,
+			id, executor).Scan(&claimable); err != nil {
+			return false, err
+		}
+		if claimable == 0 {
+			return false, nil // spent, missing, or held by another executor
+		}
+		// Tombstones are INCLUDED, for the reason the old subquery included
+		// them: a conflicting claim is evidence, not a consumable, and spending
+		// it is what created the evidence. Excluding them would let a reaped
+		// claim stop fencing and re-open the split this guard exists to catch.
+		var conflict int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM runtime_action_proofs
+			  WHERE lease_term = ? AND lease_key = ? AND executor_host = ?
+			    AND coordinator <> ? AND id <> ?`,
+			fence.Term, fence.Key, executor, fence.Coordinator, id).Scan(&conflict); err != nil {
+			return false, err
+		}
+		if conflict > 0 {
+			fenced = true
+			return false, nil
+		}
+		return true, nil
+	}, []Statement{{
+		SQL:    claimProofSQL,
+		Params: []interface{}{executor, now, now, id, executor},
+	}})
 	if err != nil {
 		return err
 	}
-	if n > 0 {
+	if ok {
 		return nil
 	}
-	// Zero rows is ambiguous — spent, missing, held elsewhere, OR fenced — and
-	// the two outcomes need different operator-facing reasons. Classify with a
-	// follow-up read. The SAFETY decision was already made atomically above;
-	// this read only chooses the error, so its raciness cannot admit an action.
-	// Tombstones are included here for the same reason the UPDATE's subquery
-	// includes them: the conflicting claim is evidence, not a consumable, and
-	// spending it is what created the evidence. Filtering them here too would
-	// report ErrProofSpent for a refusal that was actually a claimant conflict,
-	// pointing the operator at retention instead of at a split.
-	rows, rerr := c.Query(ctx,
-		`SELECT coordinator FROM runtime_action_proofs
-		  WHERE lease_term = ? AND lease_key = ? AND executor_host = ?
-		    AND coordinator <> ? AND id <> ? LIMIT 1`,
-		fence.Term, fence.Key, executor, fence.Coordinator, id)
-	if rerr == nil && len(rows) > 0 {
+	if fenced {
 		return ErrTermClaimantConflict
 	}
 	return ErrProofSpent
@@ -542,6 +580,12 @@ const claimProofSQL = `UPDATE runtime_action_proofs
 // (key, term) pair never recurs once the lease moves on, and the evidence a
 // tombstone carries never stops being true. It also costs nothing to retain,
 // because ReapSpentProofs never hard-deletes.
+// RETAINED, NOT EXECUTED. ClaimActionProofFenced no longer runs this shape —
+// its fence is a local guard now, because a NOT EXISTS over other rows is
+// re-evaluated on whichever node the statement reaches. The const stays so its
+// fingerprint stays in the ledger: a peer on a previous release still RELAYS
+// this shape, and this node has to keep resolving what arrives. Deleting it
+// would drop the entry and stall the stream from that peer.
 const claimProofFencedSQL = `UPDATE runtime_action_proofs
 	    SET status = 'in_progress',
 	        executor_host = ?,

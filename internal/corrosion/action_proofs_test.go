@@ -997,3 +997,110 @@ func TestClaimActionProofFenced_ANilFenceIsTodaysClaim(t *testing.T) {
 		t.Errorf("p-z refused with no fence: %v — the unfenced claim must be exactly today's", err)
 	}
 }
+
+// A REFUSED fenced claim must not go on the wire.
+//
+// claimProofFencedSQL carried its fence as a NOT EXISTS subquery over
+// runtime_action_proofs — a predicate about OTHER rows, evaluated wherever the
+// statement lands. relayStatement deliberately relays a zero-row UPDATE (the
+// receiver is meant to decide for itself, and may not hold the target row), and
+// runtime_action_proofs is a custom-merge table whose UPDATEs applyStatementLWW
+// applies verbatim. So the refusal shipped.
+//
+// Executor H holds the conflicting claim and correctly refuses with
+// ErrTermClaimantConflict. Peer P has not replicated that evidence row yet, so
+// on P the NOT EXISTS is satisfied and the UPDATE lands: P records the proof as
+// in_progress on H. proofRank puts in_progress above prepared, so anti-entropy
+// carries P's version back and it sticks. executor_host is now pinned to the
+// host that refused, and every OTHER executor's claim of that proof matches zero
+// rows and gets ErrProofSpent — permanently. The proof reads as "in flight on H"
+// while H never took it.
+//
+// The mutation_log is the right place to assert. The local row is correct either
+// way — the refusal did not change it — which is exactly why nothing local could
+// detect this.
+func TestClaimActionProofFenced_ARefusedClaimIsNotReplicated(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+
+	for _, tc := range []struct{ id, coordinator string }{
+		{"p-bound", "node-a"}, {"p-refused", "node-z"},
+	} {
+		if err := WriteActionProof(ctx, c, ActionProof{
+			ID: tc.id, Action: ActionReschedule, TargetKind: "vm", TargetName: tc.id,
+			DestHost: "node-b", Coordinator: tc.coordinator,
+			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", tc.id, err)
+		}
+	}
+	// node-b binds itself to node-a's tenure at term 7.
+	if err := ClaimActionProofFenced(ctx, c, "p-bound", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-a"}); err != nil {
+		t.Fatalf("the binding claim: %v", err)
+	}
+
+	var seqBefore int64
+	if err := c.db.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM mutation_log`).Scan(&seqBefore); err != nil {
+		t.Fatalf("read mutation_log head: %v", err)
+	}
+
+	// A second coordinator's proof, same executor, same term: must be fenced.
+	err := ClaimActionProofFenced(ctx, c, "p-refused", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-z"})
+	if !errors.Is(err, ErrTermClaimantConflict) {
+		t.Fatalf("claim = %v, want ErrTermClaimantConflict", err)
+	}
+
+	// Nothing about the refusal may have been queued for peers.
+	rows, qerr := c.Query(ctx, `SELECT stmts FROM mutation_log WHERE seq > ?`, seqBefore)
+	if qerr != nil {
+		t.Fatalf("read mutation_log: %v", qerr)
+	}
+	for _, r := range rows {
+		if strings.Contains(r.String("stmts"), "p-refused") {
+			t.Errorf("a refused fenced claim was queued for replication:\n\t%s\n"+
+				"a peer missing the conflicting evidence satisfies the NOT EXISTS and applies "+
+				"it, pinning executor_host to the host that refused — every other executor's "+
+				"claim of that proof then fails permanently", r.String("stmts"))
+		}
+	}
+}
+
+// The wire must not carry a cross-row predicate at all.
+//
+// Suppressing the refusal is only half of it: an ACCEPTED claim that ships the
+// fenced shape still hands every peer a NOT EXISTS to re-evaluate against its
+// own replica, which is the same class of divergence in the other direction —
+// a peer that DOES hold conflicting evidence would skip a claim the origin
+// legitimately made.
+func TestClaimActionProofFenced_TheWireCarriesTheRowLocalClaim(t *testing.T) {
+	ctx := context.Background()
+	c := apTestClient(t)
+
+	if err := WriteActionProof(ctx, c, ActionProof{
+		ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "node-b", Coordinator: "node-a",
+		LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := ClaimActionProofFenced(ctx, c, "p1", "node-b",
+		&TermFence{Key: LeaseKeyFailover, Term: 7, Coordinator: "node-a"}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	var stmts string
+	if err := c.db.QueryRow(
+		`SELECT stmts FROM mutation_log ORDER BY seq DESC LIMIT 1`).Scan(&stmts); err != nil {
+		t.Fatalf("read mutation_log: %v", err)
+	}
+	if strings.Contains(stmts, "NOT EXISTS") {
+		t.Errorf("the replicated claim still carries a NOT EXISTS subquery:\n\t%s\n"+
+			"its result depends on which rows the RECEIVING node holds, so peers decide "+
+			"differently from the origin", stmts)
+	}
+	if !strings.Contains(stmts, "runtime_action_proofs") {
+		t.Errorf("the accepted claim did not reach the wire at all:\n\t%s", stmts)
+	}
+}

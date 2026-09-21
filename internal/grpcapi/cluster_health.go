@@ -40,17 +40,33 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query connectivity: %v", err)
 	}
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list hosts: %v", err)
+	}
+	// internal/health's checker does not probe a target in maintenance, so that
+	// target's edges are frozen at whatever they last said. Mark them here, at
+	// the one place that knows both tables, so the roll-up can tell "this link
+	// is bad" from "nobody is looking at this link any more".
+	maintenance := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h.State == "maintenance" {
+			maintenance[h.Name] = true
+		}
+	}
 
 	// Parse the mesh once: the same edges feed both the response body and the
 	// roll-up, which counts a link that is not proven good as a coverage gap.
 	mesh := make([]connectivityEdge, 0, len(edges))
 	for _, r := range edges {
+		target := r.String("target")
 		mesh = append(mesh, connectivityEdge{
 			Observer:            r.String("observer"),
-			Target:              r.String("target"),
+			Target:              target,
 			Status:              r.String("status"),
 			ConsecutiveFailures: r.Int("consecutive_failures"),
 			LastSeen:            r.String("last_seen"),
+			TargetInMaintenance: maintenance[target],
 		})
 	}
 
@@ -105,6 +121,9 @@ type connectivityEdge struct {
 	Status              string // healthy | suspect | failing
 	ConsecutiveFailures int
 	LastSeen            string
+	// TargetInMaintenance marks an edge whose target the checker has stopped
+	// probing. Reported in the body unchanged; excluded from the roll-up.
+	TargetInMaintenance bool
 }
 
 // connectivityDegrades reports whether an edge's status means the link is not
@@ -145,7 +164,8 @@ const evaluatorScanTTL = 5 * time.Minute
 //	DEGRADED — active warning conditions, an evaluator without complete
 //	           coverage, a STALE evaluator (last scan past evaluatorScanTTL, or
 //	           dated in the FUTURE), an incomplete capacity observation, or a
-//	           connectivity edge that is not proven good. Active INFO conditions
+//	           connectivity edge that is not proven good and whose target is
+//	           still being probed. Active INFO conditions
 //	           do NOT degrade: they are advisories, not faults (see the severity
 //	           branch below);
 //	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
@@ -231,6 +251,14 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 	// Connectivity is exactly the kind of cross-host fact this endpoint is the
 	// single surface for, so a link the checker cannot prove good degrades.
 	for _, e := range mesh {
+		// A target taken out of service is not probed any more (checkAllPeers
+		// skips it), so its last recorded status never changes again. Counting
+		// it would latch the cluster DEGRADED for as long as the host stays in
+		// maintenance — a light stuck on, with no link left to fix. The edge is
+		// still reported in the body; it just stops voting.
+		if e.TargetInMaintenance {
+			continue
+		}
 		if connectivityDegrades(e.Status) {
 			degraded = true
 		}

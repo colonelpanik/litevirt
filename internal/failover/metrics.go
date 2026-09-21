@@ -63,6 +63,7 @@ const (
 	ErrAlreadyFenced     = "already_fenced"
 	ErrUpgrading         = "upgrading"
 	ErrRecentlyFenced    = "recently_fenced"
+	ErrRecoveryResumed   = "recovery_resumed" // recovery picked up from a fence a previous leader recorded
 	ErrFirmwareState     = "firmware_state_missing"
 	ErrPolicyNone        = "policy_none"
 	ErrNoCandidates      = "no_candidates"

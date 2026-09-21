@@ -173,3 +173,65 @@ func TestGetClusterHealth_TombstonedEdgeIsNotReported(t *testing.T) {
 		t.Errorf("overall = %q, want HEALTHY — a tombstoned edge must not degrade the cluster", got)
 	}
 }
+
+// TestGetClusterHealth_MaintenanceTargetDoesNotLatchDegraded pins the other
+// side of the connectivity leg. internal/health's checkAllPeers does not probe a
+// host in maintenance, so that host's inbound edges freeze at whatever they last
+// said. Counting a frozen "suspect" edge holds the whole cluster DEGRADED for as
+// long as the host stays out of service — with no link left for anyone to fix,
+// which is a permanently-lit warning light rather than a signal.
+func TestGetClusterHealth_MaintenanceTargetDoesNotLatchDegraded(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	for _, name := range []string{"host-a", "host-b"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "host-a",
+	}); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if err := s.db.Execute(ctx,
+		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES ('host-a', 'host-b', 'suspect', 3, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert suspect edge: %v", err)
+	}
+
+	// While host-b is in service the suspect edge is a live fault.
+	if got := clusterOverall(t, s, ctx); got != HealthDegraded {
+		t.Fatalf("suspect edge to an active target overall = %q, want DEGRADED", got)
+	}
+
+	// Taking host-b out of service stops the probing that could ever clear it.
+	if err := corrosion.UpdateHostState(ctx, s.db, "host-b", "maintenance"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+	if got := clusterOverall(t, s, ctx); got != HealthHealthy {
+		t.Errorf("overall = %q, want HEALTHY — an edge nobody probes any more cannot be the "+
+			"evidence that keeps the cluster degraded", got)
+	}
+
+	// The edge is still REPORTED; it just stops voting.
+	h, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterHealth: %v", err)
+	}
+	if n := len(h.GetConnectivity()); n != 1 {
+		t.Errorf("connectivity edges = %d, want 1 — excluding it from the roll-up must not hide it", n)
+	}
+}
+
+func clusterOverall(t *testing.T, s *Server, ctx context.Context) string {
+	t.Helper()
+	h, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterHealth: %v", err)
+	}
+	return h.GetOverall()
+}

@@ -869,6 +869,14 @@ UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
 0 / 1 / 2 so scripts can gate on it.
 
+Peer connectivity counts toward that state: a link the checker cannot prove
+good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
+rather than being reported and ignored. Links whose **target is in
+maintenance** are the exception — nothing probes a host that is out of
+service, so its last recorded status would never change again and counting
+it would hold the cluster DEGRADED for as long as the host stays down. Those
+edges are still listed; they just stop voting.
+
 **The same rows drive admission.** An active ownership condition blocks
 capacity-growing admission to every involved host and runtime-changing
 actions on the affected workload; an incomplete local runtime inventory

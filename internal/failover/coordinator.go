@@ -29,23 +29,43 @@ const (
 	// offlineThreshold is the number of consecutive failures before a host
 	// is considered offline by the coordinator.
 	offlineThreshold = 5
-	// leaseDuration is the TTL for the failover-leader lease. Must be
-	// comfortably larger than pollInterval so a slow tick doesn't lose the
-	// lease, and comfortably larger than the worst-case fence latency
-	// (IPMI verify ≤ 15 s + SSH 10 s + jitter) plus a renewal margin.
-	leaseDuration = 30 * time.Second
+	// leaseDuration is the TTL for the failover-leader lease. It has to clear
+	// minFenceLease with room to spare: holdLeaseAtLeast requires STRICTLY more
+	// than the floor, so a lease whose full term only just reaches it could
+	// never authorise a fence at all.
+	//
+	// Raising it past the old 30 s costs takeover latency — a leader that dies
+	// holds its row for up to this long before anyone else can act. That is the
+	// deliberate trade: a delayed takeover is recoverable, a fence cut off
+	// mid-verification is reported as a failure and strands the VMs it was
+	// supposed to move.
+	leaseDuration = 45 * time.Second
 	// leaseRenewBefore is how much head-room the leader has to renew before
 	// the lease expires. Failover renews when remaining time drops below this.
+	// It must stay below minFenceLease, or holdLease and holdLeaseAtLeast would
+	// disagree about when a lease is healthy enough to act on.
 	leaseRenewBefore = 10 * time.Second
 	// minFenceLease is the lease head-room required before a fence may START.
-	// leaseRenewBefore (10 s) is NOT enough: an IPMI fence spends up to
-	// fence.PowerOffVerifyTimeout (15 s) on verification alone, so a fence begun
-	// with only the renewal margin left outlives the lease that authorised it —
-	// the row expires mid-call, a second coordinator takes it, and two nodes
-	// fence and reschedule the same host concurrently. This is a floor, not a
-	// budget: the actual deadline comes from the lease time this node really
-	// holds, which is usually the full leaseDuration.
-	minFenceLease = 20 * time.Second
+	//
+	// It must cover the whole call it gates, not part of it. An IPMI fence
+	// spends up to fence.ipmitoolPerCallTimeout (8 s) sending the power-off and
+	// then up to fence.PowerOffVerifyTimeout (15 s) confirming the chassis is
+	// actually down — 23 s, which fence.WorstCasePowerOff() states once so this
+	// floor and that budget cannot drift apart.
+	//
+	// Two failures sit either side of this number. Too low and the deadline
+	// derived from it (minFenceLease - leaseFenceMargin) cuts a slow but
+	// SUCCESSFUL power-off off part-way through verification: fenceIPMI
+	// correctly refuses to call an unconfirmed power-off confirmed, the
+	// coordinator logs "partial", and a host that is genuinely off keeps its
+	// VMs stopped. Too low in the other direction — below the call's length —
+	// and the fence outlives the lease that authorised it, a second coordinator
+	// takes the row mid-call, and two nodes fence and reschedule the same host.
+	//
+	// This is a floor, not a budget: the actual deadline comes from the lease
+	// time this node really holds, which is usually the full leaseDuration.
+	// TestFailover_AFreshLeaseSatisfiesTheFenceFloor pins the arithmetic.
+	minFenceLease = 30 * time.Second
 	// leaseFenceMargin is withheld from the fence deadline so the call returns
 	// while this node is still demonstrably the leader, leaving room for the
 	// post-fence re-check to read the lease row before it expires.
@@ -459,7 +479,36 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue // unknown host (e.g. raced delete) — quiet skip
 		}
 		if h.State == "offline" || h.State == "maintenance" || h.State == "fenced" {
-			c.fenced[target] = true
+			// A 'fenced' host is normally finished with — the fence ran and its
+			// recovery ran with it. But the two halves can land on different
+			// coordinators: a fence that ends with the lease gone records the
+			// power-off and leaves the reschedule to whoever holds the lease
+			// next (see failover). That host is still here, quorum-down with its
+			// workloads on it, and a plain skip would strand them until the
+			// fence aged out of recentFenceWindow and the host was pointlessly
+			// powered off a second time. Resume from the record instead: it is a
+			// VERIFIED power-off, so the authority to reschedule already exists
+			// and no second fence is needed.
+			if rec, ok := c.resumableFence(ctx, h); ok {
+				slog.Info("failover: resuming recovery from a fence a previous leader recorded",
+					"host", target, "fence_id", rec.ID, "method", rec.Method)
+				c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
+				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail})
+				continue
+			}
+			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
+			// hosts.state and fencing_log replicate independently, so the state
+			// can land here a cycle or more before the row that authorises the
+			// resume. Caching the skip would decide the question before the
+			// evidence arrived and never look again — the cache is cleared only
+			// for hosts back to 'active', which a fenced host is not. Leave it
+			// eligible and re-read next cycle; the resume caches once it runs, so
+			// the standing cost is one fencing_log read per cycle per host that
+			// stays fenced. 'offline' and 'maintenance' have no resume path at
+			// all, so for those the cached skip is still the right answer.
+			if h.State != "fenced" {
+				c.fenced[target] = true
+			}
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrTerminalState)
 			continue
 		}
@@ -1027,23 +1076,55 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 	return false
 }
 
-// proofGradeFenceRef returns the fence_epoch binding for the newest PROOF-GRADE
-// fence of host within recentFenceWindow, or "" when none exists (a best-effort /
-// SSH fence, or no fence yet). A shared-disk cross-host transfer executor re-reads
-// FenceID from fencing_log and re-verifies it (never a stale hosts.state). The
-// recency filter mirrors fenceWithinWindow (Go-side, RFC3339). An IPMI fence
-// finds the row this cycle just inserted; a manual fence finds the operator's
-// "manual-confirmed" row (the fence-time "manual"/"partial" row is not proof-grade).
-func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
+// resumableFence returns the recorded fence a stranded recovery may be resumed
+// from, or ok=false when there is none. It demands all three of:
+//
+//   - the host is in 'fenced' state — the cluster's own record that it believes
+//     this host was fenced. An operator who has undrained the host back to
+//     'active' has consumed that fence, and a reschedule on the strength of a
+//     superseded record is exactly the split-brain fencing exists to prevent;
+//   - a result="fenced" row, i.e. a fence that actually RAN, not an operator's
+//     "manual-confirmed" attestation (which never produces the 'fenced' state);
+//   - proof-grade and within recentFenceWindow, so the power-off is both
+//     verified and recent enough to still be authority.
+func (c *Coordinator) resumableFence(ctx context.Context, h *corrosion.HostRecord) (fenceRecord, bool) {
+	if h.State != "fenced" {
+		return fenceRecord{}, false
+	}
+	rec, ok := c.newestProofGradeFence(ctx, h.Name)
+	if !ok || rec.Result != "fenced" {
+		return fenceRecord{}, false
+	}
+	return rec, true
+}
+
+// fenceRecord is one fencing_log row read back: the fence that physically
+// happened, as a coordinator that did not perform it sees it.
+type fenceRecord struct {
+	ID     string
+	Method string
+	Result string
+	Detail string
+	TS     string
+}
+
+// newestProofGradeFence returns the newest PROOF-GRADE fence of host within
+// recentFenceWindow, or ok=false when none exists (a best-effort / SSH fence, or
+// no fence yet). The recency filter is Go-side on RFC3339, mirroring
+// fenceWithinWindow. An IPMI fence finds the row this cycle just inserted; a
+// manual fence finds the operator's "manual-confirmed" row (the fence-time
+// "manual"/"partial" row is not proof-grade).
+func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (fenceRecord, bool) {
 	rows, err := c.db.Query(ctx,
-		`SELECT id, method, result, timestamp FROM fencing_log WHERE host_name = ?`, host)
+		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, host)
 	if err != nil {
 		slog.Warn("failover: fencing_log read for fence_epoch failed", "host", host, "error", err)
-		return ""
+		return fenceRecord{}, false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
 	var best time.Time
-	var bestRef corrosion.FenceEpochRef
+	var out fenceRecord
+	found := false
 	for _, r := range rows {
 		if !corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
 			continue
@@ -1052,12 +1133,30 @@ func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) strin
 		if perr != nil || !ts.After(cutoff) {
 			continue
 		}
-		if bestRef.FenceID == "" || ts.After(best) {
-			best = ts
-			bestRef = corrosion.FenceEpochRef{Host: host, FenceID: r.String("id"), TS: r.String("timestamp")}
+		if !found || ts.After(best) {
+			best, found = ts, true
+			out = fenceRecord{
+				ID:     r.String("id"),
+				Method: r.String("method"),
+				Result: r.String("result"),
+				Detail: r.String("detail"),
+				TS:     r.String("timestamp"),
+			}
 		}
 	}
-	return bestRef.String()
+	return out, found
+}
+
+// proofGradeFenceRef returns the fence_epoch binding for the newest proof-grade
+// fence of host, or "" when there is none. A shared-disk cross-host transfer
+// executor re-reads FenceID from fencing_log and re-verifies it (never a stale
+// hosts.state).
+func (c *Coordinator) proofGradeFenceRef(ctx context.Context, host string) string {
+	rec, ok := c.newestProofGradeFence(ctx, host)
+	if !ok {
+		return ""
+	}
+	return corrosion.FenceEpochRef{Host: host, FenceID: rec.ID, TS: rec.TS}.String()
 }
 
 // autoPromoteEnabled reports whether vmName has a replication schedule with
@@ -1108,12 +1207,15 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	span.SetAttribute("host.name", h.Name)
 	defer span.End()
 
-	c.fenced[h.Name] = true
-	// Track whether this fence actually relocates any VM. A fence that moves
-	// nothing (e.g. a spurious fence of a host whose VMs all stayed put) is safe
-	// to auto-recover later; one that relocated VMs must stay manual to avoid
-	// split-brain. See recoverHosts.
-	c.fenceRelocated[h.Name] = false
+	// NOTE: c.fenced and c.fenceRelocated are deliberately NOT seeded here. Both
+	// are claims about a recovery THIS coordinator is driving, and every return
+	// below abandons that drive — a lease too short to fence, or a lease lost
+	// while fencing. Seeding them up front left a coordinator that had abdicated
+	// still asserting "I handled this host" and "nothing moved off it": the
+	// first suppressed its own resume (the cached-state skip in run runs before
+	// resumableFence can look), and the second let it auto-undrain a host whose
+	// VMs the SUCCESSOR had since relocated. They are seeded at the point of
+	// commitment instead, just before recoverFenced.
 
 	// Re-validate the lease immediately before the destructive fence call, and
 	// require enough of it left to FINISH that call. Checking only that the
@@ -1176,31 +1278,89 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
 	}
 
+	// Step 2a: a VERIFIED power-off is a fact about the host, the same class of
+	// thing as the fencing_log row above — it is true no matter who holds the
+	// lease a moment later. Write it BEFORE the leadership re-check so a handoff
+	// mid-fence still leaves the cluster describing what physically happened,
+	// and so the next leader can pick the recovery up from it (see run's resume
+	// path) instead of leaving the workloads on a powered-off host. The
+	// "offline" state is an INFERENCE about a fence that could not prove itself,
+	// so recoverFenced writes that one, behind the check, with the reschedule.
+	if fenceProvedOff(fr) {
+		c.markHostState(ctx, h.Name, "fenced")
+	}
+
 	// The fence is recorded; confirm this node is still the leader before acting
 	// on it. If the lease expired while the fence ran, another coordinator may
 	// already be driving this host's recovery, and continuing would mean two
 	// coordinators rescheduling the same VMs. Deliberately placed AFTER the
-	// fence log and OnFence: those record a physical act that did happen and
-	// must survive regardless of who holds the lease now. What stops here is
-	// everything that ASSERTS authority — the host state write and the
-	// reschedule below.
+	// fence log, OnFence and the proof-grade state write: those record a
+	// physical act that did happen and must survive regardless of who holds the
+	// lease now. What stops here is everything that ASSERTS authority — the
+	// placement and reschedule below, which the new leader resumes from the
+	// record rather than repeating.
 	if !c.holdLease(ctx) {
-		slog.Warn("failover: lease lost during fence, not rescheduling", "host", h.Name)
+		slog.Warn("failover: lease lost during fence, leaving the recovery for the new leader to resume",
+			"host", h.Name)
 		c.mAttempt(PhaseFence, ResultRefused, ErrLeaseLost)
 		return
 	}
 
-	// Step 2: Mark host as fenced (fr.Success) or offline (best-effort/manual
-	// proceeding without confirmation). The "fenced" state is distinct from
-	// "offline" so the coordinator's recentlyFenced check can suppress repeats
-	// and the UI can surface the dangerous condition.
-	newState := "offline"
-	if fr.Success && fr.Method != "manual" {
-		newState = "fenced"
-	}
-	if err := corrosion.UpdateHostState(ctx, c.db, h.Name, newState); err != nil {
-		slog.Error("failover: mark host state", "host", h.Name, "state", newState, "error", err)
+	// Committed: this coordinator fenced the host and is driving its recovery, so
+	// it can say whether any VM moved. A fence that moves nothing (a spurious
+	// fence of a host whose VMs all stayed put) is safe to auto-recover later;
+	// one that relocated VMs must stay manual to avoid split-brain. Absent
+	// entirely — the resuming-leader case — means "not mine to judge", which
+	// recoverHosts reads as manual-undrain-only. See recoverHosts.
+	c.fenceRelocated[h.Name] = false
+
+	c.recoverFenced(ctx, h, fr)
+}
+
+// fenceProvedOff reports whether fr is a fence that PROVED the host is off: a
+// successful, non-manual fence. It decides both the host state the fence writes
+// and whether a later coordinator may resume the recovery from the record
+// alone — the two must agree, or a resumed recovery would act on a fence that
+// never established the host was down.
+func fenceProvedOff(fr fence.Result) bool {
+	return fr.Success && fr.Method != "manual"
+}
+
+// markHostState records a host-state transition the coordinator decided on,
+// surfacing a write failure without aborting: the caller is mid-recovery and a
+// lost state row must not strand the workloads.
+func (c *Coordinator) markHostState(ctx context.Context, host, state string) {
+	if err := corrosion.UpdateHostState(ctx, c.db, host, state); err != nil {
+		slog.Error("failover: mark host state", "host", host, "state", state, "error", err)
 		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+	}
+}
+
+// recoverFenced is the half of a failover that ASSERTS authority: it applies the
+// split-brain guards and re-homes the workloads that were on the fenced host.
+// It is separate from the fence itself because the two halves can end up on
+// different coordinators — a fence whose lease runs out is recorded but not
+// acted on, and the next leader resumes here from the fencing_log row rather
+// than powering off a host that is already provably down.
+//
+// fr is the fence this recovery acts on: the live result when called straight
+// from failover, or one reconstructed from the recorded fence when resuming.
+// The caller must hold the failover lease.
+func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord, fr fence.Result) {
+	// Mark the host handled for this down-episode before any early return, so a
+	// resumed recovery does not re-enter on every cycle. Note that
+	// c.fenceRelocated is deliberately NOT seeded here: it means "THIS
+	// coordinator fenced the host and knows whether VMs moved", and a resuming
+	// leader knows neither — leaving it unset keeps recoverHosts' auto-recovery
+	// off a host somebody else's fence relocated VMs away from.
+	c.fenced[h.Name] = true
+
+	// Step 2b: a fence that could not prove the host is off leaves it "offline"
+	// rather than "fenced" — a weaker claim, and the one the split-brain guards
+	// below still demand confirmation for. The proof-grade case was written by
+	// the caller, before the lease re-check, so it survives a handoff.
+	if !fenceProvedOff(fr) {
+		c.markHostState(ctx, h.Name, "offline")
 	}
 
 	// Safe-fence default (gated by SafeFenceDefaultV1). A best-effort fence is

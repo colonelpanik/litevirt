@@ -50,6 +50,13 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   every destructive action. A fence additionally requires 30 s of the lease
   still to run before it may start, because an IPMI power-off plus its
   verification can take 23 s and a fence cut short is reported as unconfirmed.
+- **A peer that stops acknowledging stops pinning the log.** `mutation_log` is
+  retained until the slowest peer has acked it. A peer only counts while it is
+  both recently-acked and currently pushable: the watermark timestamp advances
+  only on a successful push, so a peer that has just gone unreachable would
+  otherwise look recent while its sequence is frozen, and block all compaction
+  until the whole live-watermark window elapsed. Dropping a peer's tail is safe
+  — it resyncs by anti-entropy, not log replay.
 - **No double-fencing.** Once a successful fence is recorded in `fencing_log`
   (or operator confirmation under manual strategy), no coordinator will
   re-fence the same host within a 5-minute window.

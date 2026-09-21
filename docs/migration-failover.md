@@ -336,7 +336,7 @@ Scrape `http://<host>:7444/metrics` for:
   (`action` = `relocate`)
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
-- `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up
+- `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on
 - `litevirt_mutation_log_rows` — total rows in `mutation_log`; coupled with the watermark above this gives backlog visibility
 - `litevirt_replication_pending_entries` — `mutation_log` entries written but not yet acknowledged by the slowest **live** peer (`MAX(seq) − MIN(live last_seq)`); reads `0` when there are no live peers. A sustained climb means one peer is falling behind even though replication itself is healthy
 - `litevirt_replication_peer_pending_entries` — per-peer backlog (`MAX(seq) − peer last_seq`), one series per live peer; a single series climbing while the others stay flat pinpoints the lagging peer. The daemon also logs a warning when a peer stays maxed-out for several rounds

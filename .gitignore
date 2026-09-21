@@ -39,6 +39,14 @@ state.db-shm
 /etc/litevirt/
 config.local.yaml
 
+# Local review scratch: repro tests, captured logs, diagnostic patches and
+# libvirt dumps written while working a PR. This debris accumulates untracked
+# and gets swept in by a blanket `git add`, which is how something captured
+# from a real cluster would reach a public commit. Already-tracked review docs
+# are unaffected — ignore rules do not untrack — and a review note genuinely
+# meant to be published can still be added with `git add -f`.
+docs/reviews/
+
 # Downloaded front-end vendor assets (fetched by `make vendor-js`, embedded at build)
 internal/ui/static/vendor/uplot/
 internal/ui/static/vendor/htmx/

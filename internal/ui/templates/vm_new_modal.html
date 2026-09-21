@@ -40,6 +40,20 @@
           </div>
           <div class="grid-2" style="gap:12px">
             <div class="form-row">
+              <label>CPU Mode</label>
+              <select name="cpu_mode" id="new-cpu-mode" onchange="toggleCpuModel()">
+                <option value="">Host Model (default)</option>
+                <option value="host-passthrough">Host Passthrough</option>
+                <option value="custom">Custom model</option>
+              </select>
+            </div>
+            <div class="form-row" id="new-cpu-model-row" hidden>
+              <label>CPU Model</label>
+              <input type="text" name="cpu_model" value="" placeholder="e.g. x86-64-v3">
+            </div>
+          </div>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
               <label>Root Disk Size</label>
               <input type="text" name="disk" value="20G" placeholder="20G">
             </div>
@@ -269,6 +283,17 @@ function vmTab(btn, pane) {
   modal.querySelectorAll('.tab-pane').forEach(function(p) { p.hidden = (p.dataset.pane !== pane); });
   var body = modal.querySelector('.fm-body');
   if (body) body.scrollTop = 0;
+}
+
+// A CPU model is only meaningful for cpu-mode custom; libvirt rejects a custom
+// CPU with no model, so only show (and only submit) the field for that mode.
+function toggleCpuModel() {
+  var mode = document.getElementById('new-cpu-mode');
+  var row = document.getElementById('new-cpu-model-row');
+  if (!mode || !row) return;
+  var custom = mode.value === 'custom';
+  row.hidden = !custom;
+  if (!custom) { row.querySelector('input').value = ''; }
 }
 
 // Profile definitions: each key maps to {hugepages, ioThreads, numaStrict, cpuPin}.

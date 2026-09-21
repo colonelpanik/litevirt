@@ -248,6 +248,7 @@ func (s *Server) autoDefineRestoredVM(
 		Name:        targetName,
 		CPU:         int(spec.Cpu),
 		CPUMode:     spec.CpuMode,
+		CPUModel:    spec.CpuModel,
 		MemoryMiB:   int(spec.MemoryMib),
 		Machine:     spec.Machine,
 		Firmware:    spec.Firmware,

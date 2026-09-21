@@ -223,6 +223,16 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	cfg := fv.ToVMConfig()
 	spec := fv.ToVMSpec(project)
 
+	// An import DEFINES a brand-new domain, so it takes the node's cpu_mode
+	// default like any other create. The foreign source carries no litevirt
+	// cpu_mode, and leaving it empty would define the guest with no <cpu> element
+	// — QEMU's qemu64, with no SSE4.2/AVX/AVX2. That is strictly further from the
+	// hardware the guest was installed on than the host-derived default is.
+	if spec.CpuMode == "" {
+		spec.CpuMode = s.effectiveDefaultCPUMode()
+	}
+	cfg.CPUMode, cfg.CPUModel = spec.CpuMode, spec.CpuModel
+
 	// Firmware (G1): a source that had Secure Boot / a vTPM is imported WITH them,
 	// but under a FRESH identity — the source's TPM secret is NOT carried, so a
 	// BitLocker guest will need its recovery key (the new TPM can't unseal the old

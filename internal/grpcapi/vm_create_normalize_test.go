@@ -12,14 +12,14 @@ import (
 )
 
 func TestNormalizeCreateVMSpecRejectsNilSpec(t *testing.T) {
-	_, err := normalizeCreateVMSpec(nil)
+	_, err := normalizeCreateVMSpec(nil, "")
 	if got := status.Code(err); got != codes.InvalidArgument {
 		t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
 	}
 }
 
 func TestNormalizeCreateVMSpecDefaults(t *testing.T) {
-	got, err := normalizeCreateVMSpec(&pb.VMSpec{Name: "vm1"})
+	got, err := normalizeCreateVMSpec(&pb.VMSpec{Name: "vm1"}, "")
 	if err != nil {
 		t.Fatalf("normalizeCreateVMSpec: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestNormalizeCreateVMSpecRejectsNegativeResources(t *testing.T) {
 		{Name: "negative-memory", Cpu: 1, MemoryMib: -1},
 	} {
 		t.Run(spec.Name, func(t *testing.T) {
-			_, err := normalizeCreateVMSpec(spec)
+			_, err := normalizeCreateVMSpec(spec, "")
 			if got := status.Code(err); got != codes.InvalidArgument {
 				t.Fatalf("status code = %v, want InvalidArgument (err = %v)", got, err)
 			}
@@ -49,7 +49,7 @@ func TestNormalizeCreateVMSpecClonesInput(t *testing.T) {
 	}
 	wantInput := proto.Clone(in).(*pb.VMSpec)
 
-	got, err := normalizeCreateVMSpec(in)
+	got, err := normalizeCreateVMSpec(in, "")
 	if err != nil {
 		t.Fatalf("normalizeCreateVMSpec: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestNormalizeCreateVMSpecAcceptsInt32ResourceMaximum(t *testing.T) {
 		Name:      "large-vm",
 		Cpu:       math.MaxInt32,
 		MemoryMib: math.MaxInt32,
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("normalizeCreateVMSpec: %v", err)
 	}

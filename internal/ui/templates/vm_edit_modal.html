@@ -32,14 +32,20 @@
               <input type="number" name="memory_mib" value="{{.VM.MemActualMib}}" min="128" step="128" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
             </div>
           </div>
-          <div class="form-row">
-            <label>CPU Mode</label>
-            <select name="cpu_mode" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
-              <option value="" {{if eq .VM.Spec.CpuMode ""}}selected{{end}}>Default (QEMU)</option>
-              <option value="host-passthrough" {{if eq .VM.Spec.CpuMode "host-passthrough"}}selected{{end}}>Host Passthrough</option>
-              <option value="host-model" {{if eq .VM.Spec.CpuMode "host-model"}}selected{{end}}>Host Model</option>
-              <option value="custom" {{if eq .VM.Spec.CpuMode "custom"}}selected{{end}}>Custom</option>
-            </select>
+          <div class="grid-2" style="gap:12px">
+            <div class="form-row">
+              <label>CPU Mode</label>
+              <select name="cpu_mode" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+                <option value="" {{if eq .VM.Spec.CpuMode ""}}selected{{end}}>QEMU default (qemu64 — no AVX)</option>
+                <option value="host-passthrough" {{if eq .VM.Spec.CpuMode "host-passthrough"}}selected{{end}}>Host Passthrough</option>
+                <option value="host-model" {{if eq .VM.Spec.CpuMode "host-model"}}selected{{end}}>Host Model</option>
+                <option value="custom" {{if eq .VM.Spec.CpuMode "custom"}}selected{{end}}>Custom</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>CPU Model <span style="color:var(--muted)">custom mode only</span></label>
+              <input type="text" name="cpu_model" value="{{.VM.Spec.CpuModel}}" placeholder="e.g. x86-64-v3" {{if eq .VM.State.String "VM_RUNNING"}}disabled{{end}}>
+            </div>
           </div>
           <div class="grid-2" style="gap:12px">
             <div class="form-row">

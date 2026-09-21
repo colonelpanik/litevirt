@@ -175,10 +175,11 @@ type VMDef struct {
 	Machine  string `yaml:"machine"`  // q35 | pc
 
 	// Compute
-	CPU     int    `yaml:"cpu"`
-	MaxCPU  int    `yaml:"max-cpu"`  // vCPU hotplug ceiling (> cpu) for live CPU hot-add; requires live_resize
-	CPUMode string `yaml:"cpu-mode"` // host-passthrough | host-model | custom
-	Memory  Memory `yaml:"memory"`   // int MiB or string "8G"
+	CPU      int    `yaml:"cpu"`
+	MaxCPU   int    `yaml:"max-cpu"`   // vCPU hotplug ceiling (> cpu) for live CPU hot-add; requires live_resize
+	CPUMode  string `yaml:"cpu-mode"`  // host-passthrough | host-model | custom (unset → host-model)
+	CPUModel string `yaml:"cpu-model"` // CPU model for cpu-mode: custom (e.g. x86-64-v3)
+	Memory   Memory `yaml:"memory"`    // int MiB or string "8G"
 	// Memory ballooning (#4). max-memory (> memory) raises the balloon ceiling
 	// so the guest can be inflated up to it; min-memory is the floor the host may
 	// reclaim to. Both accept int MiB or "8G" strings. 0/unset = fixed memory.

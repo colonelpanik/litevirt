@@ -47,16 +47,24 @@ const (
 	// safety it does not already have, and every accept pays for a fresh sweep
 	// regardless (see leaseTermBarrier).
 	//
-	// It exists for the one event that walks the observed high water BACKWARDS: a
-	// reseed. A reseeding node loses exactly the terms its reseed source never
-	// received, so its ledger's maximum can legitimately drop, and a pre-reseed
-	// observation left in cache would refuse proofs the post-reseed ledger
-	// considers current. This bounds that window, which makes it a small fixed
+	// It exists for the event that walks the observed high water BACKWARDS:
+	// losing the peer that held the highest term. The threshold is the maximum
+	// over every REACHABLE peer (sweepLeaseTermHighWater asks them all), so when
+	// the node holding term 6 goes away the next sweep legitimately answers 4,
+	// and an observation left in cache from before would refuse term-5 proofs the
+	// cluster now considers current. This bounds that window, which makes it a
+	// small fixed
 	// constant rather than a fraction of any lease TTL — the three consumers keep
 	// deliberately different TTLs (leaseDuration, 2*interval, 2*PollInterval), so
 	// deriving from one would couple the barrier to whichever it borrowed from.
 	// 3s matches health.capActiveNegTTL, the one short-lived negative cache
 	// already in service.
+	//
+	// Both comments here used to blame a RESEED for the backwards step, and that
+	// cause is wrong: leader_lease_terms is in corrosion.reseedKeepTables, so a
+	// reseed neither discards it nor lets the merge lower it — the ledger's
+	// maximum cannot regress that way. The window is real, the old explanation
+	// was not. TestLeaseBarrier_AReseedCannotRegressTheHighWater pins it.
 	leaseBarrierCacheTTL = 3 * time.Second
 	// leaseBarrierSilentTTL bounds how long a peer stays remembered as silent.
 	//
@@ -184,9 +192,9 @@ func (s *Server) storeLeaseThreshold(key string, threshold int64) {
 	// cachedLeaseThreshold's. Clamping against an EXPIRED entry resurrects it:
 	// the higher value is kept and `at` is re-stamped, so the entry never ages
 	// out while traffic continues, and since every accept pays for a fresh sweep
-	// (leaseTermBarrier), ordinary traffic renews it indefinitely. A post-reseed
-	// threshold that legitimately drops from 6 to 4 would then refuse term-5
-	// proofs forever — and the TTL, whose entire purpose is to bound exactly that
+	// (leaseTermBarrier), ordinary traffic renews it indefinitely. A threshold
+	// that legitimately drops from 6 to 4 — the peer holding 6 became
+	// unreachable — would then refuse term-5 proofs forever — and the TTL, whose entire purpose is to bound exactly that
 	// window, would bound nothing. Read expiry here or the constant is decorative.
 	if e, ok := s.leaseBarrierCache[key]; ok &&
 		time.Since(e.at) <= leaseBarrierCacheTTL && e.threshold > threshold {

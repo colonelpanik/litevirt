@@ -236,6 +236,40 @@ func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address, expecte
 // because the row naming its owner has not arrived.
 const DefaultPCIOwnershipSweepAge = 15 * time.Minute
 
+// vmPresence is what THIS node knows about a VM name, which is not the same
+// question as "does the VM exist".
+type vmPresence int
+
+const (
+	// vmLive: a row with no tombstone. The VM exists.
+	vmLive vmPresence = iota
+	// vmTombstoned: a soft-deleted row. The delete reached this node, so the
+	// VM's absence is replicated evidence rather than an inference.
+	vmTombstoned
+	// vmUnknown: no row at all. Indistinguishable from a VM whose row simply has
+	// not replicated here yet, so callers must treat it as "cannot tell".
+	vmUnknown
+)
+
+// lookupVMPresence answers the three-way question GetVM cannot: it filters
+// `deleted_at IS NULL`, so a tombstoned VM and one this node has never heard of
+// both come back nil — and those two warrant opposite decisions when the answer
+// is used to reclaim hardware.
+func lookupVMPresence(ctx context.Context, c *Client, name string) (vmPresence, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(deleted_at, '') AS deleted_at FROM vms WHERE name = ?`, name)
+	if err != nil {
+		return vmUnknown, err
+	}
+	if len(rows) == 0 {
+		return vmUnknown, nil
+	}
+	if rows[0].String("deleted_at") == "" {
+		return vmLive, nil
+	}
+	return vmTombstoned, nil
+}
+
 // SweepStrandedPCIOwnership clears the assignment on hostName's LIVE
 // host_pci_devices rows whose owning VM no longer exists, and returns the
 // addresses it freed.
@@ -270,7 +304,34 @@ func SweepStrandedPCIOwnership(ctx context.Context, c *Client, hostName string, 
 	var cleared []string
 	for _, r := range rows {
 		addr, owner := r.String("address"), r.String("vm_name")
-		if minAge > 0 {
+		presence, pErr := lookupVMPresence(ctx, c, owner)
+		if pErr != nil {
+			// A read that failed is not an absent VM. Fail closed on this row.
+			return cleared, fmt.Errorf("look up owner %q of %s: %w", owner, addr, pErr)
+		}
+		if presence == vmLive {
+			continue
+		}
+		// The age guard applies ONLY to vmUnknown, and that is the whole of the
+		// fix for #218's sweep.
+		//
+		// It gates on the DEVICE row's updated_at, which answers "when did we
+		// last see this hardware" — not "how long has this ownership been
+		// stranded". RescanHost calls ObservePCIDevice for every scanned device
+		// immediately before sweeping, and that upsert's ON CONFLICT path sets
+		// updated_at = excluded.updated_at from c.NowTS(). So on the one path
+		// that calls this, every present device was stamped milliseconds ago and
+		// the guard skipped it; the only rows old enough were devices absent from
+		// the scan, which the loop above had just soft-deleted and the query
+		// above therefore excludes. The sweep could never free an address.
+		//
+		// A tombstone is a different kind of evidence. It means the VM's delete
+		// REPLICATED here, so the VM is provably gone and waiting longer cannot
+		// change that — no guard is needed or wanted. Only vmUnknown is genuinely
+		// ambiguous (a VM whose row has not reached this node yet looks identical
+		// to one that never existed), and that is the case the guard was written
+		// for, so that is the case it still covers.
+		if presence == vmUnknown && minAge > 0 {
 			// ParseUpdatedAt, not time.Parse: updated_at is HLC on most rows and
 			// RFC3339 on others, and an RFC3339-only parse would fail on every
 			// HLC row — making the guard skip everything and the sweep a no-op.
@@ -280,14 +341,6 @@ func SweepStrandedPCIOwnership(ctx context.Context, c *Client, hostName string, 
 			if !ok || ts.After(cutoff) {
 				continue
 			}
-		}
-		vm, gErr := GetVM(ctx, c, owner)
-		if gErr != nil {
-			// A read that failed is not an absent VM. Fail closed on this row.
-			return cleared, fmt.Errorf("look up owner %q of %s: %w", owner, addr, gErr)
-		}
-		if vm != nil {
-			continue
 		}
 		if rErr := ReleasePCIDevice(ctx, c, hostName, addr, owner); rErr != nil {
 			return cleared, fmt.Errorf("release stranded %s (owner %q): %w", addr, owner, rErr)

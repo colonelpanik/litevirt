@@ -169,3 +169,81 @@ func TestSweepStrandedPCIOwnership_IsScopedToTheHost(t *testing.T) {
 		t.Errorf("host-b owner = %q, want untouched", got)
 	}
 }
+
+// The production combination, which nothing above exercised: a real sweep age
+// AND a device that was just observed.
+//
+// Every other test here passes minAge=0, which disables the age guard outright.
+// RescanHost passes DefaultPCIOwnershipSweepAge (15m), and it calls
+// ObservePCIDevice for every scanned device immediately before the sweep — and
+// that upsert's ON CONFLICT path sets `updated_at = excluded.updated_at` from
+// c.NowTS(). So in production every device still physically present carries an
+// `updated_at` of milliseconds old when the guard reads it, `ts.After(cutoff)`
+// is true, and the row is skipped. The only rows that could be old are devices
+// missing from the scan, and the loop above has just soft-deleted those, so the
+// sweep's `deleted_at IS NULL` filter excludes them too.
+//
+// Net effect before this fix: SweepStrandedPCIOwnership could never free an
+// address on the one path that calls it, and #218 was not actually closed.
+//
+// The age guard is still right for what it was FOR — keeping a not-yet-
+// replicated VM from having its device taken — but `updated_at` answers "when
+// did we last see this hardware", not "how long has this ownership been
+// stranded". A tombstone answers the real question directly: the delete
+// replicated here, so the VM is provably gone and no amount of waiting changes
+// that.
+func TestSweepStrandedPCIOwnership_FreesATombstonedVMsDeviceDespiteAFreshObservation(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm1", HostName: "host-a", State: "stopped"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	seedPCIDevice(t, c, "host-a", "0000:41:00.0")
+	if ok, err := ClaimPCIDevice(ctx, c, "host-a", "0000:41:00.0", "vm1"); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+	if err := DeleteVM(ctx, c, "vm1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	// What RescanHost does to every present device right before sweeping.
+	seedPCIDevice(t, c, "host-a", "0000:41:00.0")
+
+	cleared, err := SweepStrandedPCIOwnership(ctx, c, "host-a", DefaultPCIOwnershipSweepAge)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0] != "0000:41:00.0" {
+		t.Fatalf("sweep cleared %v, want [0000:41:00.0]: the rescan refreshed updated_at, so "+
+			"the age guard skipped a device whose owning VM is provably deleted — the sweep "+
+			"can never free anything on the path that actually calls it", cleared)
+	}
+	if got := ownerOf(t, c, "host-a", "0000:41:00.0"); got != "" {
+		t.Errorf("owner = %q, want cleared", got)
+	}
+	if ok, err := ClaimPCIDevice(ctx, c, "host-a", "0000:41:00.0", "vm2"); err != nil || !ok {
+		t.Fatalf("the swept device must be claimable again: ok=%v err=%v", ok, err)
+	}
+}
+
+// The age guard must survive the fix: a VM with NO row at all is ambiguous —
+// it may simply not have replicated here yet — so its device stays owned.
+// Only a tombstone is proof of absence.
+func TestSweepStrandedPCIOwnership_AnAbsentVMRowStillRespectsTheAgeGuard(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+
+	seedPCIDevice(t, c, "host-a", "0000:41:00.0")
+	if ok, err := ClaimPCIDevice(ctx, c, "host-a", "0000:41:00.0", "not-yet-replicated"); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	cleared, err := SweepStrandedPCIOwnership(ctx, c, "host-a", DefaultPCIOwnershipSweepAge)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(cleared) != 0 {
+		t.Fatalf("sweep cleared %v; a VM with no row here may just not have replicated, "+
+			"and taking its device is the double-assignment hazard the guard exists for", cleared)
+	}
+}

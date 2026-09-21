@@ -42,7 +42,11 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 	}
 
 	// Scan the host.
-	scanned, err := pci.Scan()
+	scan := pci.Scan
+	if s.pciScanOverride != nil {
+		scan = s.pciScanOverride
+	}
+	scanned, err := scan()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "PCI scan: %v", err)
 	}

@@ -970,12 +970,38 @@ func (c *Coordinator) noteLeaseTermRefusal(ctx context.Context, kind, name, from
 	})
 }
 
-func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, ok bool) {
+func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, key string, ok bool) {
 	if !c.leaseTermStampAllowed(ctx) {
-		return "", "", 0, false
+		return "", "", 0, "", false
 	}
 	holder, expiresAt = c.leaseSnapshot(ctx)
-	return holder, expiresAt, c.LeaseTerm(), true
+	term = c.LeaseTerm()
+	// The key travels WITH the term, and only with it. A proof stamp is a pair,
+	// and judgeProofLeaseTerm recognises exactly two valid shapes: a positive
+	// term with a producible key, or the legacy sentinel (0, ""). The half-set
+	// (0, "failover") is neither — it lands in "not a judgeable pair" and the
+	// executor refuses the action outright, for every action including relocate,
+	// which is deliberately outside leaseTermRequiredActions.
+	//
+	// It was reachable, and not through the flag it first looked like. Minting
+	// gates on DurablyLatched(LeaseTermLedgerV1) — a token with no config flag —
+	// so clearing enforcement.lease_term leaves the mint working and the term
+	// positive. The producer is holdLeaseWithoutTerm, whose term is ALWAYS 0,
+	// taken when MayMintLeaseTerm is false: a freshly joined or re-imaged host,
+	// or one whose activation marker never persisted. That coordinator is not
+	// enforcing, so the branch above lets it stamp, while executors that HAVE
+	// latched enforce permanently — the latch never un-latches. A fenced host is
+	// processed exactly once, so every workload in that window was abandoned for
+	// good.
+	//
+	// Returning the key here rather than at the three call sites is the same
+	// reason the term is returned here: a site cannot set one half of a pair it
+	// never sees. That was already this function's stated purpose; the key was
+	// simply left behind.
+	if term <= 0 {
+		return holder, expiresAt, term, "", true
+	}
+	return holder, expiresAt, term, corrosion.LeaseKeyFailover, true
 }
 
 // leaseSnapshot returns the current failover-lease holder + expiry to record in a
@@ -1740,7 +1766,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// VM is never started and sits pending forever. Nothing detected
 			// that, because LeaseTermReadiness checks whether this node can MINT
 			// a term, not whether its producers STAMP one.
-			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			leaseHolder, leaseExp, leaseTerm, leaseKey, ok := c.leaseStamp(ctx)
 			if !ok {
 				c.noteGateRefused(ActionReschedule, health.ReasonStaleLeaseTerm)
 				c.mVM(ActionReschedule, ResultError, ErrStaleLeaseTerm)
@@ -1753,7 +1779,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				QuorumLive: live, QuorumNeeded: needed, FenceEpoch: fenceEpoch,
 				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
-				LeaseTerm:  leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
+				LeaseTerm:  leaseTerm, LeaseKey: leaseKey,
 			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
@@ -1876,7 +1902,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 				return
 			}
-			leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+			leaseHolder, leaseExp, leaseTerm, leaseKey, ok := c.leaseStamp(ctx)
 			if !ok {
 				c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
 				c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
@@ -1889,7 +1915,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 				RelocationToken: token,
 				OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
-				LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
+				LeaseTerm:       leaseTerm, LeaseKey: leaseKey,
 			}
 			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
@@ -2036,7 +2062,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			c.mCt(ActionRelocate, ResultError, ErrDestUngated)
 			return
 		}
-		leaseHolder, leaseExp, leaseTerm, ok := c.leaseStamp(ctx)
+		leaseHolder, leaseExp, leaseTerm, leaseKey, ok := c.leaseStamp(ctx)
 		if !ok {
 			c.noteGateRefused(ActionRelocate, health.ReasonStaleLeaseTerm)
 			c.mCt(ActionRelocate, ResultError, ErrStaleLeaseTerm)
@@ -2050,7 +2076,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExp,
 			RelocationToken: relocToken,
 			OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
-			LeaseTerm:       leaseTerm, LeaseKey: corrosion.LeaseKeyFailover,
+			LeaseTerm:       leaseTerm, LeaseKey: leaseKey,
 		}
 		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)

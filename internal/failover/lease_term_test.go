@@ -181,7 +181,7 @@ func TestCoordinator_StampsItsOwnTermNotTheLedgerMaximum(t *testing.T) {
 	// A peer's higher term lands in the ledger. Our lease row still names us.
 	seedLeaseTerm(t, db, mine+5, "node-b")
 
-	_, _, term, ok := c.leaseStamp(ctx)
+	_, _, term, _, ok := c.leaseStamp(ctx)
 	if !ok {
 		t.Fatal("leaseStamp refused while enforcement is off")
 	}
@@ -293,7 +293,7 @@ func TestCoordinator_PreLatchHolderStampsRatherThanStandingDown(t *testing.T) {
 		t.Fatalf("pre-latch term = %d, want 0 — this test's premise is that no term is minted", got)
 	}
 
-	_, _, term, ok := c.leaseStamp(ctx)
+	_, _, term, _, ok := c.leaseStamp(ctx)
 	if !ok {
 		t.Fatal("a healthy pre-latch leader was refused permission to stamp. With the ledger gate " +
 			"closed no term is minted, so term 0 is the CORRECT state; refusing here abandons every " +
@@ -328,7 +328,7 @@ func TestCoordinator_StampDoesNotFabricateAHolder(t *testing.T) {
 		t.Fatalf("clear the lease row: %v", err)
 	}
 
-	holder, _, _, ok := c.leaseStamp(ctx)
+	holder, _, _, _, ok := c.leaseStamp(ctx)
 	if !ok {
 		t.Fatal("leaseStamp refused while enforcement is off")
 	}
@@ -468,7 +468,7 @@ func TestCoordinator_ThresholdReadErrorFailsOpen(t *testing.T) {
 		t.Fatal("threshold read still succeeds; this test is not injecting the error it claims to")
 	}
 
-	_, _, term, ok := c.leaseStamp(ctx)
+	_, _, term, _, ok := c.leaseStamp(ctx)
 	if !ok {
 		t.Fatal("an unreadable threshold refused the stamp. The host is already fenced and is " +
 			"processed only once, so this does not defer the reschedule — it abandons it, and the " +

@@ -59,6 +59,14 @@ func TestProofLeaseKeyProducible_AcceptsEveryKeyTheTreeStamps(t *testing.T) {
 			if perr != nil {
 				return perr
 			}
+			// Identifiers this file assigns from leaseStamp. That function
+			// returns the key alongside the term precisely so a stamp site
+			// cannot set one half of the pair, so a site forwarding one of these
+			// originates nothing — the same reasoning forwardsLeaseKey already
+			// applies to proofFromPB and friends. Resolved rather than
+			// allow-listed by name: an identifier called leaseKey that came from
+			// somewhere else is still unvouched for.
+			stamped := identsFromLeaseStamp(f)
 			ast.Inspect(f, func(n ast.Node) bool {
 				lit, ok := n.(*ast.CompositeLit)
 				if !ok || !isProofType(lit.Type) {
@@ -78,6 +86,19 @@ func TestProofLeaseKeyProducible_AcceptsEveryKeyTheTreeStamps(t *testing.T) {
 					// no constant to check. The stamp it forwards was already
 					// checked wherever it was written.
 					if forwardsLeaseKey(kv.Value) {
+						continue
+					}
+					if id, ok := kv.Value.(*ast.Ident); ok && stamped[id.Name] {
+						// Recorded with the key leaseStamp actually returns, not
+						// skipped: the site still counts toward the "found any
+						// sites at all" check below, and its key is still put
+						// through proofLeaseKeyProducible like every other.
+						rel, _ := filepath.Rel(root, path)
+						sites = append(sites, site{
+							where: fmt.Sprintf("%s:%d", rel, fset.Position(kv.Pos()).Line),
+							expr:  exprText(kv.Value) + " (from leaseStamp)",
+							key:   corrosion.LeaseKeyFailover,
+						})
 						continue
 					}
 					expr := exprText(kv.Value)
@@ -132,6 +153,42 @@ func TestProofLeaseKeyProducible_AcceptsEveryKeyTheTreeStamps(t *testing.T) {
 // The key such a site carries was checked wherever it was written; requiring a
 // resolvable constant here would only force the scan to be taught about every
 // conversion in the tree, which is not what it is for.
+// identsFromLeaseStamp collects the names bound to leaseStamp's key result in
+// this file, e.g. the `leaseKey` in
+//
+//	leaseHolder, leaseExp, leaseTerm, leaseKey, ok := c.leaseStamp(ctx)
+//
+// leaseStamp is the one place a failover proof's (term, key) pair is decided,
+// and TestLeaseStamp_NeverReturnsAKeyWithoutATerm pins what it may return:
+// corrosion.LeaseKeyFailover with a positive term, or "" with none. A site
+// forwarding that result is therefore vouched for by that test rather than by
+// this scan.
+func identsFromLeaseStamp(f *ast.File) map[string]bool {
+	out := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "leaseStamp" {
+			return true
+		}
+		// (holder, expiresAt, term, key, ok) — the key is the fourth result.
+		if len(as.Lhs) == 5 {
+			if id, ok := as.Lhs[3].(*ast.Ident); ok && id.Name != "_" {
+				out[id.Name] = true
+			}
+		}
+		return true
+	})
+	return out
+}
+
 func forwardsLeaseKey(e ast.Expr) bool {
 	switch t := e.(type) {
 	case *ast.SelectorExpr:

@@ -113,7 +113,10 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				// Same tenure, term already recorded: renew, mint nothing. A
 				// renewal that bumped the term would make the holder invalidate
 				// its own in-flight work every renewal interval.
-				held, err := renewLease(ctx, c, key, holder, expires, nowRFC)
+				if renewClassifiedHook != nil {
+					renewClassifiedHook()
+				}
+				held, err := renewLeaseAtTerm(ctx, c, key, holder, expires, nowRFC, newest.Term)
 				if err != nil {
 					return false, 0, err
 				}
@@ -204,6 +207,74 @@ const leaseContended int64 = -1
 // another holder just as it renews our own (see leaseUpsertSQL's WHERE), which
 // is what makes it the whole pre-ledger acquisition path as well: it is what
 // AcquireLeaseWithTerm falls back to while the term ledger is not yet writable.
+// renewClassifiedHook is a test-only seam fired after AcquireLeaseWithTerm has
+// classified the lease and read its newest term, and BEFORE the renewal
+// commits. That gap is the race: the classification is not held under any lock,
+// so a sibling caller on this same host can let the lease lapse, re-take it and
+// mint a higher term while this caller is stalled in it.
+//
+// Same shape and same reason as ackPersistedHook in resolver_tracker.go: the
+// window cannot be reached deterministically from outside.
+var renewClassifiedHook func()
+
+// renewLeaseAtTerm renews a lease the caller classified as its own live tenure
+// at expectTerm, and declines if either half of that classification no longer
+// holds.
+//
+// The unguarded renewLease below cannot do this. It checks only that the row
+// still names the holder, which a sibling caller on the SAME host satisfies
+// after it has let the lease lapse and re-taken it — so the stalled caller's
+// renewal succeeded and it returned the term it read before the lapse, a term
+// the ledger had already superseded. Its caller then stamped work with a
+// superseded term and every executor refused it as stale, which reads as a
+// failed rebalance on a node that holds the lease perfectly well.
+func renewLeaseAtTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, expectTerm int64) (bool, error) {
+	applied, err := c.ExecuteBatchGuarded(ctx,
+		func(tx *sql.Tx) (bool, error) {
+			return leaseRenewableTx(ctx, tx, key, holder, nowRFC, expectTerm)
+		},
+		[]Statement{
+			{SQL: leaseUpsertSQL, Params: []interface{}{key, holder, expires, c.NowTS(), nowRFC}},
+		})
+	if err != nil {
+		return false, fmt.Errorf("renew lease %q at term %d: %w", key, expectTerm, err)
+	}
+	// Declined is not an error: the caller re-classifies, which is how it comes
+	// back with the term the ledger actually holds.
+	return applied, nil
+}
+
+// leaseRenewableTx re-checks BOTH halves of the caller's classification inside
+// the renewal's own transaction: that this is still an unbroken tenure of ours,
+// and that the term it classified at is still the newest one.
+//
+// Expiry is consulted as well as holder identity, for the same reason
+// AcquireLeaseWithTerm consults it: a lease that fully lapsed and was re-taken
+// by its own prior holder is a NEW tenure, and the lapse is exactly the window
+// other nodes were entitled to act in. Holder identity alone cannot see it.
+func leaseRenewableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC string, expectTerm int64) (bool, error) {
+	var curHolder, expiresAt string
+	err := tx.QueryRowContext(ctx,
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, key).Scan(&curHolder, &expiresAt)
+	switch {
+	case err == sql.ErrNoRows:
+		// No row to renew. Whatever happened, this is not the tenure we classified.
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	if curHolder != holder || expiresAt < nowRFC {
+		return false, nil
+	}
+	var newest int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(term), 0) FROM leader_lease_terms WHERE key = ? AND deleted_at IS NULL`,
+		key).Scan(&newest); err != nil {
+		return false, err
+	}
+	return newest == expectTerm, nil
+}
+
 func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC string) (bool, error) {
 	if err := c.Execute(ctx, leaseUpsertSQL,
 		key, holder, expires, c.NowTS(), nowRFC); err != nil {

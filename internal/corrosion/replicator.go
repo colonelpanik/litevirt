@@ -810,6 +810,22 @@ var (
 	ClockSkewRetention = 1 * time.Hour
 )
 
+// servedPeers returns the peers this node currently replicates to — exactly the
+// set syncPeers keeps goroutines for. A peer outside it is never pushed to from
+// here, so its watermark can never advance and must not gate compaction.
+func (r *Replicator) servedPeers() map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.peers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(r.peers))
+	for peer := range r.peers {
+		out[peer] = true
+	}
+	return out
+}
+
 // stalledPeers returns the peers whose pushes have been failing for at least
 // UnreachablePeerGrace as of now.
 func (r *Replicator) stalledPeers(now time.Time) map[string]bool {
@@ -827,10 +843,12 @@ func (r *Replicator) stalledPeers(now time.Time) map[string]bool {
 	return out
 }
 
-// watermarkFloor returns the lowest last_seq among peers that are both acked
-// since liveCutoff and not in stalled, and whether any such peer exists. The
-// MIN is taken in Go rather than SQL because the stalled set lives in memory:
-// a peer's reachability is something this process observed, not a column.
+// watermarkFloor returns the lowest last_seq among peers that gate compaction,
+// and whether any such peer exists. A peer gates only if all three hold: this
+// node serves it, it acked since liveCutoff, and its pushes are not stalled.
+// The MIN is taken in Go rather than SQL because two of those three live in
+// memory — who we serve and who we can reach are things this process knows,
+// not columns.
 //
 // No eligible peer yields ok=false, which leaves the watermark prune a no-op
 // and defers to the MaxLogRetention ceiling — the same outcome as an empty
@@ -838,7 +856,7 @@ func (r *Replicator) stalledPeers(now time.Time) map[string]bool {
 // disk, dropping log a peer still needs costs it a resync.
 //
 // Caller must hold r.client.mu.
-func (r *Replicator) watermarkFloor(ctx context.Context, liveCutoff string, stalled map[string]bool) (int64, bool) {
+func (r *Replicator) watermarkFloor(ctx context.Context, liveCutoff string, served, stalled map[string]bool) (int64, bool) {
 	rows, err := r.client.db.QueryContext(ctx,
 		`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
 	if err != nil {
@@ -856,7 +874,7 @@ func (r *Replicator) watermarkFloor(ctx context.Context, liveCutoff string, stal
 			slog.Warn("replicator: scan watermark for prune", "error", err)
 			return 0, false
 		}
-		if stalled[peer] {
+		if !served[peer] || stalled[peer] {
 			continue
 		}
 		if !found || seq < minSeq {
@@ -881,6 +899,11 @@ func (r *Replicator) pruneMutationLog(ctx context.Context) {
 	// replicator's own mutex, and every other path takes that one first, so
 	// nesting them the other way round here would invert the lock order.
 	stalled := r.stalledPeers(now)
+	// Who we actually push to. A watermark row outlives the topology that
+	// created it: syncPeers drops a peer from the target set without deleting
+	// its row, leaving a frozen seq that would otherwise gate compaction
+	// forever — or, right after a restart, for a whole LiveWatermarkWindow.
+	served := r.servedPeers()
 
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
@@ -893,7 +916,7 @@ func (r *Replicator) pruneMutationLog(ctx context.Context) {
 	// a successful push, so a peer that has just gone unreachable still looks
 	// recent while its seq is frozen — see UnreachablePeerGrace.
 	liveCutoff := now.Add(-LiveWatermarkWindow).UTC().Format(time.RFC3339)
-	minSeq, haveMin := r.watermarkFloor(ctx, liveCutoff, stalled)
+	minSeq, haveMin := r.watermarkFloor(ctx, liveCutoff, served, stalled)
 	if haveMin {
 		ageCutoff := now.Add(-PruneMinAge).UTC().Format(time.RFC3339)
 		if res, derr := r.client.db.ExecContext(ctx,

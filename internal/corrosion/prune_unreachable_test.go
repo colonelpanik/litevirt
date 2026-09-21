@@ -35,6 +35,7 @@ func TestPruneMutationLog_UnreachablePeerDoesNotPin(t *testing.T) {
 	setWatermark(t, c, "stuck-peer", 3, tsAgo(2*time.Minute))
 
 	r := NewReplicator(c, "", RelayConfig{})
+	servePeers(r, "reachable-peer", "stuck-peer")
 	r.notePushFailure("stuck-peer")
 	r.pruneMutationLog(context.Background())
 
@@ -63,6 +64,7 @@ func TestPruneMutationLog_BrieflyFailingPeerStillPins(t *testing.T) {
 	setWatermark(t, c, "blip-peer", 3, tsAgo(2*time.Minute))
 
 	r := NewReplicator(c, "", RelayConfig{})
+	servePeers(r, "fast-peer", "blip-peer")
 	r.notePushFailure("blip-peer") // streak starts now, well inside the grace
 	r.pruneMutationLog(context.Background())
 
@@ -88,6 +90,7 @@ func TestPruneMutationLog_RecoveredPeerPinsAgain(t *testing.T) {
 	setWatermark(t, c, "flapped-peer", 3, tsAgo(2*time.Minute))
 
 	r := NewReplicator(c, "", RelayConfig{})
+	servePeers(r, "fast-peer", "flapped-peer")
 	r.notePushFailure("flapped-peer")
 	r.notePushSuccess("flapped-peer") // pushes work again
 	r.pruneMutationLog(context.Background())

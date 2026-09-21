@@ -82,7 +82,9 @@ func TestPruneMutationLog_DeadPeerDoesNotPin(t *testing.T) {
 	setWatermark(t, c, "live-peer", 8, tsAgo(10*time.Second)) // fresh
 	setWatermark(t, c, "dead-peer", 2, tsAgo(2*time.Hour))    // stale, excluded
 
-	NewReplicator(c, "", RelayConfig{}).pruneMutationLog(context.Background())
+	r := NewReplicator(c, "", RelayConfig{})
+	servePeers(r, "live-peer", "dead-peer") // both are targets; only recency separates them
+	r.pruneMutationLog(context.Background())
 
 	// Old behavior (MIN over all watermarks = 2) would leave 8 rows; new
 	// behavior prunes to the live peer's seq 8, leaving seqs 9,10.
@@ -104,7 +106,9 @@ func TestPruneMutationLog_LivePeerProtected(t *testing.T) {
 	setWatermark(t, c, "fast-peer", 9, tsAgo(5*time.Second))
 	setWatermark(t, c, "slow-peer", 3, tsAgo(2*time.Minute)) // live (within window), behind
 
-	NewReplicator(c, "", RelayConfig{}).pruneMutationLog(context.Background())
+	r := NewReplicator(c, "", RelayConfig{})
+	servePeers(r, "fast-peer", "slow-peer")
+	r.pruneMutationLog(context.Background())
 
 	// MIN over live peers = 3 → only seqs 1..3 prune, 7 remain.
 	if got := countLog(t, c); got != 7 {
@@ -124,7 +128,11 @@ func TestPruneMutationLog_MinAgeFloor(t *testing.T) {
 	}
 	setWatermark(t, c, "live-peer", 5, tsAgo(5*time.Second))
 
-	NewReplicator(c, "", RelayConfig{}).pruneMutationLog(context.Background())
+	r := NewReplicator(c, "", RelayConfig{})
+	// Must be a served peer, or the watermark step no-ops and this passes
+	// without ever reaching the age floor it exists to cover.
+	servePeers(r, "live-peer")
+	r.pruneMutationLog(context.Background())
 
 	if got := countLog(t, c); got != 5 {
 		t.Fatalf("after prune: %d rows remain, want 5 (recent entries below the age floor must survive)", got)

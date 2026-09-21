@@ -485,22 +485,6 @@ func (s *Server) recentlySilentPeers(peers []string) map[string]bool {
 	return out
 }
 
-// noteSilentPeers records which peers answered nothing and forgets the ones that
-// answered. Keyed by peer rather than by (peer, key) on purpose: silence here is
-// a property of reaching the peer at all, and the three keys are served by one
-// RPC on one connection.
-
-// repairWouldAskSomeoneNew reports whether a full-price repair pass has anyone
-// left to learn from: some peer gave no answer on the short probe AND has not
-// already been given the full budget within the memo window.
-//
-// Without the second half, the repair undoes the very cost bound the silent memo
-// exists to provide — a permanently dead peer would buy a full budget on every
-// sweep, which is the 40-workload serial burst the shortcut was introduced to
-// stop. With it, a peer gets exactly one full-price chance per window: a slow
-// but living peer answers it and is un-memoised, while a dead one is charged
-// once and then stays cheap.
-
 // forgetDepartedPeers drops memo entries for hosts that are no longer in the
 // fleet.
 //
@@ -537,6 +521,16 @@ func (s *Server) forgetDepartedPeers(peers []string) {
 	}
 }
 
+// repairWouldAskSomeoneNew reports whether a full-price repair pass has anyone
+// left to learn from: some peer gave no answer on the short probe AND has not
+// already been given the full budget within the memo window.
+//
+// Without the second half, the repair undoes the very cost bound the silent memo
+// exists to provide — a permanently dead peer would buy a full budget on every
+// sweep, which is the 40-workload serial burst the shortcut was introduced to
+// stop. With it, a peer gets exactly one full-price chance per window: a slow
+// but living peer answers it and is un-memoised, while a dead one is charged
+// once and then stays cheap.
 func (s *Server) repairWouldAskSomeoneNew(peers []string, answered map[string]bool) bool {
 	s.leaseBarrierMu.Lock()
 	defer s.leaseBarrierMu.Unlock()
@@ -570,6 +564,10 @@ func (s *Server) noteFullyProbed(peers []string, answered map[string]bool) {
 	}
 }
 
+// noteSilentPeers records which peers answered nothing and forgets the ones that
+// answered. Keyed by peer rather than by (peer, key) on purpose: silence here is
+// a property of reaching the peer at all, and the three keys are served by one
+// RPC on one connection.
 func (s *Server) noteSilentPeers(peers []string, answered map[string]bool) {
 	s.leaseBarrierMu.Lock()
 	defer s.leaseBarrierMu.Unlock()

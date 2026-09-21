@@ -407,7 +407,10 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		// The <disk type>, its <source> attributes and the <driver type> are all
 		// decided by what the storage driver actually handed us: a file, a block
 		// device or an rbd locator. See diskBacking.
-		diskType, source, driverType := diskBacking(d.Path)
+		diskType, source, driverType, dbErr := diskBacking(d.Path)
+		if dbErr != nil {
+			return "", dbErr
+		}
 		disk := diskDevice{
 			Type:   diskType,
 			Device: "disk",

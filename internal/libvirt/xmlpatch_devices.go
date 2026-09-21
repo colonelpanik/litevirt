@@ -469,7 +469,10 @@ func attrRegex(attr string) *regexp.Regexp {
 func marshalNewDisk(childIndent string, d WantDisk) (string, error) {
 	// Same rule as the generator: a zvol, an LV or an rbd image is not a qcow2
 	// file, and a disk added here goes straight into a live domain.
-	diskType, source, driverType := diskBacking(d.Path)
+	diskType, source, driverType, dbErr := diskBacking(d.Path)
+	if dbErr != nil {
+		return "", dbErr
+	}
 	disk := diskDevice{
 		Type:   diskType,
 		Device: "disk",

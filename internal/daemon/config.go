@@ -15,6 +15,7 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -74,6 +75,9 @@ type Config struct {
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
+
+	// VM holds cluster-wide defaults for newly created VMs.
+	VM VMDefaultsConfig `yaml:"vm"`
 
 	// Capacity is the cluster-wide default for how much of a host may be handed
 	// to workloads. Per-host overrides live on the host record (`lv host config`)
@@ -620,6 +624,22 @@ func LoadConfig() (*Config, error) {
 			cfg.NoQuorumVIPPolicy)
 	}
 
+	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid
+	// mode into every VM created on this node — those specs would then fail at
+	// libvirt define time, one create at a time, with nothing pointing back here.
+	// Empty is legal and means libvirt.DefaultCPUMode.
+	switch cfg.VM.DefaultCPUMode {
+	case "", lv.CPUModeHostModel, lv.CPUModeHostPassthrough:
+	case lv.CPUModeCustom:
+		return nil, fmt.Errorf("config vm.default_cpu_mode: %q cannot be a cluster-wide default "+
+			"because it needs a per-VM model; set %s or %s here and pass "+
+			"--cpu-mode custom --cpu-model <model> on the VMs that need a pinned baseline",
+			lv.CPUModeCustom, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	default:
+		return nil, fmt.Errorf("config vm.default_cpu_mode: invalid mode %q: want %s or %s",
+			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	}
+
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
 	// (never silently drop a configured security policy).
 	if _, err := cfg.ImagePullBlockedPrefixes(); err != nil {
@@ -766,6 +786,27 @@ func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
 //
 // Zero/unset fields fall back to the built-in defaults
 // (corrosion.DefaultCapacityPolicy).
+// VMDefaultsConfig holds cluster-wide defaults stamped onto a VM at CREATE
+// time. They shape new specs only — nothing here reinterprets a spec that is
+// already stored, so changing one can never move a running guest.
+type VMDefaultsConfig struct {
+	// DefaultCPUMode is the cpu_mode a create stamps onto a spec that named
+	// none: host-passthrough | host-model | custom. Empty = host-model.
+	//
+	// host-model is the default because it gives the guest the host's modern ISA
+	// (SSE4.2 / AVX / AVX2 / AVX-512 as the host has them) while keeping live
+	// migration to an equal-or-richer host working. Set host-passthrough on a
+	// uniform fleet that wants nested virt and every last feature flag; set
+	// custom (with a per-VM cpu_model) to hold one baseline across a
+	// deliberately heterogeneous fleet.
+	//
+	// NOTE: this is a default, not a kill switch. There is no value here that
+	// restores the old "emit no <cpu> element" behavior, which put the guest on
+	// QEMU's qemu64 — no SSE4.2, no AVX, no AVX2. Per-VM, `lv run --cpu-mode`
+	// still wins over this.
+	DefaultCPUMode string `yaml:"default_cpu_mode,omitempty"`
+}
+
 type CapacityConfig struct {
 	// CPUOvercommitRatio multiplies physical vCPUs. Default 4.0.
 	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio,omitempty"`

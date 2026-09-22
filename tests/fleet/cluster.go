@@ -154,6 +154,12 @@ type Node struct {
 	// in-flight RPCs).
 	partMu      sync.Mutex
 	blockedFrom map[string]bool
+	// unimplemented are method names this node answers with codes.Unimplemented,
+	// as a peer running an older build that does not have the RPC would. It is
+	// how a scenario proves a new peer-RPC caller stays correct across a rolling
+	// upgrade, which no same-build cluster can otherwise exercise. Guarded by
+	// partMu.
+	unimplemented map[string]bool
 }
 
 // New brings up a Cluster ready for scenarios. Each node has:
@@ -189,12 +195,13 @@ func New(t *testing.T, opts Options) *Cluster {
 	for i := 0; i < opts.Nodes; i++ {
 		name := fmt.Sprintf("%s%d", namePrefix, i)
 		n := &Node{
-			Name:        name,
-			Region:      regionFor(opts.RegionByIndex, i),
-			Address:     "127.0.0.1",
-			PKIDir:      filepath.Join(c.tmpRoot, name, "pki"),
-			blockedFrom: make(map[string]bool),
-			cluster:     c,
+			Name:          name,
+			Region:        regionFor(opts.RegionByIndex, i),
+			Address:       "127.0.0.1",
+			PKIDir:        filepath.Join(c.tmpRoot, name, "pki"),
+			blockedFrom:   make(map[string]bool),
+			unimplemented: make(map[string]bool),
+			cluster:       c,
 		}
 		c.mintHostCert(n)
 		// Reserve an ephemeral port — close the listener immediately
@@ -662,7 +669,32 @@ func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grp
 	if n.blocked(info.FullMethod, ctx) {
 		return nil, status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
+	if n.answersUnimplemented(info.FullMethod) {
+		return nil, status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
+	}
 	return handler(ctx, req)
+}
+
+// answersUnimplemented reports whether this node is pretending not to have the
+// method (see Node.unimplemented).
+func (n *Node) answersUnimplemented(fullMethod string) bool {
+	n.partMu.Lock()
+	defer n.partMu.Unlock()
+	return n.unimplemented[methodName(fullMethod)]
+}
+
+// DoNotImplement makes this node answer the named RPC with codes.Unimplemented,
+// exactly as a peer on an older build would — the shape every new peer RPC has
+// to survive during a rolling upgrade. Returns a func that restores it.
+func (n *Node) DoNotImplement(method string) func() {
+	n.partMu.Lock()
+	n.unimplemented[method] = true
+	n.partMu.Unlock()
+	return func() {
+		n.partMu.Lock()
+		delete(n.unimplemented, method)
+		n.partMu.Unlock()
+	}
 }
 
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {

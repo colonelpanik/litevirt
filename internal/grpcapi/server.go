@@ -79,6 +79,12 @@ type Server struct {
 	// resolves it for both the mirror and the CA re-key.
 	netboxClusterName string
 
+	// defaultCPUModeCfg is the node's `vm.default_cpu_mode` — the cpu_mode a
+	// create materializes into a spec that did not name one. Empty means
+	// libvirt.DefaultCPUMode. It affects NEW specs only; see
+	// normalizeCreateVMSpec for why it is never applied in the renderer.
+	defaultCPUModeCfg string
+
 	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
 	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
 	// claim or a sweep behaves differently.
@@ -886,6 +892,12 @@ func (s *Server) sharedStorageFenceActive(ctx context.Context) bool {
 // operation protocol. The flag is the reversible kill switch; enforcement is this
 // flag AND the OperationProtocolV1 latch (see operationProtocolActive).
 func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
+
+// SetDefaultCPUMode sets the cpu_mode a create stamps onto a spec that did not
+// name one (`vm.default_cpu_mode`). Empty restores libvirt.DefaultCPUMode. An
+// operator sets it explicitly only to opt a genuinely heterogeneous fleet out of
+// the host-derived default — "" here does NOT mean "emit no <cpu> element".
+func (s *Server) SetDefaultCPUMode(mode string) { s.defaultCPUModeCfg = mode }
 
 // SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
 // enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node

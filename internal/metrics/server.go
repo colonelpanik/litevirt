@@ -473,7 +473,7 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 		),
 		replicationMinSeq: prometheus.NewDesc(
 			"litevirt_replication_min_watermark_seq",
-			"MIN(last_seq) across replication_watermarks; gates mutation_log compaction",
+			"MIN(last_seq) across recently-acked peers; a value that stops advancing means a peer stopped acknowledging",
 			nil, prometheus.Labels{"host": hostName},
 		),
 		replicationPending: prometheus.NewDesc(
@@ -732,9 +732,14 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// relay topology, so this node holds a permanently-stale watermark for any
 	// peer it does not itself serve — and an unfiltered MIN reported the
 	// slowest-EVER-seen peer instead of the current compaction floor, pinning
-	// the gauge far below reality. The prune has always filtered to live
-	// watermarks (pruneMutationLog); this now matches it, using the same cutoff
-	// the pending_entries query below computes.
+	// the gauge far below reality. The prune filters to live watermarks
+	// too (pruneMutationLog), using this same cutoff. It additionally drops
+	// peers whose pushes are currently FAILING (corrosion.UnreachablePeerGrace),
+	// which this collector cannot see — that state is the replicator's, not a
+	// column. So when a peer stops acknowledging, this gauge sits at that peer's
+	// frozen seq while the real compaction floor has already moved past it.
+	// That is the useful reading: a gauge that stops advancing is precisely the
+	// signal that some peer has stopped acknowledging.
 	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
 	if rows, rerr := c.db.Query(ctx,
 		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks WHERE updated_at > ?`,

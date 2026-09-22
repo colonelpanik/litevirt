@@ -181,6 +181,7 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	restartIf(desired.MinMemoryMib != 0 && desired.MinMemoryMib != stored.MinMemoryMib, "min-memory change needs a redefine")
 	restartIf(desired.MaxMemoryMib != 0 && desired.MaxMemoryMib != stored.MaxMemoryMib, "max-memory change needs a redefine")
 	restartIf(desired.CpuMode != "" && desired.CpuMode != stored.CpuMode, "cpu-mode change needs a redefine")
+	restartIf(desired.CpuModel != "" && desired.CpuModel != stored.CpuModel, "cpu-model change needs a redefine")
 	restartIf(desired.Machine != "" && desired.Machine != stored.Machine, "machine-type change needs a redefine")
 	restartIf(desired.Firmware != "" && desired.Firmware != stored.Firmware, "firmware change needs a redefine")
 	// Bools carry no "unset" sentinel; BuildVMSpec applies the same defaults the create

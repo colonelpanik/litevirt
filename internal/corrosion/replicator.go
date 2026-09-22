@@ -34,7 +34,12 @@ type Replicator struct {
 	relaySet       *RelaySet                     // current relay election result
 	isRelay        bool                          // cached: is this node a relay?
 	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
-	wg             sync.WaitGroup
+	// pushFailingSince records, per peer, when its CURRENT run of failed pushes
+	// began — cleared by the next success. A peer that cannot be pushed to is
+	// not consuming our log, however recent its watermark row looks, so the
+	// prune stops counting it once the run outlasts UnreachablePeerGrace.
+	pushFailingSince map[string]time.Time
+	wg               sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -393,6 +398,11 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 			if ctx.Err() != nil {
 				return
 			}
+			// A peer we cannot push to is not consuming our log. Record the run
+			// so the prune can stop counting its frozen watermark once the run
+			// outlasts UnreachablePeerGrace, instead of waiting out the whole
+			// LiveWatermarkWindow on a timestamp that will never advance again.
+			r.notePushFailure(peerName)
 			slog.Warn("replicator: error replicating to peer", "peer", peerName, "error", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
@@ -407,6 +417,10 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 			}
 			continue
 		}
+
+		// The peer is reachable again (or never stopped being): its watermark
+		// advances, so it protects its tail exactly as before.
+		r.notePushSuccess(peerName)
 
 		// Track successful relay push for fallback monitor.
 		r.mu.Lock()
@@ -706,6 +720,38 @@ func (r *Replicator) setWatermark(ctx context.Context, peerName string, seq int6
 	return err
 }
 
+// notePushFailure marks the start of a run of failed pushes to peerName. It is
+// idempotent: the recorded instant is the START of the current run, so the run
+// keeps ageing across repeated failures instead of resetting on each one.
+func (r *Replicator) notePushFailure(peerName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pushFailingSince == nil {
+		r.pushFailingSince = make(map[string]time.Time)
+	}
+	if _, failing := r.pushFailingSince[peerName]; !failing {
+		r.pushFailingSince[peerName] = time.Now()
+	}
+}
+
+// notePushSuccess clears any failure run for peerName: a peer we can push to is
+// consuming our log again, and its watermark protects its tail as before.
+func (r *Replicator) notePushSuccess(peerName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.pushFailingSince, peerName)
+}
+
+// pushStalled reports whether pushes to peerName have been failing for at least
+// UnreachablePeerGrace as of now. Such a peer's watermark can no longer advance,
+// so counting it would pin the log behind a sequence nothing will ever ack.
+func (r *Replicator) pushStalled(peerName string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	since, failing := r.pushFailingSince[peerName]
+	return failing && !now.Before(since.Add(UnreachablePeerGrace))
+}
+
 func (r *Replicator) peerGRPCClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
 	target, err := resolvePeerTarget(ctx, r.client, peerName)
 	if err != nil {
@@ -758,6 +804,25 @@ var (
 	// A peer offline longer than this recovers via anti-entropy.
 	MaxLogRetention = 24 * time.Hour
 
+	// UnreachablePeerGrace is how long a peer's pushes must have been failing
+	// continuously before its watermark stops pinning the prune.
+	//
+	// LiveWatermarkWindow cannot do this job. replication_watermarks.updated_at
+	// advances only on a SUCCESSFUL push, so a peer that has just gone
+	// unreachable keeps a timestamp from inside the window while its last_seq is
+	// frozen — it counts as live and pins MIN, and the prune reclaims nothing
+	// until the whole window elapses. Every daemon restart re-arms that, because
+	// the surviving timestamp is the last success before the restart. The
+	// replicator learns the truth in seconds (replicateOnce returns the push
+	// error), so the failing push is the signal and the window is only the
+	// backstop for a peer we never hear about again.
+	//
+	// The grace exists so one dropped connection does not cost a peer its tail
+	// and force an anti-entropy resync; it is deliberately short, because
+	// dropping the tail is safe by design (see LiveWatermarkWindow) and merely
+	// more expensive than log replay.
+	UnreachablePeerGrace = 90 * time.Second
+
 	// IncrementalVacuumPages caps how many freed pages are returned to the OS
 	// per prune tick, so a large reclaim is spread out instead of stalling
 	// under the client lock. No-op unless the DB was created with
@@ -771,32 +836,121 @@ var (
 	ClockSkewRetention = 1 * time.Hour
 )
 
+// servedPeers returns the peers this node currently replicates to — exactly the
+// set syncPeers keeps goroutines for. A peer outside it is never pushed to from
+// here, so its watermark can never advance and must not gate compaction.
+func (r *Replicator) servedPeers() map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.peers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(r.peers))
+	for peer := range r.peers {
+		out[peer] = true
+	}
+	return out
+}
+
+// stalledPeers returns the peers whose pushes have been failing for at least
+// UnreachablePeerGrace as of now.
+func (r *Replicator) stalledPeers(now time.Time) map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pushFailingSince) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(r.pushFailingSince))
+	for peer, since := range r.pushFailingSince {
+		if !now.Before(since.Add(UnreachablePeerGrace)) {
+			out[peer] = true
+		}
+	}
+	return out
+}
+
+// watermarkFloor returns the lowest last_seq among peers that gate compaction,
+// and whether any such peer exists. A peer gates only if all three hold: this
+// node serves it, it acked since liveCutoff, and its pushes are not stalled.
+// The MIN is taken in Go rather than SQL because two of those three live in
+// memory — who we serve and who we can reach are things this process knows,
+// not columns.
+//
+// No eligible peer yields ok=false, which leaves the watermark prune a no-op
+// and defers to the MaxLogRetention ceiling — the same outcome as an empty
+// live set before, and the safe direction: keeping log we might not need costs
+// disk, dropping log a peer still needs costs it a resync.
+//
+// Caller must hold r.client.mu.
+func (r *Replicator) watermarkFloor(ctx context.Context, liveCutoff string, served, stalled map[string]bool) (int64, bool) {
+	rows, err := r.client.db.QueryContext(ctx,
+		`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
+	if err != nil {
+		slog.Warn("replicator: read watermarks for prune", "error", err)
+		return 0, false
+	}
+	defer rows.Close()
+
+	var minSeq int64
+	found := false
+	for rows.Next() {
+		var peer string
+		var seq int64
+		if err := rows.Scan(&peer, &seq); err != nil {
+			slog.Warn("replicator: scan watermark for prune", "error", err)
+			return 0, false
+		}
+		if !served[peer] || stalled[peer] {
+			continue
+		}
+		if !found || seq < minSeq {
+			minSeq, found = seq, true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("replicator: iterate watermarks for prune", "error", err)
+		return 0, false
+	}
+	return minSeq, found
+}
+
 // pruneMutationLog trims the replication log in three steps: (1) prune up to
 // the slowest *live* peer's watermark, (2) enforce an absolute age ceiling so
 // a dead/forgotten peer can't keep the log growing without bound, and (3)
 // return the freed pages to the OS. Steps 1+2 bound the row count; step 3
 // bounds the on-disk file size.
 func (r *Replicator) pruneMutationLog(ctx context.Context) {
+	now := time.Now()
+	// Snapshot push health BEFORE taking the client lock: pushStalled takes the
+	// replicator's own mutex, and every other path takes that one first, so
+	// nesting them the other way round here would invert the lock order.
+	stalled := r.stalledPeers(now)
+	// Who we actually push to. A watermark row outlives the topology that
+	// created it: syncPeers drops a peer from the target set without deleting
+	// its row, leaving a frozen seq that would otherwise gate compaction
+	// forever — or, right after a restart, for a whole LiveWatermarkWindow.
+	served := r.servedPeers()
+
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
-
-	now := time.Now()
 
 	// (1) Watermark-based prune over LIVE peers only. Previously this used
 	// MIN(last_seq) across *all* watermark rows, so one dead or long-
 	// partitioned peer (watermark never advancing) pinned the log forever.
+	// A peer counts toward the watermark only if it is BOTH recently-acked and
+	// currently pushable. The timestamp alone is not enough: it advances only on
+	// a successful push, so a peer that has just gone unreachable still looks
+	// recent while its seq is frozen — see UnreachablePeerGrace.
 	liveCutoff := now.Add(-LiveWatermarkWindow).UTC().Format(time.RFC3339)
-	var minSeq sql.NullInt64
-	if err := r.client.db.QueryRowContext(ctx,
-		`SELECT MIN(last_seq) FROM replication_watermarks WHERE updated_at > ?`,
-		liveCutoff).Scan(&minSeq); err == nil && minSeq.Valid {
+	minSeq, haveMin := r.watermarkFloor(ctx, liveCutoff, served, stalled)
+	if haveMin {
 		ageCutoff := now.Add(-PruneMinAge).UTC().Format(time.RFC3339)
 		if res, derr := r.client.db.ExecContext(ctx,
 			`DELETE FROM mutation_log WHERE seq <= ? AND created_at < ?`,
-			minSeq.Int64, ageCutoff); derr != nil {
+			minSeq, ageCutoff); derr != nil {
 			slog.Warn("replicator: prune error", "error", derr)
 		} else if n, _ := res.RowsAffected(); n > 0 {
-			slog.Info("replicator: pruned mutation_log", "deleted", n, "up_to_seq", minSeq.Int64)
+			slog.Info("replicator: pruned mutation_log", "deleted", n, "up_to_seq", minSeq)
 		}
 	}
 

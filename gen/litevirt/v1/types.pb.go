@@ -385,9 +385,14 @@ type VMSpec struct {
 	StopTimeoutSec int32                  `protobuf:"varint,25,opt,name=stop_timeout_sec,json=stopTimeoutSec,proto3" json:"stop_timeout_sec,omitempty"` // ACPI shutdown timeout before force-kill (0 = default 30s)
 	Restart        *RestartPolicy         `protobuf:"bytes,26,opt,name=restart,proto3" json:"restart,omitempty"`                                        // auto-restart policy for stopped/crashed VMs
 	DisableVnc     bool                   `protobuf:"varint,27,opt,name=disable_vnc,json=disableVnc,proto3" json:"disable_vnc,omitempty"`               // true = headless (no VNC graphics device)
-	CpuMode        string                 `protobuf:"bytes,28,opt,name=cpu_mode,json=cpuMode,proto3" json:"cpu_mode,omitempty"`                         // host-passthrough | host-model | custom (default: QEMU default)
-	EnableSpice    bool                   `protobuf:"varint,29,opt,name=enable_spice,json=enableSpice,proto3" json:"enable_spice,omitempty"`            // true = add a SPICE graphics device alongside VNC
-	Project        string                 `protobuf:"bytes,30,opt,name=project,proto3" json:"project,omitempty"`                                        // tenancy bucket; "" → "_default"
+	// cpu_mode selects how the guest CPU is derived from the host:
+	// host-passthrough | host-model | custom. Create defaults it to host-model
+	// (see libvirt.DefaultCPUMode); empty means a spec that predates that
+	// default, which still renders with NO <cpu> element — QEMU's qemu64, which
+	// carries no SSE4.2/AVX/AVX2.
+	CpuMode     string `protobuf:"bytes,28,opt,name=cpu_mode,json=cpuMode,proto3" json:"cpu_mode,omitempty"`
+	EnableSpice bool   `protobuf:"varint,29,opt,name=enable_spice,json=enableSpice,proto3" json:"enable_spice,omitempty"` // true = add a SPICE graphics device alongside VNC
+	Project     string `protobuf:"bytes,30,opt,name=project,proto3" json:"project,omitempty"`                             // tenancy bucket; "" → "_default"
 	// Memory ballooning (#4). When max_memory_mib > memory_mib the domain gets a
 	// virtio-balloon and a hot-pluggable maxMemory region; min_memory_mib (>0)
 	// sets the floor the host may reclaim to. 0 = classic fixed memory_mib.
@@ -412,6 +417,11 @@ type VMSpec struct {
 	// value 0, which encoding/json omitempty drops entirely on store, making
 	// restart-any indistinguishable from unset. The string field round-trips.
 	OnHostFailure string `protobuf:"bytes,41,opt,name=on_host_failure,json=onHostFailure,proto3" json:"on_host_failure,omitempty"`
+	// cpu_model names the CPU model for cpu_mode="custom" and MUST be empty for
+	// any other mode. Additive and mixed-version safe: an older peer ignores it,
+	// and an older entry node simply never sets it (a custom-mode spec is
+	// refused at validation rather than rendered without a model).
+	CpuModel      string `protobuf:"bytes,42,opt,name=cpu_model,json=cpuModel,proto3" json:"cpu_model,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -729,6 +739,13 @@ func (x *VMSpec) GetMaxCpu() int32 {
 func (x *VMSpec) GetOnHostFailure() string {
 	if x != nil {
 		return x.OnHostFailure
+	}
+	return ""
+}
+
+func (x *VMSpec) GetCpuModel() string {
+	if x != nil {
+		return x.CpuModel
 	}
 	return ""
 }
@@ -5453,7 +5470,7 @@ var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
-	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xbc\f\n" +
+	"\x17litevirt/v1/types.proto\x12\vlitevirt.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1bgoogle/protobuf/empty.proto\"\xd9\f\n" +
 	"\x06VMSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5502,7 +5519,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\x03tpm\x18& \x01(\bR\x03tpm\x12\x12\n" +
 	"\x04uuid\x18' \x01(\tR\x04uuid\x12\x17\n" +
 	"\amax_cpu\x18( \x01(\x05R\x06maxCpu\x12&\n" +
-	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x1a9\n" +
+	"\x0fon_host_failure\x18) \x01(\tR\ronHostFailure\x12\x1b\n" +
+	"\tcpu_model\x18* \x01(\tR\bcpuModel\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb5\x01\n" +

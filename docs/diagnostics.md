@@ -607,6 +607,48 @@ nothing until the capability has latched cluster-wide, so no host is fencing
 whatever the table shows. Without that line a mid-rollout fleet — every operator
 having already set the flag — prints a column of `enforcing` that reads as
 covered.
+## `lv doctor cpu-mode`
+
+Read-only. Lists VMs whose **persisted spec** has an empty `cpu_mode`.
+
+```
+lv doctor cpu-mode
+```
+
+Such a VM is defined with no `<cpu>` element, so libvirt passes no `-cpu` to QEMU
+and the guest runs on QEMU's x86_64 default, `qemu64` — a model with no `sse4.1`,
+no `sse4.2` and no `xsave`, and therefore neither AVX nor AVX2, however capable
+the host is. Guest software that assumes a modern baseline will not start, and the
+fault presents as a broken binary rather than a hypervisor setting.
+
+New VMs default to `host-model` (see `vm.default_cpu_mode` in
+[configuration](configuration.md)). VMs listed here were created before that
+default existed. Their stored spec is honored verbatim and deliberately not
+rewritten: changing the CPU a running guest sees is not something an upgrade
+should do behind the operator's back.
+
+To move one forward, with the VM **stopped**:
+
+```
+lv update <vm> --cpu-mode host-model
+```
+
+or, in one step on a running VM, `lv update <vm> --cpu-mode host-model
+--restart-if-needed`, which does a stop → redefine → start under a single VM
+lock.
+
+The retrofit is an **in-place patch of libvirt's own inactive domain XML**, not a
+regeneration from the stored spec, so every libvirt-assigned detail the spec does
+not describe — guest PCI slot addresses, controller models, disk ordering —
+survives unchanged. That matters for guests (e.g. Windows) that key licensing off
+stable hardware addresses. If the patch cannot be applied for any reason the
+redefine falls back to full regeneration rather than failing.
+
+Two things to expect. It changes the guest-visible CPU, so it needs a full
+stop/start rather than a guest reboot. And it narrows live migration for that VM
+to hosts with an equal-or-richer CPU — the trade the modern instruction set
+costs, and no trade at all on a homogeneous cluster.
+
 ## `lv doctor vm-uuids`
 
 Read-only. Lists VMs whose **persisted spec** carries no domain uuid.

@@ -444,6 +444,7 @@ message UpdateVMRequest    { string name = 1; int32 cpu = 2;
     string         idempotency_key = 19;  // cross-entry-node dedup of a retried update (D4 semantics)
     optional int32 max_cpu         = 20;  // set the vCPU hotplug ceiling (live_resize; latched)
     optional bool  allow_restart   = 21;  // permit a stop→redefine→start for a change that can't apply live
+    string         cpu_model       = 23;  // CPU model for --cpu-mode custom; empty for any other mode
 
     // allow_overcommit skips HOST capacity admission for a --restart-if-needed
     // reconfigure that GROWS the VM (project quota still applies). Audited.
@@ -1839,6 +1840,24 @@ message EnsureFirmwareStateRequest {
 // CleanupMigrationArtifactsRequest removes the stub disks + cloud-init ISO that
 // EnsureDisks/EnsureCloudInit pre-created on a migration target, after the
 // migration failed (the VM never got defined there, so they are orphaned).
+// CheckCPUCompatibility asks a prospective migration TARGET whether it can run a
+// guest requiring cpu_xml (a standalone <cpu> element). The source derives that
+// requirement from the VM's live domain XML — for a host-model guest libvirt has
+// already expanded it to a concrete model plus feature list — and refuses the
+// migration up front rather than letting it abort mid-copy on a destination whose
+// CPU is missing instructions the guest is already executing.
+//
+// Peer-only (host-cert mTLS). Purely advisory and read-only: it decides nothing
+// and writes nothing. An older peer does not implement it at all, so the caller
+// treats Unimplemented as "cannot verify" and proceeds — the check must never be
+// the reason a migration stops working during a rolling upgrade.
+message CheckCPUCompatibilityRequest  { string cpu_xml = 1; }
+message CheckCPUCompatibilityResponse {
+    bool   runnable = 1;  // true = this host can run that guest (identical or superset)
+    string verdict  = 2;  // identical | superset | incompatible
+    string detail   = 3;  // hypervisor detail when not runnable
+}
+
 message CleanupMigrationArtifactsRequest {
     string vm_name              = 1;
     repeated string disk_paths  = 2;  // stub disk files to remove on this (target) host
@@ -2454,6 +2473,7 @@ service LiteVirt {
     rpc EnsureDisks(EnsureDisksRequest)            returns (google.protobuf.Empty);
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (google.protobuf.Empty);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
+    rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
 
     // ── Internal: State Sync ──
     rpc GetStateDigest(google.protobuf.Empty)      returns (StateDigestResponse);

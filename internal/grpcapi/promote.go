@@ -848,7 +848,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	if !started {
 		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
-			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode,
+			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
 			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,

@@ -20,7 +20,7 @@ func TestSweepPrunesDeletedVMs_StopsPoisoning(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// Simulate three VMs deleted while failing — stale counters at the failing threshold.
 	v.mu.Lock()
 	for _, n := range []string{"gone-1", "gone-2", "gone-3"} {

@@ -10,6 +10,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // Retrofitting a CPU mode onto an EXISTING VM is the whole point of having the
@@ -113,5 +114,134 @@ func TestUpdateVM_RetrofitCPUModeRefusedOnRunningVM(t *testing.T) {
 	// would leave the stored CPU disagreeing with the running domain.
 	if got := loadStoredSpec(t, s, "busy-vm").GetCpuMode(); got != "" {
 		t.Fatalf("refused update still wrote cpu_mode = %q", got)
+	}
+}
+
+// The retrofit must PATCH libvirt's own inactive XML, not regenerate the domain
+// from the spec.
+//
+// It matters because GenerateDomainXML emits no guest-side PCI addresses, so a
+// regeneration hands libvirt an unaddressed device list and lets it re-derive
+// every slot. A Windows guest that keys its licensing off stable hardware
+// addresses is the case that cares.
+//
+// The fixture seeds an inactive XML carrying libvirt-assigned <address>
+// elements and a controller model that the spec does not describe at all. If the
+// redefine regenerated, they would be gone — which is exactly what this asserts
+// against.
+func TestUpdateVM_RetrofitCPUModePatchesInPlaceKeepingPCIAddresses(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := adminCtx()
+
+	legacy := &pb.VMSpec{
+		Name: "pinned-vm", Cpu: 2, MemoryMib: 4096,
+		Machine: "pc-q35-9.0", Firmware: "uefi",
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "20G", Bus: "virtio"}},
+		Network: []*pb.NetworkAttachment{
+			{Name: "br0", Model: "virtio", Mac: "52:54:00:ab:cd:ef"},
+		},
+	}
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{
+			Name: "pinned-vm", HostName: "test-host", State: "stopped",
+			CPUActual: 2, MemActual: 4096, Spec: seedSpecJSON(t, legacy),
+		},
+		[]corrosion.InterfaceRecord{{
+			VMName: "pinned-vm", NetworkName: "br0", Ordinal: 0, MAC: "52:54:00:ab:cd:ef",
+		}},
+		[]corrosion.DiskRecord{{
+			VMName: "pinned-vm", DiskName: "root", HostName: "test-host",
+			Path: "/data/pinned-vm/root.qcow2", SizeBytes: 20 << 30, StorageType: "local",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM pinned-vm: %v", err)
+	}
+
+	// libvirt's serialized form, with the details only libvirt knows.
+	const pinnedAddr = `<address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>`
+	inactive := `<domain type='kvm'>
+  <name>pinned-vm</name>
+  <memory unit='KiB'>4194304</memory>
+  <vcpu placement='static'>2</vcpu>
+  <os><type arch='x86_64' machine='pc-q35-9.0'>hvm</type></os>
+  <devices>
+    <controller type='scsi' index='0' model='virtio-scsi'/>
+    <disk type='file' device='disk'>
+      <source file='/data/pinned-vm/root.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      ` + pinnedAddr + `
+    </disk>
+  </devices>
+</domain>`
+	if err := fake.DefineDomain(inactive); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+	fake.SetInactiveXML("pinned-vm", inactive)
+
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{
+		Name: "pinned-vm", CpuMode: lv.CPUModeHostModel,
+	}); err != nil {
+		t.Fatalf("retrofit: %v", err)
+	}
+
+	got, err := fake.DumpXMLInactive("pinned-vm")
+	if err != nil {
+		t.Fatalf("DumpXMLInactive: %v", err)
+	}
+	if !strings.Contains(got, `mode="`+lv.CPUModeHostModel+`"`) &&
+		!strings.Contains(got, `mode='`+lv.CPUModeHostModel+`'`) {
+		t.Fatalf("redefined domain carries no %s cpu element:\n%s", lv.CPUModeHostModel, got)
+	}
+	if !strings.Contains(got, pinnedAddr) {
+		t.Errorf("the redefine dropped libvirt's assigned PCI address, so it regenerated "+
+			"instead of patching in place:\n%s", got)
+	}
+	if !strings.Contains(got, `model='virtio-scsi'`) {
+		t.Errorf("the redefine dropped libvirt's controller model:\n%s", got)
+	}
+}
+
+// The safety half: a memory-only edit on a VM that names no CPU mode must not
+// gain a <cpu> element. Otherwise resizing a legacy VM's RAM would silently
+// change the CPU its guest sees — a far worse surprise than the qemu64 default.
+func TestUpdateVM_MemoryOnlyEditDoesNotAddACPUElement(t *testing.T) {
+	s := testServer(t)
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "mem-only", "test-host", "stopped",
+		seedSpecJSON(t, &pb.VMSpec{Name: "mem-only", Cpu: 2, MemoryMib: 4096, Machine: "pc-q35-9.0"}))
+
+	inactive := `<domain type='kvm'>
+  <name>mem-only</name>
+  <memory unit='KiB'>4194304</memory>
+  <vcpu placement='static'>2</vcpu>
+  <os><type arch='x86_64' machine='pc-q35-9.0'>hvm</type></os>
+  <devices></devices>
+</domain>`
+	if err := fake.DefineDomain(inactive); err != nil {
+		t.Fatalf("DefineDomain: %v", err)
+	}
+	fake.SetInactiveXML("mem-only", inactive)
+
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "mem-only", MemoryMib: 8192}); err != nil {
+		t.Fatalf("memory-only update: %v", err)
+	}
+
+	got, err := fake.DumpXMLInactive("mem-only")
+	if err != nil {
+		t.Fatalf("DumpXMLInactive: %v", err)
+	}
+	if strings.Contains(got, "<cpu") {
+		t.Errorf("a memory-only edit added a <cpu> element, changing the guest CPU "+
+			"as a side effect:\n%s", got)
+	}
+	if !strings.Contains(got, "8388608</memory>") {
+		t.Errorf("memory was not actually updated:\n%s", got)
+	}
+	if spec := loadStoredSpec(t, s, "mem-only"); spec.GetCpuMode() != "" {
+		t.Errorf("a memory-only edit wrote cpu_mode = %q", spec.GetCpuMode())
 	}
 }

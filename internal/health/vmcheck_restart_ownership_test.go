@@ -57,7 +57,7 @@ func restartAttempts(t *testing.T, db *corrosion.Client, name string) int {
 func TestMaybeRestartVM_RefusesAVMThisHostNoLongerOwns(t *testing.T) {
 	db := testStartDB(t)
 	seedRestartPolicyVM(t, db, "vm1", "node2") // owned elsewhere
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// The stale snapshot this host is acting on still names itself as owner —
 	// that is what makes the re-read load-bearing.
@@ -74,7 +74,7 @@ func TestMaybeRestartVM_RefusesAVMThisHostNoLongerOwns(t *testing.T) {
 func TestMaybeRestartVM_RestartsAVMThisHostOwns(t *testing.T) {
 	db := testStartDB(t)
 	seedRestartPolicyVM(t, db, "vm1", "node1")
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	vm, err := corrosion.GetVM(context.Background(), db, "vm1")
 	if err != nil || vm == nil {
@@ -103,7 +103,7 @@ func TestMaybeRestartVM_RefusesWhileAnotherHolderHasTheVMLock(t *testing.T) {
 		t.Fatalf("seed vm_lock: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm, _ := corrosion.GetVM(ctx, db, "vm1")
 	v.maybeRestartVM(ctx, *vm, time.Now())
 
@@ -118,7 +118,7 @@ func TestMaybeRestartVM_ReleasesTheVMLock(t *testing.T) {
 	db := testStartDB(t)
 	ctx := context.Background()
 	seedRestartPolicyVM(t, db, "vm1", "node1")
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	vm, _ := corrosion.GetVM(ctx, db, "vm1")
 	v.maybeRestartVM(ctx, *vm, time.Now())
@@ -137,7 +137,7 @@ func TestMaybeRestartVM_ReleasesTheVMLock(t *testing.T) {
 // restarted — there is nothing left to own.
 func TestMaybeRestartVM_RefusesAVanishedVM(t *testing.T) {
 	db := testStartDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	stale := corrosion.VMRecord{Name: "ghost", HostName: "node1", State: "stopped", StateDetail: "crashed"}
 	v.maybeRestartVM(context.Background(), stale, time.Now())

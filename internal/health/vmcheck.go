@@ -780,11 +780,18 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	// 2. Take the per-VM lease, so this host's own reconciler cannot start the
 	// same VM concurrently. Its comment is the reason: "the same physical disk
 	// gets two QEMU writers -> guaranteed corruption".
-	if !acquireVMLockFor(ctx, v.db, v.hostName, vm.Name, time.Now()) {
+	//
+	// Under vmcheckLockHolder, NOT the bare host name. The upsert admits
+	// `holder = excluded.holder` so a component can re-take its own lease
+	// across passes; sharing the host name with the reconciler made that
+	// clause match ITS lease too, so this path acquired a lease held for a
+	// start already in flight and then freed it on the way out.
+	holder := vmcheckLockHolder(v.hostName)
+	if !acquireVMLockFor(ctx, v.db, holder, vm.Name, time.Now()) {
 		slog.Info("vmcheck: restart-policy skipped — vm_lock held elsewhere", "vm", vm.Name)
 		return
 	}
-	defer releaseVMLockFor(ctx, v.db, v.hostName, vm.Name)
+	defer releaseVMLockFor(ctx, v.db, holder, vm.Name)
 
 	// 3. Refuse a runtime this cluster has superseded. The row can still name us
 	// while the owner epoch has moved on, which is what the self-heal path

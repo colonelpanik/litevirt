@@ -1387,8 +1387,24 @@ const vmLockTTL = 10 * time.Minute
 // lock then discovered the VM moved, and we release without acting", not
 // "two hosts both started the VM."
 func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
-	return acquireVMLockFor(ctx, r.db, r.hostName, vmName, r.now())
+	return acquireVMLockFor(ctx, r.db, reconcilerLockHolder(r.hostName), vmName, r.now())
 }
+
+// The per-VM lease is held by a COMPONENT on a host, not by the host. Both
+// the reconciler's start path and the restart-policy path run in the same
+// daemon, and the upsert guard admits `holder = excluded.holder` so that a
+// component can re-take its own lease across passes. With a bare host name as
+// the holder that clause matched the OTHER component too: the restart path
+// took a lease the reconciler was holding for a start in progress, and its
+// deferred release — a DELETE by holder — then freed it, after which a peer
+// reading host_name=self could start the same VM against the same disk.
+//
+// The reconciler keeps the bare host name so a lease written by an older
+// binary mid-upgrade is still recognised as its own.
+func reconcilerLockHolder(hostName string) string { return hostName }
+
+// vmcheckLockHolder is the restart-policy path's distinct identity.
+func vmcheckLockHolder(hostName string) string { return hostName + "/vmcheck" }
 
 // acquireVMLockFor is acquireVMLock without a Reconciler. The restart-policy
 // path in VMChecker needs the same lease and is not a Reconciler, and a second
@@ -1428,7 +1444,7 @@ func acquireVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmNam
 // releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
 // is recoverable (next acquire after vmLockTTL succeeds).
 func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
-	releaseVMLockFor(ctx, r.db, r.hostName, vmName)
+	releaseVMLockFor(ctx, r.db, reconcilerLockHolder(r.hostName), vmName)
 }
 
 // releaseVMLockFor is releaseVMLock without a Reconciler. See acquireVMLockFor.

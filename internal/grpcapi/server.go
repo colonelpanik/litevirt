@@ -1179,7 +1179,50 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 	}
 }
 
-// persistVMState records an authoritative VM state via the strict helper,
+// publishRunning routes a NON-MINTING transition through the marker chokepoint.
+// Why there are two orderings, and why this one marks first, lives on
+// health.PublishVMRunning; do not restate it here, or the copies drift.
+//
+// Not for a cross-host handoff. s.virt and s.dataDir are THIS host's, and after
+// a migration cutover the domain they name is gone (MigrateToTarget sets
+// MigrateUndefineSource) — marking would fail and, in this ordering, take the
+// ownership commit down with it. Those sites are excluded by name; see
+// scripts/ci/runningcheck's allowlist.
+func (s *Server) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
+	return health.PublishRunningVia(ctx, s.virt, s.db, s.dataDir, s.hostName, name, state, commit)
+}
+
+// publishRunningMinted routes a MINTING transition — one whose statement sets
+// state='running' AND advances vm_owner_epoch together — through the chokepoint
+// in the OTHER order. See health.PublishVMRunningMinted for why that order is
+// the only correct one here.
+//
+// Local publishes only, for the same reason publishRunning is: see its comment.
+func (s *Server) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, commit)
+}
+
+// persistVMState records an authoritative VM state, routing a "running" write
+// through the marker chokepoint so the row never says running before a marker
+// names its generation.
+func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
+	committed := false
+	err := s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+		committed = true
+		return s.persistVMStateDirect(ctx, name, state, detail, op)
+	})
+	// A publish refused BEFORE the commit never reaches persistVMStateDirect,
+	// which is the only place that counts a dropped state write. Without this the
+	// metric is blind to the entire drop class the chokepoint introduces — a
+	// failed epoch read or a lost marker — and on a fleet with an unhealthy store
+	// running writes disappear against a flat graph.
+	if err != nil && !committed {
+		s.noteStateWriteFail(op, err)
+	}
+	return err
+}
+
+// persistVMStateDirect is the state write itself, via the strict helper,
 // retrying briefly to absorb a transient Corrosion/DB error (the realistic
 // failure after a runtime action already succeeded). A zero-row result
 // (ErrNoRowsAffected — the row vanished) returns immediately; retrying it is
@@ -1187,9 +1230,11 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 // returns the error, letting the caller decide whether losing THIS write is fatal
 // (operator-stop, whose loss lets HA restart a stopped VM) or merely observed (a
 // "running" state the reconciler heals from libvirt).
-func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
+func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, op string) error {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
+		//runningcheck:allow routed by its only caller — persistVMStateDirect is the body
+		// persistVMState hands to publishRunning, and is private with no other call site.
 		if err = corrosion.UpdateVMStateStrict(ctx, s.db, name, state, detail); err == nil {
 			return nil
 		}

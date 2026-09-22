@@ -611,7 +611,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// loop is NOT started here — it launches below, only after the full gate
 	// (SetPeerPinger) and its callbacks are wired, so a gated runtime start never
 	// runs in a window where capability can't yet be confirmed.
-	vmChecker := health.NewVMChecker(d.cfg.HostName, d.db, d.virt)
+	vmChecker := health.NewVMChecker(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	vmChecker.SetGate(d.checker)
 	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)

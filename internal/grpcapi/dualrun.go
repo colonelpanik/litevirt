@@ -405,6 +405,12 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 		for _, h := range hosts {
 			knownHost[h.Name] = true
 		}
+		// The set actually probed this pass — witnesses and anything else
+		// dualRunProbeTargets excludes are absent from it by construction.
+		probeTarget := make(map[string]bool, len(targets))
+		for _, t := range targets {
+			probeTarget[t] = true
+		}
 
 		// SUPPRESSION A — deleted_at. ListVMs filters `deleted_at IS NULL`, so a
 		// tombstone removes the VM from vmOwner entirely: no epoch check, no
@@ -446,13 +452,23 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 				// this pass; a host_name naming a host that is not in the cluster
 				// at all is never probed, so the deferral never resolves and no
 				// coverage finding names this VM.
-				if !knownHost[owner] {
+				// Membership is not the test — being PROBED is. A witness is a
+				// real cluster host that dualRunProbeTargets structurally
+				// excludes, so it is never probed, raises no coverage finding,
+				// and naming it as owner suppresses this check permanently
+				// with no renewal. Checking only !knownHost closed the
+				// invented-host case and left the one needing no invention.
+				if !probeTarget[owner] {
 					if hs := vmHolders[vm]; len(hs) > 0 {
+						why := "is not a host in this cluster"
+						if knownHost[owner] {
+							why = "is a cluster host that is never probed (a witness)"
+						}
 						add(kindEpochSuppressed, vm, fmt.Sprintf(
-							"VM %q names owner %q, which is not a host in this cluster, while running on %s — "+
+							"VM %q names owner %q, which %s, while running on %s — "+
 								"an owner that can never be probed suppresses the owner-epoch check permanently "+
 								"and raises no coverage finding of its own.",
-							vm, owner, strings.Join(hs, ", ")), hs...)
+							vm, owner, why, strings.Join(hs, ", ")), hs...)
 					}
 				}
 				continue // owner unprobed (coverage covers it) or a fixture without markers
@@ -560,22 +576,41 @@ func (s *Server) dbVMIndex(ctx context.Context) (idx dbVMView, ok bool) {
 		idx.updated[vm.Name] = vm.UpdatedAt
 		idx.epoch[vm.Name] = vm.OwnerEpoch
 	}
-	// Tombstoned rows are read SEPARATELY because ListVMs filters them out —
-	// which is precisely what makes deleted_at a one-write suppression of the
-	// epoch check. A tombstoned row whose runtime is still live is not a
-	// deleted VM; it is an unexamined running workload.
+	tomb, tombOK := s.readTombstonedVMs(ctx)
+	if !tombOK {
+		// A blind pass must not read as a clean one. Returning ok here left
+		// coverage COMPLETE while SUPPRESSION A iterated nothing, so two such
+		// passes auto-resolved a confirmed critical owner_epoch_suppressed
+		// condition with a notification claiming the absence was proven. The
+		// rule is stated on coverageComplete: a failed DB read gates
+		// resolution exactly like an unreachable host, because the pass proved
+		// nothing.
+		return idx, false
+	}
+	idx.tombstoned = tomb
+	return idx, true
+}
+
+// readTombstonedVMs reads the tombstoned rows, which ListVMs filters out —
+// precisely what makes deleted_at a one-write suppression of the epoch check.
+// A tombstoned row whose runtime is still live is not a deleted VM; it is an
+// unexamined running workload.
+//
+// Separate from dbVMIndex so its failure contract is testable on its own: the
+// interesting case is this read failing while ListVMs succeeds, which is what
+// a lock-contention blip on one statement looks like.
+func (s *Server) readTombstonedVMs(ctx context.Context) (map[string]string, bool) {
 	rows, err := s.db.Query(ctx,
 		`SELECT name, host_name FROM vms WHERE deleted_at IS NOT NULL`)
 	if err != nil {
-		// Not fatal to the pass: the live index above is still usable. But the
-		// tombstone corroboration is blind this sweep, so say so.
 		slog.Warn("dual-run detector: list tombstoned VMs", "error", err)
-		return idx, true
+		return nil, false
 	}
+	out := make(map[string]string, len(rows))
 	for _, r := range rows {
-		idx.tombstoned[r.String("name")] = r.String("host_name")
+		out[r.String("name")] = r.String("host_name")
 	}
-	return idx, true
+	return out, true
 }
 
 // dbVMView is the detector's DB-side index. It carries the tombstoned set

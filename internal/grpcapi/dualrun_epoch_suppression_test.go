@@ -239,3 +239,91 @@ func TestEpochSuppression_HealthyVMIsSilent(t *testing.T) {
 }
 
 var _ = corrosion.SeverityCritical
+
+// ── crossexam c-0001: a witness is a real host that is NEVER probed ──────
+
+// SUPPRESSION C fires when the DB owner is not a host in the cluster. That
+// closed the ghost-host case and left the one that needs no invention: a
+// WITNESS. dualRunProbeTargets structurally excludes witnesses, so a witness
+// is a known host that is never probed — the coverage deferral never
+// resolves, no coverage finding names the VM, and pointing host_name at an
+// existing witness is a permanent single-write escape needing no renewal.
+func TestEpochSuppression_OwnerIsAWitnessThatIsNeverProbed(t *testing.T) {
+	s := epochServer(t)
+	ctx := context.Background()
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+		Name: "wit", Address: "10.0.0.9", State: "active", Role: "witness",
+	}); err != nil {
+		t.Fatalf("InsertHost witness: %v", err)
+	}
+	seedVM(t, s, "vmA", "h1", "running")
+	if err := s.db.Execute(ctx,
+		`UPDATE vms SET host_name = 'wit', vm_owner_epoch = 7 WHERE name = 'vmA'`); err != nil {
+		t.Fatalf("repoint at the witness: %v", err)
+	}
+	// Really running on h2, which we can see.
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {},
+		"h2": {diskHolderVMs: []string{"vmA"},
+			vmMarkers: map[string]markerInfo{"vmA": {epoch: 3, status: MarkerValid}}},
+	})
+	twice(s)
+
+	if !confirmedCond(s, kindEpochSuppressed, "vmA") {
+		t.Fatal("a VM whose host_name names an existing WITNESS escaped the epoch check; " +
+			"a witness is never a probe target, so the coverage deferral never resolves")
+	}
+}
+
+// ── crossexam c-0003: a blind pass must not read as a clean one ─────────
+
+// dbVMIndex reads tombstoned rows separately, because ListVMs hiding them is
+// the whole mechanism SUPPRESSION A exists to catch. When that read FAILS the
+// pass is blind to SUPPRESSION A — but it returned ok=true, so coverage still
+// read COMPLETE and the pass counted as clean.
+//
+// Two such passes auto-resolve a confirmed critical owner_epoch_suppressed
+// condition, emitting a notification that says the absence was proven. The
+// rule this breaks is stated in this same file: a failed DB read "must gate
+// resolution exactly like an unreachable host: the pass proved nothing".
+func TestEpochSuppression_BlindTombstoneReadIsNotCompleteCoverage(t *testing.T) {
+	s := epochServer(t)
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+
+	// The interesting case is this ONE read failing while ListVMs succeeds —
+	// a lock-contention blip on a single statement. readTombstonedVMs is
+	// separate precisely so that contract is testable on its own.
+	if err := s.db.Execute(ctx, `DROP TABLE vms`); err != nil {
+		t.Fatalf("drop vms: %v", err)
+	}
+	if _, ok := s.readTombstonedVMs(ctx); ok {
+		t.Fatal("readTombstonedVMs reported ok on a failed read; the pass is blind to " +
+			"SUPPRESSION A and must say so")
+	}
+	if _, ok := s.dbVMIndex(ctx); ok {
+		t.Fatal("dbVMIndex reported ok while blind to the tombstone suppression; coverage " +
+			"would read COMPLETE and two such passes auto-resolve a confirmed critical condition")
+	}
+}
+
+// And the propagation is the load-bearing half: readTombstonedVMs reporting
+// failure must make the whole index not-ok, or coverage still reads complete.
+func TestEpochSuppression_BlindTombstoneReadFailsTheWholeIndex(t *testing.T) {
+	s := epochServer(t)
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+
+	// Sanity: a healthy DB reports ok, so the assertion below is about the
+	// failure and not about the fixture.
+	if _, ok := s.dbVMIndex(ctx); !ok {
+		t.Fatal("fixture inert: a healthy DB did not report ok")
+	}
+
+	if err := s.db.Execute(ctx, `DROP TABLE vms`); err != nil {
+		t.Fatalf("drop vms: %v", err)
+	}
+	if _, ok := s.dbVMIndex(ctx); ok {
+		t.Fatal("a failed tombstone read did not fail the index")
+	}
+}

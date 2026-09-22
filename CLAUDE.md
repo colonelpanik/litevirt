@@ -14,7 +14,7 @@ replicated SQL builder whose statement shape is not in the compatibility ledger.
 
 **`-race` on `internal/corrosion` or `internal/grpcapi` needs an explicit
 `-timeout`.** Both run past Go's 10-minute default under the race detector —
-`internal/corrosion` takes ~18½ minutes on a current laptop, and
+`internal/corrosion` takes ~40 minutes on a current laptop, and
 **`internal/grpcapi` takes ~68** — so the plain command fails like this:
 
 ```
@@ -25,9 +25,15 @@ FAIL	github.com/litevirt/litevirt/internal/corrosion	600.588s
 killed. Reach for a real budget:
 
 ```bash
-go test -race -timeout 30m ./internal/corrosion/
+go test -race -timeout 60m ./internal/corrosion/
 go test -race -timeout 90m ./internal/grpcapi/
 ```
+
+**Both numbers have been raised once already, and will drift again.** The
+corrosion budget said 30m against a measured ~18½ minutes; the package has
+since grown past it, and a run at 30m died at `FAIL ... 1817.560s` looking
+exactly like a finding. A re-run at a real budget passed in 2358s — 39 minutes,
+with zero warnings. When either package times out, measure before believing it.
 
 **grpcapi is the one that catches people out**, because 30m is nowhere near
 enough for it and the failure is indistinguishable from a real finding: a 45m

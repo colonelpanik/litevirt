@@ -1188,6 +1188,10 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q is a template and cannot be started; clone it first (lv vm clone %s <new-name>)", req.Name, req.Name)
 	}
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {
+		return nil, err
+	}
+
 	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
 	// non-template VM as a linked-clone source, so a plain VM can be backing
 	// overlays; starting it lets qemu write into the backing file underneath
@@ -1196,6 +1200,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// Fails CLOSED on a read error, like ConvertToTemplate's guard: "we cannot
 	// tell whether anything is layered on this disk" is not permission to write
 	// to it.
+	//
+	// BELOW RequirePerm, not above it. Only the path-blind requirePermPrecheck
+	// has run before that call, so evaluating this guard first let an operator
+	// scoped to one project name the linked clones of a VM in another — the
+	// error text lists them — and charged a DB read to an unauthorized caller.
+	// Authorize the resource, then touch it.
 	clones, cErr := s.linkedClonesOf(ctx, req.Name)
 	if cErr != nil {
 		return nil, status.Errorf(codes.Internal,
@@ -1208,9 +1218,6 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 				"re-create them as independent copies with `lv clone <source> <name> "+
 				"--mode full`, first",
 			req.Name, len(clones), strings.Join(clones, ", "))
-	}
-	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {
-		return nil, err
 	}
 
 	if vm.HostName != s.hostName {

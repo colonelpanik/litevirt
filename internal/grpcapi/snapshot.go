@@ -28,8 +28,21 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
+	// releaseLock is idempotent so the peer-forward paths below can drop the
+	// lock EARLY. A process-local mutex must never be held across a peer RPC:
+	// the remote call can outlive any local work (an adopted migration keeps
+	// libvirt busy for as long as the guest takes to move), and during a CRDT
+	// ownership flip two hosts can each hold their own lock for the same VM
+	// and forward to each other, blocking until the gRPC deadlines fire.
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	unlocked := false
+	releaseLock := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+	defer releaseLock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
@@ -45,6 +58,7 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 			"invalid snapshot name %q: allowed [A-Za-z0-9_.-], not '.' or '..'", req.Name)
 	}
 	if vm.HostName != s.hostName {
+		releaseLock() // never hold a process lock across a peer RPC
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -258,8 +272,21 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
+	// releaseLock is idempotent so the peer-forward paths below can drop the
+	// lock EARLY. A process-local mutex must never be held across a peer RPC:
+	// the remote call can outlive any local work (an adopted migration keeps
+	// libvirt busy for as long as the guest takes to move), and during a CRDT
+	// ownership flip two hosts can each hold their own lock for the same VM
+	// and forward to each other, blocking until the gRPC deadlines fire.
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	unlocked := false
+	releaseLock := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+	defer releaseLock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
@@ -272,6 +299,7 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return nil, status.Errorf(codes.InvalidArgument, "invalid snapshot name %q", req.SnapshotName)
 	}
 	if vm.HostName != s.hostName {
+		releaseLock() // never hold a process lock across a peer RPC
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -360,8 +388,21 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 	// or another snapshot. The container twins in snapshot_container.go already
 	// take this lock; the VM ones did not. Taken before the row read so the
 	// state guards below cannot go stale underneath the work.
+	// releaseLock is idempotent so the peer-forward paths below can drop the
+	// lock EARLY. A process-local mutex must never be held across a peer RPC:
+	// the remote call can outlive any local work (an adopted migration keeps
+	// libvirt busy for as long as the guest takes to move), and during a CRDT
+	// ownership flip two hosts can each hold their own lock for the same VM
+	// and forward to each other, blocking until the gRPC deadlines fire.
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	unlocked := false
+	releaseLock := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+	defer releaseLock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
@@ -374,6 +415,7 @@ func (s *Server) DeleteSnapshot(ctx context.Context, req *pb.DeleteSnapshotReque
 		return nil, status.Errorf(codes.InvalidArgument, "invalid snapshot name %q", req.SnapshotName)
 	}
 	if vm.HostName != s.hostName {
+		releaseLock() // never hold a process lock across a peer RPC
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)

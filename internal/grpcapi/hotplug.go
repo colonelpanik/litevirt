@@ -181,6 +181,19 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 	unlock := s.lockVM(req.VmName)
 	defer unlock()
 
+	// RE-READ under the lock. Taking the lock and then testing the row fetched
+	// before it closes nothing: the barrier and running-state checks would
+	// still be evaluating a pre-lock snapshot, which is the read-then-act the
+	// lock was added to prevent. The sibling lock sites added alongside this
+	// one (StartVM, RebuildVM, attachPCIOwner) all re-read; these did not.
+	vmRec, err = corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "re-read VM %q under lock: %v", req.VmName, err)
+	}
+	if vmRec == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot attach a device to %q: an operation is in progress", req.VmName)
 	}
@@ -275,6 +288,16 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 	// unlocked, those are a read-then-act both callers pass.
 	unlock := s.lockVM(req.VmName)
 	defer unlock()
+
+	// RE-READ under the lock — see AttachDevice for why testing the pre-lock
+	// row leaves the race the lock was added to close.
+	vmRec, err = corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "re-read VM %q under lock: %v", req.VmName, err)
+	}
+	if vmRec == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
 
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot detach a device from %q: an operation is in progress", req.VmName)

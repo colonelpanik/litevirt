@@ -28,7 +28,7 @@
 {{if .Error}}<div style="color:var(--red);padding:16px">Error: {{.Error}}</div>{{end}}
 
 <div class="section">
-  <div class="section-header"><h2>Proposals ({{len .Proposals}})</h2></div>
+  <div class="section-header"><h2>Proposals ({{if .TotalCount}}{{.TotalCount}}{{else}}{{len .Proposals}}{{end}})</h2></div>
   <table>
     <thead><tr>
       <th>VM</th><th>From → To</th><th>Policy</th><th>Gain%</th><th>Status</th><th>Proposed</th><th>Detail</th><th></th>
@@ -65,5 +65,12 @@
     {{end}}
     </tbody>
   </table>
+  {{if or .Truncated .Offset}}
+  <div style="padding:10px 16px;color:var(--muted);font-size:12px;display:flex;gap:12px;align-items:center">
+    <span>Showing {{.ShowFrom}}&ndash;{{.NextOffset}} of {{.TotalCount}}</span>
+    {{if .Offset}}<a href="/rebalance?status={{.StatusFilter}}&amp;offset={{.PrevOffset}}">&larr; newer</a>{{end}}
+    {{if .Truncated}}<a href="/rebalance?status={{.StatusFilter}}&amp;offset={{.NextOffset}}">older &rarr;</a>{{end}}
+  </div>
+  {{end}}
 </div>
 {{end}}

@@ -294,3 +294,85 @@ func TestSqliteDSN_EnablesIncrementalAutoVacuum(t *testing.T) {
 		t.Fatalf("auto_vacuum = %d, want 2 (incremental)", av)
 	}
 }
+
+// ── rebalance_proposals retention ────────────────────────────────────────
+
+func insertProposal(t *testing.T, c *Client, id, status, updatedAt string) {
+	t.Helper()
+	if _, err := c.db.ExecContext(context.Background(),
+		`INSERT INTO rebalance_proposals
+		   (id, vm_name, src_host, dst_host, policy, expected_gain, status,
+		    proposed_at, expires_at, updated_at)
+		 VALUES (?, 'vm1', 'a', 'b', 'balance', 0.5, ?, ?, ?, ?)`,
+		id, status, updatedAt, updatedAt, updatedAt); err != nil {
+		t.Fatalf("insert rebalance_proposals: %v", err)
+	}
+}
+
+func proposalIDs(t *testing.T, c *Client) []string {
+	t.Helper()
+	rows, err := c.db.QueryContext(context.Background(),
+		`SELECT id FROM rebalance_proposals ORDER BY id`)
+	if err != nil {
+		t.Fatalf("select rebalance_proposals: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// pruneRebalanceProposals reclaims terminal proposals past the retention
+// window. Without it the table grows without bound and ListRebalanceProposals
+// eventually exceeds the 4 MB gRPC message limit.
+func TestPruneRebalanceProposals(t *testing.T) {
+	defer func(orig time.Duration) { RebalanceProposalRetention = orig }(RebalanceProposalRetention)
+	RebalanceProposalRetention = 7 * 24 * time.Hour
+
+	c := newPruneTestClient(t)
+	insertProposal(t, c, "old-expired", "expired", tsAgo(30*24*time.Hour))  // terminal + old → drop
+	insertProposal(t, c, "old-applied", "applied", tsAgo(14*24*time.Hour))  // terminal + old → drop
+	insertProposal(t, c, "old-rejected", "rejected", tsAgo(8*24*time.Hour)) // terminal + old → drop
+	insertProposal(t, c, "new-expired", "expired", tsAgo(1*time.Hour))      // terminal + fresh → keep
+	insertProposal(t, c, "old-pending", "pending", tsAgo(30*24*time.Hour))  // live work → keep
+
+	NewReplicator(c, "", RelayConfig{}).pruneRebalanceProposals(context.Background())
+
+	got := proposalIDs(t, c)
+	want := []string{"new-expired", "old-pending"}
+	if len(got) != len(want) {
+		t.Fatalf("after prune: %v remain, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("after prune: %v remain, want %v", got, want)
+		}
+	}
+}
+
+// A non-terminal proposal is never pruned on age. An "approved" or "applying"
+// row is work the executor still owns; deleting it strands the migration.
+func TestPruneRebalanceProposals_KeepsNonTerminalHowEverOld(t *testing.T) {
+	defer func(orig time.Duration) { RebalanceProposalRetention = orig }(RebalanceProposalRetention)
+	RebalanceProposalRetention = 1 * time.Hour
+
+	c := newPruneTestClient(t)
+	for _, st := range []string{"pending", "approved", "applying"} {
+		insertProposal(t, c, st, st, tsAgo(365*24*time.Hour))
+	}
+
+	NewReplicator(c, "", RelayConfig{}).pruneRebalanceProposals(context.Background())
+
+	if got := proposalIDs(t, c); len(got) != 3 {
+		t.Fatalf("after prune: %v remain, want all 3 non-terminal rows", got)
+	}
+}

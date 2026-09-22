@@ -8,6 +8,7 @@ package restapi
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -52,6 +53,18 @@ func (s *Server) registerParityRoutes() {
 	s.mux.HandleFunc("/api/v1/backup/schedules", s.wrap(s.handleBackupSchedules))
 }
 
+// queryInt reads a non-negative integer query parameter. An absent or
+// unparseable value reads as 0, which every caller treats as "unset" — a
+// malformed ?limit= gives the server default rather than an error the caller
+// cannot act on.
+func queryInt(r *http.Request, key string) int {
+	n, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 // ── Rebalance proposals ────────────────────────────────────────────────────
 
 func (s *Server) handleRebalanceProposals(w http.ResponseWriter, r *http.Request) {
@@ -59,8 +72,12 @@ func (s *Server) handleRebalanceProposals(w http.ResponseWriter, r *http.Request
 		jsonError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	// limit/offset page through history; the response carries total_count and
+	// truncated so a client can tell a page from the whole table.
 	resp, err := s.grpc.ListRebalanceProposals(s.grpcCtx(r), &pb.ListRebalanceProposalsRequest{
 		StatusFilter: r.URL.Query().Get("status"),
+		Limit:        int32(queryInt(r, "limit")),
+		Offset:       int32(queryInt(r, "offset")),
 	})
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)

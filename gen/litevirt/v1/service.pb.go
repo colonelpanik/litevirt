@@ -22037,8 +22037,14 @@ func (x *RebalanceProposal) GetDetail() string {
 }
 
 type ListRebalanceProposalsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StatusFilter  string                 `protobuf:"bytes,1,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"` // empty = all
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	StatusFilter string                 `protobuf:"bytes,1,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"` // empty = all
+	// limit caps the page size. 0 means the server default; the server also
+	// applies a hard ceiling, so the response can never outgrow the gRPC
+	// message limit however large the table is.
+	Limit int32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	// offset pages through older proposals, newest first.
+	Offset        int32 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22080,9 +22086,28 @@ func (x *ListRebalanceProposalsRequest) GetStatusFilter() string {
 	return ""
 }
 
+func (x *ListRebalanceProposalsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListRebalanceProposalsRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
 type ListRebalanceProposalsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Proposals     []*RebalanceProposal   `protobuf:"bytes,1,rep,name=proposals,proto3" json:"proposals,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Proposals []*RebalanceProposal   `protobuf:"bytes,1,rep,name=proposals,proto3" json:"proposals,omitempty"`
+	// total_count is how many proposals match status_filter, ignoring
+	// limit/offset, so a caller can tell a full page from the whole table.
+	TotalCount int32 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	// truncated is true when more rows match past this page.
+	Truncated     bool `protobuf:"varint,3,opt,name=truncated,proto3" json:"truncated,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22122,6 +22147,20 @@ func (x *ListRebalanceProposalsResponse) GetProposals() []*RebalanceProposal {
 		return x.Proposals
 	}
 	return nil
+}
+
+func (x *ListRebalanceProposalsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+func (x *ListRebalanceProposalsResponse) GetTruncated() bool {
+	if x != nil {
+		return x.Truncated
+	}
+	return false
 }
 
 type RunRebalanceRequest struct {
@@ -27122,11 +27161,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"expires_at\x18\n" +
 	" \x01(\tR\texpiresAt\x12\x16\n" +
-	"\x06detail\x18\v \x01(\tR\x06detail\"D\n" +
+	"\x06detail\x18\v \x01(\tR\x06detail\"r\n" +
 	"\x1dListRebalanceProposalsRequest\x12#\n" +
-	"\rstatus_filter\x18\x01 \x01(\tR\fstatusFilter\"^\n" +
+	"\rstatus_filter\x18\x01 \x01(\tR\fstatusFilter\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
+	"\x06offset\x18\x03 \x01(\x05R\x06offset\"\x9d\x01\n" +
 	"\x1eListRebalanceProposalsResponse\x12<\n" +
-	"\tproposals\x18\x01 \x03(\v2\x1e.litevirt.v1.RebalanceProposalR\tproposals\".\n" +
+	"\tproposals\x18\x01 \x03(\v2\x1e.litevirt.v1.RebalanceProposalR\tproposals\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\x12\x1c\n" +
+	"\ttruncated\x18\x03 \x01(\bR\ttruncated\".\n" +
 	"\x13RunRebalanceRequest\x12\x17\n" +
 	"\adry_run\x18\x01 \x01(\bR\x06dryRun\"C\n" +
 	"\x14RunRebalanceResponse\x12+\n" +

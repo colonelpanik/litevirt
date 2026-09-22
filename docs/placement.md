@@ -214,11 +214,14 @@ trace what gets applied.
 ## CLI reference
 
 ```sh
-# List all proposals (any status)
+# List proposals, newest first (a bounded page — see Retention below)
 lv rebalance list
 
 # Filter by status
 lv rebalance list --status pending
+
+# Page through older proposals
+lv rebalance list --limit 50 --offset 50
 
 # Force an immediate evaluation cycle (respects per-VM mode)
 lv rebalance run
@@ -232,6 +235,39 @@ lv rebalance approve <proposal-id>
 lv rebalance list --status applying
 lv rebalance reject  <proposal-id> --reason "operator: not now"
 ```
+
+---
+
+## Proposal retention
+
+`rebalance_proposals` is pruned and `lv rebalance list` is paged, for the same
+reason: the table is append-only in practice, and both the table and the
+response used to grow for the life of the cluster.
+
+**Retention.** Terminal proposals — `applied`, `failed`, `rejected`, `expired`
+— are deleted once they are older than
+`corrosion.RebalanceProposalRetention` (7 days, measured on `updated_at`, so
+from when the proposal went terminal). The prune runs on the replicator's
+existing 5-minute prune tick alongside `mutation_log` and `clock_skew`. It is
+a local delete on each node rather than a replicated one, so it costs no
+replication bandwidth and converges because every node applies the same
+threshold.
+
+Non-terminal proposals (`pending`, `approved`, `applying`) are never pruned on
+age. They are live work, and deleting one would strand the executor. The
+terminal set is an allow-list: a status the prune has not heard of is kept.
+
+**Paging.** `ListRebalanceProposals` returns at most 200 proposals by default
+and 1000 on request, newest first, with `total_count` and `truncated` in the
+response. `lv rebalance list` prints a footer naming the next `--offset` when
+more rows match than fit.
+
+Without both, a cluster emitting ~1k proposals/day reached 60k rows and an
+11.7 MB response against gRPC's 4 MB limit, at which point `lv rebalance list`
+failed with `ResourceExhausted` — and `approve`/`reject` became unusable too,
+because they need an id the operator could no longer enumerate. Retention
+alone would not have been enough: it leaves the response one long outage away
+from the same failure.
 
 ---
 

@@ -7,6 +7,12 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
+// NOTE: these exercise the pure selection only. They hand-build pb.VM values,
+// so they CANNOT catch the server failing to populate Spec.CpuMode — which is
+// exactly what happened: ListVMs ships a projection of the stored spec, cpu_mode
+// was missing from it, and this report called every VM legacy on a live cluster
+// while these tests stayed green. The projection itself is pinned by
+// TestListVMsProjectsTheCPUMode in internal/grpcapi; keep both.
 func TestLegacyCPUModeVMs(t *testing.T) {
 	vms := []*pb.VM{
 		// Reported: empty cpu_mode renders no <cpu> element → qemu64, no AVX.

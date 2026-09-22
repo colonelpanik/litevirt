@@ -1103,19 +1103,25 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Anything added here ships for every VM in the cluster on every list,
 		// so it has to be a scalar a list-level caller reads. Labels render the
 		// table's tag chips and the ansible inventory's litevirt_label_* vars;
-		// Uuid and Machine are what `lv doctor vm-uuids` and
-		// `lv doctor machine-types` report on.
+		// Uuid, Machine and CpuMode are what `lv doctor vm-uuids`,
+		// `lv doctor machine-types` and `lv doctor cpu-mode` report on. CpuModel
+		// rides along with CpuMode so a list-level caller can render a custom
+		// mode without a per-VM InspectVM round trip.
 		if vm.Spec != "" {
 			var lite struct {
-				Labels  map[string]string `json:"labels"`
-				UUID    string            `json:"uuid"`
-				Machine string            `json:"machine"`
+				Labels   map[string]string `json:"labels"`
+				UUID     string            `json:"uuid"`
+				Machine  string            `json:"machine"`
+				CPUMode  string            `json:"cpu_mode"`
+				CPUModel string            `json:"cpu_model"`
 			}
 			if json.Unmarshal([]byte(vm.Spec), &lite) == nil {
 				pbVM.Spec = &pb.VMSpec{
-					Labels:  lite.Labels,
-					Uuid:    lite.UUID,
-					Machine: lite.Machine,
+					Labels:   lite.Labels,
+					Uuid:     lite.UUID,
+					Machine:  lite.Machine,
+					CpuMode:  lite.CPUMode,
+					CpuModel: lite.CPUModel,
 				}
 			}
 		}

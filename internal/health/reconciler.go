@@ -50,6 +50,12 @@ var reconcileWalkBudget = 10 * time.Second
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	// startDomainHook runs immediately before StartDomain, with the context
+	// the start is running under. Test-only seam: it makes a walk budget that
+	// expires between the start and the commit reproducible instead of a
+	// timing race, and lets a test see WHICH context the walk handed down.
+	// Nil in production.
+	startDomainHook  func(context.Context)
 	hostName         string
 	dataDir          string
 	db               *corrosion.Client
@@ -905,7 +911,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}
-	defer r.releaseVMLock(ctx, vm.Name)
+	// Releasing the lease is CLEANUP, and cleanup must not inherit the caller's
+	// deadline. reconcilePass bounds this walk with reconcileWalkBudget; on the
+	// very case that budget exists for, it expires mid-start and the DELETE
+	// fails (Debug-logged), stranding the lease for the full vmLockTTL so no
+	// other host can reconcile this VM.
+	defer r.releaseVMLock(context.WithoutCancel(ctx), vm.Name)
 
 	// A pending transition that carries a proof marker (pending_action_id) was minted
 	// by a coordinator that held the lease + quorum, so we MUST validate + claim it
@@ -1371,6 +1382,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	if r.startDomainHook != nil {
+		r.startDomainHook(ctx)
+	}
 	if err := r.virt.StartDomain(vm.Name); err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
@@ -1387,18 +1401,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// still in_progress — NOT stranded: the reconcile "starting" case re-drives
 	// startPendingVM, whose already-running-domain branch retries CompleteVMStartProof
 	// until it lands (the marker safely blocks any re-start meanwhile).
+	// StartDomain is not context-bound, so past this line the GUEST IS RUNNING
+	// whatever the walk budget says. Recording that is no longer optional work
+	// the caller may cancel: a running guest whose row still reads "starting"
+	// is a VM the cluster cannot account for, and the reconcile retry only
+	// converges it a tick later — after the budget has already cost the lease.
+	commitCtx := context.WithoutCancel(ctx)
 	if proofID != "" {
 		// Routed through the minting chokepoint, which IS the hand-rolled
 		// write-through this block used to carry — same ordering, one
 		// implementation, and it gains the typed-nil guard and the
 		// ownership-moved check the hand-rolled version did not have.
-		if err := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
+		if err := r.publishRunningMinted(commitCtx, vm.Name, func(ctx context.Context) error {
 			return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
 		}); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
 		}
-	} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+	} else if err := r.publishRunning(commitCtx, vm.Name, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
 	}); err != nil {
 		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)

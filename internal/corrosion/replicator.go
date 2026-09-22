@@ -32,6 +32,7 @@ type Replicator struct {
 	mu             sync.Mutex
 	peers          map[string]context.CancelFunc // peer name → cancel for its goroutine
 	relaySet       *RelaySet                     // current relay election result
+	lastEligible   map[string]bool               // last successfully-read relay eligibility
 	isRelay        bool                          // cached: is this node a relay?
 	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
 	// pushFailingSince records, per peer, when its CURRENT run of failed pushes
@@ -284,6 +285,48 @@ func (r *Replicator) cleanupDepartedWatermark(name string) {
 	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
 }
 
+// relayEligibility is RelayEligibleHosts for the REPLICATION path, which needs
+// a stronger failure mode than the self-upgrade caller does.
+//
+// RelayEligibleHosts returns nil on a read error, and ComputeRelays reads nil
+// as "no information" and reproduces the plain sorted-hostname ordering. For a
+// single-node question that is right. Here it is the exact divergence
+// ComputeRelays forbids: a local query failure is THIS node's opinion, and
+// acting on it makes this one node elect a relay set no peer agrees with.
+//
+// The damage is asymmetric, which is what makes it worth retaining state to
+// avoid. Only a node that believes itself a relay re-records forwarded
+// mutations for fan-out, so a diverged node pushes to hosts that apply its
+// writes locally and forward nothing: its mutations reach nowhere else until
+// anti-entropy catches up, while every backlog gauge reads healthy because the
+// pushes themselves succeed.
+//
+// So a failed read RETAINS the last eligibility this node successfully
+// computed. Before anything has been proved — the first read at startup — it
+// yields no information, which is the honest answer and the documented nil
+// behaviour.
+func (r *Replicator) relayEligibility(ctx context.Context) map[string]bool {
+	if got := RelayEligibleHosts(ctx, r.client); got != nil {
+		r.mu.Lock()
+		r.lastEligible = got
+		r.mu.Unlock()
+		return got
+	}
+	r.mu.Lock()
+	last := r.lastEligible
+	r.mu.Unlock()
+	if last == nil {
+		return nil
+	}
+	// Copy: the caller must not be able to mutate the retained map, and the
+	// next successful read replaces it wholesale.
+	out := make(map[string]bool, len(last))
+	for k, v := range last {
+		out[k] = v
+	}
+	return out
+}
+
 func (r *Replicator) syncPeers() {
 	members := r.client.Members()
 
@@ -292,7 +335,7 @@ func (r *Replicator) syncPeers() {
 	// it is this node's own view, and of the gossip port rather than the
 	// replication one, so two nodes could disagree about the topology.
 	rs := ComputeRelays(members, r.client.HostName(), r.relayCfg,
-		RelayEligibleHosts(context.Background(), r.client))
+		r.relayEligibility(context.Background()))
 
 	r.mu.Lock()
 	oldIsRelay := r.isRelay

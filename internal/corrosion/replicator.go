@@ -287,8 +287,12 @@ func (r *Replicator) cleanupDepartedWatermark(name string) {
 func (r *Replicator) syncPeers() {
 	members := r.client.Members()
 
-	// Compute relay set from current membership.
-	rs := ComputeRelays(members, r.client.HostName(), r.relayCfg)
+	// Compute the relay set from current membership, restricted to hosts the
+	// REPLICATED state says are fit to relay. Memberlist liveness is not used:
+	// it is this node's own view, and of the gossip port rather than the
+	// replication one, so two nodes could disagree about the topology.
+	rs := ComputeRelays(members, r.client.HostName(), r.relayCfg,
+		RelayEligibleHosts(context.Background(), r.client))
 
 	r.mu.Lock()
 	oldIsRelay := r.isRelay

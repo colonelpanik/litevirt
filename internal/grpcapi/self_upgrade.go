@@ -227,7 +227,7 @@ func candidateConfirmed(candidate, live peerVersionInfo, reachable bool) bool {
 // the ~R relays instead of all hammering the first-sorted peer. Falls back to
 // the original target when it's already a relay or none of the matches is one.
 func (s *Server) preferRelaySource(target peerVersionInfo, peers []peerVersionInfo) peerVersionInfo {
-	rs := corrosion.ComputeRelays(s.db.Members(), s.hostName, corrosion.RelayConfig{})
+	rs := corrosion.ComputeRelays(s.db.Members(), s.hostName, corrosion.RelayConfig{}, nil)
 	if rs == nil || rs.IsRelay(target.host) {
 		return target
 	}

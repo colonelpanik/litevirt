@@ -172,6 +172,18 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
+// publishRunning routes a NON-MINTING transition through the marker chokepoint.
+// See PublishVMRunning for the ordering and why it is the right one here.
+func (r *Reconciler) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
+	return PublishRunningVia(ctx, r.virt, r.db, r.dataDir, r.hostName, name, state, commit)
+}
+
+// publishRunningMinted routes a MINTING transition through the chokepoint in the
+// other order. See PublishVMRunningMinted.
+func (r *Reconciler) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return PublishVMRunningMinted(ctx, r.virt, r.db, r.dataDir, r.hostName, name, commit)
+}
+
 // NewReconciler creates a VM reconciler for the local host. virt is a
 // LibvirtBackend — production passes the real *libvirt.Client; tests/the fleet
 // harness pass a fake. A nil virt is tolerated (the reconcile loop guards every
@@ -507,8 +519,13 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			syncErr := error(nil)
 			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); r.ownerEpochEnforced(ctx) &&
 				gerr == nil && fresh != nil && fresh.OwnerEpoch > 0 {
+				//runningcheck:allow provably not running — newState comes from classifyStop,
+				// which returns ("", "", false) for the "running" reason, so this out-of-band
+				// STOP sync never publishes a running VM. The guard cannot see through the
+				// helper's return.
 				syncErr = corrosion.UpdateVMStateAtEpoch(ctx, r.db, vm.Name, newState, detail, fresh.OwnerEpoch)
 			} else {
+				//runningcheck:allow provably not running — same classifyStop reasoning.
 				syncErr = corrosion.UpdateVMState(ctx, r.db, vm.Name, newState, detail)
 			}
 			if err := syncErr; err != nil {
@@ -542,7 +559,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				if state, err := r.virt.DomainState(vm.Name); err == nil && state == "running" {
 					slog.Info("reconciler: VM in error state but running in libvirt — updating state",
 						"vm", vm.Name)
-					if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "reconciler: domain is alive"); err != nil {
+					if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+						return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "reconciler: domain is alive")
+					}); err != nil {
 						r.noteStateWriteFail(corrosion.OpVMState, err)
 					}
 				}
@@ -569,7 +588,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				live = st
 			}
 			slog.Info("reconciler: clearing stuck backing-up state", "vm", vm.Name, "live", live)
-			if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, live, "reconciler: stale backing-up cleared"); err != nil {
+			if err := r.publishRunning(ctx, vm.Name, live, func(ctx context.Context) error {
+				return corrosion.UpdateVMState(ctx, r.db, vm.Name, live, "reconciler: stale backing-up cleared")
+			}); err != nil {
 				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}
 		}
@@ -986,12 +1007,20 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			// completion doesn't apply (proof already terminal / VM re-pointed), leave
 			// the row: the domain is running, so the state reconciler converges it.
 			if proofID != "" {
-				if cerr := corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName); cerr != nil {
+				// Routed: the completion MINTS (its second statement is
+				// vm_owner_epoch = vm_owner_epoch + 1 under the same guard), and
+				// before this it wrote no marker at all — a running VM at a fresh
+				// generation that could not prove it until the next sweep.
+				if cerr := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
+					return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
+				}); cerr != nil {
 					slog.Error("reconciler: complete start proof (already-running) did not apply — leaving state for reconcile",
 						"vm", vm.Name, "proof", proofID, "error", cerr)
 				}
-			} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present"); err != nil {
-				slog.Error("reconciler: already-present running-state write failed", "vm", vm.Name, "error", err)
+			} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+				return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present")
+			}); err != nil {
+				LogPublishRefusal("reconciler: already-present running-state write failed", vm.Name, err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
@@ -1270,30 +1299,20 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// startPendingVM, whose already-running-domain branch retries CompleteVMStartProof
 	// until it lands (the marker safely blocks any re-start meanwhile).
 	if proofID != "" {
-		if err := corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName); err != nil {
+		// Routed through the minting chokepoint, which IS the hand-rolled
+		// write-through this block used to carry — same ordering, one
+		// implementation, and it gains the typed-nil guard and the
+		// ownership-moved check the hand-rolled version did not have.
+		if err := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
+			return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
+		}); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
-		} else {
-			// Phase 4 write-through: the completion just minted the next
-			// ownership generation; mirror it into the domain metadata so the
-			// RUNTIME carries the generation a rejoined stale replica can be
-			// checked against. Best-effort — the VM is already running, and the
-			// convergence pass repairs a missed write; failing the start over a
-			// marker would be strictly worse than a temporarily absent marker.
-			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
-				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
-					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
-						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
-				}
-				// The durable twin, which survives the domain being undefined.
-				if merr := WriteVMOwnerEpochMarker(r.dataDir, vm.Name, fresh.OwnerEpoch); merr != nil {
-					slog.Warn("reconciler: owner-epoch file marker write failed (convergence will repair)",
-						"vm", vm.Name, "epoch", fresh.OwnerEpoch, "error", merr)
-				}
-			}
 		}
-	} else if err := corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover"); err != nil {
-		slog.Error("reconciler: post-failover running-state write failed", "vm", vm.Name, "error", err)
+	} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
+	}); err != nil {
+		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
@@ -1416,9 +1435,26 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 // at epoch 0 is pre-epoch: the sweep never stamps it — deciding when a
 // workload graduates into the marker regime is the backfill's job, and a
 // sweep-stamped zero would be indistinguishable from a real generation.
+//
+// The row must still name THIS host. Its caller confirms only that the local
+// domain is running, which is also true of a domain this host has not yet torn
+// down after losing ownership — so without this check convergence stamped the
+// old runtime with the NEW owner's generation. runtimeSuperseded decides by
+// `row.OwnerEpoch > marker`, so a marker equal to the row reads as current, and
+// the superseded runtime it exists to catch was made to look live. That is the
+// same unsafe direction the publish chokepoint refuses, reached by the repair
+// path rather than by a publish — and refusing to converge is the fail-safe
+// answer: a marker LAGGING the row is exactly what the check should see when
+// ownership has genuinely moved.
 func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) {
 	row, err := corrosion.GetVM(ctx, r.db, name)
 	if err != nil || row == nil || row.OwnerEpoch == 0 {
+		return
+	}
+	if row.HostName != r.hostName {
+		slog.Warn("reconciler: not converging the owner-epoch marker for a VM the row says "+
+			"belongs elsewhere — stamping it would make this superseded runtime look current",
+			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", r.hostName)
 		return
 	}
 	// Each marker converges INDEPENDENTLY. A single early-return keyed on the
@@ -1456,7 +1492,23 @@ func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
 	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
 	// the domain metadata for a VM whose file marker has not been written yet.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
+	if errors.Is(err, ErrPreEpochMarker) {
+		// A marker asserting generation 0 is not an unreadable marker, and must not
+		// be treated as one. It is this host's own statement that its runtime
+		// belongs to NO generation — so any row at a real generation has superseded
+		// it, and the comparison below reaches that conclusion with marker = 0.
+		// Collapsing it into the unreadable case instead would license exactly the
+		// resurrection this check exists to refuse, for precisely the population
+		// most likely to carry such a marker: a node returning from an older build.
+		marker, ok, err = 0, true, nil
+	}
 	if err != nil || !ok {
+		// No pre-epoch coercion on this fallback: it cannot fire. This function is
+		// reached only from the !DomainExists branch, and DomainExists IS a
+		// DomainLookupByName — the same lookup GetDomainOwnerEpoch does first — so
+		// here it can only ever return a lookup error, never a parse result. The
+		// fallback is retained as written because that is pre-existing behaviour,
+		// but nothing decides anything from it.
 		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
 	}
 	if err != nil || !ok {

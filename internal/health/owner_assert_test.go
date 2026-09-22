@@ -313,8 +313,18 @@ func asserterWithAbsentPeers(t *testing.T) (*Reconciler, *corrosion.Client, *tim
 func TestOwnerAssert_ExactMarkerReclaims(t *testing.T) {
 	ctx := context.Background()
 	r, db, _, results := asserterWithAbsentPeers(t)
-	// The fixture VM is pre-epoch (OwnerEpoch 0); write the matching marker.
-	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 0); err != nil {
+	// Graduate the fixture VM into the marker regime, then write the marker that
+	// matches. This used to write a marker of 0 against the row's pre-epoch
+	// default, but a zero is not a generation and no longer reads back as a
+	// valid marker: the legitimate pre-epoch evidence state is an ABSENT marker
+	// (the !found pre-latch path, covered by TestOwnerAssert_AllAbsentReclaims),
+	// so a zero on disk was testing a state only the reconciler's own
+	// zero-stamping bug could produce. A positive pair is what "exact marker"
+	// actually means.
+	if err := corrosion.BackfillOwnerEpochs(ctx, db, "node-b"); err != nil {
+		t.Fatalf("graduate the fixture VM: %v", err)
+	}
+	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 1); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	r.assertRuntimeOwnership(ctx)
@@ -370,7 +380,13 @@ func TestOwnerAssert_CorruptMarkerRefuses(t *testing.T) {
 func TestOwnerAssert_ActiveConditionRefuses(t *testing.T) {
 	ctx := context.Background()
 	r, db, _, results := asserterWithAbsentPeers(t)
-	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 0); err != nil {
+	// A real generation on both sides, so the marker gate is passed on its own
+	// terms and the condition freeze is the only thing this test can be
+	// measuring. (It used to write a marker of 0, which is no longer a reading.)
+	if err := corrosion.BackfillOwnerEpochs(ctx, db, "node-b"); err != nil {
+		t.Fatalf("graduate the fixture VM: %v", err)
+	}
+	if err := WriteVMOwnerEpochMarker(r.dataDir, "vm1", 1); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{

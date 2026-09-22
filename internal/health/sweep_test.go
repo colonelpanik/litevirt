@@ -22,7 +22,7 @@ func testSweepDB(t *testing.T) *corrosion.Client {
 
 func TestVMChecker_SweepEmpty(t *testing.T) {
 	db := testSweepDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// No VMs in DB — sweep should complete without error or panic.
 	v.sweep(context.Background())
@@ -44,7 +44,7 @@ func TestVMChecker_SweepSkipsNonRunning(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// sweep skips non-running VMs, so no goroutines should be launched
 	// and no failure counters should be set.
 	v.sweep(ctx)
@@ -74,7 +74,7 @@ func TestVMChecker_SweepSkipsNoHealthcheck(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// No VMs should have had checkVM called since none have healthcheck specs.
@@ -102,7 +102,7 @@ func TestVMChecker_SweepSkipsOtherHost(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// ListVMs filters by hostName, so VMs on other hosts are not included.
@@ -117,7 +117,7 @@ func TestVMChecker_SweepSkipsOtherHost(t *testing.T) {
 
 func TestPickMigrationTarget_NoHosts(t *testing.T) {
 	db := testSweepDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	_, err := v.pickMigrationTarget(context.Background(), "node1", 512)
 	if err == nil {
@@ -144,7 +144,7 @@ func TestPickMigrationTarget_ExcludesSelf(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	_, err = v.pickMigrationTarget(ctx, "node1", 512)
 	if err == nil {
 		t.Fatal("expected error when only host is self")
@@ -177,7 +177,7 @@ func TestPickMigrationTarget_InsufficientMemory(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// node2 has 1024 total, 800 used = 224 free. Request 512 MiB — should fail.
 	_, err = v.pickMigrationTarget(ctx, "node1", 512)
 	if err == nil {
@@ -200,7 +200,7 @@ func TestPickMigrationTarget_SelectsBestHost(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	target, err := v.pickMigrationTarget(ctx, "node1", 512)
 	if err != nil {
 		t.Fatalf("pickMigrationTarget: %v", err)
@@ -224,7 +224,7 @@ func TestPickMigrationTarget_ExcludesInactiveHosts(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// node2 is in maintenance — should not be picked even though it has more memory.
 	_, err := v.pickMigrationTarget(ctx, "node1", 512)
 	if err == nil {
@@ -245,7 +245,7 @@ func TestPickMigrationTarget_ZeroMemVM(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// vmMemMiB=0 skips the free memory check.
 	target, err := v.pickMigrationTarget(ctx, "node1", 0)
 	if err != nil {

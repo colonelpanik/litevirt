@@ -637,6 +637,46 @@ counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising co
 means something on the host keeps trying to bounce the orchestrator, which is
 worth chasing even though the daemon now survives it.
 
+## VM defaults
+
+Cluster-wide defaults stamped onto a VM at **create** time. They shape new specs
+only — nothing here reinterprets a spec that is already stored, so changing one
+can never move a running guest's hardware underneath it.
+
+```yaml
+vm:
+  default_cpu_mode: host-model     # default host-model
+```
+
+`default_cpu_mode` is the `cpu_mode` a create writes into a spec that named none:
+`host-model` or `host-passthrough`. It is the setting that decides what CPU your
+guests actually see.
+
+**Why this has a default at all.** With no CPU mode, litevirt emits no `<cpu>`
+element, libvirt passes no `-cpu` to QEMU, and the guest lands on QEMU's x86_64
+default: `qemu64`. That model reports no `sse4.1`, no `sse4.2` and no `xsave`, so
+it has neither AVX nor AVX2 — on a host that has all three. Guest software built
+against a modern baseline then refuses to start, and the failure looks like a
+broken binary rather than a hypervisor setting. There is deliberately **no value
+here that restores that behavior**.
+
+**Why `host-model` and not `host-passthrough`.** `host-model` resolves, at domain
+start, to the closest named model the host supports plus its extra feature flags:
+the guest gets the host's modern ISA while staying migratable to any host with an
+equal-or-richer CPU. `host-passthrough` exposes the host CPU verbatim — marginally
+faster, and the only mode that carries nested virtualization (`vmx`/`svm`) and
+every last feature flag — but it pins live migration to effectively identical
+hardware, which is at odds with migration, failover and rebalancing. Set it only
+on a uniform fleet.
+
+For a deliberately heterogeneous fleet, hold one baseline per VM instead:
+`lv run --cpu-mode custom --cpu-model x86-64-v3`. `custom` is not accepted here,
+because a cluster-wide default cannot supply the per-VM model it requires.
+
+A VM created before this default existed keeps its empty `cpu_mode` and renders
+exactly as it always has. List them with `lv doctor cpu-mode` and move one
+forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
+
 ## Capacity and overcommit
 
 How much of a host litevirt is willing to hand to workloads. Cluster-wide

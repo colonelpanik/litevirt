@@ -89,7 +89,12 @@ message VMSpec {
     int32 stop_timeout_sec = 25;   // ACPI shutdown timeout before force-kill (0 = default 30s)
     RestartPolicy restart  = 26;   // auto-restart policy for stopped/crashed VMs
     bool  disable_vnc      = 27;   // true = headless (no VNC graphics device)
-    string cpu_mode         = 28;   // host-passthrough | host-model | custom (default: QEMU default)
+    // cpu_mode selects how the guest CPU is derived from the host:
+    // host-passthrough | host-model | custom. Create defaults it to host-model
+    // (see libvirt.DefaultCPUMode); empty means a spec that predates that
+    // default, which still renders with NO <cpu> element — QEMU's qemu64, which
+    // carries no SSE4.2/AVX/AVX2.
+    string cpu_mode         = 28;
     bool  enable_spice     = 29;   // true = add a SPICE graphics device alongside VNC
     string project          = 30;  // tenancy bucket; "" → "_default"
 
@@ -118,6 +123,12 @@ message VMSpec {
     // value 0, which encoding/json omitempty drops entirely on store, making
     // restart-any indistinguishable from unset. The string field round-trips.
     string on_host_failure = 41;
+
+    // cpu_model names the CPU model for cpu_mode="custom" and MUST be empty for
+    // any other mode. Additive and mixed-version safe: an older peer ignores it,
+    // and an older entry node simply never sets it (a custom-mode spec is
+    // refused at validation rather than rendered without a model).
+    string cpu_model = 42;
 }
 
 message DiskSpec {

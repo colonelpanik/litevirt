@@ -137,3 +137,69 @@ func TestListVMsDoesNotShipTheWholeSpec(t *testing.T) {
 		t.Errorf("the list projection shipped cloud-init user-data: %q", ci.GetUserdata())
 	}
 }
+
+// TestListVMsProjectsTheCPUMode is the regression behind `lv doctor cpu-mode`.
+//
+// The projection carried labels/uuid/machine but not cpu_mode, so every VM came
+// back with Spec.CpuMode == "" and the report called ALL of them legacy —
+// including ones just retrofitted to host-model, whose stored spec plainly said
+// so. The report could never reach zero, which is the one thing it exists to
+// show.
+//
+// Caught on a live cluster, not by the doctor unit test, because that test
+// hand-builds pb.VM values with a full spec and so never exercises the
+// projection. This asserts through the real RPC, where the gap is visible.
+func TestListVMsProjectsTheCPUMode(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "retrofitted", HostName: "host-1", State: "running",
+		Spec: `{"name":"retrofitted","cpu":2,"cpu_mode":"host-model"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "pinned", HostName: "host-1", State: "running",
+		Spec: `{"name":"pinned","cpu":2,"cpu_mode":"custom","cpu_model":"x86-64-v3"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// The genuinely legacy shape the report is meant to surface.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "legacy-cpu", HostName: "host-1", State: "running",
+		Spec: `{"name":"legacy-cpu","cpu":2}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	resp, err := s.ListVMs(ctx, &pb.ListVMsRequest{})
+	if err != nil {
+		t.Fatalf("ListVMs: %v", err)
+	}
+	got := map[string]*pb.VM{}
+	for _, vm := range resp.GetVms() {
+		got[vm.GetName()] = vm
+	}
+
+	if m := got["retrofitted"].GetSpec().GetCpuMode(); m != "host-model" {
+		t.Errorf("retrofitted: Spec.CpuMode = %q, want host-model — the report would "+
+			"call an already-fixed VM legacy", m)
+	}
+	if m := got["pinned"].GetSpec().GetCpuMode(); m != "custom" {
+		t.Errorf("pinned: Spec.CpuMode = %q, want custom", m)
+	}
+	// cpu_model rides along so a list-level caller can render a custom mode
+	// without a per-VM InspectVM round trip.
+	if m := got["pinned"].GetSpec().GetCpuModel(); m != "x86-64-v3" {
+		t.Errorf("pinned: Spec.CpuModel = %q, want x86-64-v3", m)
+	}
+	// And the legacy VM must still read as empty, or the report reaches zero by
+	// lying rather than by anything being fixed.
+	if m := got["legacy-cpu"].GetSpec().GetCpuMode(); m != "" {
+		t.Errorf("legacy-cpu: Spec.CpuMode = %q, want empty", m)
+	}
+	if got["legacy-cpu"].GetSpec() == nil {
+		t.Fatal("legacy-cpu: Spec is nil for a VM that HAS a stored spec")
+	}
+}

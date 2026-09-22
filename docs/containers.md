@@ -272,6 +272,23 @@ lxc.cgroup2.memory.max = 512M
 lxc.cgroup.memory.limit_in_bytes = 512M
 ```
 
+`--memory 0` means "no cap", and litevirt expresses that by **omitting** the
+key rather than writing a zero. That distinction matters when the limits are
+read back, because the config is root-editable and cgroup2 accepts both
+spellings of a very different thing:
+
+| In the config | Read back as |
+|---|---|
+| key absent | unlimited |
+| `memory.max = max` | unlimited |
+| `memory.max = 0` | a **finite** zero-byte cap |
+| `memory.max = 512M` | a 512 MiB cap |
+
+A hand-written `memory.max = 0` is a legal cgroup2 value and the most
+restrictive cap there is, so it is read as finite rather than rejected or
+treated as unlimited. Reading it as unlimited would flag the container as
+uncapped, which trips the uncapped gate and blocks new admission on the host.
+
 ## Restart policy
 
 `lv ct create --restart {none|on-failure|always}` (and compose `restart:`) makes a

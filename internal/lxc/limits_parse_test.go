@@ -14,31 +14,32 @@ import (
 // "max" (unlimited) failed the whole parse instead of reading as unlimited.
 func TestParseResourceConfig_CgroupNativeForms(t *testing.T) {
 	cases := []struct {
-		name    string
-		cfg     string
-		wantCPU int
-		wantMem int
-		wantErr bool
+		name          string
+		cfg           string
+		wantCPU       int
+		wantMem       int
+		wantUnlimited bool
+		wantErr       bool
 	}{
-		{"litevirt round-trip", ResourceConfig(2, 512), 2, 512, false},
-		{"raw bytes are bytes", "lxc.cgroup2.memory.max = 268435456\n", 0, 256, false},
-		{"bytes round up", "lxc.cgroup2.memory.max = 268435457\n", 0, 257, false},
-		{"unlimited memory", "lxc.cgroup2.memory.max = max\n", 0, 0, false},
-		{"unlimited cpu", "lxc.cgroup2.cpu.max = max 100000\n", 0, 0, false},
-		{"bare unlimited cpu", "lxc.cgroup2.cpu.max = max\n", 0, 0, false},
-		{"gigabyte suffix", "lxc.cgroup2.memory.max = 1G\n", 0, 1024, false},
-		{"lowercase suffix", "lxc.cgroup2.memory.max = 512m\n", 0, 512, false},
-		{"kilobyte suffix", "lxc.cgroup2.memory.max = 2048K\n", 0, 2, false},
-		{"custom period same ratio", "lxc.cgroup2.cpu.max = 25000 50000\n", 50, 0, false},
-		{"default period when absent", "lxc.cgroup2.cpu.max = 2000\n", 2, 0, false},
-		{"garbage memory still errors", "lxc.cgroup2.memory.max = banana\n", 0, 0, true},
-		{"garbage cpu still errors", "lxc.cgroup2.cpu.max = banana 100000\n", 0, 0, true},
+		{"litevirt round-trip", ResourceConfig(2, 512), 2, 512, false, false},
+		{"raw bytes are bytes", "lxc.cgroup2.memory.max = 268435456\n", 0, 256, false, false},
+		{"bytes round up", "lxc.cgroup2.memory.max = 268435457\n", 0, 257, false, false},
+		{"unlimited memory", "lxc.cgroup2.memory.max = max\n", 0, 0, true, false},
+		{"unlimited cpu", "lxc.cgroup2.cpu.max = max 100000\n", 0, 0, true, false},
+		{"bare unlimited cpu", "lxc.cgroup2.cpu.max = max\n", 0, 0, true, false},
+		{"gigabyte suffix", "lxc.cgroup2.memory.max = 1G\n", 0, 1024, false, false},
+		{"lowercase suffix", "lxc.cgroup2.memory.max = 512m\n", 0, 512, false, false},
+		{"kilobyte suffix", "lxc.cgroup2.memory.max = 2048K\n", 0, 2, false, false},
+		{"custom period same ratio", "lxc.cgroup2.cpu.max = 25000 50000\n", 50, 0, true, false},
+		{"default period when absent", "lxc.cgroup2.cpu.max = 2000\n", 2, 0, true, false},
+		{"garbage memory still errors", "lxc.cgroup2.memory.max = banana\n", 0, 0, false, true},
+		{"garbage cpu still errors", "lxc.cgroup2.cpu.max = banana 100000\n", 0, 0, false, true},
 	}
 	for _, c := range cases {
 		cpu, mem, err := parseResourceConfig(c.cfg)
 		if c.wantErr {
 			if err == nil {
-				t.Errorf("%s: parsed (%d,%d), want error", c.name, cpu, mem)
+				t.Errorf("%s: parsed (%d,%+v), want error", c.name, cpu, mem)
 			}
 			continue
 		}
@@ -46,8 +47,9 @@ func TestParseResourceConfig_CgroupNativeForms(t *testing.T) {
 			t.Errorf("%s: %v", c.name, err)
 			continue
 		}
-		if cpu != c.wantCPU || mem != c.wantMem {
-			t.Errorf("%s: got cpu=%d mem=%d, want %d/%d", c.name, cpu, mem, c.wantCPU, c.wantMem)
+		if cpu != c.wantCPU || mem.Unlimited != c.wantUnlimited || (!c.wantUnlimited && mem.MiB != c.wantMem) {
+			t.Errorf("%s: got cpu=%d mem=%+v, want cpu=%d mem=%d unlimited=%v",
+				c.name, cpu, mem, c.wantCPU, c.wantMem, c.wantUnlimited)
 		}
 	}
 }
@@ -194,5 +196,57 @@ func TestParseResourceConfig_ZeroQuotaAndMaxPeriodValidation(t *testing.T) {
 		if err != nil || cpu != 0 {
 			t.Errorf("%q: cpu=%d err=%v, want 0/nil — a well-formed max is still unlimited", cfg, cpu, err)
 		}
+	}
+}
+
+// cgroup2 accepts BOTH "max" (unlimited) and "0" (a finite zero-byte cap), and
+// they are not the same thing. Collapsing them into a sentinel 0 reported a
+// zero-capped container as UNCAPPED, which trips the uncapped gate and blocks
+// new admission on the host.
+//
+// Rejecting "0" is not the alternative: it is a legal cgroup2 value, and
+// erroring would fail closed on a valid read.
+func TestParseMemoryMax_FiniteZeroIsNotUnlimited(t *testing.T) {
+	unlimited, err := parseMemoryMax("max")
+	if err != nil {
+		t.Fatalf(`parseMemoryMax("max"): %v`, err)
+	}
+	if !unlimited.Unlimited {
+		t.Fatalf(`parseMemoryMax("max") = %+v, want Unlimited`, unlimited)
+	}
+
+	for _, in := range []string{"0", "0K", "0M", "0G", "0T"} {
+		got, err := parseMemoryMax(in)
+		if err != nil {
+			t.Errorf("parseMemoryMax(%q): %v — a zero cap is legal cgroup2, not an error", in, err)
+			continue
+		}
+		if got.Unlimited {
+			t.Errorf("parseMemoryMax(%q) = %+v, want a FINITE zero cap (Unlimited=false)", in, got)
+		}
+		if got.MiB != 0 {
+			t.Errorf("parseMemoryMax(%q).MiB = %d, want 0", in, got.MiB)
+		}
+	}
+}
+
+// The same distinction has to survive the whole config parse, since that is
+// what the runtime-inventory collector actually calls.
+func TestParseResourceConfig_ZeroMemoryCapIsFinite(t *testing.T) {
+	_, mem, err := parseResourceConfig("lxc.cgroup2.memory.max = 0\n")
+	if err != nil {
+		t.Fatalf("parseResourceConfig: %v", err)
+	}
+	if mem.Unlimited {
+		t.Fatalf("memory.max = 0 parsed as %+v, want a finite zero cap", mem)
+	}
+
+	// An ABSENT key is still unlimited — that is the case the sentinel got right.
+	_, absent, err := parseResourceConfig("lxc.cgroup2.cpu.max = 2000\n")
+	if err != nil {
+		t.Fatalf("parseResourceConfig: %v", err)
+	}
+	if !absent.Unlimited {
+		t.Fatalf("absent memory.max parsed as %+v, want Unlimited", absent)
 	}
 }

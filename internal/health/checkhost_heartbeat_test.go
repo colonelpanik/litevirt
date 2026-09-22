@@ -179,3 +179,34 @@ func TestRecoveryPendingMatchesRecoverHosts(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckHost_FencedHostKeepsAFreshHealthyRow walks the second recovery
+// state end-to-end.
+//
+// 'fenced' is the more dangerous of the two: it means a fence actually
+// succeeded, so recentlyFenced suppresses recovery for five minutes and the
+// heartbeat has to carry a healthy row across that whole window. The predicate
+// test pins recoveryPending("fenced"), but only this one proves the value
+// reaches the write decision from a real HostRecord.
+func TestCheckHost_FencedHostKeepsAFreshHealthyRow(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	addr, port := healthyPeer(t)
+	c := probingChecker(t, db)
+	host := corrosion.HostRecord{Name: "host-b", Address: addr, GRPCPort: port, State: "fenced"}
+
+	c.checkHost(ctx, host)
+	first := healthRowUpdatedAt(t, db, "host-a", "host-b")
+
+	restore := HeartbeatInterval
+	HeartbeatInterval = time.Millisecond
+	t.Cleanup(func() { HeartbeatInterval = restore })
+	time.Sleep(20 * time.Millisecond)
+
+	c.checkHost(ctx, host)
+	if healthRowUpdatedAt(t, db, "host-a", "host-b") == first {
+		t.Fatalf("a healthy peer whose host is 'fenced' was never re-stamped (%s); "+
+			"recentlyFenced suppresses recovery for five minutes, so by the time "+
+			"recoverHosts may look, this row is the only evidence it has", first)
+	}
+}

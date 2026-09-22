@@ -95,6 +95,8 @@ lv host ceph osd-tree                     # Ceph CRUSH topology
 ```bash
 lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu <n>             # vCPUs (default 2)
+  --cpu-mode <mode>     # host-passthrough|host-model|custom (default host-model)
+  --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
@@ -116,6 +118,25 @@ lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```
 
+**CPU mode.** The default, `host-model`, gives the guest the host's modern
+instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
+live migration to a host with an equal-or-richer CPU. It matters because the
+alternative is not "a slightly older CPU": with no mode at all, QEMU falls back to
+`qemu64`, which has no AVX, and guest software built against a modern baseline
+will not start.
+
+`host-passthrough` exposes the host CPU verbatim and is the only mode that carries
+nested virtualization into the guest, at the cost of pinning live migration to
+effectively identical hardware. `custom` needs `--cpu-model` and is how you hold
+one baseline across a heterogeneous fleet. The cluster-wide default is
+`vm.default_cpu_mode` (see [configuration](configuration.md)); `lv doctor cpu-mode`
+lists VMs created before it existed, which are still on `qemu64`.
+
+Changing the mode on an existing VM is an in-place edit — `lv update <vm>
+--cpu-mode host-model` on a stopped VM, or with `--restart-if-needed` to fold the
+stop/start in. It patches libvirt's own domain XML rather than regenerating it, so
+guest PCI addresses and controller models are preserved.
+
 ## VM configuration
 
 ```bash
@@ -129,7 +150,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
   [--restart none]                           # clear the policy
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
-  [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
+  [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
+  [--disable-vnc]
   [--machine q35] [--firmware uefi|bios] [--guest-agent]
   [--min-mem N] [--max-mem N]
   [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);

@@ -80,7 +80,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	spec, err := normalizeCreateVMSpec(req.GetSpec())
+	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1103,19 +1103,25 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Anything added here ships for every VM in the cluster on every list,
 		// so it has to be a scalar a list-level caller reads. Labels render the
 		// table's tag chips and the ansible inventory's litevirt_label_* vars;
-		// Uuid and Machine are what `lv doctor vm-uuids` and
-		// `lv doctor machine-types` report on.
+		// Uuid, Machine and CpuMode are what `lv doctor vm-uuids`,
+		// `lv doctor machine-types` and `lv doctor cpu-mode` report on. CpuModel
+		// rides along with CpuMode so a list-level caller can render a custom
+		// mode without a per-VM InspectVM round trip.
 		if vm.Spec != "" {
 			var lite struct {
-				Labels  map[string]string `json:"labels"`
-				UUID    string            `json:"uuid"`
-				Machine string            `json:"machine"`
+				Labels   map[string]string `json:"labels"`
+				UUID     string            `json:"uuid"`
+				Machine  string            `json:"machine"`
+				CPUMode  string            `json:"cpu_mode"`
+				CPUModel string            `json:"cpu_model"`
 			}
 			if json.Unmarshal([]byte(vm.Spec), &lite) == nil {
 				pbVM.Spec = &pb.VMSpec{
-					Labels:  lite.Labels,
-					Uuid:    lite.UUID,
-					Machine: lite.Machine,
+					Labels:   lite.Labels,
+					Uuid:     lite.UUID,
+					Machine:  lite.Machine,
+					CpuMode:  lite.CPUMode,
+					CpuModel: lite.CPUModel,
 				}
 			}
 		}
@@ -3311,7 +3317,8 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 // the shape eligible for the live vCPU hot-add fast path.
 func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 	return req.Cpu > 0 &&
-		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
@@ -3406,19 +3413,26 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
-	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
+	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
-	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
-	// domain XML in place rather than regenerating it, so libvirt-assigned details
-	// (PCI slot addresses, controller models) survive — which matters for guests
-	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
-	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
+	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
+	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
+	// details (PCI slot addresses, controller models) survive — which matters for
+	// guests (e.g. Windows) that key licensing off stable hardware addresses. Any
+	// other redefine-class change (machine/firmware/SB/TPM/guest-agent/VNC) needs
 	// full regeneration.
+	//
+	// cpu-mode is in the fast path because retrofitting a CPU mode onto an existing
+	// VM is the main reason to change one at all: a VM created before litevirt
+	// defaulted cpu_mode runs on QEMU's qemu64 (no AVX), and moving it forward
+	// should not also reshuffle its hardware addresses.
+	//
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
-	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+	inPlaceEligible := redefine &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	restartAfter := false
@@ -3576,9 +3590,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if req.MemoryMib > 0 {
 			spec.MemoryMib = req.MemoryMib
 		}
-		if req.CpuMode != "" {
-			spec.CpuMode = req.CpuMode
+		cpuMode, cpuModel, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel)
+		if cerr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
 		}
+		spec.CpuMode, spec.CpuModel = cpuMode, cpuModel
 		if req.Machine != "" {
 			spec.Machine = req.Machine
 		}
@@ -3777,9 +3793,20 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// or the patch doesn't apply (both correct — regeneration now includes Min/Max
 	// memory + hostdevs).
 	var domXML string
-	if cpuMemOnly {
+	if inPlaceEligible {
 		if inactiveXML, derr := s.virt.DumpXMLInactive(req.Name); derr == nil {
-			if patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib)); perr == nil {
+			patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib))
+			if perr == nil {
+				// Only call the CPU patch when this request asked to touch the CPU.
+				// PatchInactiveCPUMode is already a no-op on an empty mode — that is
+				// where the "a memory edit never moves the guest's CPU" guarantee
+				// actually lives and is tested — so this is belt-and-braces that also
+				// keeps the call-site intent obvious.
+				if req.CpuMode != "" || req.CpuModel != "" {
+					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
+				}
+			}
+			if perr == nil {
 				domXML = patched
 			} else {
 				slog.Warn("inactive-XML patch failed; regenerating", "vm", req.Name, "error", perr)

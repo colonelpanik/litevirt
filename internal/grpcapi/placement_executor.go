@@ -263,7 +263,7 @@ func (s *Server) ExecuteCreateVM(ctx context.Context, envelope *pb.ExecuteCreate
 		return nil, status.Error(codes.FailedPrecondition, "capacity policy changed after placement; retry create")
 	}
 
-	spec, err := normalizeCreateVMSpec(envelope.Request.Spec)
+	spec, err := normalizeCreateVMSpec(envelope.Request.Spec, s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
 	}

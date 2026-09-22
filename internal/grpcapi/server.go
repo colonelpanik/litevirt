@@ -51,9 +51,15 @@ type Server struct {
 	db         *corrosion.Client
 
 	// dualRunLeaseTerm is the fencing term of the dual-run detector's current
-	// lease incarnation, 0 when this node does not hold it. Recorded for
-	// observability only: the detector is alert-only and destroys nothing, so
-	// there is no protected write here to fence.
+	// lease incarnation, 0 when this node does not hold it.
+	//
+	// It is LOAD-BEARING, not observability. This said the detector was
+	// alert-only and had no protected write to fence; that stopped being true
+	// when its findings became durable health conditions, because
+	// ownershipConditionCodes gates admission on them and there is no operator
+	// force-clear. A pass that outlived its lease could resolve a condition its
+	// successor had confirmed. detectDualRunPass captures this term at the
+	// start and refuses to write if the tenure changed.
 	//
 	// Atomic because Server is shared across every gRPC handler goroutine; the
 	// detector loop is the only writer today, but an unguarded mutable field on

@@ -176,8 +176,12 @@ func (s *Server) stepDownDualRun() {
 // Lifecycle state is DURABLE (health_conditions rows), so a leadership handover
 // preserves observation counts and confirmed state: the new leader's first pass picks
 // up exactly where the old one stopped — no re-arm, no false `.cleared`, no re-page.
-// The per-peer timeout keeps a pass well under the lease TTL, so leadership only moves
-// on a genuine failover, not on a slow pass.
+// The per-peer timeout bounds the PEER probes, but not the pass: the self probe
+// goes through collectRuntimeInventory, whose libvirt calls (ListDomains,
+// DomainState, DumpXML) take no context and cannot be cut short, and the DB
+// reads are unbounded too. A pass CAN therefore outlive the lease TTL — which
+// is why detectDualRunPass re-asserts leadership after the gather and discards
+// its findings if the tenure changed, rather than relying on a timing claim.
 func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 60 * time.Second
@@ -201,6 +205,41 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 		}
 	}
 }
+
+// stillDualRunLeader reports whether this node still holds the detector lease
+// under the SAME tenure the pass began in.
+//
+// It re-reads rather than comparing the cached term to itself: a successor
+// taking the lease does not touch this node's cached value, so the cached
+// comparison would always agree with itself and prove nothing.
+//
+// A term of 0 means the ledger cannot mint yet (mid rolling upgrade). There is
+// no tenure to compare, so the pass is allowed through rather than blocked —
+// the lease itself still gates who runs at all, and refusing here would
+// silently disable the detector for the length of an upgrade.
+func (s *Server) stillDualRunLeader(ctx context.Context, passTerm int64) bool {
+	if passTerm == 0 {
+		return true
+	}
+	held, term, err := corrosion.AcquireLeaseWithTerm(
+		ctx, s.db, dualRunLeaseKey, s.hostName, 2*dualRunLeaseProbeTTL, time.Now())
+	if err != nil {
+		// Cannot prove we still lead. Fail CLOSED: discarding a pass costs one
+		// interval, applying a stale one re-opens admission to a split-brain.
+		slog.Warn("dual-run detector: re-assert lease", "error", err)
+		return false
+	}
+	if !held {
+		return false
+	}
+	s.dualRunLeaseTerm.Store(term)
+	return term == passTerm
+}
+
+// dualRunLeaseProbeTTL is the TTL used by the mid-pass re-assert. It matches
+// the default interval so a re-assert never SHORTENS a lease taken with a
+// larger configured interval.
+const dualRunLeaseProbeTTL = 60 * time.Second
 
 // acquireDualRunLease takes/renews the dual_run_detector leader lease via the
 // shared corrosion helper, which carries the RFC3339 expiry compare that keeps a
@@ -229,6 +268,10 @@ func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration
 // cross-reference against the DB, debounce, and emit metrics + set-transition
 // notifications. It NEVER destroys or reconciles anything — alert-only.
 func (s *Server) detectDualRunPass(ctx context.Context) {
+	// The tenure this pass belongs to. Everything below is only valid if the
+	// same tenure still holds when the writes happen.
+	passTerm := s.dualRunLeaseTerm.Load()
+
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil {
 		slog.Warn("dual-run detector: list hosts", "error", err)
@@ -441,6 +484,28 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 		coverageDetail = fmt.Sprintf("unreachable=%v partial=%v unsupported=%v db_index_ok=%v ct_index_ok=%v",
 			unreachable, partialHosts, unsupported, dbIndexOK, ctIndexOK)
 	}
+	// RE-ASSERT LEADERSHIP before acting on what the gather found.
+	//
+	// The pass has no wall-clock bound and the self probe cannot be given one
+	// — ListDomains, DomainState and DumpXML take no context — so a leader
+	// wedged on hung storage can outlive its own lease by minutes and then
+	// finish against a snapshot taken before the stall. The conditions written
+	// here gate admission and have no operator force-clear, so a stale pass
+	// could RESOLVE a dual-run its successor had confirmed and re-open
+	// admission to a split-brained host.
+	//
+	// The term is the right test rather than holder identity, because
+	// AcquireLeaseWithTerm already treats a lease that lapsed and was re-taken
+	// — even by its own prior holder — as a NEW tenure: the lapse is exactly
+	// the window in which other nodes were entitled to act, so work from
+	// before it must not be applied after it. Same shape as the failover
+	// coordinator's post-fence lease re-check.
+	if !s.stillDualRunLeader(ctx, passTerm) {
+		slog.Warn("dual-run detector: lease lost or re-taken during the pass — discarding its findings",
+			"pass_term", passTerm, "current_term", s.dualRunLeaseTerm.Load())
+		return
+	}
+
 	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
 }
 

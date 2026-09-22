@@ -36,6 +36,7 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `ha.dualrun.vip` | error | a VIP is kernel-assigned on more than one host — a dual VIP holder |
 | `ha.owner.mismatch` | error | a VM's DB owner is not its sole runtime holder — the DB and runtime disagree (ownership drift) |
 | `ha.owner.epoch_mismatch` | error | under a latched `owner_epoch_v1`, the DB owner's runtime carries an owner-epoch marker that is missing/corrupt/unreadable or unequal to the row's epoch — the runtime cannot prove it belongs to the current ownership generation |
+| `ha.owner.epoch_suppressed` | error | under a latched `owner_epoch_v1`, a DB row is telling the owner-epoch check not to examine a VM while the runtime says that VM is running — a tombstoned row with a live disk-holder, a migration state parked well past its cutover window, or a `host_name` naming a host that is not in the cluster and so can never be probed |
 | `ha.lww.unresolved` | warn | a node is tracking unresolved equal-timestamp LWW ties |
 | `ha.dualrun.coverage` | warn | a workload-capable host could not be fully probed this pass — unreachable (segmented/down) OR returned a partial runtime (a local libvirt/container/ip probe errored, so its workload absence is unreliable); split-brain can't be ruled out there |
 | `quota.exceeded` | warn | a CreateVM is rejected by a project quota |
@@ -46,6 +47,17 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 > overlap into a VIP *outage* rather than a dual-VIP — that is only a safe trade if the
 > outage pages. Add a route matching `ha.vip.*` (or `ha.*`) at `error` severity, or a
 > silent VIP gap can go unnoticed. Recovery is `lv host fence-confirm <host>`.
+
+> **`ha.owner.epoch_suppressed` is the suppression itself, not the mismatch.** The
+> owner-epoch check branches entirely on replicated LWW state, so any peer with SQL
+> could once switch it off for a VM with a SINGLE write and nothing to renew — a
+> tombstone (which `ListVMs` filters out), a migration state (which is exempted as
+> cutover lag), or a `host_name` pointing at a host that is never probed (which defers
+> to the coverage signal). Each is now corroborated against runtime evidence the leader
+> gathered itself, and a row that says "do not look" while the workload is visibly
+> running pages under this kind. A row saying the same thing with nothing running behind
+> it is an ordinary stale row and stays silent. This narrows the trust boundary; it does
+> not close it — the detector still judges replicated state using replicated state.
 
 > **The `ha.dualrun.*` / `ha.owner.mismatch` / `ha.lww.unresolved` kinds are alert-only**
 > and always on — the leader-gated dual-run detector never destroys or reconciles; it

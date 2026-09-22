@@ -747,7 +747,15 @@ func (s *Server) adoptAbandonedMigration(
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
 			}
-			if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail); werr != nil {
+			// Routed through the chokepoint because this branch CAN publish
+			// "running" — the guest is still on this host after a failed
+			// adopted migration. A row saying running with no marker naming its
+			// generation is a workload nobody can prove, which is the whole
+			// reason the chokepoint exists; the "error" case passes through it
+			// unchanged.
+			if werr := s.publishRunning(ctx, vm.Name, state, func(ctx context.Context) error {
+				return corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail)
+			}); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)

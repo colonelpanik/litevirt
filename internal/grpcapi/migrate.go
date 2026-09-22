@@ -170,6 +170,16 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "target host %q is not active", req.TargetHost)
 	}
 
+	// CPU compatibility, SOURCE-side, before ANY target-side provisioning: a guest
+	// whose CPU is derived from its host (host-model / host-passthrough) may be
+	// executing instructions the destination does not have, and libvirt only says
+	// so once the migration is already underway. Advisory and fail-open — it
+	// refuses only on a positive "cannot run" from the target (see
+	// preflightTargetCPU), never on a peer that is old or cannot answer.
+	if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
+		return err
+	}
+
 	// PCI passthrough cannot be re-realized cross-host in this release, so refuse
 	// migrating any VM that holds PCI intent — but only once hardware_v2 is latched,
 	// so pre-latch migration behavior (incl. the legacy VF/PF/target-availability

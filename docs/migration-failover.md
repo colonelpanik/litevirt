@@ -25,6 +25,35 @@ Progress is streamed to the CLI in real-time.
 - Target host must be `active` and have sufficient resources
 - All disks must be on shared storage (NFS/Ceph/iSCSI), OR use `with-storage: true`
 - PCI passthrough devices block live migration (hot-detach first)
+- The target's CPU must be able to run the guest (see below)
+
+### CPU compatibility
+
+A guest whose CPU is derived from its host — `cpu-mode: host-model` (the create
+default) or `host-passthrough` — may be executing instructions the destination
+host does not have. litevirt checks this **before** provisioning anything on the
+target: the source reads the guest's CPU requirement from its live domain XML (for
+a `host-model` guest libvirt has already expanded that to a concrete model plus
+feature list; for `host-passthrough` the requirement is the source host's own CPU)
+and asks the target host whether it can satisfy it.
+
+A target that positively cannot refuses the migration up front:
+
+```
+target host "..." cannot run VM "...": its CPU does not provide what the guest is
+running on (cpu_mode=host-model, verdict=incompatible)
+```
+
+Migrate to a host with an equal-or-newer CPU, or stop the VM and pin a baseline
+both hosts support with `lv update <vm> --cpu-mode custom --cpu-model <model>`.
+
+The check is deliberately advisory in one direction only. It refuses **only** on a
+positive "cannot run" from the target; a target that cannot answer — a peer
+mid-rolling-upgrade that does not have the check yet, or one whose libvirt is
+briefly unhappy — is treated as *unverified*, not as incompatible, and the
+migration proceeds to libvirt's own check at cutover. A VM with an empty
+`cpu_mode` (QEMU's `qemu64`, identical on every host — see
+[`lv doctor cpu-mode`](diagnostics.md)) is not checked at all.
 
 ### Migration with local disks
 
@@ -105,7 +134,7 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 When a host goes offline, the failover coordinator:
 
 1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1)
-2. **Acquires leader lease** — only one host coordinates failover (30s TTL lease)
+2. **Acquires leader lease** — only one host coordinates failover (45s TTL lease; a fence needs 30s of it still to run before it may begin)
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
@@ -329,14 +358,14 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
   (`action` = `relocate`)
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
-- `litevirt_replication_min_watermark_seq` — minimum `last_seq` across all peers; a stalled value means replication is backing up
+- `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on
 - `litevirt_mutation_log_rows` — total rows in `mutation_log`; coupled with the watermark above this gives backlog visibility
 - `litevirt_replication_pending_entries` — `mutation_log` entries written but not yet acknowledged by the slowest **live** peer (`MAX(seq) − MIN(live last_seq)`); reads `0` when there are no live peers. A sustained climb means one peer is falling behind even though replication itself is healthy
 - `litevirt_replication_peer_pending_entries` — per-peer backlog (`MAX(seq) − peer last_seq`), one series per live peer; a single series climbing while the others stay flat pinpoints the lagging peer. The daemon also logs a warning when a peer stays maxed-out for several rounds

@@ -518,6 +518,76 @@ homogeneous cluster — every host resolving the alias identically is why this i
 a warning and not an error — but it should be cleared before introducing a host
 with a different qemu version.
 
+## `lv doctor cpu-mode`
+
+Read-only. Lists VMs whose **persisted spec** has an empty `cpu_mode`.
+
+```
+lv doctor cpu-mode
+```
+
+Such a VM is defined with no `<cpu>` element, so libvirt passes no `-cpu` to QEMU
+and the guest runs on QEMU's x86_64 default, `qemu64` — a model with no `sse4.1`,
+no `sse4.2` and no `xsave`, and therefore neither AVX nor AVX2, however capable
+the host is. Guest software that assumes a modern baseline will not start, and the
+fault presents as a broken binary rather than a hypervisor setting.
+
+New VMs default to `host-model` (see `vm.default_cpu_mode` in
+[configuration](configuration.md)). VMs listed here were created before that
+default existed. Their stored spec is honored verbatim and deliberately not
+rewritten: changing the CPU a running guest sees is not something an upgrade
+should do behind the operator's back.
+
+To move one forward, with the VM **stopped**:
+
+```
+lv update <vm> --cpu-mode host-model
+```
+
+or, in one step on a running VM, `lv update <vm> --cpu-mode host-model
+--restart-if-needed`, which does a stop → redefine → start under a single VM
+lock.
+
+The retrofit is an **in-place patch of libvirt's own inactive domain XML**, not a
+regeneration from the stored spec, so every libvirt-assigned detail the spec does
+not describe — guest PCI slot addresses, controller models, disk ordering —
+survives unchanged. That matters for guests (e.g. Windows) that key licensing off
+stable hardware addresses. If the patch cannot be applied for any reason the
+redefine falls back to full regeneration rather than failing.
+
+Two things to expect. It changes the guest-visible CPU, so it needs a full
+stop/start rather than a guest reboot. And it narrows live migration for that VM
+to hosts with an equal-or-richer CPU — the trade the modern instruction set
+costs, and no trade at all on a homogeneous cluster.
+
+## `lv doctor vm-uuids`
+
+Read-only. Lists VMs whose **persisted spec** carries no domain uuid.
+
+```
+lv doctor vm-uuids
+```
+
+The uuid is what makes a NetBox identity incarnation-unique
+(`lv:<fingerprint>:<uuid>:<mac>`), so a VM without one cannot be named in NetBox
+at all. The inventory mirror skips it **and** counts it as an unreadable record —
+and an unreadable record is indistinguishable from a destroyed VM, so the mirror
+withholds *every* delete while one exists. A single VM listed here stops the
+whole mirror converging, which is why this matters even on a cluster that does
+not care about the individual VM.
+
+libvirt mints a uuid for every domain it defines regardless of what litevirt
+stored, so the reconciler adopts it from the persistent domain XML as it sweeps
+each VM on its **owning host** — running or stopped. No other node can read that
+XML, which is why there is no cluster-wide repair command. A VM listed here has
+not been swept yet, or its host is down.
+
+The backfill never overwrites a uuid the spec already has, even if libvirt
+reports a different one: the stored value is the identity other systems already
+hold, and replacing it would orphan every object stamped with it.
+
+To fill one in: make sure its host is up and wait for the next reconciler sweep.
+
 ## Persisted LWW clock & backward-clock protection
 
 The `updated_at` conflict key is minted from a **monotonic** clock whose high-water
@@ -751,6 +821,14 @@ observed → confirmed → resolved lifecycle:
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
 0 / 1 / 2 so scripts can gate on it.
+
+Peer connectivity counts toward that state: a link the checker cannot prove
+good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
+rather than being reported and ignored. Links whose **target is in
+maintenance** are the exception — nothing probes a host that is out of
+service, so its last recorded status would never change again and counting
+it would hold the cluster DEGRADED for as long as the host stays down. Those
+edges are still listed; they just stop voting.
 
 **The same rows drive admission.** An active ownership condition blocks
 capacity-growing admission to every involved host and runtime-changing

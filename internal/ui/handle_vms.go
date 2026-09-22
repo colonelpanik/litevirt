@@ -192,6 +192,10 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	if disk := r.FormValue("disk"); disk != "" {
 		spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio"}}
 	}
+	// CPU mode: left blank the server applies its default (host-model), so the
+	// guest gets the host's AVX/AVX2 rather than QEMU's qemu64.
+	spec.CpuMode = r.FormValue("cpu_mode")
+	spec.CpuModel = strings.TrimSpace(r.FormValue("cpu_model"))
 	if r.FormValue("disable_vnc") == "true" {
 		spec.DisableVnc = true
 	}
@@ -687,6 +691,7 @@ func (s *Server) handleUpdateVMSpec(w http.ResponseWriter, r *http.Request) {
 		Cpu:        int32(cpu),
 		MemoryMib:  int32(mem),
 		CpuMode:    cpuMode,
+		CpuModel:   strings.TrimSpace(r.FormValue("cpu_model")),
 		DisableVnc: disableVNC,
 		Machine:    r.FormValue("machine"),
 		Firmware:   r.FormValue("firmware"),

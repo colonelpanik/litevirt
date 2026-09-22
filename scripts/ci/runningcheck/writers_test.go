@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -134,5 +136,84 @@ func TestStateAssignments(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// fixtureModule writes a throwaway module containing src and returns its root.
+//
+// Rule 7 has to be tested against a tree that VIOLATES it, which the real one
+// by construction does not. Pointing it at the repo would assert only that the
+// repo is clean today — a test that stays green with the rule deleted.
+func fixtureModule(t *testing.T, src string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module rule7fixture\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(src), 0o644); err != nil {
+		t.Fatalf("write a.go: %v", err)
+	}
+	return dir
+}
+
+// TestOnlyCallerClaimWithTwoCallers is the break rule 7 exists to catch.
+//
+// Adding a second caller is the natural thing to do when a new path wants the
+// helper without the chokepoint. The directive still reads as valid, so
+// nothing else in this checker objects, and the new path publishes a running
+// row with no marker naming its generation.
+func TestOnlyCallerClaimWithTwoCallers(t *testing.T) {
+	root := fixtureModule(t, `package fixture
+
+func publish() {
+	//runningcheck:allow the only caller routes this
+	_ = 1
+}
+
+func routed()   { publish() }
+func unrouted() { publish() }
+`)
+	vs, err := checkOnlyCallerClaims(root)
+	if err != nil {
+		t.Fatalf("checkOnlyCallerClaims: %v", err)
+	}
+	if len(vs) != 1 {
+		t.Fatalf("a function claiming one caller has two, want 1 violation, got %d: %+v", len(vs), vs)
+	}
+	if !strings.Contains(vs[0].msg, "2 call site(s)") {
+		t.Errorf("violation should name the real call-site count, got %q", vs[0].msg)
+	}
+}
+
+// TestOnlyCallerClaimWithOneCaller is the positive control: the rule must not
+// fire on the arrangement the directive actually describes, or it would be
+// satisfied by refusing everything.
+func TestOnlyCallerClaimWithOneCaller(t *testing.T) {
+	root := fixtureModule(t, `package fixture
+
+func publish() {
+	//runningcheck:allow the only caller routes this
+	_ = 1
+}
+
+func routed() { publish() }
+`)
+	vs, err := checkOnlyCallerClaims(root)
+	if err != nil {
+		t.Fatalf("checkOnlyCallerClaims: %v", err)
+	}
+	if len(vs) != 0 {
+		t.Fatalf("a genuinely singly-called function must not be flagged, got %+v", vs)
+	}
+}
+
+// TestNoStaleOnlyCallerClaims is rule 7 against the real tree.
+func TestNoStaleOnlyCallerClaims(t *testing.T) {
+	vs, err := checkOnlyCallerClaims(repoRoot)
+	if err != nil {
+		t.Fatalf("checkOnlyCallerClaims: %v", err)
+	}
+	for _, v := range vs {
+		t.Errorf("%s:%d: %s", v.file, v.line, v.msg)
 	}
 }

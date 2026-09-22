@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/token"
+	"go/types"
 	"sort"
 	"strings"
 
@@ -71,7 +72,11 @@ func checkWriters(root string) ([]violation, error) {
 		Dir:   root,
 		Tests: false,
 	}
-	pkgs, err := packages.Load(cfg, "./internal/...")
+	// ./... rather than ./internal/...: rule 6 asks whether a NEW function runs
+	// an existing state-writing statement, and a function outside internal/
+	// does so just as effectively. Scoping the load to internal/ made the rule
+	// blind to the rest of the module.
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load: %w", err)
 	}
@@ -286,4 +291,113 @@ func asFuncDecl(d ast.Decl) *ast.FuncDecl {
 		return nil
 	}
 	return fd
+}
+
+// checkOnlyCallerClaims turns a prose claim into a check.
+//
+// A `//runningcheck:allow` may excuse a statement on the grounds that its
+// enclosing function is routed "by its only caller". That is the same shape as
+// staleExemptions, which exists because "a stale one silently excuses whatever
+// function later takes the name": an orphaned directive is caught, but a
+// directive whose REASON has quietly become false is not. Adding a second
+// caller of such a function is the natural thing to do when a new path wants
+// the helper without the chokepoint, and CI stayed green while that path
+// published a running row with no marker naming its generation — the same
+// class as the adoptAbandonedMigration break, minus the build failure that
+// made that one visible.
+func checkOnlyCallerClaims(root string) ([]violation, error) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+		Dir:   root,
+		Tests: false,
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		return nil, fmt.Errorf("load: %w", err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		return nil, fmt.Errorf("%d package load error(s)", n)
+	}
+
+	// Functions whose allow-directive rests on being singly-called.
+	claimed := map[types.Object]token.Position{}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Syntax {
+			for _, cg := range f.Comments {
+				for _, c := range cg.List {
+					body := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(c.Text, "//"), "/*"))
+					if !strings.HasPrefix(body, "runningcheck:allow") || !strings.Contains(body, "only caller") {
+						continue
+					}
+					fn := enclosingFuncObj(pkg, f, c.Pos())
+					if fn != nil {
+						claimed[fn] = pkg.Fset.Position(c.Pos())
+					}
+				}
+			}
+		}
+	}
+	if len(claimed) == 0 {
+		return nil, nil
+	}
+
+	counts := map[types.Object]int{}
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Syntax {
+			ast.Inspect(f, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				var id *ast.Ident
+				switch fn := call.Fun.(type) {
+				case *ast.Ident:
+					id = fn
+				case *ast.SelectorExpr:
+					id = fn.Sel
+				}
+				if id == nil {
+					return true
+				}
+				if obj := pkg.TypesInfo.Uses[id]; obj != nil {
+					if _, watched := claimed[obj]; watched {
+						counts[obj]++
+					}
+				}
+				return true
+			})
+		}
+	}
+
+	var out []violation
+	for obj, pos := range claimed {
+		if n := counts[obj]; n != 1 {
+			out = append(out, violation{
+				file: pos.Filename, line: pos.Line,
+				msg: fmt.Sprintf("this //runningcheck:allow claims %s is routed by its ONLY caller, "+
+					"but it has %d call site(s). Route the new caller through the chokepoint, or "+
+					"drop the claim and justify the statement on its own terms.", obj.Name(), n),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].file != out[j].file {
+			return out[i].file < out[j].file
+		}
+		return out[i].line < out[j].line
+	})
+	return out, nil
+}
+
+// enclosingFuncObj returns the function declaration object containing pos.
+func enclosingFuncObj(pkg *packages.Package, f *ast.File, pos token.Pos) types.Object {
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || pos < fd.Pos() || pos > fd.End() {
+			continue
+		}
+		return pkg.TypesInfo.Defs[fd.Name]
+	}
+	return nil
 }

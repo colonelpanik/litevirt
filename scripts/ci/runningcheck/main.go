@@ -169,6 +169,14 @@ func main() {
 		var wv []violation
 		wv, err = checkWriters(*root)
 		violations = append(violations, wv...)
+
+		// Rule 7: an allow-directive that excuses a statement because its
+		// function has only one caller must still have only one caller.
+		if err == nil {
+			var cv []violation
+			cv, err = checkOnlyCallerClaims(*root)
+			violations = append(violations, cv...)
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runningcheck: %v\n", err)

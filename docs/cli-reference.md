@@ -132,6 +132,11 @@ one baseline across a heterogeneous fleet. The cluster-wide default is
 `vm.default_cpu_mode` (see [configuration](configuration.md)); `lv doctor cpu-mode`
 lists VMs created before it existed, which are still on `qemu64`.
 
+Changing the mode on an existing VM is an in-place edit — `lv update <vm>
+--cpu-mode host-model` on a stopped VM, or with `--restart-if-needed` to fold the
+stop/start in. It patches libvirt's own domain XML rather than regenerating it, so
+guest PCI addresses and controller models are preserved.
+
 ## VM configuration
 
 ```bash

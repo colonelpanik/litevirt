@@ -746,9 +746,13 @@ type domain struct {
 }
 
 type cpuDef struct {
-	Mode  string    `xml:"mode,attr"`
-	Match string    `xml:"match,attr,omitempty"`
-	Model *cpuModel `xml:"model,omitempty"`
+	// XMLName names the element explicitly so the type can also be marshaled on
+	// its own, outside a domain struct (see PatchInactiveCPUMode). Identical to
+	// the name the domain field tag already gives it.
+	XMLName xml.Name  `xml:"cpu"`
+	Mode    string    `xml:"mode,attr"`
+	Match   string    `xml:"match,attr,omitempty"`
+	Model   *cpuModel `xml:"model,omitempty"`
 }
 
 type cpuModel struct {

@@ -544,10 +544,21 @@ To move one forward, with the VM **stopped**:
 lv update <vm> --cpu-mode host-model
 ```
 
-That changes the guest-visible CPU, so it needs a full stop/start rather than a
-guest reboot, and it narrows live migration for that VM to hosts with an
-equal-or-richer CPU — which is the trade the modern instruction set costs. On a
-homogeneous cluster there is no trade to make.
+or, in one step on a running VM, `lv update <vm> --cpu-mode host-model
+--restart-if-needed`, which does a stop → redefine → start under a single VM
+lock.
+
+The retrofit is an **in-place patch of libvirt's own inactive domain XML**, not a
+regeneration from the stored spec, so every libvirt-assigned detail the spec does
+not describe — guest PCI slot addresses, controller models, disk ordering —
+survives unchanged. That matters for guests (e.g. Windows) that key licensing off
+stable hardware addresses. If the patch cannot be applied for any reason the
+redefine falls back to full regeneration rather than failing.
+
+Two things to expect. It changes the guest-visible CPU, so it needs a full
+stop/start rather than a guest reboot. And it narrows live migration for that VM
+to hosts with an equal-or-richer CPU — the trade the modern instruction set
+costs, and no trade at all on a homogeneous cluster.
 
 ## `lv doctor vm-uuids`
 

@@ -73,6 +73,46 @@ func (c *Client) HostCPUXML() (string, error) {
 	return cpu, nil
 }
 
+// extractRootChild returns the named element VERBATIM when it appears as a
+// DIRECT child of doc's root element, plus whether it was found.
+//
+// The depth scoping is the point: a plain document-wide search for "cpu" in a
+// domain XML could match something nested under <metadata> or a future schema
+// addition, and patching the wrong element would rewrite the guest's CPU from a
+// node that has nothing to do with it.
+func extractRootChild(doc, name string) (string, bool) {
+	dec := xml.NewDecoder(strings.NewReader(doc))
+	var startOff int64
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if depth == 2 && se.Name.Local == name {
+				if serr := dec.Skip(); serr != nil {
+					return "", false
+				}
+				return strings.TrimSpace(doc[startOff:dec.InputOffset()]), true
+			}
+			if depth >= 2 {
+				// Not the element we want: skip its whole subtree so nothing
+				// inside it can be mistaken for a root child.
+				if serr := dec.Skip(); serr != nil {
+					return "", false
+				}
+				depth--
+			}
+		case xml.EndElement:
+			depth--
+		}
+		startOff = dec.InputOffset()
+	}
+}
+
 // extractElement returns the named element from doc VERBATIM — attributes,
 // children and all — plus whether it was found.
 //

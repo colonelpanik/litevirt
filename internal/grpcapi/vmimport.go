@@ -335,7 +335,22 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}
-		if err := corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started"); err != nil {
+		// Graduate BEFORE publishing. The import inserts at "stopped" with
+		// vm_owner_epoch at the column default of 0, and the chokepoint writes
+		// nothing for a pre-epoch row (a marker against an epoch-0 row is the one
+		// mismatch convergence never repairs). Without this the routed publish
+		// below is a no-op on the markers, and an imported-and-started VM is
+		// exactly as unprovable as it was before — for as long as the
+		// default-off backfill stays off.
+		//
+		// Graduation is best-effort and reports a failure only in its own log
+		// line, so this ordering makes the markers POSSIBLE, not certain. When it
+		// does fail the publish below warns that it is publishing an unprovable
+		// runtime, rather than skipping the markers in silence.
+		s.assignOwnerEpochAtCreate(ctx, name)
+		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")
+		}); err != nil {
 			slog.Warn("import: recording running state failed — reconciler will heal", "vm", name, "error", err)
 			s.noteStateWriteFail(corrosion.OpVMState, err)
 		}

@@ -72,6 +72,14 @@ testdata/tmp/
 tmp/
 /litevirt
 
+# CI guard binaries. `make ci-guards` uses `go run`, but `go build ./scripts/ci/X/`
+# writes its output to the working directory — which is how 3.3MB of runningcheck
+# once ended up committed. All four, not just the two that have happened.
+/runningcheck
+/stmtshapecheck
+/writecheck
+/schemacheck
+
 # Private working notes — internal roadmap/specs/bug-plans, never published to the mirror
 /TODO.md
 /BUGS.md

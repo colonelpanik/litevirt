@@ -1867,7 +1867,17 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// backing file would corrupt them. --keep-disks bypasses (the record goes
 	// but the disks stay, so the clones remain valid).
 	if !req.KeepDisks {
-		if clones, gErr := s.linkedClonesOf(ctx, req.Name); gErr == nil && len(clones) > 0 {
+		// Fail CLOSED on a lookup error. Removing a backing file that still has
+		// overlays on top of it corrupts every one of them unrecoverably — the
+		// overlay holds only the delta — so "I could not find out" must refuse,
+		// not proceed. ConvertToTemplate's identical guard (templates.go) and
+		// DeleteVM's own NIC read below both already do this.
+		clones, gErr := s.linkedClonesOf(ctx, req.Name)
+		if gErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cannot determine whether %q still backs linked clones: %v", req.Name, gErr)
+		}
+		if len(clones) > 0 {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"%q still backs %d linked clone(s) (%s); delete or full-clone them first, or pass --keep-disks",
 				req.Name, len(clones), strings.Join(clones, ", "))

@@ -138,3 +138,71 @@ func TestVMRescheduleProofCarriesOwnerEpoch(t *testing.T) {
 			rows[0].String("owner_epoch"), rows[0].String("dest_host"))
 	}
 }
+
+// TestVMRescheduleProofCarriesLeaseTerm: the reschedule proof must carry the
+// fencing term of the tenure that minted it.
+//
+// reschedule is the ONE action in leaseTermRequiredActions, and this is its only
+// mint site. Unstamped, judgeProofLeaseTerm sees term 0 with an empty key and
+// returns ReasonStaleLeaseTerm the moment lease_term_v1 latches — so every VM
+// failover in the cluster is refused and each VM sits state=pending forever.
+// Enabling the feature meant to protect failover would have disabled it.
+//
+// Nothing detected this. LeaseTermReadiness withholds the token until this node
+// can MINT a term, which says nothing about whether its producers STAMP one, and
+// the two are independent: the mint gate was wired and working while every proof
+// went out with a zero term. What makes stamping safe to rely on cluster-wide is
+// that a build which does not stamp does not advertise lease_term_v1, so the
+// latch cannot form across one.
+//
+// The term is read from what the coordinator recorded at acquisition, never from
+// a fresh MAX(term) read — that would let a displaced holder adopt the winner's
+// term, which is the hole the ledger exists to close.
+func TestVMRescheduleProofCarriesLeaseTerm(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, h := range []string{"dead", "live"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+			Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", h, err)
+		}
+	}
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "dead", State: "running",
+		Spec: `{"on_host_failure":"restart-any"}`,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fenceQuorum(t, ctx, db, []string{"coord", "live"}, "dead")
+
+	c := newTestCoordinator("coord", db)
+	c.Gate = fakeFailoverGate{
+		supports: map[string]bool{"live": true},
+		enforced: map[string]bool{capabilities.SplitBrainGateV1: true},
+	}
+	c.run(ctx)
+
+	if c.LeaseTerm() <= 0 {
+		t.Fatalf("coordinator holds term %d after a tick that took the lease; the rest of "+
+			"this test is vacuous", c.LeaseTerm())
+	}
+
+	rows, err := db.Query(ctx,
+		`SELECT lease_term, lease_key FROM runtime_action_proofs WHERE target_name = 'vm1'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("proof rows=%d err=%v; want one", len(rows), err)
+	}
+	if got := rows[0].Int64("lease_term"); got != c.LeaseTerm() {
+		t.Errorf("proof lease_term = %d, want %d (the coordinator's own recorded term). "+
+			"An unstamped reschedule proof is refused as stale_lease_term once "+
+			"lease_term_v1 latches, so every VM failover in the cluster stops and the "+
+			"VMs sit pending forever", got, c.LeaseTerm())
+	}
+	if got := rows[0].String("lease_key"); got != corrosion.LeaseKeyFailover {
+		t.Errorf("proof lease_key = %q, want %q. The three leases allocate terms "+
+			"independently and their numbers collide by design, so a term without its "+
+			"key cannot be judged against anything", got, corrosion.LeaseKeyFailover)
+	}
+}

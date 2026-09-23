@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -105,6 +106,33 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 }
 
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
+	// Evaluated ONCE. advertisedCapabilities consults selfFenced() and
+	// walQuarantinedNow(), both written from elsewhere: calling it twice lets the
+	// watchdog trip between them, so Capabilities could carry the full list while
+	// NotEnforcing was computed from an empty one — and a reader would pass the
+	// advertise-check on stale data and conclude the node is enforcing. It is
+	// also not cheap (with enforcement.owner_epoch on it walks the runtime
+	// inventory), and Ping is on the health checker's hot path.
+	advertised := s.advertisedCapabilities()
+	// Enforcement posture is disclosed only to a caller holding a HOST
+	// certificate. Ping is in skipAuth, so it never reaches the identity
+	// interceptor and carries no role: without this, the distributable lv-cli
+	// certificate — issued to every operator, and explicitly NOT a peer
+	// credential (see isTrustedHostCN) — could enumerate which security
+	// kill-switches are off on every node in the fleet, with no session and
+	// none of the `viewer` role GetFenceReadiness requires for the same facts.
+	//
+	// This was never world-readable: the listener is RequireAndVerifyClientCert,
+	// so every caller already presented a CA-issued certificate. The boundary
+	// being drawn is peer-versus-operator-CLI, and ServerAuth is the same
+	// CA-attested discriminator isTrustedHostCN falls through to — a client
+	// cannot assert it, because issuing one needs the CA key. It is used here
+	// INSTEAD of the full peer classification because that takes a hosts-table
+	// read under the client read lock, and Ping is on the health checker's hot
+	// path. The gap that leaves is a decommissioned host's certificate, which
+	// still reads posture until it is re-issued; it also still reads
+	// `capabilities`, so nothing is disclosed to it that it did not already have.
+	disclosePosture := callerCertHasServerAuth(ctx)
 	// SchemaVersion here is the BINARY const, deliberately — self-upgrade reads
 	// it to decide "which binary to adopt" (a binary question), not "do my
 	// columns exist" (the DB-applied question the replication handshake uses).
@@ -117,7 +145,7 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		SchemaVersion: int32(corrosion.CurrentSchemaVersion),
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
-		Capabilities: s.advertisedCapabilities(),
+		Capabilities: advertised,
 		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
 		// HLC value would compare against its own wall clock as nonsense skew.
 		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
@@ -125,7 +153,94 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// records our isolation on the strength of this, because we cannot
 		// record it ourselves.
 		WalQuarantined: s.walQuarantinedNow(),
+		// The other self-report: tokens advertised above but NOT acted on,
+		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
+		// PingResponse.not_enforcing and notEnforcingTokens.
+		NotEnforcing: notEnforcingIf(disclosePosture, advertised, s.tokenEnabled),
+		// True on this binary for a caller allowed to see posture, so an empty
+		// NotEnforcing above reads as "nothing unenforced" rather than "too old
+		// to say". FALSE for a caller that is not, which lands in the same
+		// UNKNOWN bucket as an old binary — the fail-closed reading, and the
+		// honest one: that caller was told nothing either way.
+		PostureReported: disclosePosture,
 	}, nil
+}
+
+// notEnforcingTokens lists capability tokens this node advertises but does not
+// act on, because the matching `enforcement.*` / `auth.*` config flag is false.
+//
+// Advertising and enforcing are deliberately separate here (see
+// advertisedCapabilities): a node advertises so the cluster can LATCH a token,
+// while its own kill-switch decides whether it honours it. The consequence is
+// that a token can be latched cluster-wide while members silently skip it, and
+// until this list existed nothing could observe that — not a peer, not an
+// operator. safe_fence_default_v1 is the shape: a latched cluster where one
+// node still best-effort-fences looks, from every other node, exactly like a
+// cluster that requires proof.
+//
+// It does NOT cover shared_storage_fence_v1, and cannot: that token is
+// advertised conditionally, so a node with the flag off drops out of
+// `advertised` and its absence — not this list — is the posture signal. See
+// postureFromPing, which reads it that way.
+//
+// This is a self-report of DEGRADATION, trustworthy for the same reason
+// wal_quarantined is: a node misreporting its posture would claim to enforce,
+// not to skip. It must stay diagnostic — no enforcement decision may read it,
+// in either direction.
+//
+// The list is scoped to what this node ADVERTISES, which has a consequence the
+// consumer must handle rather than this function: a self-fenced or
+// WAL-quarantined node advertises nothing, so its list is empty and says nothing
+// about its kill-switches. Reading that emptiness as "enforces everything" would
+// give exactly the most degraded node the cleanest posture. postureFromPing
+// therefore treats an EMPTY advertised set as unknown, and only reads a missing
+// token as not-enforcing when the node advertised something else.
+//
+// Scoping to Supported() instead would not fix that and would add noise:
+// tokenEnabled's default is false — correct fail-closed behaviour for the
+// decisions it actually gates — so every supported token with no kill-switch
+// case (hardware_v2 today) would be reported unenforced on every node forever.
+func (s *Server) notEnforcingTokens() []string {
+	return notEnforcingFrom(s.advertisedCapabilities(), s.tokenEnabled)
+}
+
+// tokensWithoutKillSwitch have no enforcement.* flag at all, so tokenEnabled
+// returns its fail-closed default for them — correct for the decisions it gates,
+// wrong as a posture claim. Reporting them would put a permanent, unactionable
+// entry in every node's list and teach operators to skim past the field.
+//
+// hardware_v2 is documented as "the one capability with no kill switch"
+// (docs/diagnostics.md); token_enabled_test.go pins the same gap.
+var tokensWithoutKillSwitch = map[string]bool{
+	capabilities.HardwareV2: true,
+}
+
+// notEnforcingIf is the disclosure gate, taking the same decision that sets
+// PingResponse.posture_reported so the two cannot drift apart. Populating the
+// list while reporting posture_reported=false would be worse than either
+// consistent answer: postureFromPing reads the flag first and would discard a
+// list it had already been handed, so the disclosure would happen with none of
+// the benefit.
+func notEnforcingIf(disclose bool, advertised []string, enabled func(string) bool) []string {
+	if !disclose {
+		return nil
+	}
+	return notEnforcingFrom(advertised, enabled)
+}
+
+// notEnforcingFrom is the pure half of notEnforcingTokens, taking the advertised
+// set so a caller that already computed it does not evaluate it twice.
+func notEnforcingFrom(advertised []string, enabled func(string) bool) []string {
+	out := make([]string, 0, len(advertised))
+	for _, token := range advertised {
+		if tokensWithoutKillSwitch[token] {
+			continue
+		}
+		if !enabled(token) {
+			out = append(out, token)
+		}
+	}
+	return out
 }
 
 // PeerCapabilities fresh-Pings a peer (or short-circuits for self) and returns

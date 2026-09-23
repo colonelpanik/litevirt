@@ -8,72 +8,120 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
-// ListRebalanceProposals returns all rebalance proposals, optionally
-// filtered by status.
+// Page-size bounds for ListRebalanceProposals.
+var (
+	// ListProposalsDefaultLimit is the page size when the caller asks for
+	// none. It is what an operator running `lv rebalance list` gets.
+	ListProposalsDefaultLimit = 200
+
+	// ListProposalsMaxLimit is the hard ceiling. A caller asking for more is
+	// silently clamped to it, so the response size is bounded by the server
+	// regardless of what the client requests.
+	ListProposalsMaxLimit = 1000
+)
+
+// ListRebalanceProposals returns a bounded page of rebalance proposals,
+// newest first, optionally filtered by status.
+//
+// The page is bounded because the response used to be every row in the table.
+// Terminal proposals accumulate (see corrosion.RebalanceProposalRetention),
+// and on a cluster emitting ~1k proposals/day the response reached 11.7 MB
+// against gRPC's 4 MB ceiling — at which point `lv rebalance list` fails with
+// ResourceExhausted and there is no CLI path back, because approve and reject
+// both need an id the operator can no longer enumerate.
+//
+// Retention alone would not fix that: it leaves the RPC one long outage away
+// from the same failure. The bound is what makes the response size
+// independent of how much history exists.
+//
+// TotalCount reports how many rows match the filter, ignoring the page, so a
+// caller can tell a full page from the whole table; Truncated says whether
+// more rows follow.
 func (s *Server) ListRebalanceProposals(ctx context.Context, req *pb.ListRebalanceProposalsRequest) (*pb.ListRebalanceProposalsResponse, error) {
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
-	var rows []map[string]any
-	var qErr error
-	if req.StatusFilter != "" {
-		rs, err := s.db.Query(ctx,
-			`SELECT id, vm_name, src_host, dst_host, policy, expected_gain, status,
-			        proposed_at, applied_at, expires_at, detail
-			 FROM rebalance_proposals WHERE status = ?
-			 ORDER BY proposed_at DESC`, req.StatusFilter)
-		qErr = err
-		for _, r := range rs {
-			rows = append(rows, map[string]any{
-				"id": r.String("id"), "vm_name": r.String("vm_name"),
-				"src_host": r.String("src_host"), "dst_host": r.String("dst_host"),
-				"policy": r.String("policy"), "expected_gain": r.Int("expected_gain"),
-				"status": r.String("status"), "proposed_at": r.String("proposed_at"),
-				"applied_at": r.String("applied_at"), "expires_at": r.String("expires_at"),
-				"detail": r.String("detail"),
-			})
-		}
-	} else {
-		rs, err := s.db.Query(ctx,
-			`SELECT id, vm_name, src_host, dst_host, policy, expected_gain, status,
-			        proposed_at, applied_at, expires_at, detail
-			 FROM rebalance_proposals
-			 ORDER BY proposed_at DESC`)
-		qErr = err
-		for _, r := range rs {
-			rows = append(rows, map[string]any{
-				"id": r.String("id"), "vm_name": r.String("vm_name"),
-				"src_host": r.String("src_host"), "dst_host": r.String("dst_host"),
-				"policy": r.String("policy"), "expected_gain": r.Int("expected_gain"),
-				"status": r.String("status"), "proposed_at": r.String("proposed_at"),
-				"applied_at": r.String("applied_at"), "expires_at": r.String("expires_at"),
-				"detail": r.String("detail"),
-			})
-		}
+
+	limit, offset := pageBounds(int(req.GetLimit()), int(req.GetOffset()))
+
+	// Args are shared by the count and the page so the two can never disagree
+	// about which rows they are talking about.
+	where, args := "", []any{}
+	if req.GetStatusFilter() != "" {
+		where = " WHERE status = ?"
+		args = append(args, req.GetStatusFilter())
 	}
-	if qErr != nil {
-		return nil, status.Errorf(codes.Internal, "query proposals: %v", qErr)
+
+	countRows, err := s.db.Query(ctx,
+		`SELECT COUNT(*) AS c FROM rebalance_proposals`+where, args...)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "count proposals: %v", err)
 	}
+	total := 0
+	if len(countRows) > 0 {
+		total = countRows[0].Int("c")
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT id, vm_name, src_host, dst_host, policy, expected_gain, status,
+		        proposed_at, applied_at, expires_at, detail
+		 FROM rebalance_proposals`+where+`
+		 ORDER BY proposed_at DESC, id DESC
+		 LIMIT ? OFFSET ?`, append(append([]any{}, args...), limit, offset)...)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query proposals: %v", err)
+	}
+
 	out := make([]*pb.RebalanceProposal, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, &pb.RebalanceProposal{
-			Id:           r["id"].(string),
-			VmName:       r["vm_name"].(string),
-			SrcHost:      r["src_host"].(string),
-			DstHost:      r["dst_host"].(string),
-			Policy:       r["policy"].(string),
-			ExpectedGain: float64(r["expected_gain"].(int)),
-			Status:       r["status"].(string),
-			ProposedAt:   r["proposed_at"].(string),
-			AppliedAt:    r["applied_at"].(string),
-			ExpiresAt:    r["expires_at"].(string),
-			Detail:       r["detail"].(string),
-		})
+		out = append(out, proposalFromRow(r))
 	}
-	return &pb.ListRebalanceProposalsResponse{Proposals: out}, nil
+	return &pb.ListRebalanceProposalsResponse{
+		Proposals:  out,
+		TotalCount: int32(total),
+		Truncated:  offset+len(out) < total,
+	}, nil
+}
+
+// pageBounds resolves a requested page to one the server is willing to serve:
+// an unset limit takes the default, anything above the ceiling is clamped to
+// it, and a negative limit or offset is treated as unset rather than rejected
+// — a client that sends one gets the first page, not an error it cannot act
+// on.
+func pageBounds(limit, offset int) (int, int) {
+	if limit <= 0 {
+		limit = ListProposalsDefaultLimit
+	}
+	if limit > ListProposalsMaxLimit {
+		limit = ListProposalsMaxLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// proposalFromRow projects one row. expected_gain is a REAL column and must be
+// read with Float: Row.Int truncates, which reported every fractional gain —
+// most of them — as 0.
+func proposalFromRow(r corrosion.Row) *pb.RebalanceProposal {
+	return &pb.RebalanceProposal{
+		Id:           r.String("id"),
+		VmName:       r.String("vm_name"),
+		SrcHost:      r.String("src_host"),
+		DstHost:      r.String("dst_host"),
+		Policy:       r.String("policy"),
+		ExpectedGain: r.Float("expected_gain"),
+		Status:       r.String("status"),
+		ProposedAt:   r.String("proposed_at"),
+		AppliedAt:    r.String("applied_at"),
+		ExpiresAt:    r.String("expires_at"),
+		Detail:       r.String("detail"),
+	}
 }
 
 // RunRebalance triggers a single rebalance evaluation cycle. Without this
@@ -147,20 +195,7 @@ func (s *Server) fetchProposal(ctx context.Context, id string) (*pb.RebalancePro
 	if len(rs) == 0 {
 		return nil, status.Errorf(codes.NotFound, "proposal %q not found", id)
 	}
-	r := rs[0]
-	return &pb.RebalanceProposal{
-		Id:           r.String("id"),
-		VmName:       r.String("vm_name"),
-		SrcHost:      r.String("src_host"),
-		DstHost:      r.String("dst_host"),
-		Policy:       r.String("policy"),
-		ExpectedGain: float64(r.Int("expected_gain")),
-		Status:       r.String("status"),
-		ProposedAt:   r.String("proposed_at"),
-		AppliedAt:    r.String("applied_at"),
-		ExpiresAt:    r.String("expires_at"),
-		Detail:       r.String("detail"),
-	}, nil
+	return proposalFromRow(rs[0]), nil
 }
 
 func (s *Server) countProposals(ctx context.Context) int {

@@ -779,6 +779,7 @@ func (r *Replicator) pruneLoop(ctx context.Context) {
 			r.pruneMutationLog(ctx)
 			r.pruneMutationSeen(ctx)
 			r.pruneClockSkew(ctx)
+			r.pruneRebalanceProposals(ctx)
 		}
 	}
 }
@@ -834,6 +835,19 @@ var (
 	// this is dead weight; without a prune the table grows without bound under
 	// host churn (one row per observer×target, never deleted on its own).
 	ClockSkewRetention = 1 * time.Hour
+
+	// RebalanceProposalRetention bounds how long a TERMINAL rebalance proposal
+	// is kept. Proposals move pending→approved→applied, or to rejected/expired,
+	// and nothing ever deleted them: a cluster emitting ~1k proposals/day
+	// accumulated 60k rows and ListRebalanceProposals began returning 11.7 MB
+	// against gRPC's 4 MB ceiling, which breaks `lv rebalance list` with no CLI
+	// path back.
+	//
+	// A week is long enough to answer "why did this VM move on Tuesday" and
+	// short enough that the table stays small. Non-terminal proposals
+	// (pending, approved, applying) are never pruned on age — they are live
+	// work, and dropping one would strand the executor.
+	RebalanceProposalRetention = 7 * 24 * time.Hour
 )
 
 // servedPeers returns the peers this node currently replicates to — exactly the
@@ -1040,6 +1054,45 @@ func (r *Replicator) pruneClockSkew(ctx context.Context) {
 	}
 	if n, _ := result.RowsAffected(); n > 0 {
 		slog.Info("replicator: pruned clock_skew", "deleted", n)
+	}
+}
+
+// pruneRebalanceProposals deletes terminal rebalance proposals past
+// RebalanceProposalRetention. Nothing else in the tree ever deletes from this
+// table — proposals reach a terminal status and stay — so without this the
+// table grows for the life of the cluster and ListRebalanceProposals
+// eventually exceeds gRPC's 4 MB message limit.
+//
+// The terminal set is an ALLOW-list, not a deny-list of live states. A status
+// this function has never heard of is kept, so adding a new one to the
+// rebalancer cannot silently start deleting live work; the cost of the
+// conservative direction is retained rows, the cost of the other is a
+// stranded migration.
+//
+// Age is measured on updated_at, which every transition sets (see
+// scheduler.rebalancer and grpcapi.rebalanceExecutor), so it is the time the
+// proposal went terminal rather than the time it was proposed.
+//
+// Like the other prune helpers this is a LOCAL delete (raw ExecContext, not
+// the mutation_log path), so it is not replicated: every node prunes its own
+// copy on the same age threshold, which converges without spending
+// replication bandwidth on deletions of dead rows.
+func (r *Replicator) pruneRebalanceProposals(ctx context.Context) {
+	cutoff := time.Now().Add(-RebalanceProposalRetention).UTC().Format(time.RFC3339)
+
+	r.client.mu.Lock()
+	defer r.client.mu.Unlock()
+
+	result, err := r.client.db.ExecContext(ctx,
+		`DELETE FROM rebalance_proposals
+		 WHERE status IN ('applied', 'failed', 'rejected', 'expired')
+		   AND updated_at < ?`, cutoff)
+	if err != nil {
+		slog.Warn("replicator: prune rebalance_proposals error", "error", err)
+		return
+	}
+	if n, _ := result.RowsAffected(); n > 0 {
+		slog.Info("replicator: pruned rebalance_proposals", "deleted", n)
 	}
 }
 

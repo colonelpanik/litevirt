@@ -2685,9 +2685,20 @@ message RebalanceProposal {
 
 message ListRebalanceProposalsRequest {
     string status_filter = 1;     // empty = all
+    // limit caps the page size. 0 means the server default; the server also
+    // applies a hard ceiling, so the response can never outgrow the gRPC
+    // message limit however large the table is.
+    int32  limit         = 2;
+    // offset pages through older proposals, newest first.
+    int32  offset        = 3;
 }
 message ListRebalanceProposalsResponse {
     repeated RebalanceProposal proposals = 1;
+    // total_count is how many proposals match status_filter, ignoring
+    // limit/offset, so a caller can tell a full page from the whole table.
+    int32 total_count = 2;
+    // truncated is true when more rows match past this page.
+    bool  truncated   = 3;
 }
 
 message RunRebalanceRequest {

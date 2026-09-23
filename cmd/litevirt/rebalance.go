@@ -29,13 +29,24 @@ func newRebalanceCmd() *cobra.Command {
 
 func newRebalanceListCmd() *cobra.Command {
 	var statusFilter string
+	var limit, offset int
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List pending and recent rebalance proposals",
+		Long: `Lists rebalance proposals, newest first.
+
+The server returns a bounded page, so a long-running cluster's proposal
+history cannot outgrow the gRPC message limit. When more proposals match than
+fit on one page, the footer says so; use --limit and --offset to page through
+the rest.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.ListRebalanceProposals(ctx,
-					&pb.ListRebalanceProposalsRequest{StatusFilter: statusFilter})
+					&pb.ListRebalanceProposalsRequest{
+						StatusFilter: statusFilter,
+						Limit:        int32(limit),
+						Offset:       int32(offset),
+					})
 				if err != nil {
 					return fmt.Errorf("list: %w", err)
 				}
@@ -51,12 +62,26 @@ func newRebalanceListCmd() *cobra.Command {
 						p.ExpectedGain, p.Status, p.Detail,
 					)
 				}
-				return w.Flush()
+				if err := w.Flush(); err != nil {
+					return err
+				}
+				// A silently short page is worse than no page: the operator
+				// would read a partial list as the whole table.
+				if resp.Truncated {
+					shown := offset + len(resp.Proposals)
+					fmt.Printf("\nShowing %d-%d of %d. Next page: lv rebalance list --offset %d\n",
+						offset+1, shown, resp.TotalCount, shown)
+				}
+				return nil
 			})
 		},
 	}
 	cmd.Flags().StringVar(&statusFilter, "status", "",
 		"Filter by status (pending, approved, applying, applied, failed, rejected, expired)")
+	cmd.Flags().IntVar(&limit, "limit", 0,
+		"Maximum proposals to return (0 = server default)")
+	cmd.Flags().IntVar(&offset, "offset", 0,
+		"Skip this many proposals, newest first, for paging")
 	return cmd
 }
 

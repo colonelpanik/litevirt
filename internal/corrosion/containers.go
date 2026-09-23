@@ -801,9 +801,6 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	if existing, _ := GetContainer(ctx, c, newHost, name); existing != nil {
 		return fmt.Errorf("target host %q already has a live container %q; refusing to clobber", newHost, name)
 	}
-	if err := DeleteContainer(ctx, c, oldHost, name); err != nil {
-		return err
-	}
 	rec := *old
 	rec.HostName = newHost
 	rec.State = "pending"
@@ -819,24 +816,68 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	// relocation proof carries that epoch and the executor compares it before
 	// recreating, so a target row at 0 (or an eager +1) wedges a legitimate
 	// relocation forever. The +1 mints only at completion.
+	var target Statement
 	if old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == "" {
-		return UpsertContainer(ctx, c, rec)
-	}
-	labelsJSON := ""
-	if len(rec.Labels) > 0 {
-		b, jerr := json.Marshal(rec.Labels)
-		if jerr != nil {
-			return jerr
+		ts, terr := upsertContainerStmt(c, rec)
+		if terr != nil {
+			return terr
 		}
-		labelsJSON = string(b)
+		target = ts
+	} else {
+		labelsJSON := ""
+		if len(rec.Labels) > 0 {
+			b, jerr := json.Marshal(rec.Labels)
+			if jerr != nil {
+				return jerr
+			}
+			labelsJSON = string(b)
+		}
+		target = Statement{SQL: containerRelocatePendingInsertSQL, Params: []interface{}{
+			rec.HostName, rec.Name, rec.Image, rec.CPULimit, rec.MemMiB, labelsJSON,
+			rec.RestartPolicy, rec.StateDetail, rec.Project, boolToInt(rec.IsTemplate),
+			rec.OnHostFailure, rec.CreateSpec, rec.RelocateToken,
+			old.OwnerEpoch, old.SpecGeneration, old.ActiveOperationID,
+			nowRFC3339(), c.NowTS(),
+		}}
 	}
-	return c.Execute(ctx, containerRelocatePendingInsertSQL,
-		rec.HostName, rec.Name, rec.Image, rec.CPULimit, rec.MemMiB, labelsJSON,
-		rec.RestartPolicy, rec.StateDetail, rec.Project, boolToInt(rec.IsTemplate),
-		rec.OnHostFailure, rec.CreateSpec, rec.RelocateToken,
-		old.OwnerEpoch, old.SpecGeneration, old.ActiveOperationID,
-		nowRFC3339(), c.NowTS(),
-	)
+
+	// ONE transaction for the whole move. Tombstoning the source and creating
+	// the target used to be two separate writes, and a failure in between — a
+	// tick deadline, SQLITE_BUSY, a restart — left NO live row at either host
+	// with the source tombstone already replicated. The sweep that would retry
+	// iterates LIVE containers on the dead host, finds nothing, and the
+	// container is simply gone from cluster state. Delete-first is the worse
+	// ordering; insert-first would at least leave a recoverable duplicate.
+	// Atomic is better than either, and both siblings in this file already are.
+	//
+	// The source's mutation guard covers the batch, so a source row that moved
+	// between the read above and the CAS applies nothing at all.
+	guard, gErr := containerDeleteMutationGuard(*old)
+	if gErr != nil {
+		return gErr
+	}
+	now := c.NowTS()
+	wall := nowRFC3339()
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return c.mutationGuardMatches(ctx, tx, guard)
+	}, []Statement{
+		// Fence the source's managed interfaces while its parent row is still
+		// live, tombstone the parent as the semantic barrier, then create the
+		// target — the same ordering deleteContainerGuardedFrom uses, with the
+		// target write brought inside.
+		{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, old.HostName, old.Name}, Guard: guard},
+		{SQL: containerDeleteSQL, Params: []interface{}{
+			wall, now, old.HostName, old.Name, old.OwnerEpoch, old.SpecGeneration,
+		}, Guard: guard},
+		target,
+	})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return fmt.Errorf("container %q on %q moved underneath the relocation; retry", name, oldHost)
+	}
+	return nil
 }
 
 // CompleteContainerRelocation flips a relocated container's target row

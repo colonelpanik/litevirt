@@ -42,7 +42,11 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 	}
 
 	// Scan the host.
-	scanned, err := pci.Scan()
+	scan := pci.Scan
+	if s.pciScanOverride != nil {
+		scan = s.pciScanOverride
+	}
+	scanned, err := scan()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "PCI scan: %v", err)
 	}
@@ -121,6 +125,21 @@ func (s *Server) RescanHost(ctx context.Context, req *pb.RescanHostRequest) (*pb
 				slog.Error("assigned device disappeared", "address", d.Address, "vm", d.VMName)
 				s.publish("device.lost", d.VMName, d.Address+" was assigned to running VM")
 			}
+		}
+	}
+
+	// Reclaim assignments whose VM no longer exists. A device that vanished and
+	// came back keeps its vm_name deliberately (a transient scan drop must not
+	// let a second VM claim hardware still in use), but nothing else ever clears
+	// it once the VM is gone — and ClaimPCIDevice matches only an empty vm_name,
+	// so such a device would be unassignable forever (#218). The age guard keeps
+	// a not-yet-replicated VM from having its device taken.
+	if freed, sErr := corrosion.SweepStrandedPCIOwnership(ctx, s.db, s.hostName,
+		corrosion.DefaultPCIOwnershipSweepAge); sErr != nil {
+		slog.Warn("rescan: stranded-ownership sweep failed", "error", sErr)
+	} else {
+		for _, addr := range freed {
+			s.publish("device.reclaimed", s.hostName, addr+" freed: owning VM no longer exists")
 		}
 	}
 

@@ -323,7 +323,9 @@ func (s *Server) planCutover(vm *corrosion.VMRecord, src *corrosion.DiskRecord, 
 	if derr != nil {
 		return cutoverNoVirt, "", "", fmt.Errorf("dump inactive domain xml: %w", derr)
 	}
-	out, changed, derr := libvirt.RewriteDiskSourceFile(xml, src.TargetDev, src.Path, dstPath)
+	// Backing-aware: a zfs, lvm-thin or iscsi disk carries <source dev=> and a
+	// ceph one <source name=>, so the file-only spelling would refuse them.
+	out, changed, derr := libvirt.RewriteDiskSource(xml, src.TargetDev, src.Path, dstPath)
 	if derr != nil {
 		return cutoverNoVirt, xml, "", derr
 	}

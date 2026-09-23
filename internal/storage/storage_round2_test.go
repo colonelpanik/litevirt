@@ -257,11 +257,16 @@ func TestCephDriver_CreateDisk_WithSourceImage(t *testing.T) {
 		SourceImage: "rbd/base@snap1",
 	})
 	if err == nil {
-		return
+		t.Fatal("expected an error: there is no rbd binary on the test host")
 	}
-	// Should fail at rbd create (no rbd binary), not at clone.
-	if !strings.Contains(err.Error(), "rbd create") {
-		t.Errorf("error should reference rbd create, got: %v", err)
+	// A source snapshot means the CLONE is the allocation — there is no prior
+	// `rbd create` to fail at. This test used to assert the opposite, which is
+	// how the create-then-clone-onto-the-same-name defect survived it.
+	if !strings.Contains(err.Error(), "clone") {
+		t.Errorf("error should reference the clone, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "rbd create") {
+		t.Errorf("clone path must not run rbd create, got: %v", err)
 	}
 }
 

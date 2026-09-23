@@ -2,6 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"time"
 )
 
 // pciSelectCols is the common column list for PCI device queries.
@@ -224,6 +227,129 @@ func ReleasePCIDevice(ctx context.Context, c *Client, hostName, address, expecte
 		`UPDATE host_pci_devices SET vm_name = '', updated_at = ?
 		 WHERE host_name = ? AND address = ? AND vm_name = ?`,
 		c.NowTS(), hostName, address, expectedVM)
+}
+
+// DefaultPCIOwnershipSweepAge is how long a PCI assignment must have sat
+// untouched before the sweeper is willing to call it stranded. It exists for
+// the replication race: a VM created on another node may not have reached this
+// node's vms replica yet, and a fresh assignment must never be reclaimed just
+// because the row naming its owner has not arrived.
+const DefaultPCIOwnershipSweepAge = 15 * time.Minute
+
+// vmPresence is what THIS node knows about a VM name, which is not the same
+// question as "does the VM exist".
+type vmPresence int
+
+const (
+	// vmLive: a row with no tombstone. The VM exists.
+	vmLive vmPresence = iota
+	// vmTombstoned: a soft-deleted row. The delete reached this node, so the
+	// VM's absence is replicated evidence rather than an inference.
+	vmTombstoned
+	// vmUnknown: no row at all. Indistinguishable from a VM whose row simply has
+	// not replicated here yet, so callers must treat it as "cannot tell".
+	vmUnknown
+)
+
+// lookupVMPresence answers the three-way question GetVM cannot: it filters
+// `deleted_at IS NULL`, so a tombstoned VM and one this node has never heard of
+// both come back nil — and those two warrant opposite decisions when the answer
+// is used to reclaim hardware.
+func lookupVMPresence(ctx context.Context, c *Client, name string) (vmPresence, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COALESCE(deleted_at, '') AS deleted_at FROM vms WHERE name = ?`, name)
+	if err != nil {
+		return vmUnknown, err
+	}
+	if len(rows) == 0 {
+		return vmUnknown, nil
+	}
+	if rows[0].String("deleted_at") == "" {
+		return vmLive, nil
+	}
+	return vmTombstoned, nil
+}
+
+// SweepStrandedPCIOwnership clears the assignment on hostName's LIVE
+// host_pci_devices rows whose owning VM no longer exists, and returns the
+// addresses it freed.
+//
+// Why this is needed at all: SoftDeletePCIDevice tombstones a vanished device
+// WITHOUT clearing vm_name, and ObservePCIDevice preserves vm_name when it
+// revives the row. Both are deliberate — a device can drop out of a scan
+// transiently (driver reload, rescan race) while the VM is still using it, and
+// clearing the owner there would let a second VM claim hardware that is in use.
+// But nothing then reclaims the assignment once the VM is genuinely gone, and
+// ClaimPCIDevice matches only `vm_name IS NULL OR vm_name = ”`, so such a
+// device matches zero rows forever.
+//
+// The existence test is deliberately per-row and in Go rather than a NOT EXISTS
+// subquery: a replicated statement is applied verbatim on every peer, so one
+// whose effect depends on another table's LOCAL contents would decide
+// differently on each node. Each clear goes through ReleasePCIDevice, whose
+// UPDATE is CAS-on-owner — an assignment that changed underneath the scan is a
+// safe no-op — and which is an already-registered statement shape.
+//
+// Scoped to one host: only that host's daemon can see its own hardware.
+func SweepStrandedPCIOwnership(ctx context.Context, c *Client, hostName string, minAge time.Duration) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT address, COALESCE(vm_name, '') AS vm_name, COALESCE(updated_at, '') AS updated_at
+		 FROM host_pci_devices
+		 WHERE host_name = ? AND deleted_at IS NULL
+		   AND vm_name IS NOT NULL AND vm_name != ''`, hostName)
+	if err != nil {
+		return nil, fmt.Errorf("list owned pci devices: %w", err)
+	}
+	cutoff := time.Now().UTC().Add(-minAge)
+	var cleared []string
+	for _, r := range rows {
+		addr, owner := r.String("address"), r.String("vm_name")
+		presence, pErr := lookupVMPresence(ctx, c, owner)
+		if pErr != nil {
+			// A read that failed is not an absent VM. Fail closed on this row.
+			return cleared, fmt.Errorf("look up owner %q of %s: %w", owner, addr, pErr)
+		}
+		if presence == vmLive {
+			continue
+		}
+		// The age guard applies ONLY to vmUnknown, and that is the whole of the
+		// fix for #218's sweep.
+		//
+		// It gates on the DEVICE row's updated_at, which answers "when did we
+		// last see this hardware" — not "how long has this ownership been
+		// stranded". RescanHost calls ObservePCIDevice for every scanned device
+		// immediately before sweeping, and that upsert's ON CONFLICT path sets
+		// updated_at = excluded.updated_at from c.NowTS(). So on the one path
+		// that calls this, every present device was stamped milliseconds ago and
+		// the guard skipped it; the only rows old enough were devices absent from
+		// the scan, which the loop above had just soft-deleted and the query
+		// above therefore excludes. The sweep could never free an address.
+		//
+		// A tombstone is a different kind of evidence. It means the VM's delete
+		// REPLICATED here, so the VM is provably gone and waiting longer cannot
+		// change that — no guard is needed or wanted. Only vmUnknown is genuinely
+		// ambiguous (a VM whose row has not reached this node yet looks identical
+		// to one that never existed), and that is the case the guard was written
+		// for, so that is the case it still covers.
+		if presence == vmUnknown && minAge > 0 {
+			// ParseUpdatedAt, not time.Parse: updated_at is HLC on most rows and
+			// RFC3339 on others, and an RFC3339-only parse would fail on every
+			// HLC row — making the guard skip everything and the sweep a no-op.
+			ts, ok := ParseUpdatedAt(r.String("updated_at"))
+			// An unparseable or missing timestamp is not evidence of age, so
+			// leave the row alone rather than reclaim a device on a guess.
+			if !ok || ts.After(cutoff) {
+				continue
+			}
+		}
+		if rErr := ReleasePCIDevice(ctx, c, hostName, addr, owner); rErr != nil {
+			return cleared, fmt.Errorf("release stranded %s (owner %q): %w", addr, owner, rErr)
+		}
+		slog.Warn("pci: cleared an assignment whose VM no longer exists",
+			"host", hostName, "address", addr, "stale_owner", owner)
+		cleared = append(cleared, addr)
+	}
+	return cleared, nil
 }
 
 // SoftDeletePCIDevice marks a device as deleted (disappeared from host).

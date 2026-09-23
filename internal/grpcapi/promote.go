@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -182,6 +183,20 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	// correct dest) — before relaying/executing — so the replicated row and the
 	// carried proof agree on the exact action/target/dest binding.
 	if req.Proof != nil {
+		// The lease-term stamp is validated FIRST: before the destination probes,
+		// and above all before the seed below.
+		//
+		// claimCarriedProof also validates it, but that call is several hundred
+		// lines later, inside doPromoteLocal. The seed below commits the presented
+		// proof and relays the batch, so a key that fails validation down there has
+		// already become the row every peer holds — and the row, not the proto, is
+		// what enforcement reads afterwards. A malformed stamp is also malformed
+		// regardless of what the destination advertises, so it costs nothing to
+		// refuse it before spending a Fresh-Ping on it.
+		if err := validateProofTermStamp(req.Proof); err != nil {
+			s.noteGateRefused(corrosion.ActionPromote, health.ReasonProofConflict)
+			return err
+		}
 		// Fresh-Ping the resolved destination: never stamp a proof for a target that
 		// no longer advertises the gate (a regressed/replaced replica host that
 		// couldn't honor it). Fail closed — refuse rather than promote there ungated.
@@ -200,7 +215,25 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 				"promote refused: destination %q does not advertise the shared-storage fence gate", host)
 		}
 		req.Proof.DestHost = host
-		if err := corrosion.WriteActionProof(ctx, s.db, proofFromPB(req.Proof)); err != nil {
+		// WriteActionProofValidated, not WriteActionProof: req.Proof may be
+		// CALLER-SUPPLIED. This block is gated on req.Proof != nil, not on
+		// `automated`, so a peer-mTLS caller's proof lands here too.
+		//
+		// Seeding through the unvalidated writer defeated the divergence check
+		// entirely on this path. It committed the presented statement to
+		// mutation_log — which relays the whole batch, so a local no-op still
+		// ships — and then claimCarriedProof compared the presented proof
+		// against the row this line had just written from it, found them equal
+		// by construction, and claimed it. ErrProofDiverges could never fire on
+		// promote: the most destructive action in the tree, and the one case
+		// b122f70 exists to close.
+		if err := corrosion.WriteActionProofValidated(ctx, s.db, proofFromPB(req.Proof)); err != nil {
+			if errors.Is(err, corrosion.ErrProofDiverges) {
+				s.noteGateRefused(corrosion.ActionPromote, health.ReasonProofConflict)
+				return status.Errorf(codes.FailedPrecondition,
+					"persisted proof %s does not match the presented promote proof (divergent/seeded row)",
+					req.Proof.GetId())
+			}
 			return status.Errorf(codes.Unavailable, "persist promote proof: %v", err) // fail closed
 		}
 	}
@@ -815,7 +848,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// this proof (guarded above at the destroy step); persist below is idempotent.
 	if !started {
 		domXML, err := lv.GenerateDomainXML(lv.VMConfig{
-			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode,
+			Name: targetName, CPU: int(spec.Cpu), CPUMode: spec.CpuMode, CPUModel: spec.CpuModel,
 			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,
@@ -895,9 +928,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
+		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
+		// promotion inserts a fresh row and no transfer ever follows it, so
+		// nothing here mints a generation. Without this the row is born running
+		// at epoch 0 and stays there — convergence early-returns on zero and the
+		// backfill is off by default.
+		s.assignOwnerEpochAtCreate(ctx, targetName)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
-		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running"); err != nil {
+		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
+			return corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running")
+		}); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
 		}
 		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, src.DiskName, s.hostName, livePath); err != nil {

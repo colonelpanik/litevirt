@@ -23,7 +23,7 @@ func testStartDB(t *testing.T) *corrosion.Client {
 
 func TestVMChecker_Start_CancelledContext(t *testing.T) {
 	db := testStartDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

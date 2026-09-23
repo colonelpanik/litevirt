@@ -101,7 +101,8 @@ vms:
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it
-    cpu-mode: "host-model"    # host-passthrough | host-model | custom
+    cpu-mode: "host-model"    # host-passthrough | host-model | custom (default host-model)
+    cpu-model: "x86-64-v3"    # required by cpu-mode: custom; invalid for any other mode
     memory: "4G"              # Memory: "4G", "4096M", or 4096 (MiB) — boot allocation
     min-memory: "1G"          # Ballooning floor the host may reclaim to (0 = none)
     max-memory: "8G"          # Ballooning ceiling the guest may inflate to (0 = fixed at memory)
@@ -127,9 +128,17 @@ restart is a no-op (running VMs are left alone), only an actual host reboot trig
 operator action — a normal daemon restart/upgrade leaves VMs running, so `stop-delay`
 is consumed only by that command, never by routine daemon lifecycle.
 
-`cpu-mode` controls how the guest CPU is exposed: `host-passthrough` (expose the host
-CPU verbatim — fastest, but pins live migration to identical hardware), `host-model`
-(a portable model close to the host), or `custom`.
+`cpu-mode` controls how the guest CPU is exposed: `host-model` (the default — the
+closest named model the host supports plus its feature flags, so the guest gets the
+host's SSE4.2/AVX/AVX2 and stays migratable to an equal-or-richer host),
+`host-passthrough` (expose the host CPU verbatim — marginally faster and the only
+mode carrying nested virtualization, but it pins live migration to identical
+hardware), or `custom`, which requires `cpu-model`.
+
+Left unset, `cpu-mode` takes the cluster-wide `vm.default_cpu_mode`. It is not left
+empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
+`qemu64`, which has no AVX at all. Changing either field is restart-class — the CPU
+bakes into the domain XML — so `lv compose up --strategy in-place` refuses it.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 

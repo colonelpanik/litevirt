@@ -223,6 +223,16 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	cfg := fv.ToVMConfig()
 	spec := fv.ToVMSpec(project)
 
+	// An import DEFINES a brand-new domain, so it takes the node's cpu_mode
+	// default like any other create. The foreign source carries no litevirt
+	// cpu_mode, and leaving it empty would define the guest with no <cpu> element
+	// — QEMU's qemu64, with no SSE4.2/AVX/AVX2. That is strictly further from the
+	// hardware the guest was installed on than the host-derived default is.
+	if spec.CpuMode == "" {
+		spec.CpuMode = s.effectiveDefaultCPUMode()
+	}
+	cfg.CPUMode, cfg.CPUModel = spec.CpuMode, spec.CpuModel
+
 	// Firmware (G1): a source that had Secure Boot / a vTPM is imported WITH them,
 	// but under a FRESH identity — the source's TPM secret is NOT carried, so a
 	// BitLocker guest will need its recovery key (the new TPM can't unseal the old
@@ -325,7 +335,22 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}
-		if err := corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started"); err != nil {
+		// Graduate BEFORE publishing. The import inserts at "stopped" with
+		// vm_owner_epoch at the column default of 0, and the chokepoint writes
+		// nothing for a pre-epoch row (a marker against an epoch-0 row is the one
+		// mismatch convergence never repairs). Without this the routed publish
+		// below is a no-op on the markers, and an imported-and-started VM is
+		// exactly as unprovable as it was before — for as long as the
+		// default-off backfill stays off.
+		//
+		// Graduation is best-effort and reports a failure only in its own log
+		// line, so this ordering makes the markers POSSIBLE, not certain. When it
+		// does fail the publish below warns that it is publishing an unprovable
+		// runtime, rather than skipping the markers in silence.
+		s.assignOwnerEpochAtCreate(ctx, name)
+		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")
+		}); err != nil {
 			slog.Warn("import: recording running state failed — reconciler will heal", "vm", name, "error", err)
 			s.noteStateWriteFail(corrosion.OpVMState, err)
 		}

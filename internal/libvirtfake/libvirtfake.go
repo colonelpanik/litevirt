@@ -90,8 +90,18 @@ type Fake struct {
 	// test can prove the shut-off reclaim took the config path, NOT the live one.
 	detachHostdevConfigN int
 
+	// comparedCPUXML records every CompareCPU argument (see ComparedCPUXML).
+	comparedCPUXML []string
+
+	// CPUCompareResult overrides CompareCPU's verdict; nil = Superset (this host
+	// can run anything). HostCPUModel names the model HostCPUXML reports.
+	CPUCompareResult *libvirt.CPUCompare
+	HostCPUModel     string
+
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
+	FailCompareCPU   func(cpuXML string) error
+	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
@@ -1309,6 +1319,52 @@ func (f *Fake) SetVCPUs(name string, count int) error {
 func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {
 	return 8, 32 * 1024, nil
 }
+
+// CompareCPU answers the migration CPU preflight. The default is Superset — a
+// fake host runs anything — so no existing scenario changes behavior. Set
+// CPUCompareResult (or FailCompareCPU) to model a destination whose CPU is
+// poorer than the guest needs.
+func (f *Fake) CompareCPU(cpuXML string) (libvirt.CPUCompare, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.comparedCPUXML = append(f.comparedCPUXML, cpuXML)
+	if f.FailCompareCPU != nil {
+		if err := f.FailCompareCPU(cpuXML); err != nil {
+			return libvirt.CPUCompareIncompatible, err
+		}
+	}
+	if f.CPUCompareResult != nil {
+		return *f.CPUCompareResult, nil
+	}
+	return libvirt.CPUCompareSuperset, nil
+}
+
+// HostCPUXML returns the fake host's CPU element. HostCPUModel (default
+// "fake-host-cpu") names the model, so two fakes in one fleet test can be given
+// deliberately different host CPUs.
+func (f *Fake) HostCPUXML() (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.FailHostCPUXML != nil {
+		if err := f.FailHostCPUXML(); err != nil {
+			return "", err
+		}
+	}
+	model := f.HostCPUModel
+	if model == "" {
+		model = "fake-host-cpu"
+	}
+	return "<cpu mode='custom' match='exact'><model>" + model + "</model></cpu>", nil
+}
+
+// ComparedCPUXML returns, in order, every cpu XML CompareCPU was asked about —
+// so a test can prove the preflight asked the DESTINATION, and asked it about
+// the right CPU, rather than passing because nothing was checked.
+func (f *Fake) ComparedCPUXML() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.comparedCPUXML...)
+}
 func (f *Fake) GetDomainStats(name string) (*libvirt.DomainStats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1426,6 +1482,12 @@ func (f *Fake) Close() error { return nil }
 // stored in domain metadata. The fake records them per domain so fleet and
 // unit tests can assert write-through and convergence without libvirt.
 func (f *Fake) SetDomainOwnerEpoch(name string, epoch int64, running bool) error {
+	// The real client refuses a pre-epoch value (a generation starts at 1); the
+	// fake must too, or a test could pass against a marker state production
+	// cannot produce.
+	if epoch < 1 {
+		return fmt.Errorf("refusing to set owner-epoch metadata %d on %q: a generation starts at 1", epoch, name)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.domains[name]; !ok {

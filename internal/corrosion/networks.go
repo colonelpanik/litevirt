@@ -139,6 +139,15 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 	}
 
 	now := c.NowTS()
+	// renamed maps each network name this pass actually rescopes to its new
+	// name; existing is the set of network names that exist once the pass is
+	// done. Both drive the spec-blob rewrite below, which must follow REAL
+	// renames only.
+	renamed := map[string]string{}
+	existing := make(map[string]bool, len(nets))
+	for _, nr := range nets {
+		existing[nr.Name] = true
+	}
 
 	for _, nr := range nets {
 		if nr.StackName == "" {
@@ -162,6 +171,9 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 		}
 
 		scopedName := compose.ScopedNetworkName(nr.StackName, nr.Name)
+		renamed[nr.Name] = scopedName
+		delete(existing, nr.Name)
+		existing[scopedName] = true
 		slog.Info("migrating legacy network name", "old", nr.Name, "new", scopedName)
 
 		// networks.name is the single primary key, so this rename is a full-PK LWW update.
@@ -196,7 +208,7 @@ func MigrateLegacyNetworkNames(ctx context.Context, c *Client) error {
 	}
 
 	// Migrate network names inside VM spec JSON.
-	if err := migrateVMSpecNetworkNames(ctx, c); err != nil {
+	if err := migrateVMSpecNetworkNames(ctx, c, renamed, existing); err != nil {
 		slog.Warn("failed to migrate VM spec network names", "error", err)
 	}
 
@@ -220,9 +232,19 @@ func inferNetworkStack(ctx context.Context, c *Client, networkName string) ([]st
 	return stacks, nil
 }
 
-// migrateVMSpecNetworkNames updates network attachment names inside the
-// stored VM spec JSON so they use scoped names.
-func migrateVMSpecNetworkNames(ctx context.Context, c *Client) error {
+// migrateVMSpecNetworkNames updates the network attachment names inside the
+// stored VM spec JSON to follow the networks this pass renamed, and heals a
+// name an earlier pass mis-prefixed. renamed is old name → scoped name for
+// the networks actually rescoped; existing is the set of network names that
+// exist afterwards.
+//
+// An earlier version prefixed EVERY attachment name with the VM's stack,
+// including an external network attached under its plain, unscoped name. The
+// blob then pointed at a network that did not exist, while the NIC rows (which
+// are only rescoped for the renamed networks) kept the real name — so an
+// unchanged compose attachment compared against the blob as a network-topology
+// change, which the default update strategy executes as delete + recreate.
+func migrateVMSpecNetworkNames(ctx context.Context, c *Client, renamed map[string]string, existing map[string]bool) error {
 	rows, err := c.Query(ctx,
 		`SELECT name, stack_name, spec FROM vms
 		 WHERE stack_name != '' AND deleted_at IS NULL`)
@@ -235,7 +257,7 @@ func migrateVMSpecNetworkNames(ctx context.Context, c *Client) error {
 		stackName := r.String("stack_name")
 		spec := r.String("spec")
 
-		updated, changed := scopeSpecNetworkNames(spec, stackName)
+		updated, changed := rescopeSpecNetworkNames(spec, stackName, renamed, existing)
 		if !changed {
 			continue
 		}
@@ -248,75 +270,65 @@ func migrateVMSpecNetworkNames(ctx context.Context, c *Client) error {
 	return nil
 }
 
-// scopeSpecNetworkNames does a targeted update of the "name" fields inside
-// the "network" array of a VMSpec JSON string. Returns the updated JSON and
-// whether any changes were made.
-func scopeSpecNetworkNames(specJSON, stackName string) (string, bool) {
-	// Quick check: if no network field, nothing to do.
-	if !strings.Contains(specJSON, `"network"`) {
-		return specJSON, false
-	}
-
-	prefix := stackName + "_"
-	changed := false
-	result := specJSON
-
-	// The spec JSON stores network attachments as:
-	//   "network":[{"name":"LAN",...},...]
-	// We need to find each "name":"X" inside network objects and prefix
-	// those that aren't already scoped. Use simple string replacement
-	// since the network names don't contain special characters.
-	// We look for patterns like "name":"X" where X doesn't start with the prefix.
-	//
-	// A full JSON unmarshal/remarshal would be cleaner but risks reordering
-	// fields and changing the spec hash. This targeted approach preserves
-	// the exact JSON structure.
-
-	// Find all network attachment name values. They appear as:
-	//   "name":"<value>" inside the network array.
-	// We iterate to find each occurrence after "network":[
-	netIdx := strings.Index(result, `"network":[`)
+// rescopeSpecNetworkNames does a targeted rewrite of the "name" fields inside
+// the "network" array of a VMSpec JSON string, returning the updated JSON and
+// whether anything changed. A name is rewritten in exactly two cases:
+//
+//   - it is a key of renamed: the network it refers to was rescoped by this
+//     pass, so the attachment follows it;
+//   - it carries the VM's stack prefix, no network of that name exists, and
+//     the plain name does: an earlier pass mis-prefixed an attachment to an
+//     unscoped network, and the blob is healed back to the real name.
+//
+// Every other name — in particular an external network attached under its
+// plain name — is left exactly as it is. The rewrite works on the JSON text
+// rather than unmarshal/remarshal so no other field is dropped or reordered.
+func rescopeSpecNetworkNames(specJSON, stackName string, renamed map[string]string, existing map[string]bool) (string, bool) {
+	netIdx := strings.Index(specJSON, `"network":[`)
 	if netIdx == -1 {
 		return specJSON, false
 	}
+	prefix := stackName + "_"
 
 	// Work within the network array portion.
 	arrStart := netIdx + len(`"network":[`)
-	// Find matching ]
 	depth := 1
 	arrEnd := arrStart
-	for arrEnd < len(result) && depth > 0 {
-		if result[arrEnd] == '[' {
+	for arrEnd < len(specJSON) && depth > 0 {
+		if specJSON[arrEnd] == '[' {
 			depth++
-		} else if result[arrEnd] == ']' {
+		} else if specJSON[arrEnd] == ']' {
 			depth--
 		}
 		arrEnd++
 	}
+	section := specJSON[arrStart : arrEnd-1]
+	changed := false
 
-	networkSection := result[arrStart : arrEnd-1]
-	updatedSection := networkSection
-
-	// Replace "name":"X" patterns where X doesn't have the prefix.
 	nameTag := `"name":"`
 	offset := 0
 	for {
-		idx := strings.Index(updatedSection[offset:], nameTag)
+		idx := strings.Index(section[offset:], nameTag)
 		if idx == -1 {
 			break
 		}
 		valueStart := offset + idx + len(nameTag)
-		valueEnd := strings.Index(updatedSection[valueStart:], `"`)
+		valueEnd := strings.Index(section[valueStart:], `"`)
 		if valueEnd == -1 {
 			break
 		}
-		value := updatedSection[valueStart : valueStart+valueEnd]
+		value := section[valueStart : valueStart+valueEnd]
 
-		if !strings.HasPrefix(value, prefix) && value != "" {
-			scopedValue := prefix + value
-			updatedSection = updatedSection[:valueStart] + scopedValue + updatedSection[valueStart+valueEnd:]
+		replacement := ""
+		if to, ok := renamed[value]; ok && to != value {
+			replacement = to
+		} else if plain := strings.TrimPrefix(value, prefix); plain != value && !existing[value] && existing[plain] {
+			replacement = plain
+		}
+		if replacement != "" {
+			section = section[:valueStart] + replacement + section[valueStart+valueEnd:]
 			changed = true
-			offset = valueStart + len(scopedValue) + 1
+			offset = valueStart + len(replacement) + 1
 		} else {
 			offset = valueStart + valueEnd + 1
 		}
@@ -325,7 +337,5 @@ func scopeSpecNetworkNames(specJSON, stackName string) (string, bool) {
 	if !changed {
 		return specJSON, false
 	}
-
-	result = result[:arrStart] + updatedSection + result[arrEnd-1:]
-	return result, true
+	return specJSON[:arrStart] + section + specJSON[arrEnd-1:], true
 }

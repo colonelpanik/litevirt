@@ -21,6 +21,10 @@ images:
   test:
     source: file:///dev/null
 
+networks:
+  lan:
+    external: true
+
 vms:
   box-1:
     image: test
@@ -30,6 +34,8 @@ vms:
       root: 10G
     labels:
       owner: fleet-test
+    network:
+      - name: lan
     placement:
       host: node-0
     cloud-init:
@@ -62,6 +68,14 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
 		t.Fatalf("stage image file: %v", err)
 	}
+	// The external network the VM attaches to must already exist. A direct
+	// (macvtap) network is the family an unprivileged harness can attach a VM
+	// NIC to: it resolves to "direct:<iface>" and never runs `ip link add`.
+	if err := corrosion.UpsertNetwork(ctx, node.DB, corrosion.NetworkRecord{
+		Name: "lan", Type: "direct", Config: `{"type":"direct","interface":"lo"}`,
+	}); err != nil {
+		t.Fatalf("seed external network: %v", err)
+	}
 	client := c.SelfClient(node)
 
 	deployAndDrain(t, ctx, client, &pb.DeployStackRequest{ComposeYaml: composeCloudInit})
@@ -74,6 +88,22 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 		t.Fatal("first deploy stored a spec without a uuid")
 	}
 	eventsBefore := len(node.Virt.EventLog())
+
+	// Every daemon start runs the legacy network-name migration over the
+	// stored specs. It used to prefix EVERY attachment name with the stack,
+	// including an external network attached under its plain name — so after
+	// the first restart the blob pointed at "<stack>_lan", and the unchanged
+	// compose attachment read as a network-topology change (a recreate).
+	if err := corrosion.MigrateLegacyNetworkNames(ctx, node.DB); err != nil {
+		t.Fatalf("MigrateLegacyNetworkNames: %v", err)
+	}
+	afterRestart, err := corrosion.GetVM(ctx, node.DB, "box-1")
+	if err != nil || afterRestart == nil {
+		t.Fatalf("GetVM after migration: vm=%v err=%v", afterRestart, err)
+	}
+	if !strings.Contains(afterRestart.Spec, `"network":[{"name":"lan"}]`) {
+		t.Errorf("startup migration rewrote the external network attachment in the stored spec: %s", afterRestart.Spec)
+	}
 
 	// The server's own plan for the same file must be a no-op for the VM.
 	for _, op := range dryRunPlan(t, ctx, client, composeCloudInit) {

@@ -22,7 +22,7 @@ var sanctionedSpecWriters = map[string]string{
 	"InsertVMWithHardware":      "creates the row (InsertVM delegates here with nics/pciIntents nil)",
 	"BeginVMCreateOperation":    "creates the provisional row with its operation barrier in the same transaction",
 	"CommitVMCreateOperation":   "commits the provisional row's desired/observed fields under operation+owner+generation fencing",
-	"RenameVM":                  "structural rename — changes the primary key, can't use a name-keyed CAS",
+	"execVMRekey":               "structural rename — changes the primary key, can't use a name-keyed CAS",
 	"BeginVMOperation":          "F1 op-start: sets desired spec + bumps generation + claims the barrier atomically",
 	"MutateDesiredSpec":         "THE sanctioned desired-spec writer",
 	"UpdateObservedActuals":     "THE sanctioned cpu_actual/mem_actual writer",
@@ -37,6 +37,11 @@ var sanctionedSpecWriters = map[string]string{
 	"validateGuardedCreateBeginEntry": "fingerprints the exact create-begin batch envelope; " +
 		"it does not execute a write",
 	"HistoricalShapes": "enumerates retained SQL strings for compatibility-ledger generation; " +
+		"it does not execute a write",
+	"vmReplaceStatements": "guarded VM-name replacement — writes the replacement's spec AT the " +
+		"contested name under a single receiver decision; there is no name-keyed CAS to use " +
+		"because the row being written is not the row being read",
+	"validateGuardedVMReplaceEntry": "fingerprints the exact guarded-replace batch envelope; " +
 		"it does not execute a write",
 }
 

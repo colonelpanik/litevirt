@@ -14,9 +14,11 @@ grpc_port: 7443
 # Prometheus metrics endpoint (HTTP, no auth).
 metrics_port: 7444
 
-# Address the /metrics endpoint listens on. Empty (default) binds all
-# interfaces; set "127.0.0.1" to restrict it to localhost (scrape via a
-# local exporter / SSH tunnel only).
+# Address the /metrics endpoint listens on. Empty (default) binds ALL
+# interfaces, and that endpoint has NO auth and NO TLS — set "127.0.0.1" or a
+# management-network address. See "Metrics endpoint exposure" below for what is
+# readable without a credential; the daemon warns at startup while this is
+# world-readable.
 metrics_bind: ""
 
 # Web UI port (HTTP).
@@ -236,6 +238,22 @@ enforcement:
                               # until the deferred operator-run contract (see docs/diagnostics.md).
                               # The flag gates advertisement/opt-in only; it does not revoke an
                               # already-formed latch. Advertised only while on; enable fleet-uniformly.
+  vm_replace: false           # allow `lv cutover` to give a replacement VM the name a replaced VM
+                              # still holds. The replaced VM is soft-deleted, so its tombstone still
+                              # occupies that PRIMARY KEY, and no pre-existing replicated statement
+                              # shape makes the handover safe on a RECEIVER — the batch needs ONE
+                              # receiver decision over both VMs' incarnations and authority, which
+                              # is a guard protocol only an upgraded peer understands. Advertised
+                              # only while this flag is on, and `lv cutover` REFUSES until the flag
+                              # is set AND vm_replace_v1 has latched fleet-wide — refusing before it
+                              # stops a domain or writes to either VM, so a cluster that has not
+                              # opted in gets a cutover that declines rather than one that
+                              # half-applies. Requires enforcement.operation_protocol as well:
+                              # the transition displaces the rows describing what the replaced
+                              # VM owned, so the cleanup manifest is journaled as an operation
+                              # and the step authorizing the destruction is committed with the
+                              # transition. Enable fleet-uniformly; the flag is the reversible
+                              # kill switch.
   project_authority: false    # route the PROJECT-QUOTA half of an admission to the project's
                               # admission-authority holder instead of deciding from this node's
                               # replica. Admission counts in-flight reservations, but two nodes
@@ -281,7 +299,14 @@ enforcement:
                               # backfill every workload this host owns from the pre-epoch 0
                               # to a real generation, stamping its runtime marker (libvirt
                               # domain metadata / the container marker file) in the same
-                              # pass. The token is advertised only once this node is READY —
+                              # pass. A VM created through CreateVM does not normally need
+                              # that sweep: it is assigned the first generation and both its
+                              # markers are stamped before the call returns, REGARDLESS of
+                              # this flag. Nothing else is: a VM created by template
+                              # instantiation, import, restore or promote still lands at
+                              # epoch 0, as does every container and any VM whose graduation
+                              # failed, so this sweep remains what graduates them.
+                              # The token is advertised only once this node is READY —
                               # flag on and no owned workload left at epoch 0 — so the fleet
                               # can never latch across a node whose workloads are still
                               # ungraduated. Enforcement (refusing a stale rejoined replica's
@@ -621,6 +646,46 @@ counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising co
 means something on the host keeps trying to bounce the orchestrator, which is
 worth chasing even though the daemon now survives it.
 
+## VM defaults
+
+Cluster-wide defaults stamped onto a VM at **create** time. They shape new specs
+only — nothing here reinterprets a spec that is already stored, so changing one
+can never move a running guest's hardware underneath it.
+
+```yaml
+vm:
+  default_cpu_mode: host-model     # default host-model
+```
+
+`default_cpu_mode` is the `cpu_mode` a create writes into a spec that named none:
+`host-model` or `host-passthrough`. It is the setting that decides what CPU your
+guests actually see.
+
+**Why this has a default at all.** With no CPU mode, litevirt emits no `<cpu>`
+element, libvirt passes no `-cpu` to QEMU, and the guest lands on QEMU's x86_64
+default: `qemu64`. That model reports no `sse4.1`, no `sse4.2` and no `xsave`, so
+it has neither AVX nor AVX2 — on a host that has all three. Guest software built
+against a modern baseline then refuses to start, and the failure looks like a
+broken binary rather than a hypervisor setting. There is deliberately **no value
+here that restores that behavior**.
+
+**Why `host-model` and not `host-passthrough`.** `host-model` resolves, at domain
+start, to the closest named model the host supports plus its extra feature flags:
+the guest gets the host's modern ISA while staying migratable to any host with an
+equal-or-richer CPU. `host-passthrough` exposes the host CPU verbatim — marginally
+faster, and the only mode that carries nested virtualization (`vmx`/`svm`) and
+every last feature flag — but it pins live migration to effectively identical
+hardware, which is at odds with migration, failover and rebalancing. Set it only
+on a uniform fleet.
+
+For a deliberately heterogeneous fleet, hold one baseline per VM instead:
+`lv run --cpu-mode custom --cpu-model x86-64-v3`. `custom` is not accepted here,
+because a cluster-wide default cannot supply the per-VM model it requires.
+
+A VM created before this default existed keeps its empty `cpu_mode` and renders
+exactly as it always has. List them with `lv doctor cpu-mode` and move one
+forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
+
 ## Capacity and overcommit
 
 How much of a host litevirt is willing to hand to workloads. Cluster-wide
@@ -697,16 +762,114 @@ To exceed the policy deliberately for one VM, pass `--allow-overcommit` to
 `lv run` or `lv start`; the host check is skipped (project quota still applies)
 and the bypass is audited.
 
+## Metrics endpoint exposure
+
+`/metrics` on `metrics_port` has **no TLS and no authentication**, and
+`metrics_bind` defaults to **all interfaces**. Anyone who can reach the port
+reads, without a credential:
+
+- every VM and container name on this host, with CPU and memory allocations,
+  and for VMs live disk and network I/O counters (per-VM traffic volume)
+- host names, capacity and `litevirt_host_pressure{host,dim}` for **every host
+  in the cluster**, not only this one, plus every peer name via
+  `litevirt_peer_healthy`, `litevirt_cluster_clock_skew_seconds` and
+  `litevirt_replication_peer_pending_entries`
+- `litevirt_vm_snapshot_chain_depth{vm}`, which carries VM names from other hosts
+- `litevirt_enforcement_config_enabled{feature}` and
+  `litevirt_enforcement_latched{feature}` — which hardening kill-switches are
+  set on this node and which capability tokens have latched
+- `litevirt_auth_bearerless_client_admin_total`, whose own help text describes
+  it as the population strict mTLS would deny, plus
+  `litevirt_audit_chain_findings{kind}` and `litevirt_ha_degraded{reason}`
+- `go_info{version}` and `process_*` from the default registry — the exact Go
+  toolchain version, i.e. which runtime CVEs apply
+
+The enforcement gauges are worth naming separately: read together they say which
+hardening features are **not** in force here, which is what an attacker choosing
+an approach would want. No API path hands that out without a credential — today
+the gRPC API carries no enforcement posture on any RPC. So this endpoint is a
+weaker gate than the API for **posture**, not only for the inventory described
+below: it is the only place the kill-switch readout is published at all, and it
+is published to anyone who can reach the port.
+
+The inventory is a different gate, and how much weaker this endpoint is depends
+on one flag:
+
+- with `auth.strict_mtls_identity` **off** (the default), a bearerless
+  CA-signed client certificate is treated as admin, so the API inventory is
+  gated by a credential distributed to every operator — roughly what
+  `/metrics` gives away for free
+- with the flag **on** *and* `strict_mtls_identity_v1` latched cluster-wide —
+  enforcement is `flag && latch`, like the rest of the family, so setting the
+  flag alone changes nothing until the token latches — that same certificate is
+  refused without a session (`run lv login`). The API inventory then needs a
+  real identity while `/metrics` still needs nothing. **Enforcing strict mTLS
+  widens this gap rather than closing it** — the metrics endpoint becomes the
+  weakest path to the inventory, and `metrics_bind` is the only thing narrowing
+  it. During the flag-on-but-not-yet-latched window the first case still
+  applies, and `litevirt_auth_bearerless_client_admin_total` counts the
+  requests that would be denied once it latches
+
+`/api/v1/status` is served on the same port and is also unauthenticated (and
+method-unrestricted). The same path on `rest_port` requires a bearer token.
+Fronting only `/metrics` with a proxy or a path ACL leaves it open.
+
+That default is reasonable on a trusted management network and poor anywhere
+else, and the daemon cannot tell which it is on — so it logs a warning at
+startup when the bind reaches every interface, and a differently-worded one when
+it is a **public** address, which is almost never deliberate for an endpoint
+with no authentication. It is left as the default because changing it would
+silently break every deployment scraping from a remote Prometheus, the way any
+listener change does.
+
+**Silence is not a safety claim.** No warning means the bind is neither a
+wildcard nor obviously public — a loopback, RFC1918, CGNAT/tailnet or link-local
+address, or a hostname, which is deliberately not resolved (resolution at startup
+can block and can disagree with what the listener does). Whether the networks
+that can reach it are trusted is not something the daemon can know.
+
+Restrict it by binding one interface — pick **one** of these:
+
+```yaml
+metrics_bind: "127.0.0.1"
+```
+
+```yaml
+metrics_bind: "10.13.200.5"
+```
+
+The first scrapes via a local exporter or an SSH tunnel; the second exposes it on
+a management network only. Both IPv6 wildcard spellings also work — `"::"` and
+`"[::]"`.
+
+`metrics_port: 0` disables the endpoint entirely.
+
+A host firewall achieves the same thing without a config change, but litevirt
+ships no host-firewall guidance and `metrics_bind` is the supported route. Note
+that [firewall.md](firewall.md) is about the **guest** firewall — per-NIC
+security groups for VM traffic — and does nothing to the daemon's own listeners.
+
+`ui_port` already defaults to localhost and this does not, which is a historical
+difference rather than a judgement that this endpoint carries less.
+
 ## Ports summary
 
 | Setting | Default | Protocol | Purpose |
 |---------|---------|----------|---------|
-| `grpc_port` | 7443 | gRPC/mTLS | API (CLI, inter-host) |
-| `metrics_port` | 7444 | HTTP | Prometheus `/metrics` |
-| `ui_port` | 7445 | HTTP | Web dashboard |
-| `rest_port` | 7446 | HTTP | REST API gateway |
-| `gossip_port` | 7946 | TCP+UDP | Cluster membership |
-| `dns_port` | 5354 | UDP | VM name DNS |
+| Setting | Default | Protocol | Authenticated? | Default bind | Purpose |
+|---------|---------|----------|----------------|--------------|---------|
+| `grpc_port` | 7443 | gRPC/mTLS | yes — mTLS, client cert required | all | API (CLI, inter-host) |
+| `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
+| `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
+| `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
+| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey` | **all** | Cluster membership |
+| `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |
+
+Three of these are unauthenticated, not one. `rest_port` and `ui_port` are
+protected by *binding to loopback* rather than by their credential, which is the
+same mechanism `metrics_bind` offers and the reason the bind column is here.
+Restricting `gossip_port` and `dns_port` is out of scope for this setting — they
+are listed so this table is not read as a claim that only `/metrics` is open.
 
 ## Environment variables
 

@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	lvpkg "github.com/litevirt/litevirt/internal/libvirt"
 )
 
 func newRunCmd() *cobra.Command {
@@ -33,6 +34,8 @@ func newRunCmd() *cobra.Command {
 		restartWin   string
 		secureBoot   bool
 		tpm          bool
+		cpuMode      string
+		cpuModel     string
 
 		allowOvercommit bool
 	)
@@ -58,6 +61,13 @@ func newRunCmd() *cobra.Command {
 					StopDelaySec:  stopDelay,
 					SecureBoot:    secureBoot,
 					Tpm:           tpm,
+					CpuMode:       cpuMode,
+					CpuModel:      cpuModel,
+				}
+				// Validate here too, so a typo costs a round trip and not a
+				// half-understood server error.
+				if err := lvpkg.ValidateCPUMode(cpuMode, cpuModel); err != nil {
+					return err
 				}
 				if disk != "" {
 					spec.Disks = []*pb.DiskSpec{{Name: "root", Size: disk, Bus: "virtio"}}
@@ -86,6 +96,10 @@ func newRunCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&name, "name", "", "VM name (required)")
 	cmd.Flags().Int32Var(&cpu, "cpu", 2, "Number of vCPUs")
+	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "",
+		"CPU mode: host-passthrough|host-model|custom (default host-model — the guest gets the host's "+
+			"AVX/AVX2/SSE4.2; host-passthrough adds nested virt but pins live migration to identical hardware)")
+	cmd.Flags().StringVar(&cpuModel, "cpu-model", "", "CPU model for --cpu-mode custom (e.g. x86-64-v3)")
 	cmd.Flags().Int32Var(&memory, "memory", 4096, "Memory in MiB (boot allocation)")
 	cmd.Flags().Int32Var(&minMemory, "min-mem", 0, "Minimum memory in MiB the balloon may reclaim to (0 = none)")
 	cmd.Flags().Int32Var(&maxMemory, "max-mem", 0, "Maximum memory in MiB the guest may balloon up to (0 = fixed at --memory)")

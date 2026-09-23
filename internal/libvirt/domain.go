@@ -77,6 +77,24 @@ func (c *Client) UndefineDomain(name string, removeStorage bool) error {
 	return nil
 }
 
+// DomainIsActive asks libvirt whether a domain is ACTIVE, which is not the same
+// question as DomainState's coarse lifecycle view: that collapses paused,
+// shut-off and pm-suspended all to "stopped", and a PAUSED domain is very much
+// active. An undefine of an active domain does not remove it — it survives as a
+// transient domain still holding its UUID — so any caller about to undefine has
+// to ask this, not infer it from a state string.
+func (c *Client) DomainIsActive(name string) (bool, error) {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return false, fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	active, err := c.virt.DomainIsActive(dom)
+	if err != nil {
+		return false, fmt.Errorf("domain %s is-active: %w", name, err)
+	}
+	return active != 0, nil
+}
+
 // UndefineDomainPreservingState undefines a domain WITHOUT deleting its NVRAM or
 // vTPM state (G1). Use for redefine-class operations that tear the domain down
 // only to immediately redefine the SAME VM (snapshot revert, UpdateVM redefine,

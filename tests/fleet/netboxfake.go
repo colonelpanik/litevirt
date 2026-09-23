@@ -41,9 +41,13 @@ type NetBoxFake struct {
 	clusterTypes map[string]int
 	clusters     map[string]int
 	devices      map[string]int
-	nextVM       int
-	nextIface    int
-	nextNamed    int
+	// deviceCluster is each DCIM device's virtualization cluster, keyed by
+	// device id; 0 means the device belongs to no cluster. NetBox validates a
+	// virtual_machine's device against it — see deviceClusterLocked.
+	deviceCluster map[int]int
+	nextVM        int
+	nextIface     int
+	nextNamed     int
 
 	// writers is the set of API tokens that have issued an inventory write, and
 	// patches counts every PATCH served. Each fleet node carries its own token,
@@ -233,12 +237,13 @@ func NewNetBoxFake() *NetBoxFake {
 		prefixes: map[int]fakePrefix{},
 		vrfs:     map[int]bool{},
 
-		vms:          map[int]*fakeVM{},
-		ifaces:       map[int]*fakeIface{},
-		clusterTypes: map[string]int{},
-		clusters:     map[string]int{},
-		devices:      map[string]int{},
-		writers:      map[string]bool{},
+		vms:           map[int]*fakeVM{},
+		ifaces:        map[int]*fakeIface{},
+		clusterTypes:  map[string]int{},
+		clusters:      map[string]int{},
+		devices:       map[string]int{},
+		deviceCluster: map[int]int{},
+		writers:       map[string]bool{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
@@ -423,7 +428,7 @@ func (f *NetBoxFake) handle(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, clustersAPIPath):
 		f.namedCollection(w, r, f.clusters, f.nextNamedID)
 	case strings.HasPrefix(r.URL.Path, devicesAPIPath):
-		f.namedCollection(w, r, f.devices, f.nextNamedID)
+		f.deviceCollection(w, r)
 	case strings.HasSuffix(r.URL.Path, "/available-ips/"):
 		f.claimAvailable(w, r)
 	case r.URL.Path == "/api/ipam/ip-addresses/" && r.Method == http.MethodPost:

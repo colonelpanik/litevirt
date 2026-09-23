@@ -95,6 +95,8 @@ lv host ceph osd-tree                     # Ceph CRUSH topology
 ```bash
 lv run --name <vm> --image <img> [flags]  # Create and start a VM
   --cpu <n>             # vCPUs (default 2)
+  --cpu-mode <mode>     # host-passthrough|host-model|custom (default host-model)
+  --cpu-model <model>   # CPU model for --cpu-mode custom, e.g. x86-64-v3
   --memory <mib>        # Memory in MiB (default 4096)
   --disk <size>         # Root disk size (default 20G)
   --host <name>         # Target host (auto-placed if omitted)
@@ -116,6 +118,25 @@ lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```
 
+**CPU mode.** The default, `host-model`, gives the guest the host's modern
+instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
+live migration to a host with an equal-or-richer CPU. It matters because the
+alternative is not "a slightly older CPU": with no mode at all, QEMU falls back to
+`qemu64`, which has no AVX, and guest software built against a modern baseline
+will not start.
+
+`host-passthrough` exposes the host CPU verbatim and is the only mode that carries
+nested virtualization into the guest, at the cost of pinning live migration to
+effectively identical hardware. `custom` needs `--cpu-model` and is how you hold
+one baseline across a heterogeneous fleet. The cluster-wide default is
+`vm.default_cpu_mode` (see [configuration](configuration.md)); `lv doctor cpu-mode`
+lists VMs created before it existed, which are still on `qemu64`.
+
+Changing the mode on an existing VM is an in-place edit — `lv update <vm>
+--cpu-mode host-model` on a stopped VM, or with `--restart-if-needed` to fold the
+stop/start in. It patches libvirt's own domain XML rather than regenerating it, so
+guest PCI addresses and controller models are preserved.
+
 ## VM configuration
 
 ```bash
@@ -129,7 +150,8 @@ lv update <vm> --restart on-failure          # set/clear restart policy (live)
   [--restart none]                           # clear the policy
 lv update <vm> [--onboot] [--startup-order N] [--start-delay N] [--stop-delay N]   # autostart/ordering (live)
 lv update <vm> [--cpu N] [--memory N]        # resources — VM must be STOPPED
-  [--cpu-mode host-passthrough|host-model|custom] [--disable-vnc]
+  [--cpu-mode host-passthrough|host-model|custom] [--cpu-model <model>]
+  [--disable-vnc]
   [--machine q35] [--firmware uefi|bios] [--guest-agent]
   [--min-mem N] [--max-mem N]
   [--max-cpu N]                              # vCPU hotplug ceiling (needs live_resize);
@@ -145,6 +167,39 @@ lv cutover <vm>                              # Snapshot-and-replace update
 lv resize-disk <vm> --disk <name> --size <size>   # Grow a disk
 lv stats <vm>                                # VM resource statistics
 ```
+
+`lv cutover <vm>` gives the `<vm>-next` replacement the original's name. The replaced
+VM is deleted first, and a delete is a SOFT delete, so its rows still hold the primary
+keys the replacement needs. Taking them is a single guarded transition rather than a
+purge or a two-step move: a purge is applied unconditionally by a lagging peer while the
+write meant to replace the row is not, and two steps can apply independently there. The
+row installed at the name keeps the REPLACEMENT's `created_at` and carries authority
+above both VMs, which is what stops a lagging peer's pre-delete copy of the replaced VM
+from reappearing on top of it.
+
+A cutover of a RUNNING replacement restarts it, and `lv cutover` prints that before it
+starts. libvirt has no operation that moves a live domain to another name, so the
+replacement is stopped — a PAUSED one too, since a paused domain is still active — then
+redefined under the new name and started again. The cutover's journal makes that restart
+survive an interruption.
+
+That needs receiver behaviour an older peer does not have, so cutover **refuses** until
+`enforcement.vm_replace` is set on every node and `vm_replace_v1` has latched — refusing
+before it stops a domain or writes to either VM. See docs/diagnostics.md.
+
+A cutover retires the replaced VM's domain only on the node it runs on. If the replaced
+VM is hosted elsewhere, cutover asks that node instead, and **refuses** unless it reports
+no domain left at the name — a domain still defined there, an incomplete survey, or a
+node it cannot reach all refuse, before anything is written. Stop and remove the original
+on its own host first.
+
+The database transition runs before the replaced VM's disks and firmware state are
+freed, so a cutover that fails partway leaves the original intact and can simply be
+retried. Because that transition also displaces the rows describing what the replaced
+VM owned, the cleanup is journaled as a `vm_replace` operation whose manifest is
+recorded first and whose authorizing step is committed with the transition — so a
+daemon that dies in between finishes the cleanup when it restarts. Cutover therefore
+requires `enforcement.operation_protocol` alongside `enforcement.vm_replace`.
 
 ## Secure Boot + vTPM (Windows 11)
 
@@ -766,6 +821,7 @@ lv stats <vm>                                # VM resource statistics
 ```bash
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
+lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
 ```
 
 `divergence` is read-only; `repair-owner` is an audited, admin-gated repair for an

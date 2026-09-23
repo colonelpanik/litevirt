@@ -55,7 +55,12 @@ type netboxWriter interface {
 	AssignIPToInterface(ctx context.Context, ipID, ifaceID int) error
 	ClearIPAssignment(ctx context.Context, ipID int) error
 
-	FindDeviceByName(ctx context.Context, name string) (int, error)
+	FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error)
+
+	// SetPrimaryIP4 points a VM at its main address. Separate from UpdateVM
+	// because NetBox only accepts a primary already assigned to an interface of
+	// that VM, which is never true at create time.
+	SetPrimaryIP4(ctx context.Context, vmID, ipID int) error
 
 	// The cluster every mirrored VM hangs off, resolved once per sweep. Both
 	// halves are here because a cluster cannot be created without its type, and
@@ -283,6 +288,8 @@ func (r *Reconciler) applyOne(ctx context.Context, a Action, idx desiredIndex, f
 		// other into the set Diff clears from — so this branch cannot detach an
 		// operator's address even by mistake.
 		return r.nb.ClearIPAssignment(ctx, a.IPID)
+	case a.Kind == kindVM && a.Op == opPrimaryIP:
+		return r.setPrimaryIP(ctx, a)
 	case a.Op == "delete":
 		return r.deleteObject(ctx, a)
 	default:
@@ -685,6 +692,31 @@ func (r *Reconciler) parentVMID(ctx context.Context, a Action, dn desiredNIC) (i
 	return ref.NetBoxID, nil
 }
 
+// setPrimaryIP points a mirrored VM's primary_ip4 at the address on its own
+// first NIC, or clears it.
+//
+// The VM id is resolved exactly as a NIC's parent is — ACTUAL state first, then
+// the mapping row the VM phase wrote this sweep — because a VM created this pass
+// was absent from actual state and carries no id on its actions. See parentVMID.
+//
+// A VM with no resolvable id is SKIPPED, not an error: the only way to reach it
+// is a VM whose create failed earlier in this same sweep, which already failed
+// the pass, and turning it into a second error would bury the first.
+func (r *Reconciler) setPrimaryIP(ctx context.Context, a Action) error {
+	vmID := a.ParentNetBoxID
+	if vmID == 0 {
+		ref, err := corrosion.GetObjectRef(ctx, r.db, kindVM, a.Key)
+		if err != nil {
+			return fmt.Errorf("netboxsync: read mapping for VM %s: %w", a.Key, err)
+		}
+		if ref == nil {
+			return nil
+		}
+		vmID = ref.NetBoxID
+	}
+	return r.nb.SetPrimaryIP4(ctx, vmID, a.IPID)
+}
+
 // keepOldest resolves a search result to the one object to adopt.
 //
 // Exactly one match is adopted. More than one is the transient duplicate NetBox
@@ -728,15 +760,19 @@ func (r *Reconciler) recordRef(ctx context.Context, kind, identity, netboxKind s
 // has no prior link to preserve. The UPDATE path must not use it, or it writes
 // back a link the diff decided to clear; see updateVM.
 //
-// Best-effort in BOTH directions: a lookup failure and a host that is simply not
-// modelled both mean "no link", and the write body then sends device: null. An
-// operator who does not model hosts in NetBox must still get a working mirror,
-// so this can never return an error.
+// Best-effort in THREE directions: a lookup failure, a host that is simply not
+// modelled, and a host whose device belongs to another cluster all mean "no
+// link", and the write body then sends device: null. An operator who does not
+// model hosts in NetBox — or models them outside this cluster — must still get a
+// working mirror, so this can never return an error.
+//
+// The cluster scope is what makes the third case a non-link rather than a 400
+// that fails the sweep; see netbox.FindDeviceInCluster.
 func (r *Reconciler) deviceID(ctx context.Context, d DesiredVM) int {
 	if d.DeviceID != 0 || d.Host == "" {
 		return d.DeviceID
 	}
-	id, err := r.nb.FindDeviceByName(ctx, d.Host)
+	id, err := r.nb.FindDeviceInCluster(ctx, d.Host, r.clusterID)
 	if err != nil {
 		slog.Debug("netbox: host device lookup failed; mirroring without the link", "error", err)
 		return 0

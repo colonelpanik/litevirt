@@ -348,6 +348,43 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
+
+	// Refuse to remove the last account that can administer the cluster.
+	//
+	// There is no way back from that state through the API: `lv user
+	// reset-admin` resets an EXISTING admin and deliberately refuses to mint a
+	// missing one, and the daemon's startup seed only mints when the cluster has
+	// never had a user at all. So the recovery path is rebuilding a node.
+	//
+	// The delete is also a soft delete, which makes the state worse than empty
+	// rather than merely empty: a tombstoned admin is a row InsertUser will
+	// REACTIVATE (`SET deleted_at = NULL`) with a fresh password and the admin
+	// role still attached, and that reactivation replicates. A revoked
+	// administrator is therefore one careless "is there anybody" check away from
+	// coming back cluster-wide, so the cheapest place to stop it is here, before
+	// the tombstone is ever written.
+	//
+	// A lookup that FAILS is not a report that the user is harmless. Falling
+	// through on an unreadable database would skip the guard in exactly the
+	// conditions where its answer matters most.
+	target, err := corrosion.GetUser(ctx, s.db, req.Username)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "look up user %q: %v", req.Username, err)
+	}
+	if target != nil && target.Role == "admin" {
+		other, oerr := corrosion.OtherLiveAdminExists(ctx, s.db, req.Username)
+		if oerr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"check for another admin before deleting %q: %v", req.Username, oerr)
+		}
+		if !other {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"user %q is the cluster's last admin account; promote another user to "+
+					"admin before deleting it, or the cluster is left with no administrator",
+				req.Username)
+		}
+	}
+
 	if err := corrosion.DeleteUser(ctx, s.db, req.Username); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}

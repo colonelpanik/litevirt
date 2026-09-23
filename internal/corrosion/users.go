@@ -226,3 +226,27 @@ func looksLikeAPIToken(s string) bool {
 	}
 	return true
 }
+
+// OtherLiveAdminExists reports whether the cluster still has a live admin-role
+// account other than username.
+//
+// DeleteUser asks this before tombstoning a user, so both of the easy wrong
+// answers cost the cluster its administrator. Counting the target itself lets
+// the last admin delete itself. Counting a tombstoned row does the same, and is
+// the likelier mistake: InsertUser REACTIVATES a soft-deleted user rather than
+// inserting a fresh one (`SET deleted_at = NULL`), so a revoked admin is a row
+// that still exists, and any query that forgets `deleted_at IS NULL` sees it as
+// a live successor that cannot actually log in.
+//
+// A read that fails is neither answer, and is returned as an error rather than
+// collapsed into one — see UsersEverExisted for the same distinction on the
+// seeding side.
+func OtherLiveAdminExists(ctx context.Context, c *Client, username string) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL AND username != ? LIMIT 1`,
+		username)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}

@@ -64,6 +64,7 @@ func TestComposeDiff_UnchangedCloudInitStackIsNoChange(t *testing.T) {
 			CpuActual: 4, MemActualMib: 8192,
 			Spec: &pb.VMSpec{
 				Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1", Machine: "q35",
+				GuestAgent: true, Boot: "disk", CpuMode: "host-model",
 				CloudInit: &pb.CloudInitSpec{Userdata: userdata},
 			},
 		}}}, func() {}, nil
@@ -81,5 +82,66 @@ func TestComposeDiff_UnchangedCloudInitStackIsNoChange(t *testing.T) {
 	}
 	if strings.Contains(out, "cloud-init added") || strings.Contains(out, "image →") {
 		t.Errorf("diff reports phantom changes from the ListVMs projection:\n%s", out)
+	}
+}
+
+// The daemon plans a retry (an update, delete + recreate by default) for a VM
+// in error state. The CLI diff fed the planner the proto enum name
+// ("VM_ERROR") where it expects the stored state ("error"), so the same VM
+// read as unchanged — hiding a destructive step the server would take.
+func TestComposeDiff_ErrorStateVMIsRetried(t *testing.T) {
+	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n    cpu: 4\n    memory: 8192\n"
+	file := filepath.Join(t.TempDir(), "litevirt.yaml")
+	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origConnect := cli.Connect
+	t.Cleanup(func() { cli.Connect = origConnect })
+	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
+		return &projectionClient{full: []*pb.VM{{
+			Name: "box-1", StackName: "devs", HostName: "h1", State: pb.VMState_VM_ERROR,
+			CpuActual: 4, MemActualMib: 8192,
+			Spec: &pb.VMSpec{Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1", GuestAgent: true, Boot: "disk"},
+		}}}, func() {}, nil
+	}
+	out := captureStdout(t, func() {
+		cmd := newDiffCmd()
+		cmd.SetArgs([]string{"-f", file})
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("diff: %v", err)
+		}
+	})
+	if !strings.Contains(out, "1 to update") || !strings.Contains(out, "retry box-1") {
+		t.Errorf("an error-state VM must show as a retry, got:\n%s", out)
+	}
+}
+
+// With cpu/memory/image/cloud-init unchanged, an edit to any other spec field
+// (cpu-mode here) must still show as an update in the diff.
+func TestComposeDiff_CPUModeEditIsUpdate(t *testing.T) {
+	yaml := "name: devs\nvms:\n  box-1:\n    image: LTS-24.04\n    cpu: 4\n    memory: 8192\n    cpu-mode: host-passthrough\n"
+	file := filepath.Join(t.TempDir(), "litevirt.yaml")
+	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origConnect := cli.Connect
+	t.Cleanup(func() { cli.Connect = origConnect })
+	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
+		return &projectionClient{full: []*pb.VM{{
+			Name: "box-1", StackName: "devs", HostName: "h1", State: pb.VMState_VM_RUNNING,
+			CpuActual: 4, MemActualMib: 8192,
+			Spec: &pb.VMSpec{Name: "box-1", Image: "LTS-24.04", Cpu: 4, MemoryMib: 8192, Uuid: "u-1",
+				GuestAgent: true, Boot: "disk", CpuMode: "host-model", Machine: "q35"},
+		}}}, func() {}, nil
+	}
+	out := captureStdout(t, func() {
+		cmd := newDiffCmd()
+		cmd.SetArgs([]string{"-f", file})
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("diff: %v", err)
+		}
+	})
+	if !strings.Contains(out, "1 to update") || !strings.Contains(out, "cpu-mode") {
+		t.Errorf("a cpu-mode edit must show as an update naming the reason, got:\n%s", out)
 	}
 }

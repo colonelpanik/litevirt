@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,10 @@ vms:
     image: test
     cpu: 2
     memory: 1024
+    disks:
+      root: 10G
+    labels:
+      owner: fleet-test
     placement:
       host: node-0
     cloud-init:
@@ -91,6 +96,26 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 	}
 	if got := specUUID(t, second.Spec); got != firstUUID {
 		t.Errorf("VM identity changed across re-apply: uuid %s → %s", firstUUID, got)
+	}
+
+	// An edit outside the coarse cpu/memory/image/cloud-init fields is still a
+	// change: the planner compares the whole stored spec before calling a VM
+	// unchanged, so a cpu-mode edit plans an update and says why.
+	edited := strings.Replace(composeCloudInit, "    cpu: 2\n", "    cpu: 2\n    cpu-mode: host-passthrough\n", 1)
+	if edited == composeCloudInit {
+		t.Fatal("fixture edit did not apply")
+	}
+	planned := false
+	for _, op := range dryRunPlan(t, ctx, client, edited) {
+		if op.VmName == "box-1" && op.Phase == string(compose.OpUpdate) {
+			planned = true
+			if !strings.Contains(op.Detail, "cpu-mode") {
+				t.Errorf("update detail should name the cpu-mode change, got %q", op.Detail)
+			}
+		}
+	}
+	if !planned {
+		t.Error("cpu-mode edit with everything else unchanged was not planned as an update")
 	}
 }
 

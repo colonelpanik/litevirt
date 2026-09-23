@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // OpKind is the type of change in an execution plan.
@@ -41,6 +43,11 @@ type CurrentVM struct {
 	State         string
 	HostName      string
 	CloudInitHash string // sha256 of userdata+networkconfig, empty if none
+	// Spec is the VM's full stored spec when the caller has it. With it, Build
+	// runs the whole desired-vs-stored comparison (Classify) before calling a VM
+	// unchanged; without it only Image/CPU/MemMiB/CloudInitHash are compared and
+	// an edit to any other field (cpu-mode, labels, disk topology, …) is invisible.
+	Spec *pb.VMSpec
 }
 
 // Build produces an execution plan by diffing desired (compose file) vs current state.
@@ -121,6 +128,20 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			} else if vmDef.CloudInit == nil && cur.CloudInitHash != "" {
 				detail += " cloud-init removed"
 				changed = true
+			}
+
+			// The coarse fields above are what every caller can supply. When the
+			// stored spec is available, an edit to any other field must still be
+			// an update — otherwise it silently never reaches the executor.
+			if !changed && cur.Spec != nil {
+				desired, err := BuildVMSpec(instanceName, baseName, &vmDef, f)
+				if err != nil {
+					return nil, fmt.Errorf("build spec for %s: %w", instanceName, err)
+				}
+				if cp := Classify(desired, cur.Spec, StoredDisksFromSpec(cur.Spec)); cp.Max() != ActionNoChange {
+					detail += " " + cp.Reasons()
+					changed = true
+				}
 			}
 
 			// VMs in transient or error states are not in a stable steady

@@ -20,6 +20,28 @@ const (
 	probeConcurrency = 16
 )
 
+// HeartbeatInterval is how often an UNCHANGED host_health verdict is
+// re-published so it keeps a current updated_at.
+//
+// It applies ONLY to peers whose host row is 'offline' or 'fenced' — see
+// shouldPersistHealth, which is where that scoping is argued. Restamping every
+// healthy peer instead would be N*(N-1) replicated writes per interval.
+//
+// checkHost used to write only on transition. A failing peer changes every
+// probe (consecutive_failures increments), so the failing direction was always
+// fresh; a steadily healthy peer changed nothing and its row was written once
+// and never again. failover.recoverHosts counts healthy observers whose
+// updated_at is inside its freshness cutoff, so it normally saw none and a
+// fenced or offline host could not auto-recover.
+//
+// It MUST stay comfortably below failover's healthFreshness; that relationship
+// is pinned by TestHeartbeatFitsInsideHealthFreshness in internal/failover,
+// which is the package that owns the cutoff.
+//
+// A var, not a const, only so tests can shrink it; nothing in production
+// reassigns it.
+var HeartbeatInterval = 10 * time.Second
+
 // peerState tracks the last known health state for a peer so we only write
 // to the database on state transitions, not every tick.
 //
@@ -34,6 +56,10 @@ type peerState struct {
 	failures      int
 	lastHealthyAt time.Time // monotonic; zero if never probed healthy
 	lastFailureAt time.Time // monotonic; zero if never probed unhealthy
+	// lastWriteAt is when this observer last PUBLISHED a verdict for the peer
+	// (monotonic; zero until the first write). It drives the HeartbeatInterval
+	// re-publish that keeps an unchanged row's updated_at current.
+	lastWriteAt time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -271,6 +297,52 @@ func boundedFanout[T any](items []T, concurrency int, work func(T)) {
 	wg.Wait()
 }
 
+// recoveryPending reports whether the failover coordinator could auto-recover
+// a host in this state once it looks healthy again.
+//
+// These are exactly the two states recoverHosts acts on — everything else hits
+// its `default: continue`. 'maintenance' and 'draining' are operator intent and
+// are never auto-cleared, so a heartbeat for them would be traffic with no
+// reader.
+func recoveryPending(state string) bool {
+	return state == "offline" || state == "fenced"
+}
+
+// shouldPersistHealth decides whether this probe writes a host_health row.
+//
+// A transition always writes — that is the original contract and what every
+// other reader depends on. The second clause exists for ONE reader: the
+// coordinator's recovery quorum, which counts only rows newer than
+// failover.healthFreshness. A peer that comes back and then stays healthy
+// produces no further transitions, so without it the row froze at the instant
+// the peer went healthy; by the time recentlyFenced stopped suppressing
+// recovery five minutes later, the only healthy row on record was minutes old,
+// failed the freshness cutoff, and the host sat `offline` awaiting a manual
+// undrain.
+//
+// The heartbeat is deliberately narrow on both axes.
+//
+// It is limited to hosts AWAITING RECOVERY because the alternative — restamping
+// every healthy row on a timer — is N*(N-1) replicated writes per interval
+// across the cluster, for a reader that only ever looks at two states. The
+// other three consumers of this table do not need it: the fence quorum selects
+// `consecutive_failures >= offlineThreshold`, and a failing peer increments
+// that on every probe, so `changed` is already true and those rows are never
+// stale; GetClusterHealth and the metrics server read status and last_seen with
+// no freshness cutoff at all.
+//
+// And it is rate-limited to HeartbeatInterval rather than firing every probe,
+// because checkInterval is 2s and the cutoff it has to beat is 30s.
+//
+// That asymmetry — failing rows self-refresh, healthy ones do not — is why the
+// bug only ever showed up on the recovery path.
+func shouldPersistHealth(changed, healthy, recoveryPending bool, sinceLastWrite time.Duration) bool {
+	if changed {
+		return true
+	}
+	return healthy && recoveryPending && HeartbeatInterval > 0 && sinceLastWrite >= HeartbeatInterval
+}
+
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
 	// IPv6 literal, which "%s:%d" would mangle into an unparseable target. Every
@@ -282,16 +354,18 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	c.mu.Lock()
 	prev, exists := c.peers[host.Name]
 	if !exists {
+		// Deliberately NOT bootstrapped from the host_health row. A failure
+		// count is evidence THIS run gathered, and seeding it from the DB let a
+		// just-restarted daemon publish prev+1 with a current updated_at on its
+		// very first probe — a fence-quorum-eligible "suspect" verdict carrying
+		// a count it never observed. The healthy direction already refuses that
+		// credit (gate.go only counts a peer whose lastHealthyAt this run set);
+		// the failing direction is the same claim and gets the same rule.
+		//
+		// The cost is bounded and correct: after a restart a node must re-earn
+		// suspectThreshold consecutive failures — about 6 s at checkInterval —
+		// before it votes to fence again.
 		prev = &peerState{status: "", failures: 0}
-		// Bootstrap from DB so we pick up pre-existing failure counts
-		// (e.g. from a previous run of the checker).
-		rows, qerr := c.db.Query(ctx,
-			`SELECT consecutive_failures, status FROM host_health WHERE observer = ? AND target = ?`,
-			c.hostName, host.Name)
-		if qerr == nil && len(rows) == 1 {
-			prev.failures = rows[0].Int("consecutive_failures")
-			prev.status = rows[0].String("status")
-		}
 		c.peers[host.Name] = prev
 	}
 
@@ -321,9 +395,19 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	} else {
 		prev.lastFailureAt = mono
 	}
+	sinceWrite := time.Duration(0)
+	if !prev.lastWriteAt.IsZero() {
+		sinceWrite = mono.Sub(prev.lastWriteAt)
+	} else {
+		sinceWrite = HeartbeatInterval // never written: the first probe publishes
+	}
+	write := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
+	if write {
+		prev.lastWriteAt = mono
+	}
 	c.mu.Unlock()
 
-	if !changed {
+	if !write {
 		return
 	}
 

@@ -148,13 +148,12 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	healthy := make(map[string]bool, len(c.peers))
 	for name, ps := range c.peers {
 		// Count a peer toward quorum ONLY on a restart-local fresh probe success.
-		// peerState.status/failures are seeded from the host_health DB row at
-		// bootstrap (checker.go), so a just-restarted isolated node would otherwise
-		// read a peer as "healthy" from a STALE pre-restart row and briefly regain
-		// quorum until suspectThreshold fresh failures accrue — exactly the stale-row
-		// quorum Phase 1 removes. lastHealthyAt is a local monotonic anchor, zero
-		// until THIS run probes the peer healthy at least once, so it can't be
-		// credited across a restart.
+		// peerState is no longer seeded from the host_health DB row at bootstrap
+		// (checker.go stopped doing that, in both directions), but this guard is
+		// not redundant: lastHealthyAt is a local monotonic anchor, zero until
+		// THIS run probes the peer healthy at least once, so a peer can never be
+		// credited toward quorum on anything but a fresh probe of our own —
+		// whatever a future bootstrap decides to pre-populate.
 		healthy[name] = ps.status == "healthy" && !ps.lastHealthyAt.IsZero()
 	}
 	c.mu.Unlock()

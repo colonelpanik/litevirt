@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -58,5 +59,35 @@ func TestReseedDigestsConverged(t *testing.T) {
 	// reseed the node genuinely needs.
 	if _, mismatch := reseedDigestsConverged(local, map[string]string{"vms": "aaa"}); mismatch != "" {
 		t.Fatalf("a table absent on the source must not block: %q", mismatch)
+	}
+}
+
+// TestReseedLocalDigests_IncludesSensitiveTables is part of the #199
+// regression.
+//
+// reseedDigestsConverged compares whatever digests it is handed, and it was
+// handed the OPERATOR set only. The sensitive tables were neither cleared, nor
+// refetched, nor compared — so a reseed reported itself verified, cleared the
+// isolation epoch, and a healthy peer then pulled the quarantined secrets
+// fleet-wide. A reseed that cannot show the sensitive tables match its source
+// has not converged with it, so they have to be in the set that gets compared.
+func TestReseedLocalDigests_IncludesSensitiveTables(t *testing.T) {
+	s := testServer(t)
+	digests, err := s.reseedLocalDigests(context.Background())
+	if err != nil {
+		t.Fatalf("reseedLocalDigests: %v", err)
+	}
+	have := map[string]bool{}
+	for _, d := range digests {
+		have[d.Name] = true
+	}
+	for _, tbl := range corrosion.SensitiveTableNames() {
+		if !have[tbl] {
+			t.Errorf("%s is absent from the digests a reseed compares; a quarantined "+
+				"secret in it would clear the epoch unnoticed", tbl)
+		}
+	}
+	if !have["vms"] {
+		t.Error("the operator tables dropped out of the comparison")
 	}
 }

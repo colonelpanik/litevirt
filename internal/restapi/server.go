@@ -266,8 +266,17 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 		// DrainHost is a server-streaming RPC. If the client requested SSE,
 		// stream all progress events; otherwise return the first event then
 		// detach (legacy ack-only behavior).
-		stream, err := s.grpc.DrainHost(ctx, &pb.DrainHostRequest{Name: name})
+		// SSE keeps the request's context: the caller is watching, and a
+		// disconnect meaning "stop" is the existing behaviour. The ack path must
+		// NOT, because the handler returns immediately and net/http then cancels
+		// r.Context() — the stream's parent — killing the drain part-way.
+		opCtx, opCancel := ctx, context.CancelFunc(func() {})
+		if !wantsSSE(r) {
+			opCtx, opCancel = detachedOpContext(ctx)
+		}
+		stream, err := s.grpc.DrainHost(opCtx, &pb.DrainHostRequest{Name: name})
 		if err != nil {
+			opCancel()
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -281,6 +290,12 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		ackAndDetach("drain host "+name, opCancel, func() (proto.Message, error) {
+			if stream == nil {
+				return nil, io.EOF
+			}
+			return stream.Recv()
+		})
 		jsonWrite(w, map[string]string{"status": "draining", "host": name})
 
 	case action == "undrain" && r.Method == http.MethodPost:
@@ -520,8 +535,13 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.VmName = name
-		stream, err := s.grpc.MigrateVM(ctx, &req)
+		opCtx, opCancel := ctx, context.CancelFunc(func() {})
+		if !wantsSSE(r) {
+			opCtx, opCancel = detachedOpContext(ctx)
+		}
+		stream, err := s.grpc.MigrateVM(opCtx, &req)
 		if err != nil {
+			opCancel()
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -537,9 +557,16 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 		}
 		first, err := stream.Recv()
 		if err != nil {
+			opCancel()
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
+		ackAndDetach("migrate vm "+name, opCancel, func() (proto.Message, error) {
+			if stream == nil {
+				return nil, io.EOF
+			}
+			return stream.Recv()
+		})
 		jsonProto(w, first)
 
 	case action == "stats" && r.Method == http.MethodGet:
@@ -782,8 +809,13 @@ func (s *Server) handleStack(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, http.StatusBadRequest, "to or at least one map rule required")
 			return
 		}
-		stream, err := s.grpc.MigrateStackVolumes(ctx, req)
+		opCtx, opCancel := ctx, context.CancelFunc(func() {})
+		if !wantsSSE(r) {
+			opCtx, opCancel = detachedOpContext(ctx)
+		}
+		stream, err := s.grpc.MigrateStackVolumes(opCtx, req)
 		if err != nil {
+			opCancel()
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -797,6 +829,12 @@ func (s *Server) handleStack(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		ackAndDetach("migrate stack volumes "+name, opCancel, func() (proto.Message, error) {
+			if stream == nil {
+				return nil, io.EOF
+			}
+			return stream.Recv()
+		})
 		jsonWrite(w, map[string]string{"status": "migrating", "stack": name})
 
 	default:

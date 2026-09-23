@@ -372,10 +372,28 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		// on both sides: repairWouldAskSomeoneNew gives each unanswered peer only
 		// one full-price chance per memo window, so a dead peer cannot buy a
 		// second budget on every sweep.
+		//
+		// The repair ADDS to the first pass's evidence; it does not replace it.
+		// It used to re-seed `highest` from this node's own ledger and hand back
+		// only the second fan-out's answers, so a peer that reported the
+		// superseding term in the first pass and then stalled in the repair had
+		// its answer forgotten — the barrier accepted a term it had already seen
+		// superseded, on exactly the intermittent-peer failure it exists to
+		// survive. The observed maximum only rises, and an answer given once is
+		// evidence however the same peer fares a moment later.
 		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
-		highest, answers, answered = s.fanOutHighWater(rctx, key, local, peers, nil)
+		rHighest, _, rAnswered := s.fanOutHighWater(rctx, key, local, peers, nil)
 		rcancel()
-		s.noteFullyProbed(peers, answered)
+		s.noteFullyProbed(peers, rAnswered)
+		if rHighest > highest {
+			highest = rHighest
+		}
+		for p := range rAnswered {
+			if !answered[p] {
+				answered[p] = true
+				answers++
+			}
+		}
 	}
 
 	s.noteSilentPeers(peers, answered)

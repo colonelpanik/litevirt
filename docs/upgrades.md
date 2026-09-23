@@ -51,11 +51,17 @@ Six guarantees the upgrade pipeline enforces:
    actually in progress — see the sentinel gate below. Logged to journal
    with tag `litevirt-rollback`.
 
-4. **Refuse to start downgrade-into-forward-DB.** `schema_state.version`
-   in Corrosion tracks what version migrated this DB. A daemon that
-   expects an older `CurrentSchemaVersion` than the DB has refuses to
-   start, surfacing the operator error before it scribbles inconsistent
-   rows.
+4. **A forward-migrated DB does NOT block an older binary.** `schema_state.version`
+   in Corrosion tracks what version migrated this DB, but a daemon that
+   expects an older `CurrentSchemaVersion` than the DB has still starts.
+   Migrations are additive-only (CI-enforced), so the older binary tolerates
+   columns it does not know about, and that tolerance is what makes a rolling
+   upgrade reversible.
+
+   This used to be a refusal and is documented here because the change is easy
+   to miss: rolling a binary back is **not** gated on the schema. What a
+   rollback still needs care with is replicated statement shapes a downgraded
+   node cannot decode — see the capability notes below.
 
 5. **Schema-skew check in CRDT replication.** Every `PushMutations`
    request carries the sender's DB-applied schema version. A receiver

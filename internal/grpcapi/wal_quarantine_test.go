@@ -65,12 +65,12 @@ func TestEvaluateHADegraded_ReportsAQuarantinedNode(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 
-	if got := s.evaluateHADegraded(ctx); got[haRolledBackLatch] {
+	if got, _ := s.evaluateHADegraded(ctx); got[haRolledBackLatch] {
 		t.Fatal("a healthy node reported rolled_back_latch")
 	}
 
 	s.SetWALQuarantined(func() bool { return true })
-	if got := s.evaluateHADegraded(ctx); !got[haRolledBackLatch] {
+	if got, _ := s.evaluateHADegraded(ctx); !got[haRolledBackLatch] {
 		t.Fatalf("a WAL-quarantined node did not report %s; an operator would see only the "+
 			"peers' unsupported_member, which reads as an older binary or an unreachable "+
 			"host rather than a node needing a reseed", haRolledBackLatch)

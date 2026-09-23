@@ -48,7 +48,7 @@ func TestNewChecker_Fields(t *testing.T) {
 
 func TestNewVMChecker_Fields(t *testing.T) {
 	db := testCoverageDB(t)
-	v := NewVMChecker("host-x", db, nil)
+	v := NewVMChecker("host-x", t.TempDir(), db, nil)
 	if v.hostName != "host-x" {
 		t.Errorf("hostName = %q", v.hostName)
 	}
@@ -195,7 +195,7 @@ func TestVmSpecFromDB_InvalidJSON(t *testing.T) {
 
 func TestProbe_UnknownType_ReturnsTrue(t *testing.T) {
 	db := testCoverageDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	hspec := &pb.HealthCheckSpec{
 		Type:   "unknown-probe-type",
@@ -229,7 +229,7 @@ func TestProbe_HTTP_StatusCodes(t *testing.T) {
 		}))
 
 		db := testCoverageDB(t)
-		v := NewVMChecker("node1", db, nil)
+		v := NewVMChecker("node1", t.TempDir(), db, nil)
 		hspec := &pb.HealthCheckSpec{Type: "http", Target: srv.URL}
 		got := v.probe(context.Background(), "vm1", hspec, 2*time.Second)
 		srv.Close()
@@ -248,7 +248,7 @@ func TestProbe_TCP_Success_Coverage(t *testing.T) {
 	defer srv.Close()
 
 	db := testCoverageDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	addr := srv.Listener.Addr().String()
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: addr}
 	if !v.probe(context.Background(), "vm1", hspec, 2*time.Second) {
@@ -258,7 +258,7 @@ func TestProbe_TCP_Success_Coverage(t *testing.T) {
 
 func TestProbe_TCP_Failure_Coverage(t *testing.T) {
 	db := testCoverageDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: "127.0.0.1:1"} // Port 1 unlikely open.
 	if v.probe(context.Background(), "vm1", hspec, 500*time.Millisecond) {
 		t.Error("TCP probe to closed port should fail")
@@ -269,7 +269,7 @@ func TestProbe_TCP_Failure_Coverage(t *testing.T) {
 
 func TestProbe_Exec_NilVirt(t *testing.T) {
 	db := testCoverageDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Type: "exec", Target: "echo ok"}
 	result := v.probe(context.Background(), "vm1", hspec, 2*time.Second)
 	if result {
@@ -281,7 +281,7 @@ func TestProbe_Exec_NilVirt(t *testing.T) {
 
 func TestProbe_HTTP_InvalidURL(t *testing.T) {
 	db := testCoverageDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Type: "http", Target: "://invalid"}
 	result := v.probe(context.Background(), "vm1", hspec, 500*time.Millisecond)
 	if result {
@@ -318,7 +318,7 @@ func TestCheckVM_Backoff_PreventsRepeatAction(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-backoff", HostName: "node1", Spec: string(specJSON), State: "running"}
 
 	// First action triggers.
@@ -375,7 +375,7 @@ func TestCheckVM_MaxUnavailable_BlocksSecondAction(t *testing.T) {
 		}
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// Simulate an active action on the stack.
 	v.mu.Lock()
@@ -430,7 +430,7 @@ func TestCheckVM_ZeroRetries_DefaultsToThree(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-retries-default", HostName: "node1", Spec: string(specJSON), State: "running"}
 
 	// Fail twice — should NOT trigger action since default retries is 3.
@@ -605,7 +605,7 @@ func TestPickMigrationTarget_AccountsForCreatingVMs(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// node2 has 2048 - 1500 = 548 free. Requesting 1024 should fail.
 	_, err = v.pickMigrationTarget(ctx, "node1", 1024)
 	if err == nil {

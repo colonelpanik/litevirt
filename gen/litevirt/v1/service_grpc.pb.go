@@ -28,6 +28,7 @@ const (
 	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
 	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
+	LiteVirt_GetFenceReadiness_FullMethodName          = "/litevirt.v1.LiteVirt/GetFenceReadiness"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
 	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
@@ -216,6 +217,8 @@ const (
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
+	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
+	LiteVirt_GetLeaseTermHighWater_FullMethodName      = "/litevirt.v1.LiteVirt/GetLeaseTermHighWater"
 	LiteVirt_GetStateDump_FullMethodName               = "/litevirt.v1.LiteVirt/GetStateDump"
 	LiteVirt_StreamStateDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamStateDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
@@ -275,6 +278,7 @@ type LiteVirtClient interface {
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
+	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -548,6 +552,21 @@ type LiteVirtClient interface {
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
+	// AcknowledgeLeaseTermTie records that an operator has seen a contested
+	// lease term on THIS node and drops it from the node's unresolved-tie
+	// register. Both claims stay in the ledger; only the evidence tracking is
+	// cleared, and the acknowledgement itself is written to the audit log.
+	//
+	// Per-node by design and deliberately NOT peer-callable: the register is
+	// node-local, and a node must not acknowledge its own contest. An operator
+	// acknowledges on each host the ha.lww.unresolved condition names.
+	AcknowledgeLeaseTermTie(ctx context.Context, in *AcknowledgeLeaseTermTieRequest, opts ...grpc.CallOption) (*AcknowledgeLeaseTermTieResponse, error)
+	// GetLeaseTermHighWater reports this node's newest lease term for a key.
+	// Peer-callable, read-only, no side effects. It is the quorum read
+	// barrier's input: an executor fans this out before validating a proof, so
+	// its rejection threshold is quorum-observed rather than its own
+	// possibly-stale replica. It must never itself invoke the barrier.
+	GetLeaseTermHighWater(ctx context.Context, in *GetLeaseTermHighWaterRequest, opts ...grpc.CallOption) (*GetLeaseTermHighWaterResponse, error)
 	GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -784,6 +803,16 @@ func (c *liteVirtClient) GetClusterHealth(ctx context.Context, in *GetClusterHea
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClusterHealth)
 	err := c.cc.Invoke(ctx, LiteVirt_GetClusterHealth_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceReadiness)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFenceReadiness_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -2862,6 +2891,26 @@ func (c *liteVirtClient) GetStateDigest(ctx context.Context, in *emptypb.Empty, 
 	return out, nil
 }
 
+func (c *liteVirtClient) AcknowledgeLeaseTermTie(ctx context.Context, in *AcknowledgeLeaseTermTieRequest, opts ...grpc.CallOption) (*AcknowledgeLeaseTermTieResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcknowledgeLeaseTermTieResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AcknowledgeLeaseTermTie_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetLeaseTermHighWater(ctx context.Context, in *GetLeaseTermHighWaterRequest, opts ...grpc.CallOption) (*GetLeaseTermHighWaterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetLeaseTermHighWaterResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetLeaseTermHighWater_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDumpResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StateDumpResponse)
@@ -3351,6 +3400,7 @@ type LiteVirtServer interface {
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
+	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
@@ -3624,6 +3674,21 @@ type LiteVirtServer interface {
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
+	// AcknowledgeLeaseTermTie records that an operator has seen a contested
+	// lease term on THIS node and drops it from the node's unresolved-tie
+	// register. Both claims stay in the ledger; only the evidence tracking is
+	// cleared, and the acknowledgement itself is written to the audit log.
+	//
+	// Per-node by design and deliberately NOT peer-callable: the register is
+	// node-local, and a node must not acknowledge its own contest. An operator
+	// acknowledges on each host the ha.lww.unresolved condition names.
+	AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error)
+	// GetLeaseTermHighWater reports this node's newest lease term for a key.
+	// Peer-callable, read-only, no side effects. It is the quorum read
+	// barrier's input: an executor fans this out before validating a proof, so
+	// its rejection threshold is quorum-observed rather than its own
+	// possibly-stale replica. It must never itself invoke the barrier.
+	GetLeaseTermHighWater(context.Context, *GetLeaseTermHighWaterRequest) (*GetLeaseTermHighWaterResponse, error)
 	GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error)
 	// StreamStateDump is the chunked replacement for GetStateDump: it streams
 	// the gzipped dump in bounded slices so it survives at scale. GetStateDump
@@ -3791,6 +3856,9 @@ func (UnimplementedLiteVirtServer) FenceHost(context.Context, *FenceHostRequest)
 }
 func (UnimplementedLiteVirtServer) GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterHealth not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFenceReadiness not implemented")
 }
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
@@ -4356,6 +4424,12 @@ func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *Check
 func (UnimplementedLiteVirtServer) GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDigest not implemented")
 }
+func (UnimplementedLiteVirtServer) AcknowledgeLeaseTermTie(context.Context, *AcknowledgeLeaseTermTieRequest) (*AcknowledgeLeaseTermTieResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcknowledgeLeaseTermTie not implemented")
+}
+func (UnimplementedLiteVirtServer) GetLeaseTermHighWater(context.Context, *GetLeaseTermHighWaterRequest) (*GetLeaseTermHighWaterResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetLeaseTermHighWater not implemented")
+}
 func (UnimplementedLiteVirtServer) GetStateDump(context.Context, *emptypb.Empty) (*StateDumpResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStateDump not implemented")
 }
@@ -4635,6 +4709,24 @@ func _LiteVirt_GetClusterHealth_Handler(srv interface{}, ctx context.Context, de
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).GetClusterHealth(ctx, req.(*GetClusterHealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetFenceReadiness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFenceReadiness(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFenceReadiness_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFenceReadiness(ctx, req.(*emptypb.Empty))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -7787,6 +7879,42 @@ func _LiteVirt_GetStateDigest_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_AcknowledgeLeaseTermTie_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcknowledgeLeaseTermTieRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AcknowledgeLeaseTermTie(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AcknowledgeLeaseTermTie_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AcknowledgeLeaseTermTie(ctx, req.(*AcknowledgeLeaseTermTieRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetLeaseTermHighWater_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetLeaseTermHighWaterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetLeaseTermHighWater(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetLeaseTermHighWater_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetLeaseTermHighWater(ctx, req.(*GetLeaseTermHighWaterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetStateDump_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(emptypb.Empty)
 	if err := dec(in); err != nil {
@@ -8583,6 +8711,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_GetClusterHealth_Handler,
 		},
 		{
+			MethodName: "GetFenceReadiness",
+			Handler:    _LiteVirt_GetFenceReadiness_Handler,
+		},
+		{
 			MethodName: "RemoveHost",
 			Handler:    _LiteVirt_RemoveHost_Handler,
 		},
@@ -9221,6 +9353,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStateDigest",
 			Handler:    _LiteVirt_GetStateDigest_Handler,
+		},
+		{
+			MethodName: "AcknowledgeLeaseTermTie",
+			Handler:    _LiteVirt_AcknowledgeLeaseTermTie_Handler,
+		},
+		{
+			MethodName: "GetLeaseTermHighWater",
+			Handler:    _LiteVirt_GetLeaseTermHighWater_Handler,
 		},
 		{
 			MethodName: "GetStateDump",

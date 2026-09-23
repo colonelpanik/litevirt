@@ -392,7 +392,7 @@ func TestOwnerAssert_ActiveConditionRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionObserved, Severity: corrosion.SeverityWarning,
-		Hosts: []string{"node-a", "node-b"},
+		Hosts:     []string{"node-a", "node-b"},
 		FirstSeen: "2026-01-01T00:00:00Z", LastSeen: "2026-01-01T00:00:00Z",
 	}); err != nil {
 		t.Fatalf("seed condition: %v", err)

@@ -2148,8 +2148,14 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// bus for the bus-resolution fallback below (vm_disks.bus is a v42 column
 	// not yet populated by every writer — see the Bus resolution comment in
 	// the Spec.Disks projection).
+	// Storage and Cache are compose-facing fields the vm_disks row does not
+	// carry in that form; the projection keeps the stored spec's values so a
+	// caller diffing a compose file against the inspected spec (`lv compose
+	// diff`) does not see an unchanged `storage:` disk as a topology change.
 	specDiskSizes := make(map[string]int64)
 	specDiskBuses := make(map[string]string)
+	specDiskStorage := make(map[string]string)
+	specDiskCache := make(map[string]string)
 	if spec != nil {
 		for _, ds := range spec.Disks {
 			if sz := parseDiskSizeBytes(ds.Size); sz > 0 {
@@ -2158,6 +2164,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			if ds.Bus != "" {
 				specDiskBuses[ds.Name] = ds.Bus
 			}
+			specDiskStorage[ds.Name] = ds.Storage
+			specDiskCache[ds.Name] = ds.Cache
 		}
 	}
 	// Default root disk is 20G when no disks are specified.
@@ -2222,9 +2230,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 					sizeBytes = specSize
 				}
 				specDisks = append(specDisks, &pb.DiskSpec{
-					Name: disk.DiskName,
-					Size: formatDiskSizeBytes(sizeBytes),
-					Bus:  bus,
+					Name:    disk.DiskName,
+					Size:    formatDiskSizeBytes(sizeBytes),
+					Bus:     bus,
+					Storage: specDiskStorage[disk.DiskName],
+					Cache:   specDiskCache[disk.DiskName],
 				})
 			}
 			spec.Disks = specDisks

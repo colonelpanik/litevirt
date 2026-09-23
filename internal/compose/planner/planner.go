@@ -317,15 +317,25 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 		if vm.StackName != stackName {
 			continue
 		}
-		current = append(current, compose.CurrentVM{
+		cur := compose.CurrentVM{
 			Name:          vm.Name,
 			Image:         specField(vm.Spec, "image"),
 			CPU:           vm.CPUActual,
 			MemMiB:        vm.MemActual,
 			State:         vm.State,
 			HostName:      vm.HostName,
-			CloudInitHash: specField(vm.Spec, "cloud_init_hash"),
-		})
+			CloudInitHash: compose.CloudInitHashFromSpec(vm.Spec),
+		}
+		// The full stored spec lets Build compare every field, not just the
+		// coarse four; a spec that does not parse leaves Spec nil and the VM
+		// falls back to the coarse comparison rather than failing the plan.
+		if vm.Spec != "" {
+			ss := &pb.VMSpec{}
+			if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+				cur.Spec = ss
+			}
+		}
+		current = append(current, cur)
 	}
 	return current
 }

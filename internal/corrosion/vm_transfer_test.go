@@ -3,7 +3,9 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -304,5 +306,162 @@ func TestSetContainerStateAtEpoch(t *testing.T) {
 	}
 	if state != "stopped" {
 		t.Fatalf("a tombstoned container's state was written: %q, want it untouched at \"stopped\"", state)
+	}
+}
+
+// newGraduationTestClient is TestBackfillOwnerEpochs' setup, narrowed to one VM
+// on host-a inserted at the column default. Inserted through InsertVM rather
+// than seeded, so vm_owner_epoch genuinely starts at 0 — a test that chose the
+// value would not be testing graduation.
+func newGraduationTestClient(t *testing.T) *Client {
+	t.Helper()
+	db, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+	if err := InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := InsertVM(ctx, db, VMRecord{
+		Name: "vm1", HostName: "host-a", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	return db
+}
+
+// vmEpochOf reads one row's ownership generation.
+func vmEpochOf(t *testing.T, ctx context.Context, c *Client, name string) int64 {
+	t.Helper()
+	rows, err := c.Query(ctx, `SELECT vm_owner_epoch FROM vms WHERE name = ?`, name)
+	if err != nil {
+		t.Fatalf("read epoch for %q: %v", name, err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("no vms row for %q", name)
+	}
+	return rows[0].Int64("vm_owner_epoch")
+}
+
+// TestGraduateVMOwnerEpoch_MovesOneRowOffTheDefault
+func TestGraduateVMOwnerEpoch_MovesOneRowOffTheDefault(t *testing.T) {
+	ctx := context.Background()
+	c := newGraduationTestClient(t)
+
+	if got := vmEpochOf(t, ctx, c, "vm1"); got != 0 {
+		t.Fatalf("seeded epoch = %d, want 0 — this test would prove nothing otherwise", got)
+	}
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); err != nil {
+		t.Fatalf("GraduateVMOwnerEpoch: %v", err)
+	}
+	if got := vmEpochOf(t, ctx, c, "vm1"); got != 1 {
+		t.Errorf("epoch = %d, want 1", got)
+	}
+}
+
+// TestGraduateVMOwnerEpoch_DoesNotDisturbAnAlreadyGraduatedRow: the statement is
+// guarded on vm_owner_epoch = 0, so a retry or a race with the backfill cannot
+// walk a live generation backwards — AND it says so rather than returning nil.
+//
+// Both halves matter. The guard is what protects the row; the ErrNoRowsAffected
+// is what protects the caller. A create path that stamps a runtime marker on the
+// strength of this call cannot tell "the row is now at generation 1" from "this
+// statement declined to touch whatever state exists" if a no-op returns nil —
+// and stamping 1 over a live generation 7 produces the one marker/row mismatch
+// nothing converges. Idempotent here means "changes nothing", not "reports
+// success".
+func TestGraduateVMOwnerEpoch_DoesNotDisturbAnAlreadyGraduatedRow(t *testing.T) {
+	ctx := context.Background()
+	c := newGraduationTestClient(t)
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); err != nil {
+		t.Fatalf("first graduate: %v", err)
+	}
+	// Simulate an ownership transfer having moved it on.
+	if err := c.Execute(ctx,
+		`UPDATE vms SET vm_owner_epoch = 7, updated_at = ? WHERE name = ?`, c.NowTS(), "vm1"); err != nil {
+		t.Fatalf("bump: %v", err)
+	}
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Errorf("second graduate: err = %v, want ErrNoRowsAffected — a caller that stamps a "+
+			"marker must be able to tell a no-op from an applied graduation", err)
+	}
+	if got := vmEpochOf(t, ctx, c, "vm1"); got != 7 {
+		t.Errorf("epoch = %d, want 7 — graduation must be guarded on the pre-epoch "+
+			"default so it cannot reset a live generation", got)
+	}
+}
+
+// TestGraduateVMOwnerEpoch_ReportsASoftDeletedRowAsUnapplied: the reachable
+// production shape of the no-op.
+//
+// A DeleteVM racing the create path soft-deletes the row between its INSERT and
+// this UPDATE. The statement is guarded on deleted_at IS NULL, so it matches
+// nothing — and the create path must learn that, or it stamps both runtime
+// markers for a generation no row holds.
+func TestGraduateVMOwnerEpoch_ReportsASoftDeletedRowAsUnapplied(t *testing.T) {
+	ctx := context.Background()
+	c := newGraduationTestClient(t)
+	if err := DeleteVM(ctx, c, "vm1"); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); !errors.Is(err, ErrNoRowsAffected) {
+		t.Errorf("graduate against a tombstoned row: err = %v, want ErrNoRowsAffected", err)
+	}
+}
+
+// TestGraduateVMOwnerEpoch_SharesTheBackfillsStatementShape: the two callers must
+// emit ONE replicated fingerprint for one intent.
+//
+// A copy-pasted UPDATE would be a second shape for the same operation: it would
+// need its own ledger registration, and a peer holding only the backfill's shape
+// could not resolve it. Asserted on the mutation_log payload because the row is
+// identical either way — which is exactly why nothing local would notice.
+func TestGraduateVMOwnerEpoch_SharesTheBackfillsStatementShape(t *testing.T) {
+	ctx := context.Background()
+
+	// The SQL text alone, not the whole payload: the params carry a fresh
+	// timestamp on every call, so comparing payloads would only ever prove that
+	// time passes. The SQL string IS the replicated fingerprint, and it is the
+	// thing a copy-pasted second UPDATE would change.
+	emitted := func(t *testing.T, run func(*Client)) string {
+		t.Helper()
+		c := newGraduationTestClient(t)
+		run(c)
+		var stmts string
+		if err := c.db.QueryRow(
+			`SELECT stmts FROM mutation_log ORDER BY seq DESC LIMIT 1`).Scan(&stmts); err != nil {
+			t.Fatalf("read mutation_log: %v", err)
+		}
+		var decoded []struct{ SQL string }
+		if err := json.Unmarshal([]byte(stmts), &decoded); err != nil {
+			t.Fatalf("decode mutation_log payload %q: %v", stmts, err)
+		}
+		if len(decoded) != 1 {
+			t.Fatalf("want exactly one statement in the payload, got %d: %s", len(decoded), stmts)
+		}
+		return decoded[0].SQL
+	}
+
+	viaHelper := emitted(t, func(c *Client) {
+		if err := GraduateVMOwnerEpoch(ctx, c, "vm1"); err != nil {
+			t.Fatalf("GraduateVMOwnerEpoch: %v", err)
+		}
+	})
+	viaBackfill := emitted(t, func(c *Client) {
+		if err := BackfillOwnerEpochs(ctx, c, "host-a"); err != nil {
+			t.Fatalf("BackfillOwnerEpochs: %v", err)
+		}
+	})
+
+	if !strings.Contains(viaHelper, "vm_owner_epoch = 0") || !strings.Contains(viaBackfill, "vm_owner_epoch = 0") {
+		t.Fatalf("one of the payloads lacks the guard this test keys on:\nhelper:   %s\nbackfill: %s",
+			viaHelper, viaBackfill)
+	}
+	if viaHelper != viaBackfill {
+		t.Errorf("the two callers emit DIFFERENT replicated statements for the same intent, "+
+			"so one of them is a shape no peer is registered to resolve:\nhelper:   %s\nbackfill: %s",
+			viaHelper, viaBackfill)
 	}
 }

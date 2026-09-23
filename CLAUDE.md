@@ -12,6 +12,53 @@ make ci-guards          # schema bump, writecheck, stmtshapecheck, docs truth
 couple that only exist there — notably `stmtshapecheck`, which fails any
 replicated SQL builder whose statement shape is not in the compatibility ledger.
 
+**`-race` on `internal/corrosion` or `internal/grpcapi` needs an explicit
+`-timeout`.** Both run past Go's 10-minute default under the race detector —
+`internal/corrosion` takes ~40 minutes on a current laptop, and
+**`internal/grpcapi` takes ~68** — so the plain command fails like this:
+
+```
+FAIL	github.com/litevirt/litevirt/internal/corrosion	600.588s
+```
+
+600s is the timeout, not a race. Nothing is wrong with the package; the run was
+killed. Reach for a real budget:
+
+```bash
+go test -race -timeout 60m ./internal/corrosion/
+go test -race -timeout 90m ./internal/grpcapi/
+```
+
+**Both numbers have been raised once already, and will drift again.** The
+corrosion budget said 30m against a measured ~18½ minutes; the package has
+since grown past it, and a run at 30m died at `FAIL ... 1817.560s` looking
+exactly like a finding. A re-run at a real budget passed in 2358s — 39 minutes,
+with zero warnings. When either package times out, measure before believing it.
+
+**grpcapi is the one that catches people out**, because 30m is nowhere near
+enough for it and the failure is indistinguishable from a real finding: a 45m
+budget dies at `FAIL ... 2717.486s`, which is close enough to a plausible
+runtime to look like the detector found something. It did not — the same package
+passes at 90m in 4091s with no warnings. Anything under ~70m on grpcapi is a
+budget failure.
+
+Do not pipe a race run through `tail -N`. That discards the `panic: test timed
+out` header and leaves only a goroutine dump, which is exactly the evidence you
+need to tell the two apart. Redirect to a file and grep it.
+
+Or, for a change confined to a few files, run the race detector over just the
+tests that cover them — seconds instead of twenty minutes, and the same signal
+for the code you touched:
+
+```bash
+go test -race -timeout 5m ./internal/corrosion/ -run 'TestStmtShape|TestLex_'
+```
+
+This trips people because a timeout and a detected race look identical at a
+glance, and the honest reading of a 600s FAIL on a package you just edited is
+"I broke something". Confirm which it is before chasing it: a real race prints a
+`WARNING: DATA RACE` block, a timeout prints `panic: test timed out`.
+
 Commits follow conventional-commit style (`fix(cluster):`, `test(fleet):`,
 `docs:`). Scope names match the package or subsystem.
 

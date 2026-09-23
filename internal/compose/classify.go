@@ -3,10 +3,12 @@ package compose
 import (
 	"fmt"
 	"maps"
+	"strings"
 
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Action is the coarsest action a set of desired-vs-stored changes requires,
@@ -117,6 +119,26 @@ func (p ChangePlan) Max() Action {
 	}
 }
 
+// Reasons renders every change in the plan as one line, coarsest bucket first,
+// for a plan/diff detail string — so an operator reading `~ update x: …` sees
+// what will happen and why.
+func (p ChangePlan) Reasons() string {
+	var out []string
+	out = append(out, p.RecreateReasons...)
+	out = append(out, p.RestartReasons...)
+	for _, d := range p.ResourceChanges {
+		out = append(out, fmt.Sprintf("%s %s→%s", d.Field, d.Old, d.New))
+	}
+	for _, d := range p.MetadataChanges {
+		if d.Old == "" && d.New == "" {
+			out = append(out, d.Field+" changed")
+		} else {
+			out = append(out, fmt.Sprintf("%s %s→%s", d.Field, d.Old, d.New))
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
 // Classify diffs a desired spec against the stored spec (+ its disk-topology
 // projection) and returns the classified ChangePlan. It is a pure function over
 // neutral types (gen-package protos + StoredDisk) so it lives in compose without
@@ -182,7 +204,7 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	restartIf(desired.MaxMemoryMib != 0 && desired.MaxMemoryMib != stored.MaxMemoryMib, "max-memory change needs a redefine")
 	restartIf(desired.CpuMode != "" && desired.CpuMode != stored.CpuMode, "cpu-mode change needs a redefine")
 	restartIf(desired.CpuModel != "" && desired.CpuModel != stored.CpuModel, "cpu-model change needs a redefine")
-	restartIf(desired.Machine != "" && desired.Machine != stored.Machine, "machine-type change needs a redefine")
+	restartIf(desired.Machine != "" && !machineEqual(desired.Machine, stored.Machine), "machine-type change needs a redefine")
 	restartIf(desired.Firmware != "" && desired.Firmware != stored.Firmware, "firmware change needs a redefine")
 	// Bools carry no "unset" sentinel; BuildVMSpec applies the same defaults the create
 	// path stores (e.g. guest-agent via EffectiveGuestAgent), so an equality compare is
@@ -223,7 +245,7 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	metaIf(desired.StartDelaySec != stored.StartDelaySec, "start_delay", fmt.Sprintf("%d", stored.StartDelaySec), fmt.Sprintf("%d", desired.StartDelaySec))
 	metaIf(desired.StopDelaySec != stored.StopDelaySec, "stop_delay", fmt.Sprintf("%d", stored.StopDelaySec), fmt.Sprintf("%d", desired.StopDelaySec))
 	metaIf(len(desired.Labels) > 0 && !maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
-	metaIf(desired.Placement != nil && !proto.Equal(desired.Placement, stored.Placement), "placement", "", "")
+	metaIf(desired.Placement != nil && !placementEqual(desired.Placement, stored.Placement), "placement", "", "")
 	metaIf(desired.Migrate != nil && !proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
 
 	// --- Delegated: owned by another path, recorded not ignored ---
@@ -237,28 +259,94 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	return p
 }
 
+// Inherit-on-unset for the server-filled fields. A compose definition leaves
+// these empty and the create path fills them in — disk bus and NIC model
+// defaults, the reserved SR-IOV VF address, the planner's chosen placement host
+// — so the stored spec always carries a value the desired one lacks. Comparing
+// them literally made an UNCHANGED file re-applied to the VM it created read as
+// a disk/network topology change (a recreate) and a placement change. Each
+// helper therefore treats an unset desired field as "keep what is stored", and
+// only a desired value that is SET and different counts.
+
 // devicesEqual compares two device lists by content (order-sensitive — a reorder
-// is a topology change to libvirt).
-func devicesEqual(a, b []*pb.DeviceSpec) bool {
-	if len(a) != len(b) {
+// is a topology change to libvirt). An unset desired address inherits the
+// stored one (a VF address is reserved at create, never written in compose).
+func devicesEqual(desired, stored []*pb.DeviceSpec) bool {
+	if len(desired) != len(stored) {
 		return false
 	}
-	for i := range a {
-		if !proto.Equal(a[i], b[i]) {
+	for i := range desired {
+		d := desired[i]
+		if d != nil && stored[i] != nil && d.Address == "" && stored[i].Address != "" {
+			d = proto.Clone(d).(*pb.DeviceSpec)
+			d.Address = stored[i].Address
+		}
+		if !proto.Equal(d, stored[i]) {
 			return false
 		}
 	}
 	return true
 }
 
+// machineEqual compares a desired machine type against the stored one. Compose
+// names an ALIAS ("q35", "pc"); the create path stores the concrete type libvirt
+// resolved it to ("pc-q35-9.0") so the guest ABI travels with the VM. An alias
+// therefore matches a pinned type of the same family — re-applying "q35" to a
+// VM stored as "pc-q35-9.0" is not a change. Two pinned types, or an alias of
+// a different family, compare literally.
+func machineEqual(desired, stored string) bool {
+	if desired == stored {
+		return true
+	}
+	if libvirt.IsPinnedMachineType(desired) {
+		return false // an explicit pin means exactly that version
+	}
+	return machineFamily(desired) == machineFamily(stored)
+}
+
+// machineFamily reduces a machine type to its family: "q35"/"pc-q35"/"pc-q35-9.0"
+// → "q35"; "pc"/"pc-i440fx"/"pc-i440fx-9.0" → "pc"; anything else has its
+// version suffix stripped ("virt-9.0" → "virt").
+func machineFamily(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	if libvirt.IsPinnedMachineType(m) {
+		m = m[:strings.LastIndex(m, "-")]
+	}
+	switch m {
+	case "pc-q35":
+		return "q35"
+	case "pc-i440fx":
+		return "pc"
+	}
+	return m
+}
+
+// placementEqual compares placement with an unset desired host inheriting the
+// stored one: the deploy path pins the host it placed the VM on into the spec
+// it stores, and a compose that placed by constraints alone never names one.
+func placementEqual(desired, stored *pb.PlacementSpec) bool {
+	if desired.GetHost() == "" && stored.GetHost() != "" {
+		desired = proto.Clone(desired).(*pb.PlacementSpec)
+		desired.Host = stored.GetHost()
+	}
+	return proto.Equal(desired, stored)
+}
+
 // disksTopologyEqual compares disk topology (identity + bus + storage), ignoring
 // size (a grow is the resize path's job, not a recreate).
-func disksTopologyEqual(a, b []StoredDisk) bool {
-	if len(a) != len(b) {
+func disksTopologyEqual(desired, stored []StoredDisk) bool {
+	if len(desired) != len(stored) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	for i := range desired {
+		d := desired[i]
+		if d.Bus == "" {
+			d.Bus = stored[i].Bus
+		}
+		if d.Storage == "" {
+			d.Storage = stored[i].Storage
+		}
+		if d != stored[i] {
 			return false
 		}
 	}
@@ -268,12 +356,15 @@ func disksTopologyEqual(a, b []StoredDisk) bool {
 // networkTopologyEqual compares NIC topology by the stable, non-server-resolved
 // fields (network name + model), ignoring server-assigned MAC/IP so a live
 // address assignment never reads as a topology change.
-func networkTopologyEqual(a, b []*pb.NetworkAttachment) bool {
-	if len(a) != len(b) {
+func networkTopologyEqual(desired, stored []*pb.NetworkAttachment) bool {
+	if len(desired) != len(stored) {
 		return false
 	}
-	for i := range a {
-		if a[i].GetName() != b[i].GetName() || a[i].GetModel() != b[i].GetModel() {
+	for i := range desired {
+		if desired[i].GetName() != stored[i].GetName() {
+			return false
+		}
+		if m := desired[i].GetModel(); m != "" && m != stored[i].GetModel() {
 			return false
 		}
 	}

@@ -357,6 +357,12 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
+	// Guarded on the state actually inserted: a clone started with req.Start is
+	// born running at epoch 0 and needs its first generation, while a stopped
+	// one is graduated by whatever later starts it.
+	if state == "running" {
+		s.assignOwnerEpochAtCreate(ctx, req.Target)
+	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "host", s.hostName)
 	s.audit(ctx, "vm.clone", req.Target, fmt.Sprintf("source=%s mode=%s", req.Source, mode), "ok")

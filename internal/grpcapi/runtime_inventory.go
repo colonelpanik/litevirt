@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -55,13 +56,121 @@ type runtimeWorkload struct {
 
 // runtimeInventory is one host's full local runtime view.
 type runtimeInventory struct {
-	Host           string
-	Workloads      []runtimeWorkload
-	KernelVIPs     []string
+	Host       string
+	Workloads  []runtimeWorkload
+	KernelVIPs []string
+	// UnresolvedTies is the FLEET-WIDE count across every replicated table. It
+	// reports "something is divergent on this node" — the state digest and the
+	// dual-run cross-node finding both want it that broad.
 	UnresolvedTies int
-	Complete       bool
-	Errors         []string
-	SampledAt      string
+	// OwnershipTies counts unresolved ties on the ownership tables ONLY. A
+	// readiness predicate answers a narrower question than the digest does —
+	// "could a tie be hiding the ownership row I am about to certify?" — and only
+	// these categories can. See ownershipTieCategory.
+	//
+	// Carried over the wire since v53 (ownership_tie_count), so a peer's count is
+	// a real answer rather than a fabricated zero.
+	OwnershipTies int
+	Complete      bool
+	Errors        []string
+	SampledAt     string
+}
+
+// ownershipTieCategories are the tie CATEGORIES that can hide an ownership
+// decision from OwnerEpochReadiness, and therefore the only ones that withhold
+// owner_epoch_v1.
+//
+// Categories, not table names. This used to be a map of tables maintained here,
+// in a package that cannot see internal/corrosion's schema — its own comment
+// admitted the hazard ("Adding an owner_epoch column to a table WITHOUT adding
+// it here silently narrows one") and nothing could enforce it from here. It was
+// already wrong on four tables: runtime_action_proofs, operations,
+// operation_steps and project_authority_epochs all carry an owner epoch and all
+// answered "not an ownership table".
+//
+// The resolver already computes a category per conflict and corrosion splits its
+// immutable-row conflicts into an ownership and a ledger flavour, so the
+// classification is expressed in categories the emitting package defines
+// (corrosion.KnownTieCategories) and is checked against them by
+// TestOwnershipTieCategory_PartitionsEveryKnownCategory.
+//
+// An UNRECOGNISED category counts as ownership — fail closed. This latch is
+// monotone and never re-opens, so withholding it wrongly is recoverable while
+// latching over a live ownership dispute is not.
+var ownershipTieCategories = map[string]bool{
+	corrosion.TieCategoryRuntimeOwned:       true, // host_name, pending_action_id, active_operation_id
+	corrosion.TieCategoryTenancy:            true, // a project ownership split
+	corrosion.TieCategoryControlPlane:       true, // hosts.state IS the voting roster this latch is derived from
+	corrosion.TieCategoryImmutableOwnership: true,
+	corrosion.TieCategoryIdentityContent:    true,
+	corrosion.TieCategoryWorkloadIdentity:   true,
+	corrosion.TieCategoryUncategorized:      true, // unclassified by the resolver ⇒ unknown ⇒ closed
+	corrosion.TieCategoryPolicy:             true, // see below — this one was wrong
+	corrosion.TieCategoryOpaque:             true, // and so was this one
+}
+
+// nonOwnershipTieCategories are the categories deliberately EXCLUDED. Both maps
+// are READ, and TestOwnershipTieCategory_PartitionsEveryKnownCategory fails if
+// any corrosion.KnownTieCategories entry is missing from both — which is the
+// only reason the partition claim means anything. The previous version of this
+// comment claimed "a new category cannot be silently absent from both" while
+// the allowlist above was never read by anything, and three emitted categories
+// were absent from both on arrival.
+//
+//   - immutable_ledger_conflict: a contested lease term. Two nodes claiming one
+//     tenure is real and must stay visible, but it is not evidence about any
+//     workload's owner epoch — the whole point of the fix that scoped this
+//     predicate in the first place.
+//   - auth_factor: a differing 2FA secret or recovery code (user_2fa,
+//     recovery_codes). Fail-to-human by design and never auto-converging, so
+//     leaving it in the withholding set — which the missing entry did, via the
+//     fail-closed default — withheld the capability permanently for a reason
+//     that has nothing to do with any workload's ownership.
+//   - auth_pointer, lb_token: the same, for an auth pointer column and an LB
+//     bearer token.
+//
+// Two entries were moved OUT of this map, both of them wrong:
+//
+//   - policy is not "a policy blob". policyChain is
+//     {ruleTombstone(), ruleUnresolved(TieCategoryPolicy)} — an unconditional
+//     fail-to-human on any tied difference — and it covers projects,
+//     project_quotas, roles, role_bindings, users, tokens, security_groups,
+//     sg_rules, ip_sets, the firewall tables, registry_credentials and the
+//     notification tables. Two nodes disagreeing about a `projects` row IS a
+//     tenancy dispute, and the identical dispute seen on vms.project is
+//     categorised tenancy and withholds — so excluding policy made the
+//     predicate answer differently depending on which side of the relation
+//     diverged.
+//   - opaque is vms.spec and containers.create_spec, which are workload rows.
+//     It is also where a vms tie LANDS when ruleNumericMax passes on an
+//     unparseable vm_owner_epoch (cellStr returns "" for a nil cell and
+//     ParseInt fails, so the rule declines to decide) — the one case the
+//     narrowing was asserted to be safe against.
+//
+// "content" is deliberately absent from both maps: the content chains end in
+// ruleContentMax and resolve, so no tie is ever tracked under it. It used to
+// sit here, which is what made the partition claim look satisfied.
+var nonOwnershipTieCategories = map[string]bool{
+	corrosion.TieCategoryImmutableLedger: true,
+	corrosion.TieCategoryAuthFactor:      true,
+	corrosion.TieCategoryAuthPointer:     true,
+	corrosion.TieCategoryLBToken:         true,
+}
+
+// ownershipTieCategory reports whether a category withholds the owner-epoch
+// regime. Unknown ⇒ true (closed), and loudly: the latch is monotone and never
+// re-opens, so an unclassified category means this build shipped past the
+// partition test.
+func ownershipTieCategory(category string) bool {
+	if nonOwnershipTieCategories[category] {
+		return false
+	}
+	if ownershipTieCategories[category] {
+		return true
+	}
+	slog.Warn("unclassified unresolved-tie category withholding owner_epoch_v1 by default",
+		"category", category)
+	return true
 }
 
 // find returns the inventory entry for (kind, name), if present.
@@ -205,7 +314,17 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 	}
 
 	if s.db != nil {
-		inv.UnresolvedTies = s.db.UnresolvedTieCount()
+		// ONE lock acquisition, and the fleet-wide total is DERIVED from the same
+		// snapshot rather than read separately. Two acquisitions could straddle a
+		// concurrent merge and yield a snapshot where OwnershipTies exceeded
+		// UnresolvedTies — its own superset — so readiness withheld while the state
+		// digest on the same snapshot reported the node clean.
+		for category, n := range s.db.UnresolvedTieCategories() {
+			inv.UnresolvedTies += n
+			if ownershipTieCategory(category) {
+				inv.OwnershipTies += n
+			}
+		}
 	}
 	return inv
 }
@@ -277,6 +396,7 @@ func inventoryToProto(inv runtimeInventory) *pb.RuntimeInventory {
 		Host:               inv.Host,
 		KernelAssignedVips: inv.KernelVIPs,
 		UnresolvedTieCount: int32(inv.UnresolvedTies),
+		OwnershipTieCount:  int32(inv.OwnershipTies),
 		Complete:           inv.Complete,
 		Errors:             inv.Errors,
 		SampledAt:          inv.SampledAt,
@@ -297,6 +417,7 @@ func inventoryFromProto(p *pb.RuntimeInventory) runtimeInventory {
 		Host:           p.GetHost(),
 		KernelVIPs:     p.GetKernelAssignedVips(),
 		UnresolvedTies: int(p.GetUnresolvedTieCount()),
+		OwnershipTies:  int(p.GetOwnershipTieCount()),
 		Complete:       p.GetComplete(),
 		Errors:         p.GetErrors(),
 		SampledAt:      p.GetSampledAt(),

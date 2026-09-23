@@ -342,7 +342,12 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 
 	slog.Debug("pushMutations: received", "sender", req.Sender, "entries", len(req.Entries))
 
-	lastSeq, err := s.replicator.ApplyRemoteMutations(ctx, req.Entries)
+	// req.ReceiverIsRelay is the SENDER's belief about us, honoured alongside our
+	// own. Relay eligibility is derived from replicated hosts.state, so the two
+	// can differ; a receiver that ignored the claim applied the push locally and
+	// forwarded nothing, stranding every leaf behind it while the sender's
+	// backlog read healthy. A released peer leaves the field false.
+	lastSeq, err := s.replicator.ApplyRemoteMutationsFrom(ctx, req.Entries, req.ReceiverIsRelay)
 	if err != nil {
 		slog.Warn("pushMutations: apply error", "sender", req.Sender, "error", err)
 		return nil, status.Errorf(codes.Internal, "apply mutations: %v", err)

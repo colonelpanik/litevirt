@@ -1937,6 +1937,12 @@ message ReplicateRequest {
     repeated MutationEntry entries = 3; // mutations to push to the receiver
     string sender_version          = 4; // sender's binary version, e.g. "0.5.2"
     int32  sender_schema_version   = 5; // sender's CurrentSchemaVersion
+    // The sender's belief that the RECEIVER is a relay. Relay eligibility comes
+    // from hosts.state, which replicates asynchronously, so two nodes can
+    // compute different relay sets; a receiver that does not share the sender's
+    // belief used to apply the push locally and forward nothing. Absent (false)
+    // from a released peer, which reproduces exactly that prior behaviour.
+    bool   receiver_is_relay       = 6;
 }
 
 message ReplicateResponse {

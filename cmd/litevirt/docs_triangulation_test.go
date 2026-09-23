@@ -546,8 +546,8 @@ func TestCheckIdentifier(t *testing.T) {
 	}{
 		{"litevirt_foo_total", true},
 		{"litevirt_bar", false},
-		{"litevirt_foo_*", true},                        // glob prefix in prose
-		{"litevirt_label_", true},                       // trailing-underscore prefix
+		{"litevirt_foo_*", true},  // glob prefix in prose
+		{"litevirt_label_", true}, // trailing-underscore prefix
 		// The allowlist is empty by design, so a name that is neither in the code
 		// nor a prefix form must be rejected — that is the whole point of the guard.
 		{"litevirt_audit_chain_last_verified_ok", false},

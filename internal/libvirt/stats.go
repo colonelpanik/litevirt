@@ -11,16 +11,16 @@ import (
 
 // DomainStats holds live resource usage for a single domain.
 type DomainStats struct {
-	Name         string
-	CPUPct       float64 // CPU usage % (0-100 * nVCPU)
-	MemRSSBytes  int64   // resident memory in bytes
-	MemTotalBytes int64  // allocated memory in bytes
-	DiskRdBytes  int64
-	DiskWrBytes  int64
-	DiskRdReqs   int64
-	DiskWrReqs   int64
-	NetRxBytes   int64
-	NetTxBytes   int64
+	Name          string
+	CPUPct        float64 // CPU usage % (0-100 * nVCPU)
+	MemRSSBytes   int64   // resident memory in bytes
+	MemTotalBytes int64   // allocated memory in bytes
+	DiskRdBytes   int64
+	DiskWrBytes   int64
+	DiskRdReqs    int64
+	DiskWrReqs    int64
+	NetRxBytes    int64
+	NetTxBytes    int64
 }
 
 // cpuSample stores a single CPU time reading for delta computation.

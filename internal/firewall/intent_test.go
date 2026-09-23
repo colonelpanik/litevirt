@@ -34,8 +34,8 @@ func TestIntentToNATIsolation_NetworkOwnsIsolation(t *testing.T) {
 		{ScopeKey: "net:iso", Bridge: "br-iso", Isolate: true},
 		// LB on the isolated network → exceptions + SNAT, NO Isolate flag.
 		{ScopeKey: "lb:web", Bridge: "br-iso",
-			Exceptions:   []corrosion.HostFWException{{VIP: "10.100.0.50", Ports: []int{80, 443}}},
-			SNATSubnet:   "10.100.0.0/24", SNATVIP: "10.100.0.50", SNATOutIface: "eth0"},
+			Exceptions: []corrosion.HostFWException{{VIP: "10.100.0.50", Ports: []int{80, 443}}},
+			SNATSubnet: "10.100.0.0/24", SNATVIP: "10.100.0.50", SNATOutIface: "eth0"},
 	}
 	nat, iso := intentToNATIsolation(intents)
 

@@ -247,7 +247,7 @@ func (s *RealSystem) ConfirmConnectivity(ctx context.Context) error {
 }
 
 // defaultGateway parses the IPv4 default route's gateway from /proc/net/route
-// ('' when there is none — a host without one is not judged by it).
+// (empty when there is none — a host without one is not judged by it).
 func defaultGateway() string {
 	b, err := os.ReadFile("/proc/net/route")
 	if err != nil {

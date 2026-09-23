@@ -36,8 +36,8 @@ type PullOCIOptions struct {
 // Conversion runs in two stages so we can resume a failed unpack
 // without re-downloading the layers:
 //
-//   1. skopeo copy &lt;image&gt; oci:&lt;tmp&gt;:&lt;tag&gt;
-//   2. umoci unpack --image &lt;tmp&gt;:&lt;tag&gt; --rootless &lt;dest&gt;
+//  1. skopeo copy &lt;image&gt; oci:&lt;tmp&gt;:&lt;tag&gt;
+//  2. umoci unpack --image &lt;tmp&gt;:&lt;tag&gt; --rootless &lt;dest&gt;
 //
 // We choose --rootless so containers can run unprivileged when the
 // host config supports user namespaces.

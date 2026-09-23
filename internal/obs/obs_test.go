@@ -686,8 +686,8 @@ func TestExportErrorCounter_DeadCollector(t *testing.T) {
 // non-secret endpoint must remain. Guards finding 6.
 func TestSetup_ScrubsCredentialEnvAfterSetup(t *testing.T) {
 	cleanEnv(t)
-	_ = os.Setenv("LITEVIRT_OTEL_HEADERS", "Authorization=Basic c2VjcmV0")   // via mapping
-	_ = os.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-api-key=direct")   // direct vendor var
+	_ = os.Setenv("LITEVIRT_OTEL_HEADERS", "Authorization=Basic c2VjcmV0") // via mapping
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-api-key=direct") // direct vendor var
 	setup(t, Config{ServiceName: "cred-test", OTLPEndpoint: "http://127.0.0.1:4318"})
 
 	for _, k := range []string{

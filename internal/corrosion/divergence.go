@@ -77,10 +77,10 @@ type NodeSnapshot struct {
 
 // RowDivergence is one diverging row reported to the operator.
 type RowDivergence struct {
-	Table   string                `json:"table"`
-	PKLabel string                `json:"pk"`     // plaintext PK, or HMAC for sensitive tables
-	Class   DivergenceClass       `json:"class"`
-	PerNode map[string]RowMeta    `json:"per_node"` // host → meta (only nodes where it matters)
+	Table   string             `json:"table"`
+	PKLabel string             `json:"pk"` // plaintext PK, or HMAC for sensitive tables
+	Class   DivergenceClass    `json:"class"`
+	PerNode map[string]RowMeta `json:"per_node"` // host → meta (only nodes where it matters)
 }
 
 // SemanticViolation is a cluster-wide invariant breach that survives convergence

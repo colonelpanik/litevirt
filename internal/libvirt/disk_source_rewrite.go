@@ -179,8 +179,8 @@ func rewriteNthDiskSource(domXML string, matchIndex int, oldFile, newFile string
 	var buf bytes.Buffer
 	enc := xml.NewEncoder(&buf)
 
-	var stack []string    // open ancestor element names (parent is the last entry)
-	diskIndex := -1       // index among devices/disk
+	var stack []string     // open ancestor element names (parent is the last entry)
+	diskIndex := -1        // index among devices/disk
 	matchedDiskDepth := -1 // stack depth at the matched <disk> start; -1 ⇒ not inside it
 	rewrote := false
 

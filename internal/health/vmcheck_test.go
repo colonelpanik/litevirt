@@ -235,9 +235,9 @@ func TestVMChecker_MaxUnavailableBlocksAction(t *testing.T) {
 
 func TestVMChecker_ActionCountResetsOnRecovery(t *testing.T) {
 	v := &VMChecker{
-		failures:    make(map[string]int),
-		lastAction:  make(map[string]time.Time),
-		actionCount: make(map[string]int),
+		failures:      make(map[string]int),
+		lastAction:    make(map[string]time.Time),
+		actionCount:   make(map[string]int),
 		activeActions: make(map[string]int),
 	}
 

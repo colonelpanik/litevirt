@@ -130,8 +130,8 @@ func TestClassifyTable_ConvergedOmitted(t *testing.T) {
 func TestCheckLiveContainerNames_CrossHostSplit(t *testing.T) {
 	rows := []OwnedRow{
 		{Host: "host-a", Name: "web"}, {Host: "host-b", Name: "web"}, // the split
-		{Host: "host-a", Name: "web"},                                // duplicate report from another node — deduped by (host,name) grouping
-		{Host: "host-a", Name: "db"},                                 // fine: single host
+		{Host: "host-a", Name: "web"}, // duplicate report from another node — deduped by (host,name) grouping
+		{Host: "host-a", Name: "db"},  // fine: single host
 	}
 	v := CheckLiveContainerNames(rows)
 	if len(v) != 1 || v[0].Key != "web" || v[0].Kind != "duplicate_live_container" {

@@ -107,9 +107,9 @@ func (m *memFS) setDriver(address, driver string) {
 type fakeEntry struct{ name string }
 
 func (f fakeEntry) Name() string               { return f.name }
-func (f fakeEntry) IsDir() bool                 { return true }
-func (f fakeEntry) Type() os.FileMode           { return os.ModeDir }
-func (f fakeEntry) Info() (os.FileInfo, error)   { return nil, nil }
+func (f fakeEntry) IsDir() bool                { return true }
+func (f fakeEntry) Type() os.FileMode          { return os.ModeDir }
+func (f fakeEntry) Info() (os.FileInfo, error) { return nil, nil }
 
 // ── Bind tests ──
 

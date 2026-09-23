@@ -167,11 +167,11 @@ func TestLooksLikeAPIToken(t *testing.T) {
 	}{
 		{valid, true},
 		{"", false},
-		{"my-secret-token", false},                    // too short, has dashes
-		{valid[:63], false},                            // 63 chars
-		{valid + "0", false},                           // 65 chars
-		{"0123456789ABCDEF" + valid[16:], false},       // uppercase not emitted by CreateToken
-		{"lvs_0123456789abcdef", false},                // session bearer, not an API token
+		{"my-secret-token", false},               // too short, has dashes
+		{valid[:63], false},                      // 63 chars
+		{valid + "0", false},                     // 65 chars
+		{"0123456789ABCDEF" + valid[16:], false}, // uppercase not emitted by CreateToken
+		{"lvs_0123456789abcdef", false},          // session bearer, not an API token
 		{"g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", false}, // 'g' is not hex
 	} {
 		if got := looksLikeAPIToken(tc.in); got != tc.want {

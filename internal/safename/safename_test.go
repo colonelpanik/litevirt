@@ -68,9 +68,9 @@ func TestCanonicalProjectName(t *testing.T) {
 
 func TestProjectRBACPath(t *testing.T) {
 	cases := map[string]string{
-		"/":             "/projects",
-		"/_default":     "/projects/_default",
-		"/acme/team":    "/projects/acme/team",
+		"/":          "/projects",
+		"/_default":  "/projects/_default",
+		"/acme/team": "/projects/acme/team",
 	}
 	for in, want := range cases {
 		if got := ProjectRBACPath(in); got != want {

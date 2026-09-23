@@ -248,8 +248,8 @@ func RemoveBridgeVLAN(bridge string, vlanID int, underlay string) {
 	vlanIface := VLANInterfaceName(parent, vlanID)
 
 	// Detach from bridge and delete.
-	execCommand("ip", "link", "set", vlanIface, "nomaster")    //nolint:errcheck
-	execCommand("ip", "link", "del", vlanIface)                 //nolint:errcheck
+	execCommand("ip", "link", "set", vlanIface, "nomaster") //nolint:errcheck
+	execCommand("ip", "link", "del", vlanIface)             //nolint:errcheck
 	slog.Info("bridge VLAN removed", "bridge", bridge, "vlan", vlanID, "interface", vlanIface)
 }
 

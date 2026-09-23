@@ -46,11 +46,11 @@ func PushFromSource(
 	}
 
 	m := &Manifest{
-		VMName:     opts.VMName,
-		DiskName:   opts.DiskName,
-		Timestamp:  opts.Timestamp,
-		BasedOn:    basedOn,
-		BitmapName: opts.BitmapName,
+		VMName:         opts.VMName,
+		DiskName:       opts.DiskName,
+		Timestamp:      opts.Timestamp,
+		BasedOn:        basedOn,
+		BitmapName:     opts.BitmapName,
 		VMSpecJSON:     opts.VMSpecJSON,
 		DomainXML:      opts.DomainXML,
 		FirmwareChunks: opts.FirmwareChunks,

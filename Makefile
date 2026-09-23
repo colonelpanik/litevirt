@@ -102,6 +102,7 @@ test-fuzz-telemetry:
 #   - every running publish is routed through the marker chokepoint (runningcheck)
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
+	./scripts/ci/check-gofmt.sh
 	./scripts/ci/check-schema-bump.sh
 	./scripts/ci/check-ledger-drift.sh
 	go run ./scripts/ci/writecheck -root .

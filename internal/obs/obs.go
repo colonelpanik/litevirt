@@ -185,14 +185,14 @@ func traceFilter(info *stats.RPCTagInfo) bool {
 // zero values fall back to library defaults (and an empty OTLPEndpoint disables
 // OTLP export entirely, leaving local structured logging only).
 type Config struct {
-	ServiceName  string  // logical service name (default "litevirt")
-	Version      string  // build version, surfaced as service.version
-	Environment  string  // deployment env, e.g. "prod"/"homelab"
-	HostName     string  // this daemon's cluster host name → host.name / service.instance.id
-	OTLPEndpoint string  // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318" (http://|https://, no URL userinfo; auth via LITEVIRT_OTEL_HEADERS); empty = no export
+	ServiceName  string   // logical service name (default "litevirt")
+	Version      string   // build version, surfaced as service.version
+	Environment  string   // deployment env, e.g. "prod"/"homelab"
+	HostName     string   // this daemon's cluster host name → host.name / service.instance.id
+	OTLPEndpoint string   // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318" (http://|https://, no URL userinfo; auth via LITEVIRT_OTEL_HEADERS); empty = no export
 	SampleRate   *float64 // trace sample rate 0.0–1.0; nil = library default (100%), 0 = disabled (0%)
-	LogLevel     string  // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO)
-	LogFormat    string  // json|console|pretty (default console; set json for structured export)
+	LogLevel     string   // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO)
+	LogFormat    string   // json|console|pretty (default console; set json for structured export)
 }
 
 // Setup initializes telemetry and installs the enriched slog default logger.

@@ -80,12 +80,12 @@ func TestCorrosionPlanLoader_LoadsAllTiers(t *testing.T) {
 		t.Fatalf("Render: %v", err)
 	}
 	mustContainAll(t, out,
-		"policy drop;",                          // default-deny rendered
-		"set admins {",                          // ipset object
-		"jump cluster_default",                  // cluster tier hooked
-		"jump host_overrides",                   // host tier hooked
-		"tcp dport 22 ip saddr @admins accept",  // cluster rule, ingress→saddr
-		"ip daddr 192.168.0.0/16 drop",          // host rule, egress→daddr
+		"policy drop;",                         // default-deny rendered
+		"set admins {",                         // ipset object
+		"jump cluster_default",                 // cluster tier hooked
+		"jump host_overrides",                  // host tier hooked
+		"tcp dport 22 ip saddr @admins accept", // cluster rule, ingress→saddr
+		"ip daddr 192.168.0.0/16 drop",         // host rule, egress→daddr
 	)
 }
 

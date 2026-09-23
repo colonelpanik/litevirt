@@ -14,6 +14,15 @@ var appendOnlyTables = map[string]bool{
 	// from displacing a newer one on a peer, which is exactly the move that
 	// would hide a truncation.
 	"audit_chain_heads": true,
+	// leader_lease_terms is deliberately NOT listed here. It is append-only in
+	// spirit, but registering it as such made the WAL path (INSERT OR IGNORE,
+	// first-writer-wins) and the anti-entropy path (LWW on updated_at,
+	// last-writer-wins) resolve a contested (key, term) to DIFFERENT holders. It
+	// is in customMergeTables instead, whose merge keeps the local row on both
+	// paths and flags a genuine conflict; deriveDisposition checks
+	// customMergeTables first, so an entry here would be unreachable anyway and
+	// would only create a second, disagreeing source of truth.
+	//
 	// A retirement is a signed assertion about a fixed (host, key). It has no
 	// later revision, and append-only is what makes it self-repairing: a row
 	// deleted locally has nothing to conflict with, so anti-entropy re-inserts

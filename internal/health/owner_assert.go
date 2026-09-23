@@ -259,7 +259,9 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 			r.observeOwnerAssert(name, "disputed")
 			return
 		}
-		if err := corrosion.TransferVMOwner(ctx, r.db, name, r.hostName, RuntimeRunning, fresh.OwnerEpoch); err != nil {
+		if err := r.publishRunningMinted(ctx, name, func(ctx context.Context) error {
+			return corrosion.TransferVMOwner(ctx, r.db, name, r.hostName, RuntimeRunning, fresh.OwnerEpoch)
+		}); err != nil {
 			slog.Warn("owner-assert: epoch-guarded re-key refused or failed", "vm", name, "error", err)
 			r.observeOwnerAssert(name, "error")
 			return

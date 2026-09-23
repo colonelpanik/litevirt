@@ -22,7 +22,7 @@ clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
 ordinary mutation's `--force` never bypasses the barrier.
 
-## `hardware_v2` — typed hardware and the one capability with no kill switch
+## `hardware_v2` — typed hardware, with no kill switch of its own
 
 `hardware_v2` makes the typed hardware tables (disks, NICs, PCI intents) the
 source of truth instead of the free-form VM spec, and unlocks hardware mutation
@@ -193,7 +193,11 @@ table.
      table-remediation procedure above or a table-specific restamp — `repair-owner`
      cannot repair them, and `lv cluster converge` labels them accordingly.
    - **In-memory unresolved-tie records do not auto-clear** just because a table's
-     v2 digest now matches; they clear on the next daemon restart.
+     v2 digest now matches; they clear on the next daemon restart. The one
+     exception is `leader_lease_terms`, whose rows are immutable: a restart
+     empties the register but the next anti-entropy pass re-registers the same
+     tie, so that one needs `lv cluster acknowledge-lease-term` — see
+     [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
 v1-only emission (peers then compare v1 against it). Because negotiation is by
@@ -518,6 +522,133 @@ homogeneous cluster — every host resolving the alias identically is why this i
 a warning and not an error — but it should be cleared before introducing a host
 with a different qemu version.
 
+## `lv doctor fence`
+
+Read-only. Reports whether a cross-host transfer of a shared-disk VM would
+actually be fenced.
+
+```
+lv doctor fence
+```
+
+Starting a VM on a second host while the first may still be writing the same
+shared disk corrupts it. The guard against that is a **proof-grade fence** — an
+IPMI-confirmed power-off, or an operator `lv host fence-confirm` — required
+before an ownership transfer of any VM with a disk on shared storage
+(`nfs`, `ceph`, `rbd`, `iscsi`). Local-disk VMs need no fence: a relocation
+target holds a different image, not the same bytes.
+
+The guard has **two independent switches, and both must be on**:
+
+| Switch | Scope | Default |
+|---|---|---|
+| `shared_storage_fence_v1` | latches cluster-wide once every host advertises it | latches on upgrade |
+| `enforcement.shared_storage_fence` | per-host config | **false** |
+
+The gap this command exists to close: a host advertises the token **regardless
+of its own config flag**, because advertisement means "this binary supports the
+feature", not "this node enforces it" (see `advertisedCapabilities`). A cluster
+can therefore show the capability fully latched while any subset of hosts
+silently skips the fence — a state no peer and no operator could observe. This
+command asks every host for its own posture via `PingResponse.not_enforcing`,
+so the answer reflects what each node will actually do.
+
+That the token is advertised unconditionally is deliberate, and the reasoning is
+kept in `advertisedCapabilities`: the fence is enforced where a transfer is
+*created*, so no node relies on a peer enforcing it, and withholding the token
+would leave a witness — or any host mid-rollout — holding the whole cluster on
+the legacy path.
+
+A host is reported as `unknown` rather than as enforcing whenever its posture
+cannot be read, which covers five cases: it did not answer; it did not report a
+posture (it runs a binary predating the field, or it withheld posture from this
+caller — see below); it advertises nothing because it is self-fenced or
+WAL-quarantined; it advertises other tokens but not this one; or the report's
+overall budget expired before it was probed.
+
+Posture is answered only to a caller presenting a **host** certificate.
+`not_enforcing` names which security kill-switches are off, and `Ping` bypasses
+the identity interceptor, so the distributable `lv-cli` certificate would
+otherwise read it with no session and no role. The daemon's own fan-out uses its
+host certificate, so this is invisible in normal use; a caller reaching `Ping`
+some other way lands in the `unknown` bucket above rather than being told
+anything.
+Unknown counts against readiness exactly as "not enforcing" does — a diagnostic
+that cannot see a host must not report the cluster clear on its behalf.
+
+Witness hosts are excluded. A witness never hosts a workload, so it can never
+perform the fence and its flag will never be on; counting it would pin the
+warning on permanently.
+
+Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
+
+### What it does not establish
+
+Printed on **every** run, clean or not. These are the two things that would make
+a clean result wrong, and the host table reads most misleadingly on the warning
+path — a fleet can show a column of `enforcing` above a WARNING, and an operator
+who fixes the one host the remedy names would otherwise never learn that the
+per-host latch is unobservable:
+
+- **Each host's own capability latch.** The latch is per-node state
+  (`internal/health.Checker`'s `activated` map plus its marker files) with no
+  wire representation, so `capability_latched` is the *queried node's* latch.
+  During a rollout one node can latch before another finishes its sweep, and a
+  host that has not latched takes the legacy path whatever its config flag says.
+  `enforced_everywhere` therefore covers the per-host **config** half only —
+  true means "nothing is switched off", not "every node will fence".
+- **Shared-disk VMs this node has not replicated.** The count comes from the
+  queried node's `vm_disks` rows, so a VM created on a peer whose rows have not
+  arrived is not counted. A zero is "none that this node knows of".
+
+When `capability latched` is false and any host reads `enforcing`, the report
+says so explicitly: `enforcing` is that host's config flag, and the flag does
+nothing until the capability has latched cluster-wide, so no host is fencing
+whatever the table shows. Without that line a mid-rollout fleet — every operator
+having already set the flag — prints a column of `enforcing` that reads as
+covered.
+## `lv doctor cpu-mode`
+
+Read-only. Lists VMs whose **persisted spec** has an empty `cpu_mode`.
+
+```
+lv doctor cpu-mode
+```
+
+Such a VM is defined with no `<cpu>` element, so libvirt passes no `-cpu` to QEMU
+and the guest runs on QEMU's x86_64 default, `qemu64` — a model with no `sse4.1`,
+no `sse4.2` and no `xsave`, and therefore neither AVX nor AVX2, however capable
+the host is. Guest software that assumes a modern baseline will not start, and the
+fault presents as a broken binary rather than a hypervisor setting.
+
+New VMs default to `host-model` (see `vm.default_cpu_mode` in
+[configuration](configuration.md)). VMs listed here were created before that
+default existed. Their stored spec is honored verbatim and deliberately not
+rewritten: changing the CPU a running guest sees is not something an upgrade
+should do behind the operator's back.
+
+To move one forward, with the VM **stopped**:
+
+```
+lv update <vm> --cpu-mode host-model
+```
+
+or, in one step on a running VM, `lv update <vm> --cpu-mode host-model
+--restart-if-needed`, which does a stop → redefine → start under a single VM
+lock.
+
+The retrofit is an **in-place patch of libvirt's own inactive domain XML**, not a
+regeneration from the stored spec, so every libvirt-assigned detail the spec does
+not describe — guest PCI slot addresses, controller models, disk ordering —
+survives unchanged. That matters for guests (e.g. Windows) that key licensing off
+stable hardware addresses. If the patch cannot be applied for any reason the
+redefine falls back to full regeneration rather than failing.
+
+Two things to expect. It changes the guest-visible CPU, so it needs a full
+stop/start rather than a guest reboot. And it narrows live migration for that VM
+to hosts with an equal-or-richer CPU — the trade the modern instruction set
+costs, and no trade at all on a homogeneous cluster.
+
 ## `lv doctor vm-uuids`
 
 Read-only. Lists VMs whose **persisted spec** carries no domain uuid.
@@ -779,6 +910,14 @@ observed → confirmed → resolved lifecycle:
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
 0 / 1 / 2 so scripts can gate on it.
+
+Peer connectivity counts toward that state: a link the checker cannot prove
+good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
+rather than being reported and ignored. Links whose **target is in
+maintenance** are the exception — nothing probes a host that is out of
+service, so its last recorded status would never change again and counting
+it would hold the cluster DEGRADED for as long as the host stays down. Those
+edges are still listed; they just stop voting.
 
 **The same rows drive admission.** An active ownership condition blocks
 capacity-growing admission to every involved host and runtime-changing

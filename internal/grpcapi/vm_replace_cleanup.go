@@ -459,9 +459,16 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		// diagnostic text makes the next retry start a VM the operator stopped.
 		// The failure is already on the VM's event feed and the operation stays
 		// owed in the journal; the row is not the only place it can be seen.
+		//
+		// Routed like any state write that can carry "running": the row keeps the
+		// state it already had, and the chokepoint marks its current generation
+		// before the detail lands. This function returns early off the manifest's
+		// host, so the publish is always local.
 		if firmware && desired.StateDetail != operatorStopDetail {
-			if werr := corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, desired.State,
-				"cutover "+step+" failed: "+e.Error()); werr != nil {
+			if werr := s.publishRunning(ctx, m.ReplacedVM, desired.State, func(ctx context.Context) error {
+				return corrosion.UpdateVMState(ctx, s.db, m.ReplacedVM, desired.State,
+					"cutover "+step+" failed: "+e.Error())
+			}); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
 		}

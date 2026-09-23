@@ -1562,12 +1562,18 @@ func (r *Reconciler) imagePullFlight(ctx context.Context, imageName string) *ima
 //
 // Written on a context that survives the walk budget, which is usually already
 // spent by the time this runs.
+//
+// Two literal writes rather than one with a variable state: the runningcheck
+// guard proves statically that no write here can publish "running".
 func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, detail string) {
-	state := "starting"
+	cctx := context.WithoutCancel(ctx)
+	var err error
 	if proofID != "" {
-		state = "pending"
+		err = corrosion.UpdateVMState(cctx, r.db, vmName, "pending", detail)
+	} else {
+		err = corrosion.UpdateVMState(cctx, r.db, vmName, "starting", detail)
 	}
-	if err := corrosion.UpdateVMState(context.WithoutCancel(ctx), r.db, vmName, state, detail); err != nil {
+	if err != nil {
 		slog.Error("reconciler: re-arm pending write failed", "vm", vmName, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}

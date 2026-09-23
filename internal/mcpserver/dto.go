@@ -24,21 +24,26 @@ type whoamiOut struct {
 }
 
 type hostOut struct {
-	Name         string            `json:"name"`
-	Address      string            `json:"address,omitempty"`
-	State        string            `json:"state"`
-	Region       string            `json:"region,omitempty"`
-	Version      string            `json:"version,omitempty"`
-	CPUTotal     int32             `json:"cpu_total"`
-	CPUUsed      int32             `json:"cpu_used"`
-	MemTotalMiB  int32             `json:"mem_total_mib"`
-	MemUsedMiB   int32             `json:"mem_used_mib"`
-	DiskTotalGiB int64             `json:"disk_total_gib"`
-	DiskUsedGiB  int64             `json:"disk_used_gib"`
-	VMCount      int32             `json:"vm_count"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	Pools        []poolOut         `json:"storage_pools,omitempty"`
-	UpdatedAt    string            `json:"updated_at,omitempty"`
+	Name         string `json:"name"`
+	Address      string `json:"address,omitempty"`
+	State        string `json:"state"`
+	Region       string `json:"region,omitempty"`
+	Version      string `json:"version,omitempty"`
+	CPUTotal     int32  `json:"cpu_total"`
+	CPUUsed      int32  `json:"cpu_used"`
+	MemTotalMiB  int32  `json:"mem_total_mib"`
+	MemUsedMiB   int32  `json:"mem_used_mib"`
+	DiskTotalGiB int64  `json:"disk_total_gib"`
+	DiskUsedGiB  int64  `json:"disk_used_gib"`
+	// DiskAllocatedGiB is the sum of the VMs' allocated virtual disk sizes.
+	// Reported separately from DiskUsedGiB because thin provisioning makes the
+	// two diverge without limit, and only DiskUsedGiB shares a basis with
+	// DiskTotalGiB.
+	DiskAllocatedGiB int64             `json:"disk_allocated_gib"`
+	VMCount          int32             `json:"vm_count"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	Pools            []poolOut         `json:"storage_pools,omitempty"`
+	UpdatedAt        string            `json:"updated_at,omitempty"`
 }
 
 type vmOut struct {
@@ -262,12 +267,52 @@ func hostDTO(h *pb.Host) hostOut {
 	for _, p := range h.GetStoragePools() {
 		pools = append(pools, poolDTO(p))
 	}
+	// disk_used_gib and disk_total_gib sit next to each other in this JSON, so
+	// a consumer WILL divide them. Both therefore come from the pools' statfs
+	// figures — the same measurement `df` makes — rather than pairing a statfs
+	// total with the VMs' allocated virtual sizes, which thin provisioning lets
+	// diverge without limit (98 GiB allocated on a filesystem 27% used).
+	//
+	// Allocation is what admission actually spends, so it is still reported —
+	// under disk_allocated_gib, a name that cannot be mistaken for usage.
+	actualUsed, actualTotal := sumPoolActualBytes(h.GetStoragePools())
+	const gib = int64(1024 * 1024 * 1024)
+	totalGiB := actualTotal / gib
+	if actualTotal == 0 {
+		// No pool rows yet (early startup). Fall back to the figure written at
+		// registration, which is the same statfs basis — but leave used at 0
+		// rather than substituting allocation, because actual usage is
+		// genuinely unknown and a wrong number is worse than a missing one.
+		totalGiB = h.GetDiskTotalGib()
+	}
 	return hostOut{
 		Name: h.GetName(), Address: h.GetAddress(), State: h.GetState().String(), Region: h.GetRegion(), Version: h.GetVersion(),
 		CPUTotal: h.GetCpuTotal(), CPUUsed: h.GetCpuUsed(), MemTotalMiB: h.GetMemTotalMib(), MemUsedMiB: h.GetMemUsedMib(),
-		DiskTotalGiB: h.GetDiskTotalGib(), DiskUsedGiB: h.GetDiskUsedGib(), VMCount: h.GetVmCount(), Labels: h.GetLabels(),
+		DiskTotalGiB: totalGiB, DiskUsedGiB: actualUsed / gib, DiskAllocatedGiB: h.GetDiskUsedGib(),
+		VMCount: h.GetVmCount(), Labels: h.GetLabels(),
 		Pools: pools, UpdatedAt: ts(h.GetUpdatedAt()),
 	}
+}
+
+// sumPoolActualBytes sums the host's pools' statfs used/total, counting each
+// distinct target ONCE. Two pools rooted on one filesystem are one filesystem,
+// and double-counting them would overstate both halves — the same dedup the
+// daemon applies when it computes the host's disk total at registration.
+// A pool with no target is counted on its own, since nothing identifies it as
+// sharing.
+func sumPoolActualBytes(pools []*pb.StoragePool) (used, total int64) {
+	seen := map[string]bool{}
+	for _, p := range pools {
+		if t := p.GetTarget(); t != "" {
+			if seen[t] {
+				continue
+			}
+			seen[t] = true
+		}
+		used += p.GetUsedBytes()
+		total += p.GetTotalBytes()
+	}
+	return used, total
 }
 
 func mapHosts(in []*pb.Host) []hostOut {

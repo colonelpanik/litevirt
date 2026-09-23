@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -1677,5 +1678,64 @@ func TestCreateVM_UnnamedDiskIsAdmittedAgainstTheDefaultPool(t *testing.T) {
 	}})
 	if status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("unnamed 200G disk on a nearly-full default pool: got %v, want ResourceExhausted", err)
+	}
+}
+
+// The Spec.Disks projection rebuilt each disk from vm_disks with only name,
+// size and bus, dropping the compose-facing Storage (and Cache) the stored spec
+// carries. A caller diffing a compose file against the inspected spec — `lv
+// compose diff` — then saw an unchanged `storage: fast` disk as a topology
+// change, i.e. a recreate. The projection must keep them.
+func TestInspectVM_ProjectionKeepsDiskStorageAndCache(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	stored := &pb.VMSpec{
+		Name: "stor-proj", StackName: "stk", Image: "ubuntu", Cpu: 1, MemoryMib: 512,
+		GuestAgent: true, Boot: "disk",
+		Disks: []*pb.DiskSpec{{Name: "root", Size: "10G", Bus: "virtio", Storage: "fast", Cache: "none"}},
+	}
+	blob, err := json.Marshal(stored)
+	if err != nil {
+		t.Fatalf("json.Marshal(spec): %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "stor-proj", StackName: "stk", HostName: "other-host", State: "running", Spec: string(blob),
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "stor-proj", DiskName: "root", HostName: "other-host",
+		Path: "/var/lib/litevirt/stor-proj/root.qcow2", SizeBytes: 10 * 1024 * 1024 * 1024,
+		StorageType: "dir", StorageVolume: "fast", TargetDev: "vda", Bus: "virtio",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+
+	resp, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "stor-proj"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if resp.Spec == nil || len(resp.Spec.Disks) != 1 {
+		t.Fatalf("Spec.Disks = %+v, want the one root disk", resp.Spec.GetDisks())
+	}
+	if got := resp.Spec.Disks[0]; got.Storage != "fast" || got.Cache != "none" {
+		t.Errorf("projected root disk = %+v, want Storage=fast Cache=none preserved from the stored spec", got)
+	}
+
+	// The symptom: the compose definition that created this VM, diffed against
+	// the inspected spec, must be a no-op.
+	f := &compose.File{Name: "stk", VMs: map[string]compose.VMDef{
+		"stor-proj": {Image: "ubuntu", CPU: 1, Memory: 512,
+			Disks: map[string]compose.DiskDef{"root": {Size: "10G", Storage: "fast", Cache: "none"}}},
+	}}
+	plan, err := compose.Build(f, []compose.CurrentVM{{
+		Name: "stor-proj", Image: "ubuntu", CPU: 1, MemMiB: 512, State: "running", Spec: resp.Spec,
+	}})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if plan.HasChanges() {
+		t.Errorf("unchanged definition vs inspected spec planned %+v", plan.Ops)
 	}
 }

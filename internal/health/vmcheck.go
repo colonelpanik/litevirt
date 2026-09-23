@@ -751,6 +751,65 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 		}
 	}
 
+	// Ownership, three ways — this path had none of them, while every sibling
+	// start path has at least one.
+	//
+	// ExecutionGate above proves QUORUM, not ownership, and a rejoined node
+	// holding a stale replica is exactly the case that has quorum. Ownership
+	// used to be consulted only afterwards by publishRunning, which declines to
+	// publish once the guest is already booted — by which point a second QEMU is
+	// writing to the same disk.
+	//
+	// 1. Re-read the row. The snapshot this call was handed may be minutes old.
+	fresh, ferr := corrosion.GetVM(ctx, v.db, vm.Name)
+	if ferr != nil {
+		slog.Warn("vmcheck: restart-policy ownership re-read failed — not restarting",
+			"vm", vm.Name, "error", ferr)
+		return
+	}
+	if fresh == nil {
+		slog.Info("vmcheck: restart-policy skipped — VM record is gone", "vm", vm.Name)
+		return
+	}
+	if fresh.HostName != v.hostName {
+		slog.Info("vmcheck: restart-policy skipped — VM no longer owned by this host",
+			"vm", vm.Name, "owner", fresh.HostName)
+		return
+	}
+
+	// 2. Take the per-VM lease, so this host's own reconciler cannot start the
+	// same VM concurrently. Its comment is the reason: "the same physical disk
+	// gets two QEMU writers -> guaranteed corruption".
+	//
+	// Under vmcheckLockHolder, NOT the bare host name. The upsert admits
+	// `holder = excluded.holder` so a component can re-take its own lease
+	// across passes; sharing the host name with the reconciler made that
+	// clause match ITS lease too, so this path acquired a lease held for a
+	// start already in flight and then freed it on the way out.
+	holder := vmcheckLockHolder(v.hostName)
+	if !acquireVMLockFor(ctx, v.db, holder, vm.Name, time.Now()) {
+		slog.Info("vmcheck: restart-policy skipped — vm_lock held elsewhere", "vm", vm.Name)
+		return
+	}
+	defer releaseVMLockFor(ctx, v.db, holder, vm.Name)
+
+	// 3. Refuse a runtime this cluster has superseded. The row can still name us
+	// while the owner epoch has moved on, which is what the self-heal path
+	// checks. Readable here because the domain still exists — we are about to
+	// destroy and restart it — unlike the post-undefine case that forces the
+	// reconciler to prefer its on-disk marker.
+	if v.virt != nil {
+		if marker, ok, merr := v.virt.GetDomainOwnerEpoch(vm.Name); merr == nil && ok &&
+			fresh.OwnerEpoch > marker {
+			slog.Info("vmcheck: restart-policy skipped — local runtime superseded",
+				"vm", vm.Name, "domain_epoch", marker, "row_epoch", fresh.OwnerEpoch)
+			return
+		}
+	}
+
+	// Everything below acts on the FRESH record.
+	vm = *fresh
+
 	// Perform restart.
 	slog.Info("vmcheck: restarting VM per restart policy", "vm", vm.Name,
 		"condition", rp.Condition, "state", vm.State)

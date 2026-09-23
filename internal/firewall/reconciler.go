@@ -139,6 +139,22 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	return nil
 }
 
+// ReconcileForce is Reconcile with the change-detection cache cleared first, so
+// the ruleset reaches nft even when the rendered bytes are unchanged.
+//
+// This is what `lv firewall reload` must call. Routed through plain Reconcile
+// it hit the Applier's cache and did nothing — the one command an operator runs
+// when they believe the kernel has drifted out from under the daemon was a
+// no-op, which is the same defect as the "periodic re-apply self-heals" claim
+// above.
+//
+// Reset also clears the resync timestamp, so the forced apply restarts the
+// window rather than leaving the next tick due immediately.
+func (r *Reconciler) ReconcileForce(ctx context.Context) error {
+	r.applier.Reset()
+	return r.Reconcile(ctx)
+}
+
 // migrateLegacy removes, once per bridge, the pre-consolidation rules a prior
 // binary applied out-of-band. Keyed on bridges the just-applied plan now covers,
 // so a bridge's old rules are only removed after its new rules exist.

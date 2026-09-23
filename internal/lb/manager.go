@@ -52,6 +52,39 @@ func NewManager() *Manager {
 	}
 }
 
+// applyMarkerPath is the "an Apply started and did not finish" marker for an LB.
+//
+// It exists because the config FILE cannot answer that question. Apply writes
+// both configs and only then runs the steps that can fail, so a failure leaves
+// the new config on disk while the OLD keepalived still holds the OLD VIP. The
+// retry then compares the render against the file it already wrote, sees no
+// change, finds keepalived alive, and skips the reload — permanently. HAProxy
+// binds the new VIP anyway under ip_nonlocal_bind, so the LB reports healthy
+// while the VIP is advertised from nowhere.
+//
+// A file rather than a field: a daemon restart between the write and the reload
+// is one of the ways this happens, and an in-memory flag would not survive it.
+func (m *Manager) applyMarkerPath(name string) string {
+	return filepath.Join(m.configDir, name+".applying")
+}
+
+// reloadDecision reports whether haproxy and keepalived need to be
+// started/reloaded for this render.
+//
+// "Changed" means "differs from what was last successfully APPLIED", which is
+// the rendered content only when the previous Apply ran to completion. An
+// incomplete one forces both, because nothing on disk can distinguish a config
+// that was applied from one that was merely written.
+func (m *Manager) reloadDecision(name, haproxyCfg, keepalivedCfg string) (haproxyChanged, keepalivedChanged bool) {
+	incomplete := false
+	if _, err := os.Stat(m.applyMarkerPath(name)); err == nil {
+		incomplete = true
+	}
+	haproxyChanged = incomplete || configChanged(filepath.Join(m.configDir, name+"-haproxy.cfg"), haproxyCfg)
+	keepalivedChanged = incomplete || configChanged(filepath.Join(m.configDir, name+"-keepalived.conf"), keepalivedCfg)
+	return haproxyChanged, keepalivedChanged
+}
+
 // Apply writes HAProxy + keepalived configs and starts/reloads processes.
 // It is idempotent: calling Apply twice with the same config is safe.
 func (m *Manager) Apply(ctx context.Context, cfg Config) error {
@@ -66,27 +99,36 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("create lb run dir: %w", err)
 	}
 
-	// Write haproxy config. Detect change BEFORE writing so we only reload the
-	// running process when the rendered config actually differs (a burst of
-	// identical re-applies during deploy/migration must not churn — that churn
-	// is what spawned reload-race orphan processes).
+	// Render both, then decide what needs reloading BEFORE anything is written
+	// — a burst of identical re-applies during deploy/migration must not churn,
+	// and that churn is what spawned reload-race orphan processes.
+	//
+	// The decision also has to account for a PREVIOUS Apply that wrote its
+	// configs and then failed: see applyMarkerPath. Comparing the render against
+	// the file alone would call such a config unchanged and skip the reload
+	// forever, leaving the old keepalived holding the old VIP.
 	haproxyCfg, err := RenderHAProxy(cfg)
 	if err != nil {
 		return err
 	}
-	haproxyPath := filepath.Join(m.configDir, cfg.Name+"-haproxy.cfg")
-	haproxyChanged := configChanged(haproxyPath, haproxyCfg)
-	if err := os.WriteFile(haproxyPath, []byte(haproxyCfg), 0640); err != nil {
-		return fmt.Errorf("write haproxy config: %w", err)
-	}
-
-	// Write keepalived config (same change-detection).
 	keepalivedCfg, err := RenderKeepalived(cfg)
 	if err != nil {
 		return err
 	}
+	haproxyChanged, keepalivedChanged := m.reloadDecision(cfg.Name, haproxyCfg, keepalivedCfg)
+
+	// From here on the on-disk state can diverge from what is actually running,
+	// so mark the apply in flight. Cleared only by a complete pass at the end.
+	marker := m.applyMarkerPath(cfg.Name)
+	if err := os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)), 0640); err != nil {
+		return fmt.Errorf("write lb apply marker: %w", err)
+	}
+
+	haproxyPath := filepath.Join(m.configDir, cfg.Name+"-haproxy.cfg")
+	if err := os.WriteFile(haproxyPath, []byte(haproxyCfg), 0640); err != nil {
+		return fmt.Errorf("write haproxy config: %w", err)
+	}
 	keepalivedPath := filepath.Join(m.configDir, cfg.Name+"-keepalived.conf")
-	keepalivedChanged := configChanged(keepalivedPath, keepalivedCfg)
 	if err := os.WriteFile(keepalivedPath, []byte(keepalivedCfg), 0640); err != nil {
 		return fmt.Errorf("write keepalived config: %w", err)
 	}
@@ -172,6 +214,15 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		if err := m.startOrReloadHAProxy(haproxyPath, haproxyPid); err != nil {
 			return fmt.Errorf("haproxy start/reload: %w", err)
 		}
+	}
+
+	// A complete pass: what is on disk is now what is running, so the file is a
+	// trustworthy basis for the next change decision again.
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		// Leaving it costs one redundant reload next time, which is safe; the
+		// alternative — silently keeping a stale one — is not.
+		slog.Warn("lb: clearing apply marker failed; next apply will reload redundantly",
+			"lb", cfg.Name, "error", err)
 	}
 
 	slog.Info("LB applied", "name", cfg.Name, "vip", cfg.VIP, "backends", len(cfg.Backends), "snat", cfg.SNATEnabled)
@@ -282,6 +333,9 @@ func (m *Manager) Remove(ctx context.Context, name string) error {
 		filepath.Join(m.configDir, name+"-haproxy.cfg"),
 		filepath.Join(m.configDir, name+"-conntrackd.conf"),
 		filepath.Join(m.configDir, name+"-notify.sh"),
+		// The in-flight marker goes with the LB it describes; a leftover would
+		// force one redundant reload if the name were ever reused.
+		m.applyMarkerPath(name),
 	}
 	if kaErr == nil {
 		cfgFiles = append(cfgFiles, filepath.Join(m.configDir, name+"-keepalived.conf"))

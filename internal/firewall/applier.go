@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // NftRunner is the shell-out boundary so tests can drive applier
@@ -66,8 +67,11 @@ func (n NftBinary) Flush(ctx context.Context) (string, error) {
 type Applier struct {
 	runner NftRunner
 
-	mu       sync.Mutex
-	lastSent string
+	mu          sync.Mutex
+	lastSent    string
+	lastApplyAt time.Time
+	resyncAfter time.Duration
+	now         func() time.Time
 }
 
 // NewApplier wraps an NftRunner with the change-detection cache.
@@ -75,7 +79,26 @@ func NewApplier(runner NftRunner) *Applier {
 	if runner == nil {
 		runner = NftBinary{}
 	}
-	return &Applier{runner: runner}
+	return &Applier{runner: runner, resyncAfter: DefaultResyncInterval, now: time.Now}
+}
+
+// DefaultResyncInterval bounds how long an out-of-band change to the kernel
+// ruleset can persist before the reconciler re-sends the identical ruleset.
+const DefaultResyncInterval = 5 * time.Minute
+
+// SetResyncInterval overrides the resync window. Zero disables resync entirely
+// (cache-only, the pre-fix behaviour).
+func (a *Applier) SetResyncInterval(d time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.resyncAfter = d
+}
+
+// SetClock replaces the time source. Test seam.
+func (a *Applier) SetClock(now func() time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.now = now
 }
 
 // Apply renders and applies p. Returns (changed, error). When changed
@@ -89,14 +112,48 @@ func (a *Applier) Apply(ctx context.Context, p Plan) (bool, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if rs == a.lastSent {
+
+	unchanged := rs == a.lastSent
+	// The cache alone cannot self-heal. Nothing here observes the kernel, so
+	// "the bytes I last sent" is not "the bytes that are loaded": after an
+	// out-of-band `nft flush` the reconciler renders the same ruleset, skips
+	// nft, and stamps a fresh tick — reporting healthy with no rules loaded.
+	// Re-sending the identical ruleset once per resync window bounds how long
+	// that can last, while leaving the ordinary tick free.
+	if unchanged && !a.resyncDueLocked() {
 		return false, nil
 	}
 	if out, err := a.runner.Apply(ctx, rs); err != nil {
 		return false, fmt.Errorf("nft apply: %w: %s", err, strings.TrimSpace(out))
 	}
 	a.lastSent = rs
-	return true, nil
+	a.lastApplyAt = a.clockLocked()()
+	// changed reports whether the RULESET changed, not whether nft was invoked.
+	// A resync sends identical bytes, and telling the caller otherwise would
+	// emit a firewall-changed event every window on a cluster that changed
+	// nothing.
+	return !unchanged, nil
+}
+
+// resyncDueLocked reports whether the last successful apply is old enough that
+// the identical ruleset should be re-sent. Caller holds a.mu.
+func (a *Applier) resyncDueLocked() bool {
+	if a.resyncAfter <= 0 {
+		return false
+	}
+	if a.lastApplyAt.IsZero() {
+		return true
+	}
+	return a.clockLocked()().Sub(a.lastApplyAt) >= a.resyncAfter
+}
+
+// clockLocked returns the time source, defaulting to time.Now for an Applier
+// built as a zero value rather than through NewApplier. Caller holds a.mu.
+func (a *Applier) clockLocked() func() time.Time {
+	if a.now == nil {
+		return time.Now
+	}
+	return a.now
 }
 
 // LastApplied returns the most recent ruleset bytes the applier
@@ -115,4 +172,5 @@ func (a *Applier) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lastSent = ""
+	a.lastApplyAt = time.Time{}
 }

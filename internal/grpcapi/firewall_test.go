@@ -24,6 +24,10 @@ type fakeReconciler struct {
 	failNow bool
 }
 
+// ReconcileForce delegates to Reconcile so the existing call-count assertions
+// keep counting a reload, which now takes the forced path (#187).
+func (f *fakeReconciler) ReconcileForce(ctx context.Context) error { return f.Reconcile(ctx) }
+
 func (f *fakeReconciler) Reconcile(_ context.Context) error {
 	atomic.AddInt32(&f.calls, 1)
 	if f.failNow {
@@ -32,7 +36,7 @@ func (f *fakeReconciler) Reconcile(_ context.Context) error {
 	f.lastTS = time.Now()
 	return nil
 }
-func (f *fakeReconciler) LastError() error  { return f.err }
+func (f *fakeReconciler) LastError() error    { return f.err }
 func (f *fakeReconciler) LastTick() time.Time { return f.lastTS }
 
 // adminCtxWithEngine grants alice admin via a root binding so

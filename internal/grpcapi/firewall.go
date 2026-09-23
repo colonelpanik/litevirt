@@ -26,7 +26,10 @@ func (s *Server) ReloadFirewall(ctx context.Context, _ *emptypb.Empty) (*pb.Fire
 	if s.fwReconciler == nil {
 		return nil, status.Error(codes.Unavailable, "firewall reconciler not wired (test server?)")
 	}
-	if err := s.fwReconciler.Reconcile(ctx); err != nil {
+	// Forced, not the ordinary tick: `lv firewall reload` is an operator saying
+	// they believe the kernel drifted, so it must bypass the change-detection
+	// cache rather than render the same bytes and report success (#187).
+	if err := s.fwReconciler.ReconcileForce(ctx); err != nil {
 		return nil, status.Errorf(codes.Internal, "reconcile: %v", err)
 	}
 

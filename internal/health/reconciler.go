@@ -1238,7 +1238,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						// parked in error for a transfer that is going fine.
 						slog.Info("reconciler: backing image still transferring; the start resumes on a later pass",
 							"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
-						r.deferPendingStart(ctx, vm.Name,
+						r.deferPendingStart(ctx, vm.Name, proofID,
 							fmt.Sprintf("waiting for backing image %s to finish transferring", d.BackingImage))
 						return
 					}
@@ -1539,14 +1539,35 @@ func (r *Reconciler) imagePullFlight(ctx context.Context, imageName string) *ima
 	return fl
 }
 
-// deferPendingStart hands a VM whose start is waiting on something still in
-// progress back to pending, with the reason, so the next pass re-drives it.
-// Distinct from failPendingStart: nothing failed, so the proof (if any) is left
-// in_progress for the same executor to re-claim, and a proof-less VM is NOT
-// parked in error. Written on a context that survives the walk budget, which
-// is usually already spent by the time this runs.
-func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, detail string) {
-	if err := corrosion.UpdateVMState(context.WithoutCancel(ctx), r.db, vmName, "pending", detail); err != nil {
+// deferPendingStart records that a VM's start is waiting on something still in
+// progress, with the reason, in a state the next pass re-drives. Distinct from
+// failPendingStart: nothing failed, so the proof (if any) is left in_progress
+// for the same executor to re-claim, and a proof-less VM is NOT parked in
+// error.
+//
+// WHICH state depends on whether the start is an ownership transfer:
+//
+//   - With a proof it goes back to "pending". The marker (pending_action_id)
+//     stays on the row, so the re-drive re-validates and re-claims the same
+//     proof — the shape failPendingStart's retryable arm already produces.
+//   - Without a proof it stays in "starting". A proof-less start is a LOCAL
+//     recovery — onboot autostart, a domain that died under a running row —
+//     and under the split-brain gate a markerless PENDING row is refused as
+//     proof_missing, by design: the coordinator writes pending and its marker
+//     atomically, so pending without one is stale or hand-mutated. Deferring a
+//     local start into pending therefore refused it on every later pass, even
+//     after the image had finished — a VM permanently unstarted for having a
+//     large image. A markerless "starting" row is the documented shape of an
+//     interrupted local start, and the "starting" arm of reconcile re-drives it.
+//
+// Written on a context that survives the walk budget, which is usually already
+// spent by the time this runs.
+func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, detail string) {
+	state := "starting"
+	if proofID != "" {
+		state = "pending"
+	}
+	if err := corrosion.UpdateVMState(context.WithoutCancel(ctx), r.db, vmName, state, detail); err != nil {
 		slog.Error("reconciler: re-arm pending write failed", "vm", vmName, "error", err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}

@@ -394,9 +394,38 @@ func TestMigrateLegacyNetworkNames(t *testing.T) {
 		t.Fatalf("insert standalone network: %v", err)
 	}
 
+	// Two stack VMs: one attached to the legacy network AND the standalone
+	// (external, unscoped) one; one whose blob a previous pass had already
+	// mis-prefixed for the standalone network.
+	for _, vm := range []VMRecord{
+		{Name: "app", StackName: "mystack", HostName: "h1", State: "running",
+			Spec: `{"name":"app","network":[{"name":"LAN","model":"virtio"},{"name":"standalone"}]}`},
+		{Name: "healme", StackName: "mystack", HostName: "h1", State: "running",
+			Spec: `{"name":"healme","network":[{"name":"mystack_standalone","model":"virtio"}]}`},
+	} {
+		if err := InsertVM(ctx, c, vm, nil, nil); err != nil {
+			t.Fatalf("InsertVM(%s): %v", vm.Name, err)
+		}
+	}
+
 	// Run migration.
 	if err := MigrateLegacyNetworkNames(ctx, c); err != nil {
 		t.Fatalf("MigrateLegacyNetworkNames: %v", err)
+	}
+
+	// The blob follows the RENAMED network only. An external network the VM
+	// attaches to under its plain name is left alone — prefixing it pointed the
+	// blob at a network that does not exist, and made a compose re-apply read
+	// the unchanged attachment as a topology change (a recreate).
+	app, _ := GetVM(ctx, c, "app")
+	if app == nil || app.Spec != `{"name":"app","network":[{"name":"mystack_LAN","model":"virtio"},{"name":"standalone"}]}` {
+		t.Errorf("app spec after migration = %s", app.Spec)
+	}
+	// A blob a previous pass mis-prefixed is healed: the prefixed network does
+	// not exist and the plain one does.
+	healed, _ := GetVM(ctx, c, "healme")
+	if healed == nil || healed.Spec != `{"name":"healme","network":[{"name":"standalone","model":"virtio"}]}` {
+		t.Errorf("healme spec after migration = %s", healed.Spec)
 	}
 
 	// Legacy network should now be scoped.
@@ -439,7 +468,10 @@ func TestMigrateLegacyNetworkNames(t *testing.T) {
 	}
 }
 
-func TestScopeSpecNetworkNames(t *testing.T) {
+func TestRescopeSpecNetworkNames(t *testing.T) {
+	renamed := map[string]string{"LAN": "mystack_LAN", "mgmt": "s1_mgmt", "data": "s1_data"}
+	// Network names that exist after the rename pass.
+	existing := map[string]bool{"mystack_LAN": true, "s1_mgmt": true, "s1_data": true, "standalone": true, "mystack_owned": true}
 	tests := []struct {
 		name      string
 		input     string
@@ -448,7 +480,7 @@ func TestScopeSpecNetworkNames(t *testing.T) {
 		changed   bool
 	}{
 		{
-			name:      "basic scoping",
+			name:      "renamed network is rescoped",
 			input:     `{"network":[{"name":"LAN","model":"virtio"}]}`,
 			stackName: "mystack",
 			want:      `{"network":[{"name":"mystack_LAN","model":"virtio"}]}`,
@@ -469,16 +501,44 @@ func TestScopeSpecNetworkNames(t *testing.T) {
 			changed:   false,
 		},
 		{
-			name:      "multiple networks",
+			name:      "multiple renamed networks",
 			input:     `{"network":[{"name":"mgmt"},{"name":"data"}]}`,
 			stackName: "s1",
 			want:      `{"network":[{"name":"s1_mgmt"},{"name":"s1_data"}]}`,
 			changed:   true,
 		},
+		{
+			name:      "external network attached by its plain name is left alone",
+			input:     `{"network":[{"name":"standalone","model":"virtio"}]}`,
+			stackName: "mystack",
+			want:      `{"network":[{"name":"standalone","model":"virtio"}]}`,
+			changed:   false,
+		},
+		{
+			name:      "a mis-prefixed name is healed when only the plain network exists",
+			input:     `{"network":[{"name":"mystack_standalone","model":"virtio"}]}`,
+			stackName: "mystack",
+			want:      `{"network":[{"name":"standalone","model":"virtio"}]}`,
+			changed:   true,
+		},
+		{
+			name:      "a prefixed name that really exists is not touched",
+			input:     `{"network":[{"name":"mystack_owned"}]}`,
+			stackName: "mystack",
+			want:      `{"network":[{"name":"mystack_owned"}]}`,
+			changed:   false,
+		},
+		{
+			name:      "a name that exists nowhere is not guessed at",
+			input:     `{"network":[{"name":"mystack_gone"}]}`,
+			stackName: "mystack",
+			want:      `{"network":[{"name":"mystack_gone"}]}`,
+			changed:   false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, changed := scopeSpecNetworkNames(tt.input, tt.stackName)
+			got, changed := rescopeSpecNetworkNames(tt.input, tt.stackName, renamed, existing)
 			if changed != tt.changed {
 				t.Errorf("changed = %v, want %v", changed, tt.changed)
 			}

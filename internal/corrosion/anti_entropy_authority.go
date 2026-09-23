@@ -439,7 +439,7 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 				c.deferAfterCommit(tx, func() {
 					c.trackUnresolved(table, key,
 						[]interface{}{localHash}, []interface{}{incoming.identityHash},
-						pathAE, "workload_identity_conflict")
+						pathAE, TieCategoryWorkloadIdentity)
 				})
 				return mergeAuthorityKeepLocal, nil
 			}

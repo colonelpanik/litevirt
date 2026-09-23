@@ -269,3 +269,72 @@ func TestClassify_Delegated_NotAnUpdateAction(t *testing.T) {
 		t.Fatalf("load-balancer change should be recorded as delegated")
 	}
 }
+
+// A compose definition leaves disk bus, NIC model, placement host and SR-IOV
+// address unset and the create path fills them in (bus/model defaults, the
+// planner's chosen host, the reserved VF address). An unchanged file re-applied
+// to the VM it created must classify as no-change, or the default update
+// strategy would delete and recreate the VM.
+func TestClassify_ServerFilledTopologyFieldsInherit(t *testing.T) {
+	stored := &pb.VMSpec{
+		Name: "app", Image: "ubuntu", Cpu: 2, MemoryMib: 2048, Machine: "q35", Uuid: "u-1",
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "20G", Bus: "virtio"}},
+		Network:   []*pb.NetworkAttachment{{Name: "lan", Model: "virtio", Mac: "52:54:00:00:00:01"}},
+		Placement: &pb.PlacementSpec{Host: "h1", AntiAffinity: []string{"db"}},
+		Devices:   []*pb.DeviceSpec{{Type: "nic", Sriov: true, Address: "0000:01:00.1"}},
+	}
+	desired := &pb.VMSpec{
+		Name: "app", Image: "ubuntu", Cpu: 2, MemoryMib: 2048,
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "20G"}},
+		Network:   []*pb.NetworkAttachment{{Name: "lan"}},
+		Placement: &pb.PlacementSpec{AntiAffinity: []string{"db"}},
+		Devices:   []*pb.DeviceSpec{{Type: "nic", Sriov: true}},
+	}
+	p := Classify(desired, stored, StoredDisksFromSpec(stored))
+	if got := p.Max(); got != ActionNoChange {
+		t.Fatalf("unchanged compose vs server-filled stored spec: Max()=%v (restart=%v recreate=%v meta=%+v), want NoChange",
+			got, p.RestartReasons, p.RecreateReasons, p.MetadataChanges)
+	}
+
+	// The same fields SET to a different value are still changes.
+	d := &pb.VMSpec{Name: "app", Image: "ubuntu",
+		Disks:   []*pb.DiskSpec{{Name: "root", Bus: "scsi"}},
+		Network: []*pb.NetworkAttachment{{Name: "lan", Model: "e1000"}}}
+	if got := Classify(d, stored, StoredDisksFromSpec(stored)).Max(); got != ActionRecreate {
+		t.Fatalf("explicit bus/model change: Max()=%v, want Recreate", got)
+	}
+	d = &pb.VMSpec{Name: "app", Image: "ubuntu", Placement: &pb.PlacementSpec{Host: "h2", AntiAffinity: []string{"db"}}}
+	if got := Classify(d, stored, StoredDisksFromSpec(stored)).Max(); got != ActionLive {
+		t.Fatalf("explicit placement host change: Max()=%v, want Live (metadata)", got)
+	}
+}
+
+// Compose names a machine ALIAS ("q35", "pc"); the create path stores the
+// concrete type libvirt resolved it to ("pc-q35-9.0") so the guest ABI travels
+// with the VM. The same alias re-applied is therefore not a change — treating it
+// as one recreated the VM under the default strategy. A different family, or an
+// explicit pinned version that differs, still is.
+func TestClassify_MachineAliasMatchesPinnedType(t *testing.T) {
+	cases := []struct {
+		desired, stored string
+		want            Action
+	}{
+		{"q35", "pc-q35-9.0", ActionNoChange},
+		{"pc", "pc-i440fx-9.0", ActionNoChange},
+		{"pc-q35-9.0", "pc-q35-9.0", ActionNoChange},
+		{"", "pc-q35-9.0", ActionNoChange}, // unset inherits
+		{"pc", "pc-q35-9.0", ActionRestart},
+		{"q35", "pc-i440fx-9.0", ActionRestart},
+		{"pc-q35-8.2", "pc-q35-9.0", ActionRestart}, // explicit pin differs
+		{"q35", "q35", ActionNoChange},
+	}
+	for _, c := range cases {
+		st := baseSpec()
+		st.Machine = c.stored
+		d := baseSpec()
+		d.Machine = c.desired
+		if got := Classify(d, st, StoredDisksFromSpec(st)).Max(); got != c.want {
+			t.Errorf("machine desired=%q stored=%q: Max()=%v, want %v", c.desired, c.stored, got, c.want)
+		}
+	}
+}

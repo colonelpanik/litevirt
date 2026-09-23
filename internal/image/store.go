@@ -140,14 +140,25 @@ func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
 	return diskPath, nil
 }
 
-// DeleteVMDisks removes all disks for a VM using the flat naming convention.
-func (s *Store) DeleteVMDisks(vmName string) error {
+// DeleteVMDisks removes all disks for a VM using the flat naming convention,
+// skipping any path in keep.
+//
+// keep is required rather than optional because the glob is indiscriminate: it
+// matches every <vm>-*.qcow2 in the shared disk dir whether or not something
+// else still depends on it. A linked clone's base is exactly that case — the
+// overlay names it in backing_disk, the file is swept anyway, and every chain
+// built on it is destroyed. Callers pass the set of paths still referenced;
+// nil means "nothing is referenced", which the caller has to mean.
+func (s *Store) DeleteVMDisks(vmName string, keep map[string]bool) error {
 	pattern := filepath.Join(s.diskDir, vmName+"-*.qcow2")
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return err
 	}
 	for _, m := range matches {
+		if keep[m] {
+			continue
+		}
 		os.Remove(m)
 	}
 	// Also clean up legacy VM subdirectory if it exists.

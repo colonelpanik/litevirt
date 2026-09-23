@@ -372,7 +372,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
 	// incomplete delete, even if the libvirt domain is already gone.
-	s.images.DeleteVMDisks(spec.Name)
+	s.images.DeleteVMDisks(spec.Name, s.protectedDiskPaths(ctx, spec.Name))
 	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
@@ -1273,6 +1273,34 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, err
 	}
 
+	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
+	// non-template VM as a linked-clone source, so a plain VM can be backing
+	// overlays; starting it lets qemu write into the backing file underneath
+	// every one of them, corrupting each overlay silently.
+	//
+	// Fails CLOSED on a read error, like ConvertToTemplate's guard: "we cannot
+	// tell whether anything is layered on this disk" is not permission to write
+	// to it.
+	//
+	// BELOW RequirePerm, not above it. Only the path-blind requirePermPrecheck
+	// has run before that call, so evaluating this guard first let an operator
+	// scoped to one project name the linked clones of a VM in another — the
+	// error text lists them — and charged a DB read to an unauthorized caller.
+	// Authorize the resource, then touch it.
+	clones, cErr := s.linkedClonesOf(ctx, req.Name)
+	if cErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether %q still backs linked clones: %v", req.Name, cErr)
+	}
+	if len(clones) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q still backs %d linked clone(s) (%s); starting it would let qemu write "+
+				"into the backing file under each overlay. Delete those clones, or "+
+				"re-create them as independent copies with `lv clone <source> <name> "+
+				"--mode full`, first",
+			req.Name, len(clones), strings.Join(clones, ", "))
+	}
+
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1934,7 +1962,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-		s.images.DeleteVMDisks(req.Name)
+		s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
@@ -2759,6 +2787,14 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
 	}
+	// Serialize with every other mutator of this VM, and read the row UNDER the
+	// lock so the guards below cannot be invalidated between the read and the
+	// destruction. Rebuild destroys the domain, deletes every disk and wipes
+	// firmware state — it was the only destructive VM-lifecycle RPC in this file
+	// without the lock, so it could run straight through a concurrent start,
+	// resize or migrate of the same VM. Same placement as DeleteVM.
+	unlock := s.lockVM(req.Name)
+	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2774,6 +2810,31 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		}
 		defer conn.Close()
 		return client.RebuildVM(ctx, req)
+	}
+
+	// The same three barriers DeleteVM carries, for the same reason: this is a
+	// destructive operation and each of these states means something else owns
+	// the VM's disks right now.
+	if vm.ActiveOperationID != "" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot rebuild %q: an operation is in progress (abort it first with `lv operation abort %s`)", req.Name, req.Name)
+	}
+	if vm.State == "backing-up" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being backed up — wait for the backup to complete", req.Name)
+	}
+	// Rebuild always deletes the disks (there is no --keep-disks here), so a VM
+	// that still backs live linked clones would take their backing file with it.
+	// Unlike DeleteVM's guard this one fails CLOSED on a read error: there is no
+	// variant of rebuild that spares the disks, so a clone list we could not read
+	// is not evidence there are none.
+	if clones, gErr := s.linkedClonesOf(ctx, req.Name); gErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot confirm %q backs no linked clones: %v", req.Name, gErr)
+	} else if len(clones) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q still backs %d linked clone(s) (%s); delete or full-clone them first",
+			req.Name, len(clones), strings.Join(clones, ", "))
 	}
 
 	// BEFORE anything destructive: a VM holding an address on a NetBox-bound
@@ -2817,7 +2878,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
 	// then glob the default dir. Must run before the tombstone below.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-	s.images.DeleteVMDisks(req.Name)
+	s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)

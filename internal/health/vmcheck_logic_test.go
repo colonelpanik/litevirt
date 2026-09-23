@@ -110,7 +110,7 @@ func TestTakeAction_GatedWithoutQuorum(t *testing.T) {
 			}
 
 			var refused []string
-			v := NewVMChecker("node1", db, nil)
+			v := NewVMChecker("node1", t.TempDir(), db, nil)
 			// Enforced (latched) but ExecutionGate refuses (no quorum).
 			v.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
 			v.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
@@ -141,7 +141,7 @@ func TestTakeAction_AlertNotGated(t *testing.T) {
 	}
 
 	var refused []string
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.SetGate(fakeGate{exec: GateResult{OK: false, Reason: ReasonNoQuorum}, active: true})
 	v.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
 
@@ -170,7 +170,7 @@ func TestTakeAction_DroppedWhenOwnershipMoved(t *testing.T) {
 	ch, unsub := bus.Subscribe()
 	defer unsub()
 
-	v := NewVMChecker("node1", db, nil) // this host is node1
+	v := NewVMChecker("node1", t.TempDir(), db, nil) // this host is node1
 	v.SetEventBus(bus)
 
 	// The queued snapshot still claims node1 (stale).
@@ -207,7 +207,7 @@ func TestTakeAction_SuppressedByCorrelatedFailures(t *testing.T) {
 	ch, unsub := bus.Subscribe()
 	defer unsub()
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.SetEventBus(bus)
 
 	// Seed correlated failures (3 VMs with >=2 failures).
@@ -248,7 +248,7 @@ func TestTakeAction_OperatorStoppedSkipped(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-op-stop", HostName: "node1", State: "running"}
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "restart"}
 
@@ -276,7 +276,7 @@ func TestTakeAction_VMStateChanged(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-migrated", HostName: "node1", State: "running"}
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "restart"}
 
@@ -295,7 +295,7 @@ func TestTakeAction_VMDeleted(t *testing.T) {
 	db := testLogicDB(t)
 	ctx := context.Background()
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// VM doesn't exist in DB — GetVM returns nil.
 	vm := corrosion.VMRecord{Name: "ghost-vm", HostName: "node1", State: "running"}
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Action: "restart"}
@@ -321,7 +321,7 @@ func TestTakeAction_Alert(t *testing.T) {
 	ch, unsub := bus.Subscribe()
 	defer unsub()
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.SetEventBus(bus)
 
 	vm := corrosion.VMRecord{Name: "vm-alert", HostName: "node1", State: "running"}
@@ -361,7 +361,7 @@ func TestTakeAction_UnknownAction_NoOp(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-unknown-act", HostName: "node1", State: "running"}
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "reboot-host"}
 
@@ -386,7 +386,7 @@ func TestTakeAction_DefaultActionIsRestart(t *testing.T) {
 	ch, unsub := bus.Subscribe()
 	defer unsub()
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.SetEventBus(bus)
 
 	vm := corrosion.VMRecord{Name: "vm-default-act", HostName: "node1", State: "running"}
@@ -428,7 +428,7 @@ func TestTakeAction_Migrate_NilVirtAndCallback(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil) // nil virt, nil migrateVMFunc
+	v := NewVMChecker("node1", t.TempDir(), db, nil) // nil virt, nil migrateVMFunc
 	vm := corrosion.VMRecord{Name: "vm-migrate", HostName: "node1", State: "running", MemActual: 1024}
 	hspec := &pb.HealthCheckSpec{Type: "tcp", Target: "10.0.0.1:80", Action: "migrate"}
 
@@ -463,7 +463,7 @@ func TestTakeAction_Migrate_WithCallback(t *testing.T) {
 	ch, unsub := bus.Subscribe()
 	defer unsub()
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.SetEventBus(bus)
 	v.SetMigrateFunc(func(ctx context.Context, vmName, targetHost string) error {
 		migratedTo = targetHost
@@ -509,7 +509,7 @@ func TestMaybeRestartVM_NoSpec(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-norestart", HostName: "node1", State: "stopped"}
 	// Should not restart — no restart policy.
 	v.maybeRestartVM(ctx, vm, time.Now())
@@ -534,7 +534,7 @@ func TestMaybeRestartVM_ConditionNone(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-cond-none", HostName: "node1", State: "stopped"}
 	v.maybeRestartVM(ctx, vm, time.Now())
 
@@ -558,7 +558,7 @@ func TestMaybeRestartVM_ConditionEmpty(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-cond-empty", HostName: "node1", State: "error"}
 	v.maybeRestartVM(ctx, vm, time.Now())
 
@@ -582,7 +582,7 @@ func TestMaybeRestartVM_OnFailure_StoppedVM(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-onfail-stop", HostName: "node1", State: "stopped"}
 	v.maybeRestartVM(ctx, vm, time.Now())
 
@@ -606,7 +606,7 @@ func TestMaybeRestartVM_OnFailure_ErrorVM(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// state_detail=crashed is the failure evidence the reconciler persists; with
 	// libvirt unreachable (nil virt) the decision falls back to it.
 	vm := corrosion.VMRecord{Name: "vm-onfail-err", HostName: "node1", State: "error", StateDetail: crashedDetail}
@@ -642,7 +642,7 @@ func TestMaybeRestartVM_MaxAttempts(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-maxatt", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// Restart twice (hitting max_attempts=2).
@@ -677,7 +677,7 @@ func TestMaybeRestartVM_WindowReset(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-winreset", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// First restart.
@@ -713,7 +713,7 @@ func TestMaybeRestartVM_DelayEnforced(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-delay", HostName: "node1", State: "error", StateDetail: crashedDetail}
 
 	// First restart happens.
@@ -751,7 +751,7 @@ func TestMaybeRestartVM_OperatorStop(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-op-stopped", HostName: "node1",
 		State: "stopped", StateDetail: "operator-stop"}
 
@@ -781,7 +781,7 @@ func TestSweep_GracePeriod(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// VM was created < 5 minutes ago — should be skipped entirely.
@@ -811,7 +811,7 @@ func TestSweep_SecondPass_SkipsOperatorStop(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// Should not have restarted — operator-stop is filtered in sweep's second pass.
@@ -836,7 +836,7 @@ func TestSweep_SecondPass_RestartsErrorVM(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// With nil virt, restart increments counter but can't actually start domain.

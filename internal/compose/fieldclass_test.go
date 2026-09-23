@@ -30,6 +30,7 @@ var vmFieldClass = map[string]string{
 	"CPU":             "live-resource: grow within the hotplug ceiling live; shrink/beyond-ceiling restarts",
 	"MaxCPU":          "restart: vCPU hotplug ceiling is a redefine",
 	"CPUMode":         "restart: cpu mode is a redefine",
+	"CPUModel":        "restart: cpu model bakes into domain XML",
 	"Memory":          "live-resource: balloon within band live; out-of-band restarts",
 	"MinMemory":       "restart: balloon floor is a redefine",
 	"MaxMemory":       "restart: balloon ceiling is a redefine",

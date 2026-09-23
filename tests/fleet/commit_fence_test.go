@@ -62,6 +62,15 @@ func (quotaOnlyGate) DurablyLatched(token string) bool {
 func (quotaOnlyGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
 func (quotaOnlyGate) HealthyPeers(context.Context) []string                  { return nil }
 
+// QuorumProof matches the quorum this fake already claims through ExecutionGate:
+// a single-member majority. Only the lease-term barrier reads it, and
+// lease_term_v1 is not latched here, so the counts are never consulted — but a
+// QuorumUnknown zero value would be a fail-closed answer disagreeing with the
+// OK ExecutionGate above.
+func (quotaOnlyGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
+	return health.QuorumYes, 1, 1
+}
+
 // fenceSetup latches delegated quota admission and seeds a project whose
 // authority (epoch 1) is held by holder. Returns a hook that performs a planned
 // takeover to newHolder (epoch 2), to be installed on the EXECUTING node.

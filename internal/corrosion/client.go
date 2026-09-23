@@ -963,6 +963,7 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, nil
 	}
 	var mutated []Statement
+	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
 		if s.Guard != nil {
 			matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
@@ -988,12 +989,22 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 			c.mu.Unlock()
 			return false, invalidf("guarded workload transition matched authority but changed no row")
 		}
+		changed := false
 		if n, e := res.RowsAffected(); e == nil && n > 0 {
+			changed = true
 			mutated = append(mutated, s)
 		}
+		if relayStatement(s, changed) {
+			relay = append(relay, s)
+		}
 	}
-	if c.clock != nil {
-		stmtsJSON, err := json.Marshal(stmts)
+	// `relay`, not `stmts` — see relayStatement. This is the site the
+	// seed-then-compare proof validation was written to work around: it seeds a
+	// row from an untrusted proof and compares inside one transaction, because
+	// the seeding INSERT OR IGNORE reached every peer even when it changed
+	// nothing locally.
+	if c.clock != nil && len(relay) > 0 {
+		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
@@ -1050,6 +1061,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 
 	var affected int64
 	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
+	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if err != nil {
@@ -1057,18 +1069,26 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			c.mu.Unlock()
 			return 0, fmt.Errorf("exec batch: %w", err)
 		}
+		changed := false
 		if n, e := res.RowsAffected(); e == nil {
 			affected += n
 			if n > 0 {
+				changed = true
 				mutated = append(mutated, s)
 			}
+		}
+		if relayStatement(s, changed) {
+			relay = append(relay, s)
 		}
 	}
 
 	// Write to mutation_log atomically with the application statements.
-	if c.clock != nil {
+	//
+	// `relay`, not `stmts`: a create-only statement that changed nothing here
+	// must not be replayed by a peer. See relayStatement.
+	if c.clock != nil && len(relay) > 0 {
 		hlcTS := c.clock.Now()
-		stmtsJSON, err := json.Marshal(stmts)
+		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()

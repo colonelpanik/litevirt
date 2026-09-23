@@ -61,9 +61,41 @@ func (c *Client) authorityMergeRow(tx *sql.Tx, table syncTable, row []interface{
 			"incoming_holder", cellAt(row, indexOf(table.Columns, "holder")))
 	}
 
-	keepLocal := local < incoming
+	keepLocal, ok := authorityJoinKeepLocal(table.Columns, localRow, row)
+	if !ok {
+		// No order-invariant encoding exists for this row image (duplicate
+		// column names, which the encoder treats as corruption, or a col/val
+		// length mismatch). Picking a winner from the positional bytes would be
+		// the non-convergent thing this join exists to avoid, so keep local and
+		// leave the disagreement visible rather than recording a settled
+		// tie-break that the other node may have settled the other way.
+		slog.Error("project authority: no deterministic order for two disagreeing rows; keeping local",
+			"table", table.Name, "pk", pkKeyAt(row, pkIdx))
+		return true, nil
+	}
 	c.observeTieBreak(table.Name, "project_authority", tieBreakWinner(keepLocal))
 	return keepLocal, nil
+}
+
+// authorityJoinKeepLocal is the deterministic join that settles two disagreeing
+// authority rows: a total order over the row's canonical bytes, minimum wins.
+// ok reports whether a deterministic order could be computed at all.
+// The encoding is the ORDER-INVARIANT encodeRowCellsV2, which pairs each value
+// with its column name and sorts by name. The positional encodeRowCells is not
+// a total order across the fleet: these rows are aligned to the incoming dump's
+// declared column order, so the two directions of one conflict encode the same
+// pair differently and each node can compute a different minimum — the exact
+// opposite of the "independent of who merged first" property above. Both nodes
+// then keep their own authority row and both keep admitting against the
+// project's quota, which is the double-decider split this merge exists to
+// prevent. Same defect, and same fix, as ruleContentMax.
+func authorityJoinKeepLocal(cols []string, localRow, incomingRow []interface{}) (keepLocal, ok bool) {
+	a, aErr := encodeRowCellsV2(cols, localRow)
+	b, bErr := encodeRowCellsV2(cols, incomingRow)
+	if aErr != nil || bErr != nil {
+		return false, false
+	}
+	return a < b, true
 }
 
 // authorityClaimsConflict separates the two ways two authority rows can differ.

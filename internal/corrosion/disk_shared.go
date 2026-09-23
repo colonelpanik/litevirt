@@ -1,6 +1,10 @@
 package corrosion
 
-import "strings"
+import (
+	"context"
+	"sort"
+	"strings"
+)
 
 // sharedStorageTypes is the set of disk storage drivers that place a disk on
 // cluster-shared storage — a second host can open and WRITE the same bytes. A
@@ -34,4 +38,33 @@ func VMHasWritableSharedDisk(disks []DiskRecord) bool {
 		}
 	}
 	return false
+}
+
+// VMNamesWithWritableSharedDisk returns every VM with at least one disk on
+// shared storage, sorted. These are exactly the workloads a cross-host transfer
+// must fence before starting, so a diagnostic can weigh how much is exposed when
+// the fence is not switched on.
+//
+// It reads the disk rows and classifies them through DiskIsShared rather than
+// filtering by storage_type in SQL. Encoding the shared set into a query would
+// be the second copy of a definition this file exists to keep single — a new
+// shared driver added to sharedStorageType would then silently not count here.
+func VMNamesWithWritableSharedDisk(ctx context.Context, c *Client) ([]string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, storage_type FROM vm_disks WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	for _, r := range rows {
+		if DiskIsShared(DiskRecord{StorageType: r.String("storage_type")}) {
+			seen[r.String("vm_name")] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
 }

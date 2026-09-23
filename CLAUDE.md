@@ -66,14 +66,54 @@ Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
 - each has an `enforcement.*` config flag, default **false**
-- a node advertises the token only while its flag is on, so the cluster-wide
-  latch requires **config uniformity**, not just a uniform build
+- **advertising is not enforcing.** Most tokens are advertised on the strength
+  of the BUILD, whatever the local flag says, so the cluster can latch them —
+  the node's own flag then decides whether it acts. A latched token therefore
+  proves a uniform build, **not** config uniformity, and a cluster can have a
+  token fully latched while members silently do not enforce it.
+  `PingResponse.not_enforcing` is the only way to see that (diagnostic only).
+  A token is withheld while its flag is off when some node RELIES on a peer
+  honouring it — where a flag-off peer would corrupt rather than merely be
+  permissive. `advertisedCapabilities` is the authority on the list
+  (operation_protocol_v1, isolation_epoch_v1, owner_epoch_v1 and the others
+  named there); for those, a latched token DOES mean config uniformity.
+  **Ask where the guarantee is enforced before adding one.** A guarantee
+  enforced at the point a dangerous action is CREATED does not need the peer
+  to enforce anything, so withholding buys no safety and costs a great deal
+- **`shared_storage_fence_v1` looks like it should be withheld and must not be**
+  — it has been proposed twice, so the reasoning lives in
+  `advertisedCapabilities` and in `TestAdvertise_SharedStorageFenceIsUnconditional`.
+  It gates a corruption hazard, but the coordinator refuses to CREATE an
+  unproven shared-disk transfer at the source, so no node relies on a peer. The
+  cost of withholding is concrete: `internal/health/capability.go` has no role
+  filter, so a **witness** with the flag off (its operator has no reason to set
+  it) would hold the fence off fleet-wide forever; every node mid-rollout would
+  stop enforcing; and a config-on token that cannot latch consumes
+  `driveCapabilityActivation`'s one-token-per-cycle budget permanently, starving
+  every later token in `Supported()`
 - the latch is monotone and durable: once formed it survives a restart and does
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing
 
-`hardware_v2` is the exception: no flag of its own, activation gated on each
-node's startup hardware audit plus a latched `operation_protocol_v1`.
+There are exceptions, of two different kinds, and neither is "the one":
+
+- **Mandatory** — no config flag, `tokenEnabled` returns true unconditionally,
+  so they latch on every cluster with no operator opt-in. The set is declared in
+  one place, `capabilities.mandatory` (read it; prose copies of it have gone
+  stale twice). They are reserved for a token stating a *fact about the binary*
+  rather than a policy: `split_brain_gate_v1` and `lease_term_ledger_v1`.
+  A mandatory token has no flag to turn off in an incident — see the
+  per-token stand-down notes beside that declaration.
+- **Conditionally advertised** — `hardware_v2` has no flag of its own either,
+  but it is gated differently: each node's startup hardware audit plus a latched
+  `operation_protocol_v1` decide whether it is advertised at all.
+
+One mandatory token, `lease_term_ledger_v1`, is additionally
+`capabilities.ReplicationGated`: its latch is a claim about which wire shapes
+peers can *decode*, so it is confirmed against every host still receiving
+replication — memberlist membership — and not merely against voting-eligible
+members. A host parked in `maintenance` on an older build therefore holds that
+latch off, which is the intended invariant and not a bug.
 
 **`enforcement.operation_protocol` is required for all hotplug.** Disk, NIC, and
 concrete-address PCI attach/detach are journaled and have no un-journaled path,

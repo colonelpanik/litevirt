@@ -399,8 +399,8 @@ func TestIsTransientOrErrorState(t *testing.T) {
 func storedAsCreated() *pb.VMSpec {
 	return &pb.VMSpec{
 		Name: "api", StackName: "stack", Image: "ubuntu", Cpu: 2, MemoryMib: 512,
-		Machine: "q35", Uuid: "u-1", Boot: "disk", GuestAgent: true, CpuMode: "host-model",
-		Disks:     []*pb.DiskSpec{{Name: "root", Size: "20G", Bus: "virtio"}},
+		Machine: "pc-q35-9.0", Uuid: "u-1", Boot: "disk", GuestAgent: true, CpuMode: "host-model",
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "20G", Bus: "virtio", Storage: "fast"}},
 		Network:   []*pb.NetworkAttachment{{Name: "stack_lan", Model: "virtio", Mac: "52:54:00:00:00:01"}},
 		Placement: &pb.PlacementSpec{Host: "h1", AntiAffinity: []string{"db"}},
 		CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n{}\n"},
@@ -409,8 +409,8 @@ func storedAsCreated() *pb.VMSpec {
 }
 
 func createdDef() VMDef {
-	return VMDef{Image: "ubuntu", CPU: 2, Memory: 512,
-		Disks:     map[string]DiskDef{"root": {Size: "20G"}},
+	return VMDef{Image: "ubuntu", CPU: 2, Memory: 512, Machine: "q35",
+		Disks:     map[string]DiskDef{"root": {Size: "20G", Storage: "fast"}},
 		Network:   []NetworkAttachment{{Name: "lan"}},
 		Placement: &PlacementDef{AntiAffinity: []string{"db"}},
 		CloudInit: &CloudInitDef{UserData: "#cloud-config\n{}\n"},
@@ -446,6 +446,8 @@ func TestBuild_FullSpecComparison(t *testing.T) {
 	})
 	for name, edit := range map[string]func(*VMDef){
 		"cpu-mode": func(d *VMDef) { d.CPUMode = "host-passthrough" },
+		"machine":  func(d *VMDef) { d.Machine = "pc" },
+		"storage":  func(d *VMDef) { d.Disks["root"] = DiskDef{Size: "20G", Storage: "slow"} },
 		"labels":   func(d *VMDef) { d.Labels = map[string]string{"team": "b"} },
 		"disk topology": func(d *VMDef) {
 			d.Disks["data"] = DiskDef{Size: "100G"}

@@ -8,6 +8,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
 // Action is the coarsest action a set of desired-vs-stored changes requires,
@@ -203,7 +204,7 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	restartIf(desired.MaxMemoryMib != 0 && desired.MaxMemoryMib != stored.MaxMemoryMib, "max-memory change needs a redefine")
 	restartIf(desired.CpuMode != "" && desired.CpuMode != stored.CpuMode, "cpu-mode change needs a redefine")
 	restartIf(desired.CpuModel != "" && desired.CpuModel != stored.CpuModel, "cpu-model change needs a redefine")
-	restartIf(desired.Machine != "" && desired.Machine != stored.Machine, "machine-type change needs a redefine")
+	restartIf(desired.Machine != "" && !machineEqual(desired.Machine, stored.Machine), "machine-type change needs a redefine")
 	restartIf(desired.Firmware != "" && desired.Firmware != stored.Firmware, "firmware change needs a redefine")
 	// Bools carry no "unset" sentinel; BuildVMSpec applies the same defaults the create
 	// path stores (e.g. guest-agent via EffectiveGuestAgent), so an equality compare is
@@ -285,6 +286,39 @@ func devicesEqual(desired, stored []*pb.DeviceSpec) bool {
 		}
 	}
 	return true
+}
+
+// machineEqual compares a desired machine type against the stored one. Compose
+// names an ALIAS ("q35", "pc"); the create path stores the concrete type libvirt
+// resolved it to ("pc-q35-9.0") so the guest ABI travels with the VM. An alias
+// therefore matches a pinned type of the same family — re-applying "q35" to a
+// VM stored as "pc-q35-9.0" is not a change. Two pinned types, or an alias of
+// a different family, compare literally.
+func machineEqual(desired, stored string) bool {
+	if desired == stored {
+		return true
+	}
+	if libvirt.IsPinnedMachineType(desired) {
+		return false // an explicit pin means exactly that version
+	}
+	return machineFamily(desired) == machineFamily(stored)
+}
+
+// machineFamily reduces a machine type to its family: "q35"/"pc-q35"/"pc-q35-9.0"
+// → "q35"; "pc"/"pc-i440fx"/"pc-i440fx-9.0" → "pc"; anything else has its
+// version suffix stripped ("virt-9.0" → "virt").
+func machineFamily(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	if libvirt.IsPinnedMachineType(m) {
+		m = m[:strings.LastIndex(m, "-")]
+	}
+	switch m {
+	case "pc-q35":
+		return "q35"
+	case "pc-i440fx":
+		return "pc"
+	}
+	return m
 }
 
 // placementEqual compares placement with an unset desired host inheriting the

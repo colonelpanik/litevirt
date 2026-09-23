@@ -107,6 +107,7 @@ func (a *LXCRuntimeAdapter) PullOCIImage(ctx context.Context, image, dest, tag, 
 	})
 }
 
-func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (int, int, error) {
-	return a.Inner.Limits(ctx, name)
+func (a *LXCRuntimeAdapter) ContainerLimits(ctx context.Context, name string) (int, ContainerMemoryLimit, error) {
+	cpu, mem, err := a.Inner.Limits(ctx, name)
+	return cpu, ContainerMemoryLimit{MiB: mem.MiB, Unlimited: mem.Unlimited}, err
 }

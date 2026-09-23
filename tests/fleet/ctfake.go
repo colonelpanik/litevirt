@@ -205,14 +205,16 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 // ContainerLimits reports the limits recorded at create; a container seeded
 // outside CreateContainer (a bare Seed) is uncapped, matching a runtime-only
 // rogue with no configured limits.
-func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, int, error) {
+func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, grpcapi.ContainerMemoryLimit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.state[name]; !ok {
-		return 0, 0, fmt.Errorf("container %q does not exist", name)
+		return 0, grpcapi.ContainerMemoryLimit{Unlimited: true}, fmt.Errorf("container %q does not exist", name)
 	}
 	l := f.limits[name]
-	return l[0], l[1], nil
+	// A create that asked for 0 MiB asked for no cap, so it reports unlimited
+	// — the fake mirrors litevirt's own emission, which omits the key.
+	return l[0], grpcapi.ContainerMemoryLimit{MiB: l[1], Unlimited: l[1] == 0}, nil
 }
 
 func (f *CTFake) StartContainer(_ context.Context, name string) error {

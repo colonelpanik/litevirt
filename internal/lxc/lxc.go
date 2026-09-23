@@ -124,7 +124,7 @@ type Runtime interface {
 	// 0 means unlimited for that dimension. The runtime-inventory collector
 	// reports these so capacity accounting can charge runtime-only containers
 	// and flag uncapped ones.
-	Limits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
+	Limits(ctx context.Context, name string) (cpuLimit int, mem MemoryLimit, err error)
 	// Freeze suspends every process in a running container (lxc-freeze) so its
 	// rootfs can be read consistently (backup/snapshot quiesce). Pair with
 	// Unfreeze; a no-op-ish error on an already-frozen/stopped container is fine.
@@ -1103,13 +1103,28 @@ func (r *LxcRunner) ListRunning(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// MemoryLimit is a container's memory cap, with "no cap" carried as its own
+// field rather than as a magic zero.
+//
+// cgroup2 accepts both "max" (unlimited) and "0" (a finite zero-byte cap), and
+// a single int collapses them: a running container with a zero-byte cap was
+// reported as UNCAPPED, which trips the uncapped gate and blocks new
+// admission. Turning "0" into a parse error is not the alternative — it is a
+// legal cgroup2 value, and rejecting it would fail closed on a valid read.
+type MemoryLimit struct {
+	// MiB is the cap rounded up to a whole MiB. Meaningless when Unlimited.
+	MiB int
+	// Unlimited is true only for cgroup2 "max" or an absent key.
+	Unlimited bool
+}
+
 // Limits parses the container's config for the cgroup limits ResourceConfig
-// wrote — the exact inverse of what Create emitted. A key that is absent means
-// unlimited (0), matching how the limits are accounted everywhere else.
-func (r *LxcRunner) Limits(_ context.Context, name string) (int, int, error) {
+// wrote — the exact inverse of what Create emitted. An absent memory key means
+// unlimited, which is why the result carries Unlimited rather than a zero.
+func (r *LxcRunner) Limits(_ context.Context, name string) (int, MemoryLimit, error) {
 	raw, err := os.ReadFile(filepath.Join(r.lxcpath(), name, "config"))
 	if err != nil {
-		return 0, 0, fmt.Errorf("read lxc config for %q: %w", name, err)
+		return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("read lxc config for %q: %w", name, err)
 	}
 	return parseResourceConfig(string(raw))
 }
@@ -1130,7 +1145,9 @@ func (r *LxcRunner) Limits(_ context.Context, name string) (int, int, error) {
 //
 // Byte figures round UP to MiB: a cap is a cap, and a charge may not
 // undercount it. Genuinely unparseable values still error loudly.
-func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
+func parseResourceConfig(cfg string) (cpuLimit int, mem MemoryLimit, err error) {
+	// An absent memory.max key is unlimited, so that is the starting value.
+	mem = MemoryLimit{Unlimited: true}
 	for _, line := range strings.Split(cfg, "\n") {
 		key, val, ok := strings.Cut(line, "=")
 		if !ok {
@@ -1149,10 +1166,10 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			if hasPeriod {
 				p, perr := strconv.ParseInt(strings.TrimSpace(periodStr), 10, 64)
 				if perr != nil {
-					return 0, 0, fmt.Errorf("unparseable cpu.max period %q: %w", val, perr)
+					return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("unparseable cpu.max period %q: %w", val, perr)
 				}
 				if p <= 0 {
-					return 0, 0, fmt.Errorf("non-positive cpu.max period %q", val)
+					return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("non-positive cpu.max period %q", val)
 				}
 				period = p
 			}
@@ -1162,7 +1179,7 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			}
 			quota, perr := strconv.ParseInt(quotaStr, 10, 64)
 			if perr != nil {
-				return 0, 0, fmt.Errorf("unparseable cpu.max %q: %w", val, perr)
+				return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("unparseable cpu.max %q: %w", val, perr)
 			}
 			// Zero is rejected with the negatives, not admitted with the
 			// positives: the kernel enforces a minimum bandwidth and never
@@ -1170,10 +1187,10 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			// codebase's UNLIMITED sentinel — turning the most restrictive
 			// conceivable cap into no cap at all.
 			if quota <= 0 {
-				return 0, 0, fmt.Errorf("non-positive cpu.max quota %q", val)
+				return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("non-positive cpu.max quota %q", val)
 			}
 			if quota > math.MaxInt64/100 {
-				return 0, 0, fmt.Errorf("cpu.max quota %q too large", val)
+				return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("cpu.max quota %q too large", val)
 			}
 			// litevirt writes quota = cpuLimit*1000 at period 100000; the
 			// general inversion preserves that ratio for any period. Round UP,
@@ -1198,28 +1215,27 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			// so a 32-bit build cannot truncate a huge limit back down into a
 			// small — or zero — one.
 			if lim > math.MaxInt32 {
-				return 0, 0, fmt.Errorf("cpu.max %q yields an unrepresentable limit", val)
+				return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("cpu.max %q yields an unrepresentable limit", val)
 			}
 			cpuLimit = int(lim)
 		case "lxc.cgroup2.memory.max":
 			m, perr := parseMemoryMax(val)
 			if perr != nil {
-				return 0, 0, fmt.Errorf("unparseable memory.max %q: %w", val, perr)
+				return 0, MemoryLimit{Unlimited: true}, fmt.Errorf("unparseable memory.max %q: %w", val, perr)
 			}
-			memMiB = m
+			mem = m
 		}
 	}
-	return cpuLimit, memMiB, nil
+	return cpuLimit, mem, nil
 }
 
-// parseMemoryMax reads a cgroup2/lxc memory limit into MiB: "max" = unlimited
-// (0), a K/M/G/T suffix (either case) scales, and a bare integer is BYTES —
-// the cgroup2 native unit. Byte figures round up to a whole MiB, and a negative
-// value or a size that overflows int64 errors loudly rather than yielding a
-// silent negative or zero cap (a zero reads as UNLIMITED).
-func parseMemoryMax(val string) (int, error) {
+// parseMemoryMax reads a cgroup2/lxc memory limit: "max" = unlimited, a
+// K/M/G/T suffix (either case) scales, and a bare integer is BYTES — the
+// cgroup2 native unit. Byte figures round up to a whole MiB, and a negative
+// value or a size that overflows int64 errors loudly.
+func parseMemoryMax(val string) (MemoryLimit, error) {
 	if val == "max" {
-		return 0, nil
+		return MemoryLimit{Unlimited: true}, nil
 	}
 	mult, digits := int64(1), val // bytes per unit
 	if n := len(val); n > 0 {
@@ -1236,18 +1252,22 @@ func parseMemoryMax(val string) (int, error) {
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(digits))
 	if err != nil {
-		return 0, err
+		return MemoryLimit{Unlimited: true}, err
 	}
 	if n < 0 {
-		return 0, fmt.Errorf("negative memory limit %q", val)
+		return MemoryLimit{Unlimited: true}, fmt.Errorf("negative memory limit %q", val)
 	}
 	bytes := int64(n)
 	if bytes > math.MaxInt64/mult {
-		return 0, fmt.Errorf("memory limit %q too large", val)
+		return MemoryLimit{Unlimited: true}, fmt.Errorf("memory limit %q too large", val)
 	}
 	bytes *= mult
 	if bytes > math.MaxInt64-((1<<20)-1) {
-		return 0, fmt.Errorf("memory limit %q too large", val)
+		return MemoryLimit{Unlimited: true}, fmt.Errorf("memory limit %q too large", val)
 	}
-	return int((bytes + (1 << 20) - 1) >> 20), nil
+	// Unlimited is decided by the literal "max" alone, checked at the top.
+	// Anything that parsed as a number is a FINITE cap, including zero: a
+	// zero-byte cap is a legal cgroup2 value and the most restrictive one
+	// there is, so reading it as "no cap" inverts its meaning exactly.
+	return MemoryLimit{MiB: int((bytes + (1 << 20) - 1) >> 20)}, nil
 }

@@ -360,6 +360,12 @@ func (s *Server) autoDefineRestoredVM(
 			return "", "", status.Errorf(codes.Internal, "persist restored firmware VM %q: %v", targetName, err)
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
+	} else {
+		// Born running at the column default of 0, exactly like CreateVM was
+		// before the create path graduated. Nothing else does it: convergence
+		// early-returns on a zero epoch, and the backfill that would graduate it
+		// is gated behind enforcement.owner_epoch, which is off by default.
+		s.assignOwnerEpochAtCreate(ctx, targetName)
 	}
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")

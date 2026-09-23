@@ -17,8 +17,13 @@ import (
 //  2. every owned workload's epoch is nonzero (the backfill graduated);
 //  3. every RUNNING local workload carries a VALID marker matching its DB
 //     epoch — missing, corrupt, unreadable, or unequal all withhold;
-//  4. no unresolved LWW ties on this node — an unresolved tie can hide a
-//     divergent ownership row;
+//  4. no unresolved LWW ties ON THE OWNERSHIP TABLES (vms, containers) — such a
+//     tie can hide a divergent ownership row, which is what this predicate is
+//     about. A tie on any OTHER replicated table is not evidence about a
+//     workload's owner epoch and must not withhold: leader_lease_terms rows are
+//     immutable, so a contested term's tie never converges and never clears, and
+//     reading the fleet-wide count here let one partitioned election withhold
+//     this regime permanently on every node that saw it. See ownershipTieTables;
 //  5. no active runtime-ownership condition anywhere in the cluster — the
 //     regime must not latch OVER a standing dispute.
 //
@@ -33,8 +38,8 @@ func (s *Server) OwnerEpochReadiness(ctx context.Context) (bool, string) {
 	if !inv.Complete {
 		return false, "local runtime inventory incomplete: " + fmt.Sprint(inv.Errors)
 	}
-	if inv.UnresolvedTies > 0 {
-		return false, fmt.Sprintf("%d unresolved LWW tie(s)", inv.UnresolvedTies)
+	if inv.OwnershipTies > 0 {
+		return false, fmt.Sprintf("%d unresolved LWW tie(s) on ownership tables", inv.OwnershipTies)
 	}
 
 	ok, err := corrosion.OwnerEpochBackfillComplete(ctx, s.db, s.hostName)

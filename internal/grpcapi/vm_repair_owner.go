@@ -114,7 +114,9 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	// ownership without a generation bump" gap. The expected epoch is the row
 	// just read; a concurrent transition loses the CAS and the operator
 	// re-runs against fresh state instead of silently overwriting it.
-	if err := corrosion.TransferVMOwner(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch); err != nil {
+	if err := s.publishRunningMinted(ctx, req.GetName(), func(ctx context.Context) error {
+		return corrosion.TransferVMOwner(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch)
+	}); err != nil {
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			return nil, status.Errorf(codes.Aborted,
 				"vm %q changed owner epoch during repair (concurrent transition); re-run against fresh state", req.GetName())

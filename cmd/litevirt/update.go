@@ -14,6 +14,7 @@ func newUpdateCmd() *cobra.Command {
 		cpu        int32
 		memory     int32
 		cpuMode    string
+		cpuModel   string
 		disableVNC bool
 		// live metadata (applied while running, no restart)
 		restart      string
@@ -54,7 +55,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			f := cmd.Flags()
 			any := false
-			for _, n := range []string{"cpu", "memory", "cpu-mode", "disable-vnc",
+			for _, n := range []string{"cpu", "memory", "cpu-mode", "cpu-model", "disable-vnc",
 				"restart", "restart-max-attempts", "restart-delay", "restart-window",
 				"onboot", "startup-order", "start-delay", "stop-delay",
 				"machine", "firmware", "guest-agent", "min-mem", "max-mem", "max-cpu",
@@ -78,6 +79,9 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 			}
 			if f.Changed("cpu-mode") {
 				req.CpuMode = cpuMode
+			}
+			if f.Changed("cpu-model") {
+				req.CpuModel = cpuModel
 			}
 			req.DisableVnc = disableVNC
 			if f.Changed("machine") {
@@ -147,6 +151,7 @@ stop), and 'lv set-memory' balloons memory live within the min/max bounds.`,
 	cmd.Flags().Int32Var(&cpu, "cpu", 0, "Number of vCPUs (VM must be stopped)")
 	cmd.Flags().Int32Var(&memory, "memory", 0, "Memory in MiB (VM must be stopped)")
 	cmd.Flags().StringVar(&cpuMode, "cpu-mode", "", "CPU mode: host-passthrough|host-model|custom (VM must be stopped)")
+	cmd.Flags().StringVar(&cpuModel, "cpu-model", "", "CPU model for --cpu-mode custom, e.g. x86-64-v3 (VM must be stopped)")
 	cmd.Flags().BoolVar(&disableVNC, "disable-vnc", false, "Disable VNC access (VM must be stopped)")
 	cmd.Flags().StringVar(&restart, "restart", "", "Auto-restart policy: none|on-failure|always (live; none clears it)")
 	cmd.Flags().Int32Var(&restartMax, "restart-max-attempts", 0, "Max restart attempts within the window (0 = unlimited)")

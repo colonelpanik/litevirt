@@ -28,6 +28,9 @@ const (
 	kindLWWUnresolved   = "ha.lww.unresolved"       // a node is tracking unresolved LWW ties
 	kindDualRunCoverage = "ha.dualrun.coverage"     // a workload-capable host could not be probed
 	kindEpochMismatch   = "ha.owner.epoch_mismatch" // the owner's runtime marker disagrees with its DB epoch
+	// kindEpochSuppressed is the SUPPRESSION itself as a finding: a DB row is
+	// telling the epoch check not to look, and the runtime contradicts it.
+	kindEpochSuppressed = "ha.owner.epoch_suppressed"
 )
 
 // dualRunLeaseKey elects the single node that runs the detector, so a fleet-wide
@@ -312,7 +315,8 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
-	vmState, vmOwner, vmCreated, vmEpoch, dbIndexOK := s.dbVMIndex(ctx)
+	dbVMs, dbIndexOK := s.dbVMIndex(ctx)
+	vmState, vmOwner, vmCreated, vmEpoch := dbVMs.state, dbVMs.owner, dbVMs.created, dbVMs.epoch
 	// DB view for container-holder legitimacy (names are not cluster-unique).
 	ctBacked, ctIndexOK := s.dbCTIndex(ctx)
 
@@ -430,12 +434,86 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	//    a violation of the regime: this host's runtime cannot prove it belongs to
 	//    the generation the cluster believes is running there.
 	if s.gate != nil && s.gate.Enforced(ctx, capabilities.OwnerEpochV1) {
+		// Every input the epoch check branches on is replicated LWW state, so a
+		// writer with SQL on any peer could switch the check off with ONE write
+		// and nothing to renew. The three corroborations below do not close that
+		// trust boundary — the detector still reads replicated state — but they
+		// stop a single write from being SILENT: each one now has to survive
+		// contradiction by runtime evidence this leader gathered itself.
+		//
+		// Each is scoped to cases where the runtime DISAGREES with the row.
+		// A row saying "do not look" with nothing running behind it is an
+		// ordinary stale row, not a suppression, and must not page.
+		knownHost := make(map[string]bool, len(hosts))
+		for _, h := range hosts {
+			knownHost[h.Name] = true
+		}
+		// The set actually probed this pass — witnesses and anything else
+		// dualRunProbeTargets excludes are absent from it by construction.
+		probeTarget := make(map[string]bool, len(targets))
+		for _, t := range targets {
+			probeTarget[t] = true
+		}
+
+		// SUPPRESSION A — deleted_at. ListVMs filters `deleted_at IS NULL`, so a
+		// tombstone removes the VM from vmOwner entirely: no epoch check, no
+		// owner check, nothing to renew. A tombstoned row whose runtime is still
+		// live is not a deleted VM, it is an unexamined running workload.
+		for vm, lastHost := range dbVMs.tombstoned {
+			hs := vmHolders[vm]
+			if len(hs) == 0 {
+				continue // an ordinary completed delete
+			}
+			add(kindEpochSuppressed, vm, fmt.Sprintf(
+				"VM %q is TOMBSTONED in the DB (last owner %q) but is an active disk-holder on %s — "+
+					"a deleted row removes it from every ownership check while its runtime keeps running.",
+				vm, lastHost, strings.Join(hs, ", ")), hs...)
+		}
+
 		for vm, owner := range vmOwner {
 			if migrationStates[vmState[vm]] {
+				// SUPPRESSION B — a migration state. Legitimate while a cutover is
+				// in flight, permanent if never bounded. Past migrationGrace a VM
+				// still parked here is a wedged migration, which is itself the
+				// failed-cutover case this detector exists for.
+				if withinGrace(dbVMs.updated[vm], migrationGrace) {
+					continue // genuinely mid-move
+				}
+				if hs := vmHolders[vm]; len(hs) > 0 {
+					add(kindEpochSuppressed, vm, fmt.Sprintf(
+						"VM %q has been in migration state %q since %s — past the %s cutover window — "+
+							"while still an active disk-holder on %s; the state is suppressing the "+
+							"owner-epoch check on a migration that is not progressing.",
+						vm, vmState[vm], dbVMs.updated[vm], migrationGrace, strings.Join(hs, ", ")), hs...)
+				}
 				continue
 			}
 			snap, probed := snaps[owner]
 			if !probed || snap.vmMarkers == nil {
+				// SUPPRESSION C — an owner that will never be probed. Deferring to
+				// the coverage signal is right for a real host we could not reach
+				// this pass; a host_name naming a host that is not in the cluster
+				// at all is never probed, so the deferral never resolves and no
+				// coverage finding names this VM.
+				// Membership is not the test — being PROBED is. A witness is a
+				// real cluster host that dualRunProbeTargets structurally
+				// excludes, so it is never probed, raises no coverage finding,
+				// and naming it as owner suppresses this check permanently
+				// with no renewal. Checking only !knownHost closed the
+				// invented-host case and left the one needing no invention.
+				if !probeTarget[owner] {
+					if hs := vmHolders[vm]; len(hs) > 0 {
+						why := "is not a host in this cluster"
+						if knownHost[owner] {
+							why = "is a cluster host that is never probed (a witness)"
+						}
+						add(kindEpochSuppressed, vm, fmt.Sprintf(
+							"VM %q names owner %q, which %s, while running on %s — "+
+								"an owner that can never be probed suppresses the owner-epoch check permanently "+
+								"and raises no coverage finding of its own.",
+							vm, owner, why, strings.Join(hs, ", ")), hs...)
+					}
+				}
 				continue // owner unprobed (coverage covers it) or a fixture without markers
 			}
 			mi, running := snap.vmMarkers[vm]
@@ -542,20 +620,74 @@ func (s *Server) dbCTIndex(ctx context.Context) (backed map[ctHostName]bool, ok 
 // these maps, so an unreadable index silently detects nothing — and two such
 // passes counted as "clean" would auto-resolve a confirmed ownership condition
 // the detector simply could not see.
-func (s *Server) dbVMIndex(ctx context.Context) (state, owner, created map[string]string, epoch map[string]int64, ok bool) {
-	state, owner, created, epoch = map[string]string{}, map[string]string{}, map[string]string{}, map[string]int64{}
+func (s *Server) dbVMIndex(ctx context.Context) (idx dbVMView, ok bool) {
+	idx = dbVMView{
+		state:      map[string]string{},
+		owner:      map[string]string{},
+		created:    map[string]string{},
+		updated:    map[string]string{},
+		epoch:      map[string]int64{},
+		tombstoned: map[string]string{},
+	}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
 	if err != nil {
 		slog.Warn("dual-run detector: list VMs", "error", err)
-		return state, owner, created, epoch, false
+		return idx, false
 	}
 	for _, vm := range vms {
-		state[vm.Name] = vm.State
-		owner[vm.Name] = vm.HostName
-		created[vm.Name] = vm.CreatedAt
-		epoch[vm.Name] = vm.OwnerEpoch
+		idx.state[vm.Name] = vm.State
+		idx.owner[vm.Name] = vm.HostName
+		idx.created[vm.Name] = vm.CreatedAt
+		idx.updated[vm.Name] = vm.UpdatedAt
+		idx.epoch[vm.Name] = vm.OwnerEpoch
 	}
-	return state, owner, created, epoch, true
+	tomb, tombOK := s.readTombstonedVMs(ctx)
+	if !tombOK {
+		// A blind pass must not read as a clean one. Returning ok here left
+		// coverage COMPLETE while SUPPRESSION A iterated nothing, so two such
+		// passes auto-resolved a confirmed critical owner_epoch_suppressed
+		// condition with a notification claiming the absence was proven. The
+		// rule is stated on coverageComplete: a failed DB read gates
+		// resolution exactly like an unreachable host, because the pass proved
+		// nothing.
+		return idx, false
+	}
+	idx.tombstoned = tomb
+	return idx, true
+}
+
+// readTombstonedVMs reads the tombstoned rows, which ListVMs filters out —
+// precisely what makes deleted_at a one-write suppression of the epoch check.
+// A tombstoned row whose runtime is still live is not a deleted VM; it is an
+// unexamined running workload.
+//
+// Separate from dbVMIndex so its failure contract is testable on its own: the
+// interesting case is this read failing while ListVMs succeeds, which is what
+// a lock-contention blip on one statement looks like.
+func (s *Server) readTombstonedVMs(ctx context.Context) (map[string]string, bool) {
+	rows, err := s.db.Query(ctx,
+		`SELECT name, host_name FROM vms WHERE deleted_at IS NOT NULL`)
+	if err != nil {
+		slog.Warn("dual-run detector: list tombstoned VMs", "error", err)
+		return nil, false
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		out[r.String("name")] = r.String("host_name")
+	}
+	return out, true
+}
+
+// dbVMView is the detector's DB-side index. It carries the tombstoned set
+// alongside the live rows because several checks are only sound when they can
+// see what the live projection hides.
+type dbVMView struct {
+	state      map[string]string
+	owner      map[string]string
+	created    map[string]string
+	updated    map[string]string
+	epoch      map[string]int64
+	tombstoned map[string]string // name -> last known host_name
 }
 
 // newbornEpochGrace bounds how long a VM may sit at the pre-epoch generation 0
@@ -592,22 +724,56 @@ const newbornEpochGrace = 5 * time.Minute
 // alone. It does NOT bound a peer that REWRITES created_at before each pass:
 // this is re-evaluated against freshly-read DB state every sweep, so a renewed
 // stamp keeps the exception open indefinitely. That is not a property this
-// predicate can recover on its own, and it is not specific to the newborn
-// grace — the same writer suppresses the whole epoch check more cheaply by
-// setting state to a migrationState, setting deleted_at (ListVMs filters it),
-// or pointing host_name at an unprobed host, none of which need renewing. The
-// detector trusts replicated DB state throughout; closing that means either
-// detector-owned durable state the peers cannot reset, or assigning a positive
-// epoch and writing markers BEFORE a VM is published as running, which removes
-// the newborn window instead of bounding it. Both are tracked separately.
+// predicate can recover on its own.
+//
+// It used to be worse. The same writer could suppress the whole epoch check
+// more cheaply — and WITHOUT renewing — by setting state to a migrationState,
+// setting deleted_at (ListVMs filters it), or pointing host_name at a host
+// that is never probed. Those three are no longer silent: each is now
+// corroborated against runtime evidence this leader gathered itself, and a row
+// that says "do not look" while the runtime says the workload is running
+// raises kindEpochSuppressed. See the three SUPPRESSION blocks in
+// detectDualRunPass.
+//
+// That narrows the boundary; it does not close it. The detector still judges
+// replicated state using replicated state, and a writer who ALSO stops the
+// workload, or who owns the host doing the probing, is not caught by any of
+// this. Closing it properly means either detector-owned durable state the
+// peers cannot reset, or assigning a positive epoch and writing markers BEFORE
+// a VM is published as running, which removes the newborn window instead of
+// bounding it. Both are tracked separately.
 func withinNewbornGrace(createdAt string) bool {
-	t, err := time.Parse(time.RFC3339, createdAt)
+	return withinGrace(createdAt, newbornEpochGrace)
+}
+
+// withinGrace is the shared both-direction age test. An unparseable or empty
+// stamp is OUTSIDE the grace, and so is one far enough in the future to be a
+// forgery rather than clock skew — a detector must not have an input that
+// switches it off indefinitely. Any one stamp therefore buys at most two
+// windows of suppression.
+func withinGrace(ts string, window time.Duration) bool {
+	t, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
 		return false
 	}
 	age := time.Since(t)
-	return age > -newbornEpochGrace && age < newbornEpochGrace
+	return age > -window && age < window
 }
+
+// migrationGrace bounds how long a VM may sit in a migration state before the
+// owner-epoch check stops honouring it as cutover lag.
+//
+// A migration state is a legitimate reason for the DB owner and the runtime to
+// disagree, but only while a migration is actually in flight. Left unbounded
+// it is the cheapest permanent suppression of the epoch check there is: one
+// write of state='migrating' and the VM is never examined again, with nothing
+// to renew. Bounding it converts that from permanent to a window, after which
+// a VM still parked in the state is a WEDGED migration — which is itself worth
+// surfacing, and is exactly the failed-cutover case the detector exists for.
+//
+// Generous relative to a real cutover (seconds), so an honestly slow migration
+// over a saturated link is never paged.
+const migrationGrace = 15 * time.Minute
 
 // dualRunProbeTargets returns the hosts the detector must probe for a hidden runtime copy
 // (INCLUDING self). It excludes ONLY witnesses (which never host workloads). Every other

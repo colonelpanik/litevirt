@@ -24547,8 +24547,23 @@ type ExportAuditChainRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
 	// "from the beginning" / "to the end".
-	Since         string `protobuf:"bytes,1,opt,name=since,proto3" json:"since,omitempty"`
-	Until         string `protobuf:"bytes,2,opt,name=until,proto3" json:"until,omitempty"`
+	//
+	// A window that starts mid-chain exports a fragment whose first row links
+	// to a row outside it, which cannot be re-verified. Narrow the window to
+	// answer a question about a period; export the whole chain to attest to it.
+	Since string `protobuf:"bytes,1,opt,name=since,proto3" json:"since,omitempty"`
+	Until string `protobuf:"bytes,2,opt,name=until,proto3" json:"until,omitempty"`
+	// Opaque cursor from a previous response's next_cursor. Empty starts at the
+	// beginning.
+	//
+	// The export is paginated because it is one unary message against a 64 MiB
+	// server send cap, and a chain large enough to matter exceeds it. Without
+	// paging the only workaround is a since/until window — which produces
+	// exactly the fragment that cannot be re-verified, so the failure quietly
+	// converts a complete attestation into a useless one.
+	Cursor string `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	// Audit rows per page. 0 uses the server default.
+	Limit         int32 `protobuf:"varint,4,opt,name=limit,proto3" json:"limit,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24597,13 +24612,33 @@ func (x *ExportAuditChainRequest) GetUntil() string {
 	return ""
 }
 
+func (x *ExportAuditChainRequest) GetCursor() string {
+	if x != nil {
+		return x.Cursor
+	}
+	return ""
+}
+
+func (x *ExportAuditChainRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
 type ExportAuditChainResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// JSON blob — caller writes this to a WORM destination
 	// (S3 Object Lock, immutable filesystem, etc.). Format:
-	// {"rows": [{"id":..,"timestamp":..,..,"content_hash":..},...]}
-	Json          string `protobuf:"bytes,1,opt,name=json,proto3" json:"json,omitempty"`
-	RowCount      int32  `protobuf:"varint,2,opt,name=row_count,json=rowCount,proto3" json:"row_count,omitempty"`
+	// {"rows": [{"id":..,"timestamp":..,..,"content_hash":..,"seq":..},...]}
+	//
+	// The FIRST page (empty request cursor) also carries the state a verifier
+	// needs and cannot derive from the rows: "chain_heads", "signing_keys",
+	// "key_lifecycle" and "ca_pem". Later pages carry rows only.
+	Json     string `protobuf:"bytes,1,opt,name=json,proto3" json:"json,omitempty"`
+	RowCount int32  `protobuf:"varint,2,opt,name=row_count,json=rowCount,proto3" json:"row_count,omitempty"`
+	// Non-empty when more rows remain; pass it back as request.cursor.
+	NextCursor    string `protobuf:"bytes,3,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24650,6 +24685,13 @@ func (x *ExportAuditChainResponse) GetRowCount() int32 {
 		return x.RowCount
 	}
 	return 0
+}
+
+func (x *ExportAuditChainResponse) GetNextCursor() string {
+	if x != nil {
+		return x.NextCursor
+	}
+	return ""
 }
 
 type Project struct {
@@ -27838,13 +27880,17 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\a_at_seq\"d\n" +
 	"\x16RetireAuditKeyResponse\x12$\n" +
 	"\x0eretired_key_id\x18\x01 \x01(\tR\fretiredKeyId\x12$\n" +
-	"\x0eretired_at_seq\x18\x02 \x01(\x03R\fretiredAtSeq\"E\n" +
+	"\x0eretired_at_seq\x18\x02 \x01(\x03R\fretiredAtSeq\"s\n" +
 	"\x17ExportAuditChainRequest\x12\x14\n" +
 	"\x05since\x18\x01 \x01(\tR\x05since\x12\x14\n" +
-	"\x05until\x18\x02 \x01(\tR\x05until\"K\n" +
+	"\x05until\x18\x02 \x01(\tR\x05until\x12\x16\n" +
+	"\x06cursor\x18\x03 \x01(\tR\x06cursor\x12\x14\n" +
+	"\x05limit\x18\x04 \x01(\x05R\x05limit\"l\n" +
 	"\x18ExportAuditChainResponse\x12\x12\n" +
 	"\x04json\x18\x01 \x01(\tR\x04json\x12\x1b\n" +
-	"\trow_count\x18\x02 \x01(\x05R\browCount\"\x96\x01\n" +
+	"\trow_count\x18\x02 \x01(\x05R\browCount\x12\x1f\n" +
+	"\vnext_cursor\x18\x03 \x01(\tR\n" +
+	"nextCursor\"\x96\x01\n" +
 	"\aProject\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\adisplay\x18\x02 \x01(\tR\adisplay\x12\x1f\n" +

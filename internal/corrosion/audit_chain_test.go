@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 )
 
 func newAuditTestClient(t *testing.T) *Client {
@@ -46,6 +48,57 @@ func TestAuditChain_IntactAcrossInserts(t *testing.T) {
 	}
 	if res.RowsChecked != 3 {
 		t.Errorf("checked %d rows, want 3", res.RowsChecked)
+	}
+}
+
+// TestAuditChain_StampsSortAsTextInTimeOrder pins the contract the chain
+// relies on: InsertAuditLog stamps a row from the client's clock, and the
+// tail read and the verifier both walk a host's rows in timestamp TEXT order,
+// so that order has to be the time order. A stamp that trims trailing zeros
+// breaks it — ".12Z" sorts after ".125Z", and a whole second "01Z" after
+// "01.5Z" — and the verifier then checks rows out of insert order and reports
+// an intact chain as broken.
+func TestAuditChain_StampsSortAsTextInTimeOrder(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	instants := []time.Time{
+		time.Date(2026, 1, 1, 0, 0, 0, 120_000_000, time.UTC),
+		time.Date(2026, 1, 1, 0, 0, 0, 125_000_000, time.UTC),
+		time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC),
+		time.Date(2026, 1, 1, 0, 0, 1, 500_000_000, time.UTC),
+	}
+	for i, at := range instants {
+		c.nowFn = func() time.Time { return at }
+		ins(t, c, fmt.Sprintf("row-%d", i), "node-0", "")
+	}
+
+	rows, err := c.Query(ctx, `SELECT id, timestamp FROM audit_log ORDER BY timestamp ASC, id ASC`)
+	if err != nil {
+		t.Fatalf("list audit rows: %v", err)
+	}
+	if len(rows) != len(instants) {
+		t.Fatalf("got %d rows, want %d", len(rows), len(instants))
+	}
+	for i, r := range rows {
+		if want := fmt.Sprintf("row-%d", i); r.String("id") != want {
+			t.Errorf("position %d in timestamp order is %s (stamped %q), want %s",
+				i, r.String("id"), r.String("timestamp"), want)
+			continue
+		}
+		got, perr := time.Parse(time.RFC3339Nano, r.String("timestamp"))
+		if perr != nil || !got.Equal(instants[i]) {
+			t.Errorf("%s stamped %q, want the client clock's %s",
+				r.String("id"), r.String("timestamp"), instants[i].Format(time.RFC3339Nano))
+		}
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.BrokenAt != "" {
+		t.Errorf("chain broken at %q", res.BrokenAt)
 	}
 }
 
@@ -253,5 +306,252 @@ func TestResealAuditChain_Idempotent(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("reseal of an already-consistent chain rewrote %d rows, want 0", n)
+	}
+}
+
+// TestAuditChain_IntactWhenStampsRegress pins that a host's sub-chain is walked
+// in the order its rows were AUTHORED, not the order their stamps happen to
+// sort in.
+//
+// seq is the authoring host's own counter, assigned under the chain mutex in
+// the same critical section as prev_hash, so it is the one record of append
+// order a wall clock cannot contradict. The stamp can: InsertAuditLog reads the
+// clock BEFORE taking that mutex, so two goroutines on one host can stamp in
+// one order and chain in the other, and an NTP step-back or a restored snapshot
+// moves the clock under a single writer. Either way a row lands whose stamp
+// sorts before its predecessor's.
+//
+// Walking by stamp then checks that row against the wrong prev_hash and reports
+// BrokenAt plus a seq gap — a tamper verdict on a chain nothing touched. Because
+// both rows are signed, ResealAuditChain refuses to rewrite them, so the
+// accusation is permanent on every node that replicates it. That is exactly the
+// unclearable false alarm the comment above VerifyAuditChain says must never
+// happen.
+func TestAuditChain_IntactWhenStampsRegress(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	ins(t, c, "row-a", "node-0", "2026-01-01T00:00:02.000000000Z")
+	// The clock steps back between the two appends. row-b is authored second
+	// and chains onto row-a, but its stamp sorts first.
+	ins(t, c, "row-b", "node-0", "2026-01-01T00:00:01.000000000Z")
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.BrokenAt != "" {
+		t.Errorf("chain broken at %q; a backward clock step is not tampering", res.BrokenAt)
+	}
+	if len(res.SeqGaps) != 0 {
+		t.Errorf("seq gaps %v; both rows were authored in order", res.SeqGaps)
+	}
+	if res.RowsChecked != 2 {
+		t.Errorf("checked %d rows, want 2", res.RowsChecked)
+	}
+}
+
+// TestAuditChain_TailAfterRestartIsTheLastAuthoredRow covers the write path's
+// half of the same ordering question.
+//
+// The cached tail is per-process, so a daemon restart re-reads it from the log
+// through loadHostTail. If that read picks the row with the latest STAMP rather
+// than the last one authored, the first row written after the restart chains
+// onto the wrong predecessor — and unlike a mis-ordered walk, this one writes a
+// genuinely broken link into the table, where it stays after the clock is
+// corrected and every later verify reports it.
+//
+// Dropping the cache is how a restart is spelled in-process: the next insert
+// takes the loadHostTail path exactly as a fresh daemon would.
+func TestAuditChain_TailAfterRestartIsTheLastAuthoredRow(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	ins(t, c, "row-a", "node-0", "2026-01-01T00:00:02.000000000Z")
+	ins(t, c, "row-b", "node-0", "2026-01-01T00:00:01.000000000Z") // clock stepped back
+
+	c.ResetAuditChainForTests()
+
+	ins(t, c, "row-c", "node-0", "2026-01-01T00:00:03.000000000Z")
+
+	rows, err := c.Query(ctx, `SELECT prev_hash FROM audit_log WHERE id = 'row-c'`)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read row-c: %v (%d rows)", err, len(rows))
+	}
+	want, werr := c.Query(ctx, `SELECT content_hash FROM audit_log WHERE id = 'row-b'`)
+	if werr != nil || len(want) != 1 {
+		t.Fatalf("read row-b: %v (%d rows)", werr, len(want))
+	}
+	if got, exp := rows[0].String("prev_hash"), want[0].String("content_hash"); got != exp {
+		t.Errorf("row-c chained onto %q, want row-b's %q", got, exp)
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.BrokenAt != "" {
+		t.Errorf("chain broken at %q after a restart across a clock step", res.BrokenAt)
+	}
+}
+
+// TestAuditChain_ResealLeavesAGoodChainAlone covers the third walk over the
+// same rows.
+//
+// Reseal re-bases rows written before signing was enabled, so it recomputes the
+// chain from whatever order it reads them in and UPDATEs any row whose stored
+// hash differs. That makes its order a WRITE, not just a reading: walk these
+// rows by stamp while the verifier walks them by seq and reseal does not repair
+// the chain, it rewrites a correct one into an order the verifier then rejects
+// — and the rewrite replicates.
+//
+// The rows here are unsigned (the test client has no keyring), which is exactly
+// the population reseal is allowed to touch.
+func TestAuditChain_ResealLeavesAGoodChainAlone(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	ins(t, c, "row-a", "node-0", "2026-01-01T00:00:02.000000000Z")
+	ins(t, c, "row-b", "node-0", "2026-01-01T00:00:01.000000000Z") // clock stepped back
+
+	resealed, err := ResealAuditChain(ctx, c, "node-0")
+	if err != nil {
+		t.Fatalf("ResealAuditChain: %v", err)
+	}
+	if resealed != 0 {
+		t.Errorf("reseal rewrote %d rows; the chain was already correct", resealed)
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.BrokenAt != "" {
+		t.Errorf("chain broken at %q after a reseal that should have been a no-op", res.BrokenAt)
+	}
+}
+
+// TestAuditChain_GeneratedStampsNeverRegress pins the write-path half: a stamp
+// this node generates is never older than the last one it wrote for that host.
+//
+// The walk changes above make a regressed stamp survivable. This makes it not
+// happen in the first place, which is the difference between a chain that
+// verifies and a chain that verifies only because something downstream repairs
+// the order. client.go's NowTS already took this trade for replication keys —
+// it clamps to lastTS+1ns against a durable ceiling — and audit rows simply did
+// not use it.
+//
+// Only GENERATED stamps are clamped. A caller-supplied timestamp is stored
+// verbatim: rewriting it would alter data this node did not author, and the
+// replicated and legacy rows that carry one are exactly the population the walk
+// ordering exists to handle.
+func TestAuditChain_GeneratedStampsNeverRegress(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+
+	at := time.Date(2026, 1, 1, 0, 0, 2, 0, time.UTC)
+	c.nowFn = func() time.Time { return at }
+	insNow(t, c, "row-a", "node-0")
+
+	// NTP corrects backwards, or a snapshot is restored.
+	at = time.Date(2026, 1, 1, 0, 0, 1, 0, time.UTC)
+	insNow(t, c, "row-b", "node-0")
+
+	first := stampOf(t, c, "row-a")
+	second := stampOf(t, c, "row-b")
+	if !second.After(first) {
+		t.Errorf("row-b stamped %s, not after row-a's %s",
+			second.Format(time.RFC3339Nano), first.Format(time.RFC3339Nano))
+	}
+
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if res.BrokenAt != "" {
+		t.Errorf("chain broken at %q", res.BrokenAt)
+	}
+}
+
+// insNow appends a row with no timestamp, so InsertAuditLog stamps it from the
+// client's clock — the path a real caller takes.
+func insNow(t *testing.T, c *Client, id, host string) {
+	t.Helper()
+	if err := InsertAuditLog(context.Background(), c, AuditRecord{
+		ID: id, Username: "u", HostName: host,
+		Action: "vm.start", Target: "x", Result: "ok",
+	}); err != nil {
+		t.Fatalf("InsertAuditLog %s: %v", id, err)
+	}
+}
+
+// stampOf reads back the timestamp a row was actually stored with.
+func stampOf(t *testing.T, c *Client, id string) time.Time {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `SELECT timestamp FROM audit_log WHERE id = ?`, id)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("read %s: %v (%d rows)", id, err, len(rows))
+	}
+	ts, perr := time.Parse(time.RFC3339Nano, rows[0].String("timestamp"))
+	if perr != nil {
+		t.Fatalf("parse %s stamp %q: %v", id, rows[0].String("timestamp"), perr)
+	}
+	return ts
+}
+
+// TestAuditChain_ACallerStampDoesNotBecomeTheClock isolates one of the two
+// protections around the clamp.
+//
+// The clamp only ever raises its ceiling, so anything able to push it FORWARD
+// moves every later stamp with it until wall time catches up. A caller-supplied
+// timestamp is stored verbatim — this node did not author it — and must not also
+// become the floor for rows this node writes afterwards, or any caller gets a
+// lever on the whole host's timeline.
+//
+// The offset here is one minute: inside maxClampSkew, so the far-future bound
+// does not engage and this test pins the generated-only rule on its own.
+func TestAuditChain_ACallerStampDoesNotBecomeTheClock(t *testing.T) {
+	c := newAuditTestClient(t)
+
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.nowFn = func() time.Time { return at }
+
+	ins(t, c, "supplied", "node-0", at.Add(time.Minute).Format(nowTSLayout))
+	insNow(t, c, "after-supplied", "node-0")
+
+	if got := stampOf(t, c, "after-supplied"); got.After(at.Add(time.Second)) {
+		t.Errorf("a generated stamp landed at %s, past the clock's %s: a caller-supplied "+
+			"timestamp became the ceiling", got.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano))
+	}
+}
+
+// TestAuditChain_AFutureTailDoesNotDragTheClockForward isolates the other.
+//
+// After a restart the ceiling is read back out of the table, so it is whatever
+// the host's highest-seq row carries — including a row written by something that
+// is not a daemon, which is exactly what an audit log exists to reveal. A stamp
+// a year ahead is not a smaller problem than one a millisecond behind: it breaks
+// timestamp-window exports and makes `lv audit ls` lie about when things
+// happened, and unlike a backward step nothing corrects it.
+//
+// The offset is an hour, past maxClampSkew, so only the far-future bound stands
+// between that row and every stamp this host writes from then on.
+func TestAuditChain_AFutureTailDoesNotDragTheClockForward(t *testing.T) {
+	c := newAuditTestClient(t)
+
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.nowFn = func() time.Time { return at }
+
+	insNow(t, c, "normal", "node-0")
+	// Highest seq on the host, so this is the row the tail read picks up.
+	ins(t, c, "future", "node-0", at.Add(time.Hour).Format(nowTSLayout))
+
+	c.ResetAuditChainForTests()
+	insNow(t, c, "after-restart", "node-0")
+
+	if got := stampOf(t, c, "after-restart"); got.After(at.Add(time.Second)) {
+		t.Errorf("after a restart a generated stamp landed at %s, past the clock's %s: "+
+			"a future row in the table became the ceiling",
+			got.Format(time.RFC3339Nano), at.Format(time.RFC3339Nano))
 	}
 }

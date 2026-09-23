@@ -3016,15 +3016,36 @@ message RetireAuditKeyResponse {
 message ExportAuditChainRequest {
     // ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
     // "from the beginning" / "to the end".
+    //
+    // A window that starts mid-chain exports a fragment whose first row links
+    // to a row outside it, which cannot be re-verified. Narrow the window to
+    // answer a question about a period; export the whole chain to attest to it.
     string since = 1;
     string until = 2;
+    // Opaque cursor from a previous response's next_cursor. Empty starts at the
+    // beginning.
+    //
+    // The export is paginated because it is one unary message against a 64 MiB
+    // server send cap, and a chain large enough to matter exceeds it. Without
+    // paging the only workaround is a since/until window — which produces
+    // exactly the fragment that cannot be re-verified, so the failure quietly
+    // converts a complete attestation into a useless one.
+    string cursor = 3;
+    // Audit rows per page. 0 uses the server default.
+    int32 limit = 4;
 }
 message ExportAuditChainResponse {
     // JSON blob — caller writes this to a WORM destination
     // (S3 Object Lock, immutable filesystem, etc.). Format:
-    // {"rows": [{"id":..,"timestamp":..,..,"content_hash":..},...]}
+    // {"rows": [{"id":..,"timestamp":..,..,"content_hash":..,"seq":..},...]}
+    //
+    // The FIRST page (empty request cursor) also carries the state a verifier
+    // needs and cannot derive from the rows: "chain_heads", "signing_keys",
+    // "key_lifecycle" and "ca_pem". Later pages carry rows only.
     string json     = 1;
     int32  row_count = 2;
+    // Non-empty when more rows remain; pass it back as request.cursor.
+    string next_cursor = 3;
 }
 
 // ── tenancy messages ──

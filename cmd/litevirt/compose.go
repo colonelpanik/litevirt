@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -278,6 +279,15 @@ func newPsCmd() *cobra.Command {
 	return cmd
 }
 
+// composeVMState renders a VM state the way the daemon stores it ("error",
+// "creating", …), which is what the planner's transient/error retry check
+// matches on. The proto enum's String() is "VM_ERROR", which matched nothing,
+// so an error-state VM read as unchanged in the diff while the server planned a
+// retry (delete + recreate under the default strategy) for it.
+func composeVMState(s pb.VMState) string {
+	return strings.ToLower(strings.TrimPrefix(s.String(), "VM_"))
+}
+
 func newDiffCmd() *cobra.Command {
 	var file string
 	cmd := &cobra.Command{
@@ -295,20 +305,33 @@ func newDiffCmd() *cobra.Command {
 					return fmt.Errorf("list VMs: %w", err)
 				}
 
+				// ListVMs ships a PROJECTION of each spec (labels, uuid, machine,
+				// cpu mode) — no image and no cloud-init. Diffing against the
+				// projection made every VM of a cloud-init stack read as
+				// "image →X cloud-init added", so the full spec comes from
+				// InspectVM. A VM that cannot be inspected fails the diff rather
+				// than being reported as changed.
 				current := make([]compose.CurrentVM, 0, len(resp.Vms))
 				for _, vm := range resp.Vms {
-					img := ""
-					if vm.Spec != nil {
-						img = vm.Spec.Image
+					full, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: vm.Name})
+					if err != nil {
+						return fmt.Errorf("inspect %s: %w", vm.Name, err)
 					}
-					current = append(current, compose.CurrentVM{
+					cur := compose.CurrentVM{
 						Name:     vm.Name,
-						Image:    img,
 						CPU:      int(vm.CpuActual),
 						MemMiB:   int(vm.MemActualMib),
-						State:    vm.State.String(),
+						State:    composeVMState(vm.State),
 						HostName: vm.HostName,
-					})
+						Spec:     full.Spec,
+					}
+					if full.Spec != nil {
+						cur.Image = full.Spec.Image
+						if ci := full.Spec.CloudInit; ci != nil {
+							cur.CloudInitHash = compose.CloudInitHash(ci.Userdata, ci.Networkconfig)
+						}
+					}
+					current = append(current, cur)
 				}
 
 				plan, err := compose.Build(f, current)

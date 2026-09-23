@@ -246,19 +246,67 @@ func TestUnknownQueryParameterIsRejected(t *testing.T) {
 	}
 }
 
-func TestFindDeviceByNameReturnsZeroWhenAbsent(t *testing.T) {
+func TestFindDeviceInClusterReturnsZeroWhenAbsent(t *testing.T) {
 	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"results":[]}`))
 	})
 	// A host that is not modelled as a DCIM device must NOT be an error — the
 	// host link is best-effort, and requiring it would break the whole mirror
 	// for operators who do not model hosts in NetBox.
-	id, err := c.FindDeviceByName(context.Background(), "some-host")
+	id, err := c.FindDeviceInCluster(context.Background(), "some-host", 7)
 	if err != nil {
 		t.Fatalf("an absent device must not error, got %v", err)
 	}
 	if id != 0 {
 		t.Fatalf("id = %d, want 0", id)
+	}
+}
+
+// TestFindDeviceInClusterScopesTheQuery pins the constraint into the REQUEST.
+// NetBox refuses a virtual_machine whose device is outside its cluster, so an
+// unscoped lookup returns an id that is unusable — and the 400 it produces
+// fails the entire sweep rather than just that one link.
+func TestFindDeviceInClusterScopesTheQuery(t *testing.T) {
+	var gotQuery url.Values
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_, _ = w.Write([]byte(`{"results":[{"id":4242}]}`))
+	})
+
+	id, err := c.FindDeviceInCluster(context.Background(), "host-a", 7)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if id != 4242 {
+		t.Fatalf("id = %d, want 4242", id)
+	}
+	if got := gotQuery.Get("cluster_id"); got != "7" {
+		t.Fatalf("cluster_id = %q, want %q — an unscoped lookup returns a device NetBox will refuse", got, "7")
+	}
+	if got := gotQuery.Get("name"); got != "host-a" {
+		t.Fatalf("name = %q, want %q", got, "host-a")
+	}
+}
+
+// TestFindDeviceInClusterWithoutAClusterLinksNothing: with no resolved cluster
+// there is no scope to ask within, and an unscoped fallback would reintroduce
+// exactly the refusal the scope exists to prevent. No link, and no request.
+func TestFindDeviceInClusterWithoutAClusterLinksNothing(t *testing.T) {
+	called := false
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		_, _ = w.Write([]byte(`{"results":[{"id":4242}]}`))
+	})
+
+	id, err := c.FindDeviceInCluster(context.Background(), "host-a", 0)
+	if err != nil {
+		t.Fatalf("an unresolved cluster must not error, got %v", err)
+	}
+	if id != 0 {
+		t.Fatalf("id = %d, want 0", id)
+	}
+	if called {
+		t.Fatal("want no request at all when there is no cluster to scope to")
 	}
 }
 

@@ -36,6 +36,12 @@ type LibvirtBackend interface {
 	// domain (safe for destructive rollback) from a still-active paused /
 	// pm-suspended one (whose disks are attached and must not be touched).
 	DomainStateReason(name string) (libvirt.DomainStatus, error)
+	// DomainIsActive is libvirt's own activity question, which DomainState cannot
+	// answer: that collapses paused, shut-off and pm-suspended to "stopped", and a
+	// PAUSED domain is active. Anything about to undefine a domain must ask this —
+	// undefining an active domain leaves it running as a transient one, still
+	// holding its UUID.
+	DomainIsActive(name string) (bool, error)
 	DomainExists(name string) bool
 	ListDomains() ([]string, error)
 	DumpXML(name string) (string, error)
@@ -111,8 +117,26 @@ type LibvirtBackend interface {
 	// hotplug ceiling (live_resize).
 	SetVCPUs(name string, count int) error
 
+	// Owner-epoch runtime marker, mirrored into domain metadata. The create path
+	// stamps it so a fresh VM is provable before CreateVM returns; internal/health
+	// converges it thereafter. Get returns (0,false,nil) for a domain carrying
+	// none; corrupt content is an error, never epoch 0.
+	//
+	// Get is here alongside Set deliberately: an interface able to write a marker
+	// it cannot read is the asymmetry that let the file marker drift unnoticed.
+	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
+	GetDomainOwnerEpoch(name string) (int64, bool, error)
+
 	// Stats / introspection.
 	NodeInfo() (cpus int, memMiB int, err error)
+	// CompareCPU asks the LOCAL hypervisor whether it can run a guest requiring
+	// the CPU described by a standalone <cpu> element. The destination side of
+	// the migration CPU preflight.
+	CompareCPU(cpuXML string) (libvirt.CPUCompare, error)
+	// HostCPUXML returns this host's own CPU as a comparable <cpu> element — the
+	// requirement a host-passthrough guest carries, which its live domain XML
+	// does not spell out.
+	HostCPUXML() (string, error)
 	GetDomainStats(name string) (*libvirt.DomainStats, error)
 	GetAllDomainStats() ([]*libvirt.DomainStats, error)
 

@@ -49,6 +49,13 @@ func (g *flipExecGate) DurablyLatched(string) bool                             {
 func (g *flipExecGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
 func (g *flipExecGate) HealthyPeers(context.Context) []string                  { return nil }
 
+// QuorumProof: QuorumUnknown, the tri-state's fail-closed member. This double
+// exists to flip the execution gate, and a barrier consulting it must refuse
+// rather than silently inherit quorum it was never given.
+func (g *flipExecGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
+	return health.QuorumUnknown, 0, 0
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 // testServerR2 creates a Server with vmLocks, dataDir, images store, and DB.
@@ -932,6 +939,7 @@ func TestSetVMIP_DefaultNetwork(t *testing.T) {
 
 func TestCutoverVM_ResourceExhausted(t *testing.T) {
 	s := testServerR2(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 
 	// Insert local host with very small capacity.

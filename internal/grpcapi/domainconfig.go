@@ -24,6 +24,7 @@ func baseDomainConfig(spec *pb.VMSpec, disks []lv.DiskConfig, nets []lv.NetworkC
 		CPU:          int(spec.Cpu),
 		MaxCPU:       int(spec.MaxCpu),
 		CPUMode:      spec.CpuMode,
+		CPUModel:     spec.CpuModel,
 		MemoryMiB:    int(spec.MemoryMib),
 		MinMemoryMiB: int(spec.MinMemoryMib),
 		MaxMemoryMiB: int(spec.MaxMemoryMib),

@@ -2998,6 +2998,7 @@ func TestRebuildVM_InvalidSpec(t *testing.T) {
 
 func TestCutoverVM_NextVMNotFound(t *testing.T) {
 	s := testServerCov(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 	_, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "myvm"})
 	if err == nil {
@@ -3517,6 +3518,7 @@ func TestCutoverVM_MissingName(t *testing.T) {
 
 func TestCutoverVM_NextNotFound(t *testing.T) {
 	s := testServerCov(t)
+	enableVMReplace(s)
 	ctx := adminCtx()
 	_, err := s.CutoverVM(ctx, &pb.CutoverVMRequest{VmName: "myvm"})
 	if err == nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -74,6 +75,9 @@ type Config struct {
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
+
+	// VM holds cluster-wide defaults for newly created VMs.
+	VM VMDefaultsConfig `yaml:"vm"`
 
 	// Capacity is the cluster-wide default for how much of a host may be handed
 	// to workloads. Per-host overrides live on the host record (`lv host config`)
@@ -440,6 +444,17 @@ type EnforcementConfig struct {
 	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
 	// reversible advertisement opt-in only.
 	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
+	// VMReplace: allow `lv cutover` to give a replacement VM the name a replaced VM
+	// still holds (capabilities.VMReplaceV1). The transition needs a receiver-side
+	// guarantee the pre-existing statement shapes cannot express — one decision for
+	// the whole batch, over both VMs' incarnations and authority — so it ships behind
+	// a new guard protocol that only an upgraded peer understands.
+	//
+	// Cutover REFUSES while this is off or the token has not latched cluster-wide, and
+	// it refuses BEFORE stopping a domain or writing to either VM, so a cluster that
+	// has not opted in is left with a cutover that declines rather than one that
+	// half-applies. Default false; the flag is the reversible kill switch.
+	VMReplace bool `yaml:"vm_replace,omitempty"`
 	// ProjectAuthority: route the PROJECT-QUOTA half of an admission to the project's
 	// D1 authority holder instead of deciding from this node's replica
 	// (capabilities.ProjectAuthorityV1). One decider per project closes the window
@@ -472,6 +487,22 @@ type EnforcementConfig struct {
 	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
 	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
 	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
+	// LeaseTerm opts this node into leader-lease term enforcement. Enforcement is
+	// this flag AND the lease_term_v1 latch, so clearing the flag disables
+	// enforcement on this node even after the latch has closed — the latch itself
+	// is one-way and durable, and there is no way to re-open it.
+	//
+	// It is reversible, but it is NOT a control you can reach during an incident
+	// without cost. Config is read ONCE at startup and the daemon deliberately
+	// does not reload it (SIGHUP is logged and dropped — see cmd/litevirt/signals.go
+	// for why), so clearing this means editing the file and RESTARTING the daemon
+	// on each affected node. A restart discards that node's healthy-peer anchors
+	// and re-enters quorum warmup, which is disruptive in exactly the degraded
+	// state that would make an operator want to reach for it.
+	//
+	// Plan the rollback path accordingly: it is a per-node config-and-restart
+	// roll, not a switch.
+	LeaseTerm bool `yaml:"lease_term,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a
@@ -591,6 +622,22 @@ func LoadConfig() (*Config, error) {
 			"(a takeover-without-proof tier is intentionally not implemented; to recover an "+
 			"unreachable VIP holder, verify it is down and run `lv host fence-confirm <host>`)",
 			cfg.NoQuorumVIPPolicy)
+	}
+
+	// A typo'd vm.default_cpu_mode must fail load, not silently stamp an invalid
+	// mode into every VM created on this node — those specs would then fail at
+	// libvirt define time, one create at a time, with nothing pointing back here.
+	// Empty is legal and means libvirt.DefaultCPUMode.
+	switch cfg.VM.DefaultCPUMode {
+	case "", lv.CPUModeHostModel, lv.CPUModeHostPassthrough:
+	case lv.CPUModeCustom:
+		return nil, fmt.Errorf("config vm.default_cpu_mode: %q cannot be a cluster-wide default "+
+			"because it needs a per-VM model; set %s or %s here and pass "+
+			"--cpu-mode custom --cpu-model <model> on the VMs that need a pinned baseline",
+			lv.CPUModeCustom, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
+	default:
+		return nil, fmt.Errorf("config vm.default_cpu_mode: invalid mode %q: want %s or %s",
+			cfg.VM.DefaultCPUMode, lv.CPUModeHostModel, lv.CPUModeHostPassthrough)
 	}
 
 	// Validate the image-pull deny policy now so a bad CIDR fails load loudly
@@ -739,6 +786,27 @@ func (c *Config) ImagePullBlockedPrefixes() ([]netip.Prefix, error) {
 //
 // Zero/unset fields fall back to the built-in defaults
 // (corrosion.DefaultCapacityPolicy).
+// VMDefaultsConfig holds cluster-wide defaults stamped onto a VM at CREATE
+// time. They shape new specs only — nothing here reinterprets a spec that is
+// already stored, so changing one can never move a running guest.
+type VMDefaultsConfig struct {
+	// DefaultCPUMode is the cpu_mode a create stamps onto a spec that named
+	// none: host-passthrough | host-model | custom. Empty = host-model.
+	//
+	// host-model is the default because it gives the guest the host's modern ISA
+	// (SSE4.2 / AVX / AVX2 / AVX-512 as the host has them) while keeping live
+	// migration to an equal-or-richer host working. Set host-passthrough on a
+	// uniform fleet that wants nested virt and every last feature flag; set
+	// custom (with a per-VM cpu_model) to hold one baseline across a
+	// deliberately heterogeneous fleet.
+	//
+	// NOTE: this is a default, not a kill switch. There is no value here that
+	// restores the old "emit no <cpu> element" behavior, which put the guest on
+	// QEMU's qemu64 — no SSE4.2, no AVX, no AVX2. Per-VM, `lv run --cpu-mode`
+	// still wins over this.
+	DefaultCPUMode string `yaml:"default_cpu_mode,omitempty"`
+}
+
 type CapacityConfig struct {
 	// CPUOvercommitRatio multiplies physical vCPUs. Default 4.0.
 	CPUOvercommitRatio float64 `yaml:"cpu_overcommit_ratio,omitempty"`

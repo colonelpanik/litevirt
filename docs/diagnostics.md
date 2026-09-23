@@ -22,7 +22,7 @@ clears the barrier only via the exact owner-epoch + spec-generation
 compare-and-swap — so it can never clear a newer operation's barrier, and an
 ordinary mutation's `--force` never bypasses the barrier.
 
-## `hardware_v2` — typed hardware and the one capability with no kill switch
+## `hardware_v2` — typed hardware, with no kill switch of its own
 
 `hardware_v2` makes the typed hardware tables (disks, NICs, PCI intents) the
 source of truth instead of the free-form VM spec, and unlocks hardware mutation
@@ -193,7 +193,11 @@ table.
      table-remediation procedure above or a table-specific restamp — `repair-owner`
      cannot repair them, and `lv cluster converge` labels them accordingly.
    - **In-memory unresolved-tie records do not auto-clear** just because a table's
-     v2 digest now matches; they clear on the next daemon restart.
+     v2 digest now matches; they clear on the next daemon restart. The one
+     exception is `leader_lease_terms`, whose rows are immutable: a restart
+     empties the register but the next anti-entropy pass re-registers the same
+     tie, so that one needs `lv cluster acknowledge-lease-term` — see
+     [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
 v1-only emission (peers then compare v1 against it). Because negotiation is by
@@ -260,6 +264,143 @@ off, behavior-neutral), confirm every node is upgraded, then set
 pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
 separate data migration. Kill switch: set it `false` and restart (the node reverts
 to back-pressuring the collision, still non-destructive).
+
+### `vm_replace` — `lv cutover`
+
+`lv cutover` gives the `<vm>-next` replacement the name of the VM it replaces. That VM is
+deleted first, and the delete is a **soft** delete, so its tombstone still occupies the
+`vms.name` PRIMARY KEY — and every child table it tombstones holds its own composite key
+the same way.
+
+No pre-existing replicated statement shape makes that handover safe on a **receiver**.
+Clearing the tombstone with a retention DELETE is applied unconditionally there, while the
+write meant to replace the row is only last-writer-wins gated — so a delayed replay erases
+a tombstone and puts nothing in its place. Moving it aside instead splits the handover into
+two independently gated statements, and a receiver can commit one and skip the other,
+leaving no row at the name, or moving a still-live VM aside when its own newer ownership
+made the sender's delete decline there. Neither addresses the merge rules, which decide a
+both-live conflict at the contested name on owner/generation authority alone: the replaced
+VM has usually been running longer than its replacement, so its stale copy simply
+overwrites it.
+
+The transition therefore ships as **one receiver decision**: every statement in the batch
+carries the same `workload_replace_v1` guard over both VMs' incarnations and authority, and
+a receiver applies all of them or none. The row installed at the contested name keeps the
+**replacement's** `created_at` — a delete is terminal only for its own incarnation, so a
+delayed tombstone of the replaced VM must read as an older one — and carries authority
+above **both** inputs.
+
+**The cleanup is journaled.** The transition and the destruction of what the replaced VM
+owned cannot be one commit: the destruction is filesystem and storage-driver work that has
+to follow it, and the transition itself displaces the rows describing what to free — the
+replaced VM's parent row, and any child row whose key the replacement claims. A crash in
+between would leak its volumes with nothing left in the database naming them.
+
+So a `vm_replace` operation records an immutable manifest — the replaced VM's disk records,
+its firmware UUID and cloud-init ISO path, plus the replacement's spec and state — while
+those rows are still intact, and the step that AUTHORIZES the destruction is written in the
+same batch as the transition. Its phases are:
+
+| step | meaning |
+|---|---|
+| — | before anything is torn down, the REPLACED VM's domain is verifiably removed from the contested name: stopped if active (a paused one included) and undefined, with absence confirmed. A name still held by a domain makes the replacement's definition there fail, because the UUID differs — and by then its disks would be gone. A failure here changes nothing. Only on the node the cutover RUNS on: a replaced VM hosted elsewhere is asked about instead, and only a complete survey reporting no domain at the name is accepted — a domain still defined there, an incomplete survey, or an unreachable or older peer all refuse, before the operation is even journaled. Absence that could not be established is not absence, and proceeding would hand the name and the address over while that guest was still using both. |
+| `planned` | the manifest exists and **nothing** is authorized. A crash here is safe: the resources it names are still owned by a VM that still exists. |
+| `desired_persisted` | the transition landed. Written in the same batch, so it cannot be observed without it. Its facts carry the **runtime intent** the transition committed to — the replacement's accepted state at that moment — which is what the handoff restores. |
+| `released` | the replaced VM's IPAM addresses are given back — **after** the transition. Releasing first means a delete that then declines leaves a live VM whose address has already gone back to the pool, in the external IPAM too. Journaled because the release can fail on its remote half, and a best-effort attempt that did would strand the address under a cutover reporting success. The manifest carries each address's external object id **and the identity it was claimed under**, so a retry can finish a release whose local half already landed — and can prove first that it is finishing its own. Captured for every address the replaced VM holds, wherever that VM is hosted: leases are cluster-global, unlike the volumes and firmware beside them in the manifest. |
+| `config_applied` | the replaced VM's resources are freed. This also **closes** the destruction phase — past it the replacement's own firmware has moved onto the contested name, so a repeated name-keyed wipe would destroy the replacement's state. |
+| `journaled` | the replacement's exact domain definition is durably recorded, **before** anything undefines it. Without it a transient redefine failure leaves neither name defined and no way to obtain the XML again. |
+| `stopped` | the replacement's domain is confirmed INACTIVE — via libvirt's own activity query, not the coarse state, which collapses paused, shut-off and pm-suspended into "stopped" and so cannot see that a PAUSED domain is active. Activity is re-checked before **every** undefine, including a retry that already has this phase recorded: the record is a statement about the past, and an external start or libvirt autostart can reactivate the domain in between. libvirt cannot rename a domain, and undefining an **active** one leaves it running as a *transient* domain still holding its UUID — after which defining that UUID under the contested name is refused. **Cutting over a running replacement therefore restarts it**; no libvirt operation moves a live domain to another name, and `lv cutover` says so before it starts. |
+| `redefined` | the replacement's libvirt domain and firmware answer to the new name. The database transition does not do this, and a restart that finished only the destruction would leave a committed cutover with no domain at the name. |
+| `completed` | appended only after **both** later phases have run. |
+
+A restart resumes whichever phases are outstanding, from the manifest — never by
+re-running the transition, and never by reading the reused name, which now belongs to the
+replacement. Every runtime action checks the **recorded domain UUID** first, including the
+already-done shortcut, and a read that merely FAILED is neither "ours" nor "absent" — only
+a verified not-found is absence, so a transient libvirt error cannot authorize acting on a
+name whose real occupant is unknown: the temporary name is free the moment the transition commits, so a
+delayed recovery acting by name alone would undefine whatever VM has since taken it. The
+desired runtime state is read from the database at the moment the handoff acts, so an
+operator stop accepted mid-cutover is not undone by replaying a stale snapshot, and the
+whole operation — handler and recovery alike — is serialized against lifecycle calls on
+both names. A phase is recorded only when its step actually succeeded; a failed redefine or
+start leaves it owed. A firmware VM's failure is surfaced in its `state_detail`,
+never as `state=error` — operation failure and running intent are different facts, and
+overwriting the state made the retry read the row as "not asked to run" and finish with the
+VM shut off. For the same reason the running intent is taken from the JOURNAL rather than
+the row: an unfinished handoff looks exactly like a VM that stopped out of band, so a
+reconciler pass would otherwise sync it to `stopped` and erase the start still owed. Nor
+from the manifest, which is older still — captured before the first attempt's teardown and
+adopted verbatim by every retry, so a start the operator asked for between two attempts is
+not in it; the manifest is the fallback only for an operation journaled before the intent
+was recorded. Only an explicit operator stop overrides either, and the reconciler leaves a
+VM with an owed handoff alone in the first place. That marker is never overwritten by failure
+reporting either — it is the only override there is, so replacing it with diagnostic text
+would let the next retry start a VM the operator stopped. A failure goes to the VM's event
+feed and leaves the operation owed in the journal. The firmware file moves only while the temporary name is still the
+replacement's, and the destination definition is derived independently of whether this
+attempt performed that move, so a retry after a failed redefine does not point the VM at a
+vars file that has already gone. The operation's identity includes the replacement's **incarnation**, not just
+the two names: both are reused by the next deployment, and an identity built from names
+alone collides with the previous cutover's header. A retry of the same cutover therefore
+finds its own header and **adopts the manifest already journaled there** rather than taking
+a second one. It has to: a manifest can only be captured while the replaced VM's rows are
+intact, and an attempt retrying past its own teardown reads live-only rows that no longer
+describe the VM it is finishing. Only the recorded owner **epoch** may not have moved —
+every phase is keyed on it, and continuing at another one would write the authorization
+where no resume can read it back. Name-keyed artifacts — the vars file and the cloud-init ISO — are deleted only while the
+contested name still holds the incarnation this operation transitioned, judged from a read
+that sees **tombstones** as well as live rows. A name that has since been deleted and
+recreated belongs to a different VM, and so do its files — including when that newer VM was
+itself deleted with its disks retained, which deliberately keeps its firmware and reads as
+"nobody owns this name" to any live-only lookup. This operation's own tombstone still
+counts as its own, so a cutover whose result was later deleted is still cleaned up. The
+swtpm tree is keyed by the replaced VM's own UUID and is freed regardless. Destruction
+exempts **no** VM from the
+shared-reference check, because the temporary name is free and reusable — a VM created
+after a crash can legitimately reference a captured volume. IPAM allocations move by their
+own primary key and their **complete owner tuple** — `(owner_kind, owner_host, vm_name)`,
+which is what stops a same-named container's address being taken by a VM cutover, and the guard carries a digest of the leases both
+names hold: an address the receiver released and reallocated to an unrelated VM declines
+the whole transition rather than being quietly taken. The release phase applies the same
+rule to what it destroys. The allocation at that key is read **owner-blind**, because an
+owner-scoped read answers a foreign live row and a genuinely absent one with the same
+nothing — and those license opposite actions, since absence is what permits finishing a
+remote delete alone. An allocation another workload now holds vetoes both halves, and is
+left for the orphan sweep rather than retried, so it cannot wedge the phases behind it.
+One that is still this operation's has to also carry the same MAC and back the **same
+external object** the manifest captured — name, MAC and key agreeing prove nothing once
+the contested name belongs to the replacement and the MAC may have been reused. A row that is already gone is
+finished remotely only after the external object is read back **by identity** and still
+answers to the one the replaced VM claimed it under: the object id is a name, not a claim,
+and an address reallocated elsewhere keeps the id while the identity moves. That read is
+also what makes the phase idempotent — an object that is no longer there reads as absent,
+which is a completed release, so a crash between a successful delete and its record resumes
+instead of retrying into a permanent not-found. A read that FAILS is neither, and leaves the
+phase owed.
+
+That is why `operation_protocol_v1` is a hard dependency and not merely a companion.
+
+That is new receiver behaviour, which nothing in the historical ledger can retrofit onto an
+older peer, so it is gated:
+
+- **`enforcement.operation_protocol`** must be active too — the manifest lives in the
+  operation journal. Cutover treats a missing journal as not-available, checked before any
+  side effect.
+- **`enforcement.vm_replace`** (config flag, default false) gates **advertisement** of
+  `vm_replace_v1`, so the cluster-wide latch requires config uniformity rather than just a
+  uniform build — the same rule as `operation_protocol`.
+- **`lv cutover` REFUSES** while the flag is off or the token has not latched, and it
+  refuses as its first act, before stopping a domain or writing to either VM. A cluster
+  that has not opted in has a cutover that declines, not one that half-applies.
+- A receiver that has not latched **rejects** the batch's statements rather than applying
+  them under a disposition never designed for them, which is why the sender is gated too.
+
+Rollout: upgrade every node (flag off, behavior-neutral — cutover simply refuses), then set
+`enforcement.vm_replace: true` everywhere and rolling-restart; the latch closes once every
+voting-eligible member advertises the token. Kill switch: set it `false` and restart;
+cutover goes back to refusing. Acceptance of an already-emitted batch is NOT revoked by the flag — it reads the
+durable latch, because a batch in flight must not become unacceptable across a restart.
 
 ### `canonical_registry` — registry-credential migration
 
@@ -380,6 +521,161 @@ stopped, run `lv update <vm> --machine <concrete-type>`. Neither is urgent on a
 homogeneous cluster — every host resolving the alias identically is why this is
 a warning and not an error — but it should be cleared before introducing a host
 with a different qemu version.
+
+## `lv doctor fence`
+
+Read-only. Reports whether a cross-host transfer of a shared-disk VM would
+actually be fenced.
+
+```
+lv doctor fence
+```
+
+Starting a VM on a second host while the first may still be writing the same
+shared disk corrupts it. The guard against that is a **proof-grade fence** — an
+IPMI-confirmed power-off, or an operator `lv host fence-confirm` — required
+before an ownership transfer of any VM with a disk on shared storage
+(`nfs`, `ceph`, `rbd`, `iscsi`). Local-disk VMs need no fence: a relocation
+target holds a different image, not the same bytes.
+
+The guard has **two independent switches, and both must be on**:
+
+| Switch | Scope | Default |
+|---|---|---|
+| `shared_storage_fence_v1` | latches cluster-wide once every host advertises it | latches on upgrade |
+| `enforcement.shared_storage_fence` | per-host config | **false** |
+
+The gap this command exists to close: a host advertises the token **regardless
+of its own config flag**, because advertisement means "this binary supports the
+feature", not "this node enforces it" (see `advertisedCapabilities`). A cluster
+can therefore show the capability fully latched while any subset of hosts
+silently skips the fence — a state no peer and no operator could observe. This
+command asks every host for its own posture via `PingResponse.not_enforcing`,
+so the answer reflects what each node will actually do.
+
+That the token is advertised unconditionally is deliberate, and the reasoning is
+kept in `advertisedCapabilities`: the fence is enforced where a transfer is
+*created*, so no node relies on a peer enforcing it, and withholding the token
+would leave a witness — or any host mid-rollout — holding the whole cluster on
+the legacy path.
+
+A host is reported as `unknown` rather than as enforcing whenever its posture
+cannot be read, which covers five cases: it did not answer; it did not report a
+posture (it runs a binary predating the field, or it withheld posture from this
+caller — see below); it advertises nothing because it is self-fenced or
+WAL-quarantined; it advertises other tokens but not this one; or the report's
+overall budget expired before it was probed.
+
+Posture is answered only to a caller presenting a **host** certificate.
+`not_enforcing` names which security kill-switches are off, and `Ping` bypasses
+the identity interceptor, so the distributable `lv-cli` certificate would
+otherwise read it with no session and no role. The daemon's own fan-out uses its
+host certificate, so this is invisible in normal use; a caller reaching `Ping`
+some other way lands in the `unknown` bucket above rather than being told
+anything.
+Unknown counts against readiness exactly as "not enforcing" does — a diagnostic
+that cannot see a host must not report the cluster clear on its behalf.
+
+Witness hosts are excluded. A witness never hosts a workload, so it can never
+perform the fence and its flag will never be on; counting it would pin the
+warning on permanently.
+
+Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
+
+### What it does not establish
+
+Printed on **every** run, clean or not. These are the two things that would make
+a clean result wrong, and the host table reads most misleadingly on the warning
+path — a fleet can show a column of `enforcing` above a WARNING, and an operator
+who fixes the one host the remedy names would otherwise never learn that the
+per-host latch is unobservable:
+
+- **Each host's own capability latch.** The latch is per-node state
+  (`internal/health.Checker`'s `activated` map plus its marker files) with no
+  wire representation, so `capability_latched` is the *queried node's* latch.
+  During a rollout one node can latch before another finishes its sweep, and a
+  host that has not latched takes the legacy path whatever its config flag says.
+  `enforced_everywhere` therefore covers the per-host **config** half only —
+  true means "nothing is switched off", not "every node will fence".
+- **Shared-disk VMs this node has not replicated.** The count comes from the
+  queried node's `vm_disks` rows, so a VM created on a peer whose rows have not
+  arrived is not counted. A zero is "none that this node knows of".
+
+When `capability latched` is false and any host reads `enforcing`, the report
+says so explicitly: `enforcing` is that host's config flag, and the flag does
+nothing until the capability has latched cluster-wide, so no host is fencing
+whatever the table shows. Without that line a mid-rollout fleet — every operator
+having already set the flag — prints a column of `enforcing` that reads as
+covered.
+## `lv doctor cpu-mode`
+
+Read-only. Lists VMs whose **persisted spec** has an empty `cpu_mode`.
+
+```
+lv doctor cpu-mode
+```
+
+Such a VM is defined with no `<cpu>` element, so libvirt passes no `-cpu` to QEMU
+and the guest runs on QEMU's x86_64 default, `qemu64` — a model with no `sse4.1`,
+no `sse4.2` and no `xsave`, and therefore neither AVX nor AVX2, however capable
+the host is. Guest software that assumes a modern baseline will not start, and the
+fault presents as a broken binary rather than a hypervisor setting.
+
+New VMs default to `host-model` (see `vm.default_cpu_mode` in
+[configuration](configuration.md)). VMs listed here were created before that
+default existed. Their stored spec is honored verbatim and deliberately not
+rewritten: changing the CPU a running guest sees is not something an upgrade
+should do behind the operator's back.
+
+To move one forward, with the VM **stopped**:
+
+```
+lv update <vm> --cpu-mode host-model
+```
+
+or, in one step on a running VM, `lv update <vm> --cpu-mode host-model
+--restart-if-needed`, which does a stop → redefine → start under a single VM
+lock.
+
+The retrofit is an **in-place patch of libvirt's own inactive domain XML**, not a
+regeneration from the stored spec, so every libvirt-assigned detail the spec does
+not describe — guest PCI slot addresses, controller models, disk ordering —
+survives unchanged. That matters for guests (e.g. Windows) that key licensing off
+stable hardware addresses. If the patch cannot be applied for any reason the
+redefine falls back to full regeneration rather than failing.
+
+Two things to expect. It changes the guest-visible CPU, so it needs a full
+stop/start rather than a guest reboot. And it narrows live migration for that VM
+to hosts with an equal-or-richer CPU — the trade the modern instruction set
+costs, and no trade at all on a homogeneous cluster.
+
+## `lv doctor vm-uuids`
+
+Read-only. Lists VMs whose **persisted spec** carries no domain uuid.
+
+```
+lv doctor vm-uuids
+```
+
+The uuid is what makes a NetBox identity incarnation-unique
+(`lv:<fingerprint>:<uuid>:<mac>`), so a VM without one cannot be named in NetBox
+at all. The inventory mirror skips it **and** counts it as an unreadable record —
+and an unreadable record is indistinguishable from a destroyed VM, so the mirror
+withholds *every* delete while one exists. A single VM listed here stops the
+whole mirror converging, which is why this matters even on a cluster that does
+not care about the individual VM.
+
+libvirt mints a uuid for every domain it defines regardless of what litevirt
+stored, so the reconciler adopts it from the persistent domain XML as it sweeps
+each VM on its **owning host** — running or stopped. No other node can read that
+XML, which is why there is no cluster-wide repair command. A VM listed here has
+not been swept yet, or its host is down.
+
+The backfill never overwrites a uuid the spec already has, even if libvirt
+reports a different one: the stored value is the identity other systems already
+hold, and replacing it would orphan every object stamped with it.
+
+To fill one in: make sure its host is up and wait for the next reconciler sweep.
 
 ## Persisted LWW clock & backward-clock protection
 
@@ -614,6 +910,14 @@ observed → confirmed → resolved lifecycle:
 UNKNOWN), every active condition with its involved hosts, evaluator
 coverage, peer connectivity, and per-host effective capacity — and exits
 0 / 1 / 2 so scripts can gate on it.
+
+Peer connectivity counts toward that state: a link the checker cannot prove
+good is a coverage gap, so a `suspect` or `failing` edge reads DEGRADED
+rather than being reported and ignored. Links whose **target is in
+maintenance** are the exception — nothing probes a host that is out of
+service, so its last recorded status would never change again and counting
+it would hold the cluster DEGRADED for as long as the host stays down. Those
+edges are still listed; they just stop voting.
 
 **The same rows drive admission.** An active ownership condition blocks
 capacity-growing admission to every involved host and runtime-changing

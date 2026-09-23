@@ -3,25 +3,30 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
 // HA-degraded reasons (closed vocabulary for litevirt_ha_degraded{reason}).
 const (
-	haUnsupportedMember = "unsupported_member"      // a flipped capability can't be confirmed cluster-wide
-	haDemotionUnfenced  = "demotion_unfenced"       // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
-	haVIPNoHolder       = "vip_no_holder"           // a configured VIP is served by nobody
-	haStrandedPending   = "legacy_pending_stranded" // a markerless pending VM refused proof_missing forever
-	haRolledBackLatch   = "rolled_back_latch"       // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
+	haUnsupportedMember = "unsupported_member"         // a flipped capability can't be confirmed cluster-wide
+	haRolloutPending    = "capability_rollout_pending" // a MANDATORY token has not latched yet — mid-upgrade, not a fault
+	haDemotionUnfenced  = "demotion_unfenced"          // a minority node's VIP demote FAILED and it has no verified self-fence — the majority holds in the safe gap (VIP outage until repaired / a fence is provided)
+	haVIPNoHolder       = "vip_no_holder"              // a configured VIP is served by nobody
+	haStrandedPending   = "legacy_pending_stranded"    // a markerless pending VM refused proof_missing forever
+	haRolledBackLatch   = "rolled_back_latch"          // this binary is below a capability token this node already latched — WAL-quarantined, needs an operator reseed
 )
 
-var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
+var haReasons = []string{haUnsupportedMember, haRolloutPending, haDemotionUnfenced, haVIPNoHolder, haStrandedPending, haRolledBackLatch}
 
 // capabilityDegradedReason maps a configured-to-enforce token's latch state (ok = latched)
 // to an HA-degraded reason, or "" if it's fine. vip_demote_v1 is a software capability (no
@@ -29,6 +34,15 @@ var haReasons = []string{haUnsupportedMember, haDemotionUnfenced, haVIPNoHolder,
 // binary mid-roll — an unsupported member that holds back enforcement. (The dangerous
 // "demoted but can't self-fence" state is a per-node RUNTIME condition surfaced separately
 // via haDemotionUnfenced, not a capability-advertisement gap.)
+//
+// Every cause maps to the same reason, deliberately, and ha_health_test.go pins
+// it from both sides. litevirt_ha_degraded's reason vocabulary is CLOSED and
+// alerting subscribes to it, so splitting "a peer does not advertise it" from
+// "the sweep could not tell" HERE would add a series to a contract other systems
+// read. That distinction is real and an operator needs it, so it is carried in
+// the event detail instead — see degradedCause — where nothing depends on the
+// exact strings. `reason` therefore stays in the signature unread: it is what
+// makes the collapse visible at the call site rather than implicit.
 func capabilityDegradedReason(token string, ok bool, reason string) string {
 	if ok {
 		return ""
@@ -36,9 +50,82 @@ func capabilityDegradedReason(token string, ok bool, reason string) string {
 	return haUnsupportedMember
 }
 
+// degradedSetGrew reports whether an ALREADY-degraded unsupported_member should
+// be published again because a NEW token joined the ones behind it.
+//
+// Every configured token collapses into that one reason, so its on/off edge is
+// not its full identity: with operation_protocol_v1 already degraded, a second
+// token going degraded moves nothing an operator can see. The gauge is 1 either
+// way and no event fires, so the second incident arrives silently during the
+// first — which is when someone is already looking at the wrong thing.
+//
+// It is deliberately scoped to unsupported_member. The other reasons are each a
+// single condition, so their on/off edge IS their identity and republishing them
+// would be noise.
+//
+// A token that flaps still republishes each time it comes BACK, which is one
+// event per two cycles at worst and is bounded by the monitor interval.
+// pageHADegraded does not route this reason, so that cost is an event-bus and
+// webhook line, never a notification page.
+func degradedSetGrew(reason string, on, was bool, cur, prev []degradedCapability) bool {
+	if reason != haUnsupportedMember || !on || !was {
+		return false
+	}
+	// ADDITIONS only, and not any change. A shrinking set is what ordinary
+	// progress looks like: a fresh node with a dozen configured tokens starts
+	// with all of them pending and latches ONE PER CYCLE, so republishing on
+	// every change would emit a dozen events walking down a staircase during
+	// every startup. Recovery of one token while others remain is not news worth
+	// an event — the reason is still on, and the next event or the recovery edge
+	// will carry the current set. A token APPEARING is news: it is a second
+	// incident starting underneath the first, and it is the case that was
+	// invisible before.
+	for _, c := range cur {
+		if !slices.ContainsFunc(prev, func(p degradedCapability) bool { return p.Token == c.Token }) {
+			return true
+		}
+	}
+	return false
+}
+
+// haDegradedDetail names the capabilities behind unsupported_member.
+//
+// The reason string is a closed vocabulary shared by every configured token, so
+// on its own it tells an operator that something is unconfirmed cluster-wide and
+// nothing about what to do. The remedy differs completely by token — finish a
+// rollout, re-enable a flag, reseed a rolled-back peer — so the token names are
+// the actionable part and belong in the event that wakes someone up.
+// The host is named because `publish` does not carry it: it fills only Event and
+// Detail on the webhook payload, dropping even the reason, unlike the sibling
+// pageHADegraded which sets Subject. A token name with no node is not actionable
+// on a fleet — "lww_skew_guard_v1 is unconfirmed" is a different investigation
+// depending on which of twenty nodes said it.
+//
+// The reason guard is load-bearing, not defensive tidiness: the call site hands
+// the live list to EVERY reason, so without it a vip_no_holder event — one of
+// the two reasons that also raises a notify page at SevError — would blame a VIP
+// outage on unrelated capability tokens.
+func haDegradedDetail(reason, host string, unsupported []degradedCapability) string {
+	base := "HA degraded: " + reason
+	if host != "" {
+		base += " on " + host
+	}
+	if reason != haUnsupportedMember || len(unsupported) == 0 {
+		return base
+	}
+	parts := make([]string, 0, len(unsupported))
+	for _, c := range unsupported {
+		parts = append(parts, c.Token+": "+c.Cause)
+	}
+	return base + " (" + strings.Join(parts, ", ") + ")"
+}
+
 // RunHAHealthMonitor periodically evaluates the persistent HA-degraded conditions,
-// updates the litevirt_ha_degraded gauge, and emits an event on each set→clear / clear→set
-// transition (a durable, alertable surface — not just a per-refusal counter). Quiet by
+// updates the litevirt_ha_degraded gauge, and emits an event on each set→clear /
+// clear→set transition — plus, for unsupported_member only, when a NEW capability
+// joins the ones already degraded (see degradedSetGrew), since that reason is one
+// boolean shared by every token. A durable, alertable surface, not just a
+// per-refusal counter. Quiet by
 // default: a token contributes only when this node is configured to enforce it
 // (tokenEnabled) — advertising a token (Supported()) does not by itself raise degraded —
 // and the VIP axis only when vip_self_demote / vip_proof_reclaim is enabled.
@@ -74,36 +161,60 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 		interval = 15 * time.Second
 	}
 	prev := map[string]bool{}
+	// The token list behind unsupported_member, from the last cycle. Tracked
+	// separately from `prev` because the reason is a single boolean shared by
+	// every capability: without this, a second token going degraded while the
+	// first still is changes nothing an operator can observe — the gauge is
+	// already 1 and no event fires. The set changing IS the news.
+	var prevUnsupported []degradedCapability
 	eval := func() {
-		// One peer op per cycle: while any configured token is still unlatched, spend it
-		// latching one; once all are latched, spend it on a round-robin FRESHNESS check
-		// so a post-latch regression (a peer that rolled back / stopped advertising)
-		// still surfaces — the durable latch alone never flips back.
-		if !s.driveCapabilityActivation(ctx) {
-			s.checkOneCapabilityHealth(ctx)
-		}
+		// One peer op per cycle, split between the two axes so neither starves the
+		// other: mostly spent latching an unlatched token (round-robin, so one
+		// that cannot confirm does not absorb every cycle), with a reserved share
+		// spent on the round-robin FRESHNESS check so a post-latch regression (a
+		// peer that rolled back / stopped advertising) still surfaces — the
+		// durable latch alone never flips back.
+		//
+		// This supersedes spendOnePeerOp's strict alternation, which solved the
+		// same starvation problem from the other direction. Two differences
+		// decided it: retryLatchedMarkers runs EVERY cycle here (alternation
+		// skipped marker-persistence retries on the check's turn), and the
+		// reserve is 1-in-4 rather than 1-in-2, so a pending activation is not
+		// halved. spendOnePeerOp is left in place because a test still drives it
+		// directly; retiring it belongs with whichever of these lands second.
+		s.spendCapabilityPeerOp(ctx)
 		// §A: act on a peer's SELF-REPORTED quarantine by recording its
 		// isolation. One peer per cycle, so this adds no fan-out.
 		s.recordSelfReportedIsolation(ctx)
-		// Rollout observability: per-feature config intent + latch state.
+		cur, unsupported := s.evaluateHADegraded(ctx)
+		// Rollout observability: per-feature config intent, latch state, and
+		// whether the feature is degraded. Written AFTER the evaluation because
+		// the degraded set comes from it, and for EVERY supported token rather
+		// than only the configured ones — a token that was degraded and is then
+		// switched off must fall to 0 rather than keep its last value forever.
 		if s.gate != nil {
+			degraded := make(map[string]bool, len(unsupported))
+			for _, c := range unsupported {
+				degraded[c.Token] = true
+			}
 			for _, tok := range capabilities.Supported() {
 				s.haMetrics.SetEnforcement(tok, s.tokenEnabled(tok), s.gate.Latched(tok))
+				s.haMetrics.SetDegraded(tok, degraded[tok])
 			}
 		}
-		cur := s.evaluateHADegraded(ctx)
 		for _, r := range haReasons {
 			on := cur[r]
 			s.haMetrics.Set(r, on)
 			switch {
-			case on && !prev[r]:
-				s.publish("ha.degraded", r, "HA degraded: "+r)
+			case on && !prev[r], degradedSetGrew(r, on, prev[r], unsupported, prevUnsupported):
+				s.publish("ha.degraded", r, haDegradedDetail(r, s.hostName, unsupported))
 				s.pageHADegraded(ctx, r) // route the alertable VIP reasons to notify
 			case !on && prev[r]:
 				s.publish("ha.recovered", r, "")
 			}
 		}
 		prev = cur
+		prevUnsupported = unsupported
 	}
 	eval()
 	t := time.NewTicker(interval)
@@ -116,6 +227,39 @@ func (s *Server) RunHAHealthMonitor(ctx context.Context, interval time.Duration)
 			eval()
 		}
 	}
+}
+
+// spendOnePeerOp spends this cycle's single peer operation on one of the two
+// duties that need one, and returns whether the NEXT cycle is the freshness
+// check's turn.
+//
+// The two duties are not interchangeable. Driving activation closes a latch that
+// is pending; the freshness check finds a token that latched and has since
+// REGRESSED, which the one-way durable marker can never show. Giving activation
+// unconditional priority — `if !drive() { check() }` — silently makes the second
+// unreachable, because driveCapabilityActivation reports that it SPENT the
+// budget, not that it succeeded. A capability enabled against a peer that will
+// not support it for hours is not an error state and not a bug; it simply never
+// latches, and for that whole window no freshness check runs, so a regression on
+// any OTHER token is undetectable. That is the failure this alternation removes:
+// the check whose entire purpose is catching what the latch cannot is switched
+// off by an ordinary mid-rollout condition.
+//
+// Alternating costs activation half its attempts while a token is pending — a
+// retry every other cycle instead of every cycle — which is the cheaper side of
+// the trade by a wide margin. When nothing is pending, activation spends nothing
+// and the freshness check gets every cycle, exactly as before.
+func (s *Server) spendOnePeerOp(ctx context.Context, freshnessTurn bool) bool {
+	if freshnessTurn {
+		s.checkOneCapabilityHealth(ctx)
+		return false
+	}
+	if s.driveCapabilityActivation(ctx) {
+		return true // activation took this cycle; the next one is the check's
+	}
+	// Nothing to drive, so the budget is free for the check and stays free.
+	s.checkOneCapabilityHealth(ctx)
+	return false
 }
 
 // driveCapabilityActivation flips the durable enforcement latch for every SUPPORTED
@@ -140,29 +284,109 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 	// enforcing). Bound the cost: an unlatched token pays a fresh-Ping sweep, so drive
 	// at most ONE unlatched token per cycle (already-latched Enforced() is a cheap
 	// map read); the rest latch over subsequent cycles.
-	drove := false
+	s.retryLatchedMarkers(ctx)
+	return s.activateOneUnlatched(ctx)
+}
+
+// retryLatchedMarkers re-drives every ALREADY-latched token. This costs no peer
+// op — Enforced's already-path is a map read — so it is unconditional and runs
+// on every cycle, including the ones reserved for the freshness check.
+//
+// A latched token is driven regardless of its config flag: the already-path
+// RETRIES a marker write that hasn't yet persisted, and that retry must not stop
+// just because the operator disabled the flag after the token latched.
+// Otherwise a token latched in memory but not on disk would never become
+// DurablyLatched, and a durable-gated contract (canonical registry acceptance,
+// the lease-term mint) would fail closed forever.
+func (s *Server) retryLatchedMarkers(ctx context.Context) {
 	for _, tok := range capabilities.Supported() {
-		// An ALREADY-latched token is driven regardless of its config flag: Enforced's cheap
-		// already-path RETRIES a marker write that hasn't yet persisted, and that retry must not
-		// stop just because the operator disabled the flag after the token latched. Otherwise a
-		// token latched in memory but not on disk would never become DurablyLatched, and a
-		// durable-gated contract (canonical registry acceptance) would fail closed forever.
 		if s.gate.Latched(tok) {
-			s.gate.Enforced(ctx, tok) // cheap already-path; keeps retrying marker persistence
-			continue
+			s.gate.Enforced(ctx, tok)
 		}
-		// UNLATCHED activation depends on the config flag: advertised ≠ enforcing, so a config-off
-		// token is not driven and never latches.
-		if !s.tokenEnabled(tok) {
-			continue
-		}
-		if drove {
-			continue
-		}
-		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
-		drove = true
 	}
-	return drove
+}
+
+// activateOneUnlatched spends this cycle's ONE peer op driving a single
+// unlatched, config-enabled token's latch, and reports whether it spent it.
+//
+// An unlatched token pays a fresh-Ping sweep, which is why only one is driven
+// per cycle. The starting point ROTATES, and that is the load-bearing part: the
+// drive used to restart at index 0 every cycle and take the first unlatched
+// enabled token it found, so a token that cannot currently latch absorbed every
+// cycle forever and no token after it in Supported() was ever driven. The
+// blocking token needs no fault to do this — a config-uniformity flag switched
+// on here but not yet on one peer is enough, which is the ordinary state during
+// any staged config rollout. Everything later then sat inert with nothing in the
+// logs, including the tokens whose latch is the precondition for a durable-gated
+// write.
+//
+// UNLATCHED activation still depends on the config flag: advertised ≠ enforcing,
+// so a config-off token is not driven and never latches.
+func (s *Server) activateOneUnlatched(ctx context.Context) bool {
+	toks := capabilities.Supported()
+	if len(toks) == 0 {
+		return false
+	}
+
+	s.capHealthMu.Lock()
+	start := s.capDriveCursor % len(toks)
+	s.capHealthMu.Unlock()
+
+	for i := 0; i < len(toks); i++ {
+		idx := (start + i) % len(toks)
+		tok := toks[idx]
+		if s.gate.Latched(tok) || !s.tokenEnabled(tok) {
+			continue
+		}
+		// Resume AFTER this token next cycle, so one that never confirms is
+		// retried once per rotation instead of on every cycle.
+		s.capHealthMu.Lock()
+		s.capDriveCursor = (idx + 1) % len(toks)
+		s.capHealthMu.Unlock()
+
+		s.gate.Enforced(ctx, tok) // one CapabilityActive fresh-Ping sweep this cycle
+		return true
+	}
+	return false
+}
+
+// capFreshnessReserveEvery is how often the HA monitor spends its cycle on the
+// freshness axis even though activation is still incomplete.
+//
+// checkOneCapabilityHealth used to run ONLY when activation had nothing to
+// drive, on the reasoning that a cycle spends at most one peer op. That held
+// only while every flag-less token could latch on a homogeneous fleet. A
+// mandatory token that cannot latch until the last host is upgraded makes the
+// drive claim every cycle for the whole roll — and permanently on a cluster
+// deliberately held with one host back — so the only post-latch regression
+// detector never ran, capHealthLast stayed empty, and evaluateHADegraded's
+// `latched && (!checked || lastOK)` quietly degenerated to `latched`.
+//
+// One cycle in four keeps the one-peer-op-per-cycle bound and still re-checks
+// every configured token within a bounded number of cycles.
+const capFreshnessReserveEvery = 4
+
+// spendCapabilityPeerOp spends this cycle's single capability peer op, splitting
+// it between driving activation and re-checking freshness so neither axis can
+// starve the other.
+func (s *Server) spendCapabilityPeerOp(ctx context.Context) {
+	if s.gate == nil {
+		return
+	}
+	s.retryLatchedMarkers(ctx)
+
+	s.capHealthMu.Lock()
+	s.capPeerOpCycle++
+	reserved := s.capPeerOpCycle%capFreshnessReserveEvery == 0
+	s.capHealthMu.Unlock()
+
+	if reserved {
+		s.checkOneCapabilityHealth(ctx)
+		return
+	}
+	if !s.activateOneUnlatched(ctx) {
+		s.checkOneCapabilityHealth(ctx)
+	}
 }
 
 // checkOneCapabilityHealth does ONE bounded freshness check per cycle: it round-robins
@@ -193,9 +417,24 @@ func (s *Server) checkOneCapabilityHealth(ctx context.Context) {
 	s.capHealthCursor++
 	s.capHealthMu.Unlock()
 
-	ok, _ := s.gate.CapabilityActiveForHealth(ctx, tok)
+	// The reason is kept, not discarded. It comes from an existing closed
+	// vocabulary and separates the two answers an operator must not confuse:
+	// health/capability.go returns ReasonUnsupportedCapability at exactly one
+	// site (a peer genuinely not advertising the token) and
+	// ReasonActivationUnconfirm at three (a hosts-table read failing, any
+	// voting-eligible peer's Ping erroring). Collapsing them means one host
+	// rebooting is reported as a capability a peer does not support.
+	ok, why := s.gate.CapabilityActiveForHealth(ctx, tok)
 	s.capHealthMu.Lock()
+	if s.capHealthCause == nil {
+		s.capHealthCause = map[string]string{}
+	}
 	s.capHealthLast[tok] = ok
+	if ok {
+		delete(s.capHealthCause, tok)
+	} else {
+		s.capHealthCause[tok] = why
+	}
 	s.capHealthMu.Unlock()
 }
 
@@ -203,9 +442,34 @@ func (s *Server) checkOneCapabilityHealth(ctx context.Context) {
 // token that has not latched is degraded (enforcement not yet confirmed cluster-wide);
 // when VIP HA is active, a configured VIP no reachable participant holds is a zero-holder
 // outage.
-func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
+// It also returns the capabilities behind haUnsupportedMember, sorted by token,
+// each with the CAUSE that applies to it. The reason alone is not actionable:
+// every configured-to-enforce token collapses into the same string, so an
+// operator reading `unsupported_member` learns that SOMETHING is unconfirmed and
+// has to go find out what — and a second token joining the first is silent,
+// because the reason was already on.
+//
+// The cause travels with the token because a name on its own can be worse than
+// no name. "This peer does not advertise it" and "the sweep could not tell"
+// arrive through the same boolean and want opposite responses.
+func (s *Server) evaluateHADegraded(ctx context.Context) (map[string]bool, []degradedCapability) {
 	out := map[string]bool{}
-	if s.gate != nil {
+	var unsupported []degradedCapability
+	// A WAL-quarantined node advertises NOTHING, and the capability sweep asks
+	// itself through a self short-circuit (PeerCapabilities returns
+	// advertisedCapabilities for host == self). So every configured token reads
+	// unconfirmed, and without this the node would emit `unsupported_member`
+	// naming its entire capability set — "a peer is on an old binary, finish
+	// your rollout" — in the same cycle as the rolled_back_latch that says the
+	// true thing and names the real fix (reseed this node). haReasons puts
+	// unsupported_member first, so the wrong alert would arrive first and
+	// louder. The tokens it would name are precisely the ones no member is
+	// failing to support: they are the ones THIS node stopped advertising.
+	// wal_quarantine_test.go's own comment says rolled_back_latch exists to stop
+	// an operator reading a quarantine as version skew; naming tokens here would
+	// make the node itself commit that error.
+	quarantined := s.walQuarantinedNow()
+	if s.gate != nil && !quarantined {
 		for _, tok := range capabilities.Supported() {
 			// Only a token this node is configured to ENFORCE can be "degraded" —
 			// an advertised-but-disabled token (or one still mid-rollout on old
@@ -221,13 +485,45 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 			latched := s.gate.Latched(tok)
 			s.capHealthMu.Lock()
 			lastOK, checked := s.capHealthLast[tok]
+			cause := s.capHealthCause[tok]
 			s.capHealthMu.Unlock()
 			healthy := latched && (!checked || lastOK)
-			if r := capabilityDegradedReason(tok, healthy, ""); r != "" {
+			if healthy {
+				continue
+			}
+			// A MANDATORY token that has NEVER latched is separated out, because
+			// it is the ordinary state of every cluster part-way through an
+			// upgrade rather than a fault. It has no config flag, so there is no
+			// operator intent behind it to have been let down and nothing to turn
+			// off in response: the only remedy is to finish the roll. Reporting it
+			// as unsupported_member raised a hard degraded alarm — with an
+			// ha.degraded event and a page-shaped gauge — on every node for the
+			// whole of every upgrade, and permanently on a cluster deliberately
+			// held with one host back, which docs/operating-model.md blesses as
+			// by-design and describes as "visible as an empty ledger rather than
+			// as an error".
+			//
+			// Not simply skipped: waiting-on-a-rollout is real, actionable state
+			// and an operator watching a stalled upgrade wants it. It gets its own
+			// reason so alerting can treat a planned rollout differently from a
+			// member that cannot support what this node was told to enforce.
+			//
+			// A mandatory token that latched and LATER regressed still reports
+			// unsupported_member — it reaches here with latched=true, so it falls
+			// through — which is the case that genuinely warrants the alarm.
+			if !latched && capabilities.Mandatory(tok) {
+				out[haRolloutPending] = true
+				continue
+			}
+			if r := capabilityDegradedReason(tok, healthy, cause); r != "" {
 				out[r] = true
+				unsupported = append(unsupported, degradedCapability{
+					Token: tok, Cause: degradedCause(latched, cause),
+				})
 			}
 		}
 	}
+	sort.Slice(unsupported, func(i, j int) bool { return unsupported[i].Token < unsupported[j].Token })
 	// vip_no_holder is a real outage whenever VIP HA is active in EITHER direction
 	// (demote-only can leave a VIP holderless), so it keys off vipHAHealthEnabled,
 	// NOT vipGateActive (which is only the proof-reclaim gate).
@@ -255,10 +551,42 @@ func (s *Server) evaluateHADegraded(ctx context.Context) map[string]bool {
 	// advertising nothing. Peers raise haUnsupportedMember about it; this is the
 	// node's own report, which is what tells an operator that the fix is a reseed
 	// (or an upgrade back) rather than a network problem at the other end.
-	if s.walQuarantinedNow() {
+	if quarantined {
 		out[haRolledBackLatch] = true
 	}
-	return out
+	return out, unsupported
+}
+
+// degradedCapability is one capability behind haUnsupportedMember, with the
+// cause that applies to it. Comparable, so a set of them can be compared
+// directly.
+type degradedCapability struct {
+	Token string
+	Cause string
+}
+
+// degradedCause names why one token is unconfirmed, in the operator's terms.
+//
+// Three states arrive here and they call for three different actions, which is
+// the whole reason the cause is carried at all:
+//
+//	activation_pending      the latch has not formed yet — normal mid-rollout
+//	unsupported_capability  a peer really does not advertise it — finish the roll
+//	activation_unconfirmed  the sweep could not tell (a Ping failed, a read
+//	                        failed) — usually a host that is down, and not a
+//	                        capability problem
+//
+// An unlatched token is reported as pending regardless of any recorded cause:
+// the freshness check only runs once everything has latched, so a cause left
+// over from an earlier cycle would describe a question nobody is asking yet.
+func degradedCause(latched bool, recorded string) string {
+	if !latched {
+		return "activation_pending"
+	}
+	if recorded == "" {
+		return health.ReasonActivationUnconfirm
+	}
+	return recorded
 }
 
 // anyStrandedPending reports whether any VM assigned to THIS host is state=pending with no

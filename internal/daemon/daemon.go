@@ -536,6 +536,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalRegistryAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
 	})
+
+	d.wireLeaseTermLedgerGate()
+
+	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
+	// LATCHED. Durable, not Latched or the config flag, for the same reason as
+	// canonical_registry above: a replace batch already on the wire must not become
+	// unacceptable across a restart, or it stalls that sender's stream forever.
+	d.db.SetVMReplaceAccept(func() bool {
+		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
+	})
 	repl.Start(ctx)
 
 	// Audit key lifecycle, deferred until replication is running.
@@ -561,7 +571,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner := lxc.NewLxcRunner()
 	lxcRunner.HostName = d.cfg.HostName
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
-	go d.metrics.Start()
+	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
+	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
+	// and bound an EPHEMERAL port on every interface — an unauthenticated
+	// inventory endpoint on an unpredictable port, which is the opposite of
+	// what an operator setting 0 is asking for, and the exposure warning then
+	// named port 0, so the one datum needed to firewall it was useless.
+	if d.cfg.MetricsPort > 0 {
+		go d.metrics.Start()
+	} else {
+		slog.Info("metrics endpoint disabled (metrics_port: 0)")
+	}
 
 	// Start the host health checker (created above, before the replicator).
 	go d.checker.Start(ctx)
@@ -591,7 +611,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// loop is NOT started here — it launches below, only after the full gate
 	// (SetPeerPinger) and its callbacks are wired, so a gated runtime start never
 	// runs in a window where capability can't yet be confirmed.
-	vmChecker := health.NewVMChecker(d.cfg.HostName, d.db, d.virt)
+	vmChecker := health.NewVMChecker(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	vmChecker.SetGate(d.checker)
 	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
@@ -715,6 +735,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
+	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
@@ -807,14 +828,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// One operator switch drives both operation_protocol_v1 and its dependent
 	// capacity_admission_v1 token; capacity admission has no standalone flag.
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
+	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
-	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
-	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
+	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
+	// Finish any cutover cleanup a previous process left committed-but-unfinished.
+	// The replacement transition displaced the rows describing what the replaced VM
+	// owned, so its journaled manifest is the only surviving record of the volumes
+	// to free — and nothing else will ever look at it.
+	if err := svc.ResumeVMReplaceCleanups(ctx); err != nil {
+		slog.Warn("cutover: resuming journaled cleanups at startup", "error", err)
+	}
+	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority) // F2: delegate project-quota admission to the authority holder
+	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)     // drives the latch + conditional advertisement
 	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
 	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
 	// the fleet can never latch across a node whose generations do not exist yet.
@@ -826,6 +856,26 @@ func (d *Daemon) Run(ctx context.Context) error {
 		ready, reason := svc.OwnerEpochReadiness(ctx)
 		if !ready {
 			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		}
+		return ready
+	})
+	// Phase 2: lease_term_v1 is advertised only when the operator opted in AND
+	// this node can enforce — a readable ledger, split_brain_gate_v1 already
+	// latched, and a cluster large enough that the quorum barrier does not break
+	// failover.
+	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+	// The reconciler is the SECOND executor boundary for this regime: a VM
+	// reschedule proof never travels over an RPC, so it is claimed off the
+	// replicated row there rather than in claimCarriedProof. The judgment is
+	// injected because internal/grpcapi imports internal/health and cannot be
+	// imported back — one implementation, wired to both callers.
+	reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
+	svc.SetLeaseTermReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		ready, reason := svc.LeaseTermReadiness(ctx)
+		if !ready {
+			slog.Debug("lease_term_v1 readiness withheld", "reason", reason)
 		}
 		return ready
 	})
@@ -1188,6 +1238,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Metrics = metrics.NewFailoverMetrics()                           // structured failover counters (U9)
 	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault            // safe-fence kill-switch (config AND SafeFenceDefaultV1)
 	fc.SharedStorageFenceEnforce = d.cfg.Enforcement.SharedStorageFence // decide-side shared-disk fence kill-switch (config AND SharedStorageFenceV1)
+	// The coordinator half of lease-term enforcement: a local precheck that
+	// refuses to stamp a superseded term. svc.SetLeaseTermEnforce above is the
+	// executor half, and both read this one flag so the source and the enforcer
+	// can never disagree about whether enforcement is on.
+	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is
@@ -1280,7 +1335,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	slog.Info("litevirtd starting",
 		"host", d.cfg.HostName,
 		"grpc", fmt.Sprintf("0.0.0.0:%d", d.cfg.GRPCPort),
-		"metrics", fmt.Sprintf("0.0.0.0:%d", d.cfg.MetricsPort),
+		// From the metrics server, not reassembled: this line said 0.0.0.0
+		// unconditionally, so a host that had applied metrics_bind: 127.0.0.1
+		// got two startup lines asserting opposite things, and the louder one
+		// was wrong. Reads "disabled" when metrics_port is 0.
+		"metrics", d.metricsAddrForBanner(),
 		"ui", fmt.Sprintf("%s:%d", d.cfg.UIBind, d.cfg.UIPort),
 	)
 
@@ -2111,4 +2170,40 @@ func (d *Daemon) runSupersededGC(ctx context.Context, m *metrics.GCMetrics) {
 			gc()
 		}
 	}
+}
+
+// metricsAddrForBanner is what the startup banner prints for the metrics
+// endpoint: the address the listener will actually bind, or "disabled".
+//
+// The banner used to hardcode 0.0.0.0, which contradicted both metrics_bind and
+// the exposure warning the metrics server logs a few lines later.
+func (d *Daemon) metricsAddrForBanner() string {
+	if d.cfg.MetricsPort <= 0 {
+		return "disabled"
+	}
+	if d.metrics == nil {
+		return fmt.Sprintf("%s:%d", d.cfg.MetricsBind, d.cfg.MetricsPort)
+	}
+	return d.metrics.Addr()
+}
+
+// wireLeaseTermLedgerGate lets corrosion mint a leader-lease term only once
+// lease_term_ledger_v1 is DURABLY latched.
+//
+// The mint is the first replicated statement shape leader_lease_terms ever had,
+// and an unregistered shape back-pressures a previous-release peer's whole
+// replication stream instead of degrading — so the write waits for a latch that
+// cannot form while such a peer is still listening. No config flag (the token
+// has no kill switch): terms begin on their own once the roll completes.
+//
+// Extracted from Run so a test can reach it. Its absence is SILENT: this is the
+// one injected predicate on the corrosion client that fails CLOSED, so an
+// unwired gate mints nothing forever and looks exactly like a legitimate
+// mid-roll — the same signature as a starved latch. Deleting this call left the
+// corrosion, grpcapi and daemon suites all green, because every test injects the
+// gate directly and the test constructors hardcode it open.
+func (d *Daemon) wireLeaseTermLedgerGate() {
+	d.db.SetLeaseTermLedgerGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)
+	})
 }

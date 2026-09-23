@@ -28,6 +28,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -80,7 +81,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	spec, err := normalizeCreateVMSpec(req.GetSpec())
+	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -963,6 +964,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
+	} else {
+		// Guarded on the insert having landed: with no row the graduation is a
+		// replicated no-op and a misleading log line. The invariant it maintains
+		// lives on assignOwnerEpochAtCreate; do not restate it here, or the two
+		// copies drift.
+		s.assignOwnerEpochAtCreate(ctx, spec.Name)
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -982,6 +989,77 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	hooks.Run(ctx, hooks.PostStart, stubVM, spec.Hooks)
 
 	return s.vmToProto(ctx, spec.Name)
+}
+
+// assignOwnerEpochAtCreate moves a freshly inserted VM row off the pre-epoch
+// default and stamps both runtime markers at the generation it assigned, so the
+// VM is provable before CreateVM returns instead of at the reconciler's next
+// sweep.
+//
+// Split out of the create path so the graduation failure is reachable in a test
+// without also failing the insert: the two share one *corrosion.Client, and a
+// test that breaks the client to fail the graduation breaks the insert too,
+// which skips this whole block and proves nothing.
+//
+// Nothing here is fatal. The VM is already running, and every outcome is one an
+// existing repair path handles — which is the whole reason for the ordering.
+func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
+	// Detached from the RPC context. The row is already committed and the guest is
+	// already running by the time this runs, so a client ^C or an RPC deadline that
+	// expired during the preceding image and disk work must not decide whether the
+	// VM is provable. With the failure path below correctly stamping nothing, an
+	// inherited cancellation would reliably leave a running VM at epoch 0 with no
+	// marker and no backstop unless enforcement.owner_epoch happens to be on. The
+	// same function already detaches its post-commit LB work for this reason.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
+		// Leave the row pre-epoch AND unmarked. That is exactly the state a create
+		// left behind before any of this existed, and the only one the repair paths
+		// can act on: convergeOwnerEpochMarker returns early for an epoch-0 row, so
+		// stamping a marker here would produce marker-1 against row-0 — a mismatch
+		// nothing converges, which assertRuntimeOwnership reads as
+		// marker_epoch_mismatch and which would refuse this VM's legitimate
+		// sole-holder re-key for good. It would also hold the row at 0, so
+		// OwnerEpochBackfillComplete keeps reporting this host unready and the
+		// fleet's owner_epoch_v1 latch never closes. The backfill sweep is the
+		// backstop, though only where enforcement.owner_epoch is on.
+		slog.Warn("vm create: could not assign the first owner epoch — leaving the VM "+
+			"unmarked for the backfill rather than stamping a marker the row cannot match",
+			"name", name, "error", gerr)
+		return
+	}
+	// Stamp both runtime markers now, at the epoch just assigned.
+	//
+	// A marker failure is not fatal. The row is already at a positive epoch, which
+	// is the precondition convergeOwnerEpochMarker needs, and its call site fires
+	// for any confirmed-running VM regardless of the enforcement flag — so the
+	// reconciler repairs a missing marker on its next sweep. That is also why the
+	// epoch is assigned BEFORE these writes and not after: the reverse order fails
+	// into marker-present against an epoch-0 row, which convergence returns early
+	// on and never repairs.
+	//
+	// The literal 1 rather than a re-read: the guarded UPDATE just applied to a row
+	// inserted at the column default, and a fresh read here would race the backfill
+	// for no gain.
+	if merr := s.virt.SetDomainOwnerEpoch(name, 1, true); merr != nil {
+		slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
+			"name", name, "error", merr)
+	}
+	// Skipped rather than written to a relative path when dataDir is unset:
+	// readVMMarker treats an empty dataDir as MarkerMissing, so writing anyway
+	// would create a marker tree under the daemon's cwd that no reader in this
+	// package will ever look at — a marker on disk while the inventory reports
+	// none.
+	if s.dataDir == "" {
+		slog.Warn("vm create: no data directory, so no owner-epoch file marker",
+			"name", name)
+		return
+	}
+	if merr := health.WriteVMOwnerEpochMarker(s.dataDir, name, 1); merr != nil {
+		slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
+			"name", name, "error", merr)
+	}
 }
 
 // pinMachineFromDomain upgrades a spec's machine ALIAS to the concrete
@@ -1069,6 +1147,9 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
+					//runningcheck:allow provably not running — this is the
+					// `vm.State == "running" && liveState == "stopped"` case, so liveState
+					// is "stopped" here. The guard cannot see through the switch.
 					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, err)
 					}
@@ -1088,14 +1169,41 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 			IsTemplate:   vm.IsTemplate,
 		}
 
-		// Surface labels (tags) for the list view without shipping the whole
-		// spec — a cheap labels-only unmarshal so the table can render chips.
+		// A PROJECTION of the stored spec, not the whole thing: the list must
+		// not carry every VM's cloud-init user-data. A cheap scalar unmarshal
+		// covers the fields list-level callers actually read.
+		//
+		// Set whenever a stored spec EXISTS, even when every projected field is
+		// empty. Populating it only when some field was non-empty conflated two
+		// different facts — "this VM has no stored spec" and "this VM's spec has
+		// no value for the field I asked about" — and a caller reading a scalar
+		// off the projection cannot tell those apart. Both doctor reports were
+		// exactly inverted by it: an unlabelled VM was skipped as spec-less
+		// while a labelled one read as carrying every empty value.
+		//
+		// Anything added here ships for every VM in the cluster on every list,
+		// so it has to be a scalar a list-level caller reads. Labels render the
+		// table's tag chips and the ansible inventory's litevirt_label_* vars;
+		// Uuid, Machine and CpuMode are what `lv doctor vm-uuids`,
+		// `lv doctor machine-types` and `lv doctor cpu-mode` report on. CpuModel
+		// rides along with CpuMode so a list-level caller can render a custom
+		// mode without a per-VM InspectVM round trip.
 		if vm.Spec != "" {
 			var lite struct {
-				Labels map[string]string `json:"labels"`
+				Labels   map[string]string `json:"labels"`
+				UUID     string            `json:"uuid"`
+				Machine  string            `json:"machine"`
+				CPUMode  string            `json:"cpu_mode"`
+				CPUModel string            `json:"cpu_model"`
 			}
-			if json.Unmarshal([]byte(vm.Spec), &lite) == nil && len(lite.Labels) > 0 {
-				pbVM.Spec = &pb.VMSpec{Labels: lite.Labels}
+			if json.Unmarshal([]byte(vm.Spec), &lite) == nil {
+				pbVM.Spec = &pb.VMSpec{
+					Labels:   lite.Labels,
+					Uuid:     lite.UUID,
+					Machine:  lite.Machine,
+					CpuMode:  lite.CPUMode,
+					CpuModel: lite.CPUModel,
+				}
 			}
 		}
 
@@ -2040,8 +2148,14 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// bus for the bus-resolution fallback below (vm_disks.bus is a v42 column
 	// not yet populated by every writer — see the Bus resolution comment in
 	// the Spec.Disks projection).
+	// Storage and Cache are compose-facing fields the vm_disks row does not
+	// carry in that form; the projection keeps the stored spec's values so a
+	// caller diffing a compose file against the inspected spec (`lv compose
+	// diff`) does not see an unchanged `storage:` disk as a topology change.
 	specDiskSizes := make(map[string]int64)
 	specDiskBuses := make(map[string]string)
+	specDiskStorage := make(map[string]string)
+	specDiskCache := make(map[string]string)
 	if spec != nil {
 		for _, ds := range spec.Disks {
 			if sz := parseDiskSizeBytes(ds.Size); sz > 0 {
@@ -2050,6 +2164,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			if ds.Bus != "" {
 				specDiskBuses[ds.Name] = ds.Bus
 			}
+			specDiskStorage[ds.Name] = ds.Storage
+			specDiskCache[ds.Name] = ds.Cache
 		}
 	}
 	// Default root disk is 20G when no disks are specified.
@@ -2114,9 +2230,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 					sizeBytes = specSize
 				}
 				specDisks = append(specDisks, &pb.DiskSpec{
-					Name: disk.DiskName,
-					Size: formatDiskSizeBytes(sizeBytes),
-					Bus:  bus,
+					Name:    disk.DiskName,
+					Size:    formatDiskSizeBytes(sizeBytes),
+					Bus:     bus,
+					Storage: specDiskStorage[disk.DiskName],
+					Cache:   specDiskCache[disk.DiskName],
 				})
 			}
 			spec.Disks = specDisks
@@ -2737,8 +2855,31 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	if req.VmName == "" {
 		return nil, status.Error(codes.InvalidArgument, "VM name required")
 	}
+	// FIRST, before a domain is stopped or either VM's rows are touched. Giving the
+	// replacement a name the replaced VM's tombstone still holds is a transition the
+	// pre-existing replicated statement shapes cannot make safe on a receiver, so it
+	// travels under a guard protocol only an upgraded peer can evaluate. Emitting it
+	// to a cluster that has not latched vm_replace_v1 would back-pressure that peer's
+	// stream; running the teardown first and discovering that here would destroy the
+	// replaced VM for nothing. Refusing up front leaves both VMs exactly as they were.
+	if !s.vmReplaceActive(ctx) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover requires the vm_replace_v1 capability and the operation journal "+
+				"(operation_protocol_v1): set enforcement.vm_replace and "+
+				"enforcement.operation_protocol on every node and wait for both cluster-wide "+
+				"latches. Nothing was changed")
+	}
 
 	nextName := req.VmName + "-next"
+	// Serialize the whole cutover against lifecycle calls on BOTH names. The
+	// manifest captures runtime state and the handoff acts on it, and a StopVM
+	// accepted in between would be silently undone by the handoff starting the VM
+	// from a stale snapshot — leaving the runtime running and the database
+	// recording an operator stop. Locked in name order, since two locks are held.
+	for _, n := range sortedPair(req.VmName, nextName) {
+		unlock := s.lockVM(n)
+		defer unlock()
+	}
 	nextVM, err := corrosion.GetVM(ctx, s.db, nextName)
 	if err != nil || nextVM == nil {
 		return nil, status.Errorf(codes.NotFound, "no pending cutover — VM %q not found", nextName)
@@ -2787,45 +2928,165 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 	}
 
-	// Stop and delete the old VM (re-fetch in case state changed).
+	// Stop and delete the old VM (re-fetch in case state changed). The DB re-key
+	// runs FIRST and the irreversible frees follow it, so a failure anywhere in
+	// here leaves the replaced VM's disks and firmware intact and the whole
+	// cutover retryable. It used to be the other way round, which is what made
+	// the rename's UNIQUE-constraint failure destroy the VM it was replacing.
 	oldVM, _ = corrosion.GetVM(ctx, s.db, req.VmName)
-	if oldVM != nil {
-		if oldVM.HostName == s.hostName && oldVM.State == "running" {
-			s.virt.DestroyDomain(req.VmName)
+	var replacedDisks []corrosion.DiskRecord
+	// An earlier attempt may have tombstoned the original and then failed the
+	// re-key. GetVM hides a tombstone, so without this the retry would read
+	// oldVM == nil, conclude there is nothing to replace, and skip the cleanup
+	// block entirely — leaving the original's volumes, cloud-init ISO and
+	// UUID-keyed firmware state behind forever while reporting success. The
+	// tombstone is the record that its resources were never freed.
+	resumed := false
+	if oldVM == nil {
+		if tombstoned, tErr := corrosion.GetDeletedVM(ctx, s.db, req.VmName); tErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cutover: look for an interrupted teardown of %q: %v", req.VmName, tErr)
+		} else if tombstoned != nil {
+			oldVM, resumed = tombstoned, true
 		}
-		if oldVM.HostName == s.hostName {
-			s.virt.UndefineDomain(req.VmName, false)
-		}
-		// Free the replaced VM's disks at their recorded locations (driver-
-		// dispatched) before the tombstone, then glob the default dir.
-		if oldVM.HostName == s.hostName {
-			s.deleteRecordedVMDiskVolumes(ctx, req.VmName)
-			// Wipe the replaced VM's firmware state (its old UUID-keyed swtpm +
-			// name-keyed NVRAM) so cutover doesn't orphan it (G1).
-			lv.WipeFirmwareState(s.dataDir, req.VmName, parseFirmwareSpec(oldVM.Spec).UUID)
-		}
-		s.images.DeleteVMDisks(req.VmName)
-		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
-		// A declined tombstone must abort BEFORE the rename below: proceeding
-		// would leave the replaced VM's row live (a duplicate identity) while
-		// its disks and firmware are already gone. Everything up to here is
-		// idempotent teardown, so the cutover can simply be retried.
-		//
-		// The replaced VM's addresses go back BEFORE its row does: the lease
-		// survives the row otherwise, and the sweeper's live-lease veto then
-		// makes it unreclaimable for good. Best-effort — the -next VM is about
-		// to take this name, and a cutover halted between the two would leave
-		// two rows claiming one identity — but a failure is logged at ERROR and
-		// every NIC handed to the orphan sweep rather than passing silently.
-		s.releaseNICLeasesBestEffort(ctx, oldVM, "cutover")
-		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
-			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+	}
+	// The identity the runtime handoff will act on, read BEFORE anything is torn
+	// down — a read failure here has to abort while both VMs are still intact,
+	// because an empty UUID is taken downstream to mean "no local domain to hand
+	// off" and would silently skip the handoff after the original was destroyed.
+	replacementUUID, err := s.replacementDomainUUID(nextVM)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover: read the replacement's domain identity: %v (nothing was changed)", err)
+	}
+	// A replaced VM hosted ELSEWHERE has a domain this node cannot retire. The
+	// local branch below stops and undefines it before anything is torn down; there
+	// is no equivalent reach across hosts, and proceeding anyway hands the name and
+	// the address over while that guest is still running and still using them.
+	//
+	// So the retirement is REQUIRED rather than performed: the original's own host
+	// is asked, and only a complete survey that finds no domain at the name is
+	// accepted. An incomplete one reads back as unknown, an unreachable or older
+	// peer as an error, and both refuse — absence that could not be established is
+	// not absence. Checked here, before the operation is even journaled, so a
+	// refusal costs nothing.
+	if oldVM != nil && oldVM.HostName != s.hostName {
+		if rErr := s.confirmOriginalRetiredOnItsHost(ctx, oldVM.HostName, req.VmName); rErr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cutover: %v (nothing was changed)", rErr)
 		}
 	}
 
-	// Rename the -next VM to the original name.
-	if err := corrosion.RenameVM(ctx, s.db, nextName, req.VmName); err != nil {
-		return nil, status.Errorf(codes.Internal, "rename VM: %v", err)
+	// Journalled FIRST, before anything is stopped or written. Two reasons it has
+	// to be here and not after the teardown: the manifest can only be taken while
+	// the replaced VM's rows are intact, and CLAIMING the operation is what detects
+	// a conflicting one — a conflict discovered after the current VM has been
+	// undefined and tombstoned would leave no live VM at the name at all.
+	manifest := corrosion.VMReplaceManifest{
+		ReplacedVM: req.VmName, Replacement: nextName, HostName: s.hostName,
+		ReplacementIncarnation: nextVM.CreatedAt,
+		ReplacementUUID:        replacementUUID,
+		ReplacementSpec:        nextVM.Spec,
+		ReplacementState:       nextVM.State,
+	}
+	if oldVM != nil {
+		// Captured HERE, before any DB write: the transition DISPLACES the replaced
+		// VM's parent row and every child row whose key the replacement claims, so
+		// reading them afterwards would hand the deleter the REPLACEMENT's disks —
+		// or nothing at all. On a resumed attempt they are already tombstoned,
+		// which is exactly why they still need freeing.
+		if oldVM.HostName == s.hostName {
+			var derr error
+			if resumed {
+				replacedDisks, derr = corrosion.GetDeletedVMDisks(ctx, s.db, req.VmName)
+			} else {
+				replacedDisks, derr = corrosion.GetVMDisks(ctx, s.db, req.VmName)
+			}
+			if derr != nil {
+				return nil, status.Errorf(codes.Internal,
+					"cutover: read the replaced VM's disk records: %v", derr)
+			}
+			manifest.FirmwareUUID = parseFirmwareSpec(oldVM.Spec).UUID
+			manifest.Disks = replacedDisks
+			manifest.Paths = []string{lv.CloudInitISOPath(s.dataDir, req.VmName)}
+		}
+		// OUTSIDE the host gate above, which scopes the host-local artifacts —
+		// volumes, firmware state, the cloud-init ISO. An IPAM lease is none of
+		// those: it is a cluster-global row and, on a bound network, an object in
+		// an external system. A cutover run from the replacement's host onto an
+		// original hosted elsewhere would otherwise journal no addresses at all and
+		// report success while the original's allocation stayed claimed forever.
+		leases, lErr := s.replacedVMLeases(ctx, oldVM)
+		if lErr != nil {
+			return nil, status.Errorf(codes.Internal,
+				"cutover: read the replaced VM's addresses: %v (nothing was changed)", lErr)
+		}
+		manifest.Leases = leases
+	}
+	prepared, manifest, err := corrosion.PrepareVMReplace(ctx, s.db, manifest, nextVM.OwnerEpoch)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cutover: journal the cleanup manifest: %v (nothing was changed)", err)
+	}
+	if oldVM != nil {
+		// The original's domain has to be GONE from the name before anything else
+		// happens, and that has to be verified rather than attempted. A destroy
+		// decided from the database state misses a PAUSED original (and any
+		// row/runtime divergence), an ignored destroy error leaves it running, and
+		// a swallowed undefine error leaves it defined — in every case the name is
+		// still held when the replacement is redefined at it, which real libvirt
+		// refuses because the UUID differs. By then the original's disks are gone.
+		//
+		// A failure here is safe: nothing has been torn down or written, and the
+		// journaled operation is still only `planned`, which authorizes nothing.
+		if oldVM.HostName == s.hostName {
+			if rErr := s.retireOriginalDomain(req.VmName); rErr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"cutover: free the name %q from the replaced VM's domain: %v (nothing was changed)",
+					req.VmName, rErr)
+			}
+		}
+		// The replaced VM's addresses are NOT given back here. Releasing before the
+		// transition means a delete that then declines — or any later failure —
+		// leaves a LIVE VM whose address has already gone back to the pool, locally
+		// and in the external IPAM. They are captured in the manifest above and
+		// released by a journaled phase after the transition commits, which is also
+		// what makes a failed release retryable instead of a stranded address under
+		// a cutover that reported success.
+		//
+		// A declined tombstone must abort BEFORE the re-key: proceeding would
+		// leave the replaced VM's row live (a duplicate identity) under a name
+		// the replacement is taking.
+		if !resumed {
+			if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
+				return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+			}
+		}
+	}
+	if hErr := s.fireCutoverCrashHook("before-commit"); hErr != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: %v", hErr)
+	}
+
+	// Give the -next VM the original name. DeleteVM SOFT-deletes, so the replaced
+	// VM's tombstone still holds vms.name and every child primary key this has to
+	// write. ReplaceVM does it as ONE guarded transition — a single receiver
+	// decision over both VMs' incarnations and authority — which is why it needs
+	// vm_replace_v1 and why that was checked before any of the teardown above.
+	//
+	// It is a MINTING transition — the row lands at a generation above both VMs —
+	// so it goes through publishRunningMinted, which marks the generation the
+	// commit produced. Left unmarked, the replaced VM's marker at this same name
+	// still names its own older generation, and runtimeSuperseded refuses the
+	// replacement's self-heal rebuild. Local by construction: CutoverVM forwarded
+	// to the replacement's host above.
+	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
+		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: give %q the name %q: %v",
+			nextName, req.VmName, err)
+	}
+	if hErr := s.fireCutoverCrashHook("after-commit"); hErr != nil {
+		return nil, status.Errorf(codes.Internal, "cutover: %v", hErr)
 	}
 	// The SURVIVING name, once. A cutover leaves NetBox two things to do — retire
 	// the replaced incarnation's object and mirror the promoted one — but the
@@ -2836,67 +3097,75 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// and cost a replicated write to say so.
 	s.enqueueMirrorSync(ctx, req.VmName, mirrorOpUpsert)
 
-	// Rename in libvirt if on this host. For a Secure-Boot/vTPM VM, a failure here
-	// (NVRAM rename, redefine, start) is HARD — the reconciler can't reliably heal
-	// a firmware VM (a fresh redefine would mint new firmware) — so mark it errored
-	// and return rather than reporting a successful cutover. For a plain VM the
-	// reconciler rebuilds, so log + continue (G1).
-	fwVM := usesFirmwareState(nextVM.Spec)
-	if nextVM.HostName == s.hostName {
-		cutoverFail := func(step string, e error) error {
-			slog.Error("cutover: "+step+" failed", "vm", req.VmName, "error", e, "firmware_vm", fwVM)
-			s.recordVMEvent(ctx, req.VmName, "vm.cutover", "error", step+" failed: "+e.Error())
-			if fwVM {
-				if werr := corrosion.UpdateVMState(ctx, s.db, req.VmName, "error", "cutover "+step+" failed: "+e.Error()); werr != nil {
-					s.noteStateWriteFail(corrosion.OpVMState, werr)
-				}
-				return status.Errorf(codes.Internal, "cutover %s for %q: %v", step, req.VmName, e)
-			}
-			return nil // plain VM — reconciler will rebuild
-		}
-		// Libvirt doesn't support rename directly — dump XML, undefine, redefine.
-		xml, derr := s.virt.DumpXML(nextName)
-		if derr != nil {
-			if e := cutoverFail("dump XML", derr); e != nil {
-				return nil, e
-			}
-		} else {
-			// KEEP NVRAM/vTPM — the dumped XML retains the stable <uuid> so the
-			// UUID-keyed swtpm follows it automatically; only the name-keyed NVRAM
-			// file needs renaming. Undefine MUST succeed before we rename NVRAM —
-			// renaming the vars file out from under a still-defined -next domain
-			// would leave a dangling <nvram> path (G1), so treat failure as hard.
-			if e := s.virt.UndefineDomainPreservingState(nextName); e != nil {
-				if e := cutoverFail("undefine -next", e); e != nil {
-					return nil, e
-				}
-			}
-			xml = replaceDomainName(xml, nextName, req.VmName)
-			oldNvram, newNvram := lv.NvramPath(s.dataDir, nextName), lv.NvramPath(s.dataDir, req.VmName)
-			if _, e := os.Stat(oldNvram); e == nil {
-				if e := os.Rename(oldNvram, newNvram); e == nil {
-					xml = strings.ReplaceAll(xml, oldNvram, newNvram)
-				} else if e := cutoverFail("nvram rename", e); e != nil {
-					return nil, e
-				}
-			}
-			if e := s.virt.DefineDomain(xml); e != nil {
-				if e := cutoverFail("redefine", e); e != nil {
-					return nil, e
-				}
-			} else if nextVM.State == "running" {
-				if e := s.virt.StartDomain(req.VmName); e != nil {
-					if e := cutoverFail("start", e); e != nil {
-						return nil, e
-					}
-				}
-			}
-		}
+	// The runtime intent this transition committed, read back from the journal
+	// rather than kept from the value that was sent — so the live path and a
+	// restart's recovery answer it from the same durable place.
+	accepted, aErr := corrosion.VMReplaceAcceptedState(ctx, s.db, prepared.OperationID, prepared.OwnerEpoch)
+	if aErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cutover: read the committed runtime intent: %v (the transition is committed; the "+
+				"journaled phases will be retried)", aErr)
+	}
+
+	// The destruction of what the replaced VM owned, then the runtime handoff that
+	// moves the replacement's domain and firmware onto the name — both driven from
+	// the journal, in that order (the handoff puts the replacement's vars file at
+	// the path the destruction wipes), each recorded only once it has run.
+	// A crash between them leaves the rest journaled for a restart to finish.
+	if err := s.finishVMReplaceCleanup(ctx, corrosion.VMReplaceCleanup{
+		OperationID: prepared.OperationID, OwnerEpoch: prepared.OwnerEpoch, Manifest: manifest,
+		AcceptedState: accepted,
+	}); err != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cutover: finish the replacement: %v (the transition is committed; the journaled "+
+				"phases will be retried)", err)
 	}
 
 	slog.Info("cutover complete", "vm", req.VmName, "replaced_from", nextName)
 	s.recordVMEvent(ctx, req.VmName, "vm.cutover", "ok", "from="+nextName)
 	return s.vmToProto(ctx, req.VmName)
+}
+
+// replacementDomainUUID pins the identity the runtime handoff will act on.
+//
+// It is read from the LIVE domain, because that is the identity libvirt will show
+// when the handoff later looks the name up — and the temporary name is free and
+// reusable by then, so a name match alone proves nothing. The spec is the
+// fallback for a VM whose domain carries no UUID.
+//
+// Empty means there is VERIFIABLY no local domain to hand off, and the handoff
+// phase becomes a no-op: a cutover of a VM this host does not run has nothing to
+// move. A read that merely FAILED is not that, and is returned as an error — a
+// transient libvirt hiccup must not be read as "nothing to do" and let the
+// teardown proceed to destroy the original for a cutover that then defines no
+// domain at all.
+func (s *Server) replacementDomainUUID(vm *corrosion.VMRecord) (string, error) {
+	if vm.HostName != s.hostName {
+		return "", nil
+	}
+	xml, err := s.virt.DumpXML(vm.Name)
+	switch {
+	case err == nil:
+		if id := domainUUIDFromXML(xml); id != "" {
+			return id, nil
+		}
+		// Defined but reporting no UUID. Real libvirt always assigns one, so fall
+		// back to the spec rather than treating it as absent.
+		return parseFirmwareSpec(vm.Spec).UUID, nil
+	case lv.IsNotFound(err):
+		return "", nil // verifiably absent
+	default:
+		return "", err
+	}
+}
+
+// sortedPair orders two lock names, so a caller taking both always takes them in
+// the same order.
+func sortedPair(a, b string) [2]string {
+	if a <= b {
+		return [2]string{a, b}
+	}
+	return [2]string{b, a}
 }
 
 // replaceDomainName swaps the domain name in libvirt XML.
@@ -3094,7 +3363,8 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 // the shape eligible for the live vCPU hot-add fast path.
 func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 	return req.Cpu > 0 &&
-		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
@@ -3189,19 +3459,26 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
-	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
+	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
-	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
-	// domain XML in place rather than regenerating it, so libvirt-assigned details
-	// (PCI slot addresses, controller models) survive — which matters for guests
-	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
-	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
+	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
+	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
+	// details (PCI slot addresses, controller models) survive — which matters for
+	// guests (e.g. Windows) that key licensing off stable hardware addresses. Any
+	// other redefine-class change (machine/firmware/SB/TPM/guest-agent/VNC) needs
 	// full regeneration.
+	//
+	// cpu-mode is in the fast path because retrofitting a CPU mode onto an existing
+	// VM is the main reason to change one at all: a VM created before litevirt
+	// defaulted cpu_mode runs on QEMU's qemu64 (no AVX), and moving it forward
+	// should not also reshuffle its hardware addresses.
+	//
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
-	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+	inPlaceEligible := redefine &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	restartAfter := false
@@ -3359,9 +3636,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if req.MemoryMib > 0 {
 			spec.MemoryMib = req.MemoryMib
 		}
-		if req.CpuMode != "" {
-			spec.CpuMode = req.CpuMode
+		cpuMode, cpuModel, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel)
+		if cerr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
 		}
+		spec.CpuMode, spec.CpuModel = cpuMode, cpuModel
 		if req.Machine != "" {
 			spec.Machine = req.Machine
 		}
@@ -3560,9 +3839,20 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// or the patch doesn't apply (both correct — regeneration now includes Min/Max
 	// memory + hostdevs).
 	var domXML string
-	if cpuMemOnly {
+	if inPlaceEligible {
 		if inactiveXML, derr := s.virt.DumpXMLInactive(req.Name); derr == nil {
-			if patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib)); perr == nil {
+			patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib))
+			if perr == nil {
+				// Only call the CPU patch when this request asked to touch the CPU.
+				// PatchInactiveCPUMode is already a no-op on an empty mode — that is
+				// where the "a memory edit never moves the guest's CPU" guarantee
+				// actually lives and is tested — so this is belt-and-braces that also
+				// keeps the call-site intent obvious.
+				if req.CpuMode != "" || req.CpuModel != "" {
+					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
+				}
+			}
+			if perr == nil {
 				domXML = patched
 			} else {
 				slog.Warn("inactive-XML patch failed; regenerating", "vm", req.Name, "error", perr)

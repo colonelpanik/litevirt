@@ -39,8 +39,16 @@ func NewTestClient() (*Client, error) {
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
+		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
 }
+
+// testLeaseTermLedgerOpen is what the test constructors wire into
+// Client.leaseTermLedger. The real gate is DurablyLatched(lease_term_ledger_v1),
+// which answers "is any peer still on a build that cannot resolve the mint's
+// statement shape" — a question a single-version test cluster cannot pose. A
+// test that wants the CLOSED side calls SetLeaseTermLedgerGate itself.
+func testLeaseTermLedgerOpen() bool { return true }
 
 // NewSharedTestClient opens a shared in-memory SQLite database identified by
 // dsnSuffix. Multiple calls with the same dsnSuffix return clients pointing
@@ -66,5 +74,6 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		clock:            hlc.NewClock(hostName),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
+		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
 }

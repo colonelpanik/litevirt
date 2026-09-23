@@ -401,8 +401,12 @@ func TestMigrationKeepsAddressAndInterface(t *testing.T) {
 func TestMigrationMovesTheDeviceLink(t *testing.T) {
 	nb, c := migratableMirrorCluster(t, 2)
 	src, dst := c.Nodes[0], c.Nodes[1]
-	nb.AddDevice(src.Name, srcDeviceID)
-	nb.AddDevice(dst.Name, dstDeviceID)
+	// IN the cluster the mirror writes into: NetBox refuses a virtual_machine
+	// whose device belongs to another cluster, so a device modelled outside it
+	// is not a link the mirror may follow at all.
+	cluster := nb.SeedCluster("fleet")
+	nb.AddDeviceInCluster(src.Name, srcDeviceID, cluster)
+	nb.AddDeviceInCluster(dst.Name, dstDeviceID, cluster)
 
 	mustCreateVM(t, src, "vm-1", orphanNetwork)
 	mustSyncAllNodes(t, c)
@@ -592,6 +596,7 @@ func TestCutoverQueuesTheSurvivingName(t *testing.T) {
 	n := c.Nodes[0]
 
 	mustCreateVM(t, n, "app-next", orphanNetwork)
+	latchCutoverCapabilities(t, c)
 	if got := pendingQueueItems(t, n, netboxsync.QueueKind); got != 0 {
 		t.Fatalf("precondition: %d mirror items queued before the cutover, want 0", got)
 	}

@@ -149,7 +149,7 @@ func TestVMCheckSpec_Parsed(t *testing.T) {
 
 func TestNewVMChecker(t *testing.T) {
 	db := testVMDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	if v == nil {
 		t.Fatal("NewVMChecker returned nil")
 	}
@@ -163,7 +163,7 @@ func TestNewVMChecker(t *testing.T) {
 
 func TestVMChecker_BackoffPreventsAction(t *testing.T) {
 	db := testVMDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// Seed state: vm1 has been acted on twice without recovery, and the last
 	// action happened just now so the backoff window (60s for acts=2) has not
@@ -203,7 +203,7 @@ func TestVMChecker_BackoffPreventsAction(t *testing.T) {
 
 func TestVMChecker_MaxUnavailableBlocksAction(t *testing.T) {
 	db := testVMDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// Simulate one action already in flight for "mystack".
 	v.mu.Lock()

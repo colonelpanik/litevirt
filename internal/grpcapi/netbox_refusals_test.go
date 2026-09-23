@@ -236,22 +236,40 @@ func TestEveryNonClaimingCreatePathCallsTheRefusal(t *testing.T) {
 // TestEveryVMRowDeletingPathReleasesItsLeases is the other half of that source
 // guard.
 //
-// Four paths tombstone a VM row. DeleteVM releases inline and SURFACES a
-// failure; the other three could not (a cutover has already renamed the
-// replacement into place, a stale-record cleanup runs because the VM is gone
-// everywhere) and so call the best-effort form. Either way the release must be
-// there: a lease that outlives its row is one the sweeper's live-lease veto can
-// never reclaim.
+// Four paths tombstone a VM row. DeleteVM releases inline and SURFACES a failure;
+// a stale-record cleanup runs because the VM is gone everywhere and a rebuild
+// re-creates immediately, so both call the best-effort form. Either way the
+// release must be there: a lease that outlives its row is one the sweeper's
+// live-lease veto can never reclaim.
+//
+// Cutover is the exception, and deliberately so. Releasing before its transition
+// meant a delete that then declined left a LIVE VM whose address had already gone
+// back to the pool — and a best-effort release that failed stranded the address
+// under a cutover reporting success. It captures the addresses in its operation
+// manifest instead and gives them back in a journaled, retryable phase after the
+// transition commits, so this guards that mechanism rather than the call.
 func TestEveryVMRowDeletingPathReleasesItsLeases(t *testing.T) {
 	src, err := os.ReadFile("vm.go")
 	if err != nil {
 		t.Fatalf("read vm.go: %v", err)
 	}
-	for _, op := range []string{"delete-stale-record", "rebuild", "cutover"} {
+	for _, op := range []string{"delete-stale-record", "rebuild"} {
 		want := `s.releaseNICLeasesBestEffort(ctx, ` // op is the trailing argument
 		if !strings.Contains(string(src), want+"vm, \""+op+"\")") &&
 			!strings.Contains(string(src), want+"oldVM, \""+op+"\")") {
 			t.Errorf("the %q path no longer releases its NIC leases before tombstoning the VM row", op)
+		}
+	}
+	if !strings.Contains(string(src), "manifest.Leases = leases") {
+		t.Error("the cutover path no longer captures the replaced VM's addresses into its manifest")
+	}
+	cleanup, err := os.ReadFile("vm_replace_cleanup.go")
+	if err != nil {
+		t.Fatalf("read vm_replace_cleanup.go: %v", err)
+	}
+	for _, want := range []string{"releaseReplacedVMAddresses", "corrosion.OpStepReleased"} {
+		if !strings.Contains(string(cleanup), want) {
+			t.Errorf("the cutover path no longer releases its addresses through %s", want)
 		}
 	}
 }

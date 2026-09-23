@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -505,7 +506,7 @@ func TestSpecField(t *testing.T) {
 		{`{"image":"ubuntu","cpu":2}`, "image", "ubuntu"},
 		{`{"image":"ubuntu","cpu":2}`, "missing", ""},
 		{`{}`, "image", ""},
-		{`{"cloud_init_hash":"abc123"}`, "cloud_init_hash", "abc123"},
+		{`{"uuid":"abc123"}`, "uuid", "abc123"},
 	}
 	for _, tt := range tests {
 		got := specField(tt.spec, tt.field)
@@ -646,4 +647,118 @@ func TestResolve_UpdatePinsToCurrentHost(t *testing.T) {
 	if !found {
 		t.Fatal("expected an OpUpdate for web")
 	}
+}
+
+// A stack whose VMs carry cloud-init must plan as no-change when the same file
+// is applied again. The stored spec records the block under `cloud_init`; the
+// planner used to look for a `cloud_init_hash` field nothing ever wrote, so every
+// re-apply of a cloud-init stack planned an update — which the default strategy
+// executes as delete + create, destroying the VM's disks.
+func TestResolve_ReapplyCloudInitStackIsNoChange(t *testing.T) {
+	userdata := "#cloud-config\nusers:\n  - name: ubuntu\n"
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 1, Memory: 512,
+			CloudInit: &compose.CloudInitDef{UserData: userdata}},
+	})
+	state := makeState(
+		[]corrosion.HostRecord{makeHost("h1", 16, 32768)},
+		[]corrosion.VMRecord{{
+			Name: "web", StackName: "mystack", HostName: "h1",
+			// What CreateVM persists for this definition: the compose fields plus
+			// the server-filled ones (uuid, machine pin, cpu-mode default).
+			Spec: `{"name":"web","image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true,"boot":"disk",` +
+				`"machine":"q35","cpu_mode":"host-model","uuid":"u-1","cloud_init":{"userdata":` + jsonString(userdata) + `}}`,
+			State:     "running",
+			CPUActual: 1, MemActual: 512,
+		}},
+		nil,
+	)
+
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	for _, vm := range plan.VMs {
+		if vm.Kind != OpNoChange {
+			t.Errorf("re-applying an unchanged cloud-init stack planned %s for %s (%s); want no-change",
+				vm.Kind, vm.VMName, vm.Detail)
+		}
+	}
+}
+
+// The converse: an edited userdata IS a change (it recreates the VM), and a
+// VM whose stored spec has no cloud-init gains one → update.
+func TestResolve_CloudInitEditIsUpdate(t *testing.T) {
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 1, Memory: 512,
+			CloudInit: &compose.CloudInitDef{UserData: "#cloud-config\npackages: [git]\n"}},
+	})
+	for name, spec := range map[string]string{
+		"edited": `{"image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true,"cloud_init":{"userdata":"#cloud-config\n{}\n"}}`,
+		"added":  `{"image":"ubuntu","cpu":1,"memory_mib":512,"guest_agent":true}`,
+	} {
+		state := makeState(
+			[]corrosion.HostRecord{makeHost("h1", 16, 32768)},
+			[]corrosion.VMRecord{{
+				Name: "web", StackName: "mystack", HostName: "h1",
+				Spec: spec, State: "running", CPUActual: 1, MemActual: 512,
+			}},
+			nil,
+		)
+		plan, err := Resolve(context.Background(), f, state)
+		if err != nil {
+			t.Fatalf("%s: Resolve: %v", name, err)
+		}
+		found := false
+		for _, vm := range plan.VMs {
+			if vm.VMName == "web" && vm.Kind == OpUpdate {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: expected an OpUpdate for web, got %+v", name, plan.VMs)
+		}
+	}
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// A cpu-mode edit with cpu/memory/image/cloud-init all unchanged must still be
+// an update: the planner has to compare the whole stored spec, not the four
+// coarse fields, before calling a VM unchanged.
+func TestResolve_CPUModeEditIsUpdate(t *testing.T) {
+	userdata := "#cloud-config\n{}\n"
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 1, Memory: 512, CPUMode: "host-passthrough",
+			CloudInit: &compose.CloudInitDef{UserData: userdata}},
+	})
+	state := makeState(
+		[]corrosion.HostRecord{makeHost("h1", 16, 32768)},
+		[]corrosion.VMRecord{{
+			Name: "web", StackName: "mystack", HostName: "h1",
+			Spec: `{"name":"web","image":"ubuntu","cpu":1,"memory_mib":512,"cpu_mode":"host-model","machine":"q35",` +
+				`"cloud_init":{"userdata":` + jsonString(userdata) + `}}`,
+			State: "running", CPUActual: 1, MemActual: 512,
+		}},
+		nil,
+	)
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	for _, vm := range plan.VMs {
+		if vm.VMName == "web" {
+			if vm.Kind != OpUpdate {
+				t.Fatalf("cpu-mode edit planned %s (%s); want update", vm.Kind, vm.Detail)
+			}
+			if vm.Plan.Max() != compose.ActionRestart {
+				t.Errorf("cpu-mode edit classified as %v, want Restart", vm.Plan.Max())
+			}
+			return
+		}
+	}
+	t.Fatal("no action for web")
 }

@@ -261,8 +261,24 @@ func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
 
 // WipeFirmwareState removes a VM's firmware state (true delete). Best-effort.
 func WipeFirmwareState(dataDir, vmName, uuid string) {
+	WipeNameKeyedFirmwareState(dataDir, vmName)
+	WipeFirmwareStateByUUID(uuid)
+}
+
+// WipeNameKeyedFirmwareState removes only the artifacts keyed by the VM's NAME.
+//
+// Split out because a name is reusable: a caller cleaning up after a VM that no
+// longer owns the name — a delayed cutover cleanup, say — would otherwise delete
+// the vars file of whatever VM holds it now. Callers that cannot prove the name
+// is still theirs must skip this and take WipeFirmwareStateByUUID alone.
+func WipeNameKeyedFirmwareState(dataDir, vmName string) {
 	_ = os.Remove(NvramPath(dataDir, vmName))
 	_ = os.Remove(retainedMarkerPath(dataDir, vmName))
+}
+
+// WipeFirmwareStateByUUID removes the swtpm tree, which is keyed by the VM's
+// UUID and therefore cannot belong to anything else.
+func WipeFirmwareStateByUUID(uuid string) {
 	if uuid != "" {
 		_ = os.RemoveAll(LibvirtSwtpmDir(uuid))
 	}

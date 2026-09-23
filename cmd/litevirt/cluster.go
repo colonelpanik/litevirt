@@ -22,7 +22,74 @@ func newClusterCmd() *cobra.Command {
 	cmd.AddCommand(
 		newClusterDigestCmd(),
 		newClusterConvergeCmd(),
+		newClusterAckLeaseTermCmd(),
 	)
+	return cmd
+}
+
+// lv cluster acknowledge-lease-term — clear a contested lease term from the CONNECTED
+// host's unresolved-tie register.
+//
+// Node-local on purpose, and the reason this command has no --host flag: the register
+// lives in one daemon's memory, the RPC refuses peer certificates, and a node must not
+// be able to silence its own split-brain evidence. So the operator points LV_HOST at
+// each host the condition names and runs this there — the same per-host shape the
+// handler and the ha.lww.unresolved condition already describe.
+func newClusterAckLeaseTermCmd() *cobra.Command {
+	var key string
+	var term int64
+	cmd := &cobra.Command{
+		Use:     "acknowledge-lease-term",
+		Aliases: []string{"ack-lease-term"},
+		Short:   "Acknowledge a contested leader-lease term on the connected host",
+		Long: `Two nodes each minted the same leader-lease term, and anti-entropy refused to
+merge the disagreement — a deliberate safety fault, reported as the ha.lww.unresolved
+health condition and as a SAFETY-FAULT row for leader_lease_terms in 'lv cluster digest'.
+
+Lease-term rows are immutable, so there is no remediating write to wait for: the
+condition stays dirty forever until a human says they have seen it. This records that
+statement.
+
+It clears EVIDENCE TRACKING, not the conflict. Both claims stay in the ledger, no
+winner is picked, and the acknowledgement is written to the audit log with your
+principal, the key and the term.
+
+Node-local: acknowledge on EVERY host the condition names, pointing LV_HOST at each in
+turn. Requires the cluster.lww.acknowledge verb (held by Operator and Admin).
+
+  --key    which lease: failover, rebalancer, dual_run_detector
+  --term   the contested term, as reported by the health condition
+
+Investigate BEFORE acknowledging: two live leaders for one lease means the fencing
+token did its job and something upstream let both nodes believe they held the lease.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if key == "" || term <= 0 {
+				return fmt.Errorf("--key and --term are both required (term starts at 1)")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.AcknowledgeLeaseTermTie(ctx, &pb.AcknowledgeLeaseTermTieRequest{
+					Key: key, Term: term,
+				})
+				if err != nil {
+					return fmt.Errorf("acknowledge %s term %d: %w", key, term, err)
+				}
+				// acknowledged=false is not an error — an already-acknowledged term, a
+				// term that never contested, or a daemon that restarted since. Say which
+				// state the operator is in rather than printing a bare boolean, because
+				// "nothing to do here" and "done" lead to different next steps on the
+				// remaining hosts.
+				if resp.GetAcknowledged() {
+					fmt.Printf("Acknowledged %s term %d on this host. Both claims remain in the ledger.\n", key, term)
+				} else {
+					fmt.Printf("No tracked tie for %s term %d on this host — already acknowledged, or this host never contested it.\n", key, term)
+				}
+				fmt.Println("Run this on every host `lv health` names; verify with `lv cluster digest`.")
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&key, "key", "", "lease key: failover, rebalancer or dual_run_detector")
+	cmd.Flags().Int64Var(&term, "term", 0, "the contested lease term")
 	return cmd
 }
 

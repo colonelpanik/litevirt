@@ -99,6 +99,7 @@ test-fuzz-telemetry:
 #   - schema growth must come with a CurrentSchemaVersion bump (diff-based)
 #   - History block documents every version (unit test)
 #   - docs reference only real CLI commands + metrics (unit test)
+#   - every running publish is routed through the marker chokepoint (runningcheck)
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
 	./scripts/ci/check-gofmt.sh
@@ -108,6 +109,8 @@ ci-guards:
 	go test ./scripts/ci/writecheck/
 	go run ./scripts/ci/stmtshapecheck -root .
 	go test ./scripts/ci/stmtshapecheck/
+	go run ./scripts/ci/runningcheck -root .
+	go test ./scripts/ci/runningcheck/
 	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest|TestCompatibilityDigestFrozen'
 	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsDocumentEvery|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
 

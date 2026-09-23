@@ -14,6 +14,15 @@ var appendOnlyTables = map[string]bool{
 	// from displacing a newer one on a peer, which is exactly the move that
 	// would hide a truncation.
 	"audit_chain_heads": true,
+	// leader_lease_terms is deliberately NOT listed here. It is append-only in
+	// spirit, but registering it as such made the WAL path (INSERT OR IGNORE,
+	// first-writer-wins) and the anti-entropy path (LWW on updated_at,
+	// last-writer-wins) resolve a contested (key, term) to DIFFERENT holders. It
+	// is in customMergeTables instead, whose merge keeps the local row on both
+	// paths and flags a genuine conflict; deriveDisposition checks
+	// customMergeTables first, so an entry here would be unreachable anyway and
+	// would only create a second, disagreeing source of truth.
+	//
 	// A retirement is a signed assertion about a fixed (host, key). It has no
 	// later revision, and append-only is what makes it self-repairing: a row
 	// deleted locally has nothing to conflict with, so anti-entropy re-inserts
@@ -195,6 +204,25 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// capability-gated — it auto-derives to DispPlainInsert and stays accepted; rejecting it is part
 	// of the deferred operator-run writer-activation contract, not this reversible core.)
 	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
+	// Guarded VM-name replacement (`lv cutover`): REJECT until vm_replace_v1 is
+	// active on this receiver, then apply verbatim under the shared
+	// workload_replace_v1 guard. Rejecting before activation is what makes the
+	// rollout safe in both directions — a peer that has not latched refuses the
+	// shape instead of applying it under a disposition that was never designed for
+	// it, and a sender only emits it once the token is latched cluster-wide, so no
+	// un-upgraded receiver is ever handed one. See vm_replace.go.
+	{SQL: vmReplaceTargetSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceInterfaceSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceDiskSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplacePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplacePCIRealizationSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireInterfaceSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireDiskSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetireNICSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIIntentSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceRetirePCIRealSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
+	{SQL: vmReplaceLeaseSQL, Disposition: DispReject, RequiresCapability: capVMReplaceV1, DispositionAfter: DispGuardedReplace},
 }
 
 var explicitPolicyByFP = buildExplicitPolicies()

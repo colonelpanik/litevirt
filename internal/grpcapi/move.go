@@ -472,6 +472,22 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 			"vm", vmName, "error", err)
 		return
 	}
+	// Best-effort by design on this path: the caller globs the default dir next.
+	_ = s.deleteRecordedVMDiskVolumeRecords(ctx, vmName, disks)
+}
+
+// deleteRecordedVMDiskVolumeRecords frees an ALREADY-READ set of disk records.
+// Split out for cutover, which has to capture the replaced VM's rows before the
+// rekey moves them to its retired name and hands the name itself to the
+// replacement — reading them afterwards returns the REPLACEMENT's disks.
+// It reports the first failure rather than only logging it, because a caller that
+// records the cleanup as DONE must not do so while a volume is still there — the
+// record is what stops a restart from retrying. Skipping a path another VM still
+// references is a success, not a failure.
+func (s *Server) deleteRecordedVMDiskVolumeRecords(
+	ctx context.Context, vmName string, disks []corrosion.DiskRecord,
+) error {
+	var firstErr error
 	for i := range disks {
 		d := &disks[i]
 		if d.Path == "" {
@@ -484,8 +500,12 @@ func (s *Server) deleteRecordedVMDiskVolumes(ctx context.Context, vmName string)
 			slog.Warn("delete: free disk volume",
 				"vm", vmName, "disk", d.DiskName, "path", d.Path,
 				"storage_type", d.StorageType, "pool", poolLabel(d.StorageVolume), "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 // deleteDiskAtRecordedLocation resolves the storage driver for a disk's pool
@@ -535,6 +555,61 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		return true
 	}
 	return false
+}
+
+// diskPathReferencedByAnyLiveVM is the cleanup-time variant: it exempts NO VM.
+//
+// The ordinary check exempts the VM being deleted, because its own rows describe
+// the volume it is entitled to free. A journaled cutover cleanup has no such VM —
+// the records it holds were captured from a name that now belongs to the
+// replacement, and the temporary name they were replaced from is FREE and
+// reusable. Exempting either would mean exempting whatever VM happens to hold
+// that name when the cleanup finally runs, which can be a VM created after the
+// crash that legitimately references the volume. So every live reference is a
+// reason to keep the file.
+func (s *Server) diskPathReferencedByAnyLiveVM(ctx context.Context, d *corrosion.DiskRecord) bool {
+	refs, err := corrosion.DisksReferencingPath(ctx, s.db, d.Path)
+	if err != nil {
+		slog.Warn("cutover cleanup: shared-disk check failed; keeping the volume",
+			"disk", d.DiskName, "path", d.Path, "error", err)
+		return true
+	}
+	for _, r := range refs {
+		rel := "disk file"
+		if r.BackingImage == d.Path {
+			rel = "backing image"
+		}
+		slog.Warn("cutover cleanup: volume still referenced by a live VM — NOT deleting",
+			"path", d.Path, "referenced_by_vm", r.VMName, "referenced_by_disk", r.DiskName, "as", rel)
+		return true
+	}
+	return false
+}
+
+// deleteCapturedVMDiskVolumes frees an already-read set of disk records that no
+// VM owns any more — a journaled cutover cleanup. It reports the first failure
+// rather than only logging it, because a caller that records the cleanup as DONE
+// must not do so while a volume is still there.
+func (s *Server) deleteCapturedVMDiskVolumes(ctx context.Context, disks []corrosion.DiskRecord) error {
+	var firstErr error
+	for i := range disks {
+		d := &disks[i]
+		if d.Path == "" {
+			continue
+		}
+		if s.diskPathReferencedByAnyLiveVM(ctx, d) {
+			continue
+		}
+		if err := s.deleteDiskAtRecordedLocation(ctx, d); err != nil {
+			slog.Warn("cutover cleanup: free volume",
+				"disk", d.DiskName, "path", d.Path, "storage_type", d.StorageType,
+				"pool", poolLabel(d.StorageVolume), "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // syncStackComposeForMovedDisk keeps a stack's stored compose YAML in sync with

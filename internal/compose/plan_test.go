@@ -1,6 +1,8 @@
 package compose
 
 import (
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"strings"
 	"testing"
 )
 
@@ -388,5 +390,79 @@ func TestIsTransientOrErrorState(t *testing.T) {
 		if got := isTransientOrErrorState(state); got != want {
 			t.Errorf("isTransientOrErrorState(%q) = %v, want %v", state, got, want)
 		}
+	}
+}
+
+// storedAsCreated is what CreateVM persists for `createdDef` deployed once:
+// the compose fields plus the server-filled ones (uuid, machine pin, disk bus,
+// NIC model + MAC, placement host).
+func storedAsCreated() *pb.VMSpec {
+	return &pb.VMSpec{
+		Name: "api", StackName: "stack", Image: "ubuntu", Cpu: 2, MemoryMib: 512,
+		Machine: "pc-q35-9.0", Uuid: "u-1", Boot: "disk", GuestAgent: true, CpuMode: "host-model",
+		Disks:     []*pb.DiskSpec{{Name: "root", Size: "20G", Bus: "virtio", Storage: "fast"}},
+		Network:   []*pb.NetworkAttachment{{Name: "stack_lan", Model: "virtio", Mac: "52:54:00:00:00:01"}},
+		Placement: &pb.PlacementSpec{Host: "h1", AntiAffinity: []string{"db"}},
+		CloudInit: &pb.CloudInitSpec{Userdata: "#cloud-config\n{}\n"},
+		Labels:    map[string]string{"team": "a"},
+	}
+}
+
+func createdDef() VMDef {
+	return VMDef{Image: "ubuntu", CPU: 2, Memory: 512, Machine: "q35",
+		Disks:     map[string]DiskDef{"root": {Size: "20G", Storage: "fast"}},
+		Network:   []NetworkAttachment{{Name: "lan"}},
+		Placement: &PlacementDef{AntiAffinity: []string{"db"}},
+		CloudInit: &CloudInitDef{UserData: "#cloud-config\n{}\n"},
+		Labels:    map[string]string{"team": "a"},
+	}
+}
+
+func buildWithStored(t *testing.T, def VMDef, stored *pb.VMSpec) *Plan {
+	t.Helper()
+	f := makeFile("stack", map[string]VMDef{"api": def})
+	f.Networks = map[string]NetworkDef{"lan": {Type: "bridge"}}
+	plan, err := Build(f, []CurrentVM{{
+		Name: "api", Image: stored.Image, CPU: int(stored.Cpu), MemMiB: int(stored.MemoryMib),
+		State: "running", HostName: "h1",
+		CloudInitHash: CloudInitHash(stored.CloudInit.GetUserdata(), stored.CloudInit.GetNetworkconfig()),
+		Spec:          stored,
+	}})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return plan
+}
+
+// With cpu/memory/image/cloud-init unchanged, Build used to stop comparing and
+// call the VM unchanged, so a cpu-mode, label or disk-topology edit never
+// reached the executor. Given the stored spec it now runs the full comparison.
+func TestBuild_FullSpecComparison(t *testing.T) {
+	t.Run("unchanged file vs server-filled stored spec is no-change", func(t *testing.T) {
+		plan := buildWithStored(t, createdDef(), storedAsCreated())
+		if plan.HasChanges() {
+			t.Fatalf("re-applying an unchanged definition planned %+v", plan.Ops)
+		}
+	})
+	for name, edit := range map[string]func(*VMDef){
+		"cpu-mode": func(d *VMDef) { d.CPUMode = "host-passthrough" },
+		"machine":  func(d *VMDef) { d.Machine = "pc" },
+		"storage":  func(d *VMDef) { d.Disks["root"] = DiskDef{Size: "20G", Storage: "slow"} },
+		"labels":   func(d *VMDef) { d.Labels = map[string]string{"team": "b"} },
+		"disk topology": func(d *VMDef) {
+			d.Disks["data"] = DiskDef{Size: "100G"}
+		},
+	} {
+		t.Run(name+" edit is an update", func(t *testing.T) {
+			def := createdDef()
+			edit(&def)
+			plan := buildWithStored(t, def, storedAsCreated())
+			if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpUpdate {
+				t.Fatalf("%s edit: got %+v, want one OpUpdate", name, plan.Ops)
+			}
+			if !strings.Contains(plan.Ops[0].Detail, "update api:") {
+				t.Errorf("update detail should name the VM and the reason, got %q", plan.Ops[0].Detail)
+			}
+		})
 	}
 }

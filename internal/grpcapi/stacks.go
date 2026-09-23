@@ -1200,22 +1200,10 @@ func (s *Server) deployCreate(ctx context.Context, instanceName string, f *compo
 	return nil
 }
 
-// specCloudInitHash extracts cloud-init userdata+networkconfig from a JSON spec
-// and returns a stable hash, or "" if no cloud-init is present.
+// specCloudInitHash is compose.CloudInitHashFromSpec — the hash the planner
+// compares a compose file's cloud-init against.
 func specCloudInitHash(specJSON string) string {
-	if specJSON == "" {
-		return ""
-	}
-	var raw struct {
-		CloudInit *struct {
-			Userdata      string `json:"userdata"`
-			Networkconfig string `json:"networkconfig"`
-		} `json:"cloud_init"`
-	}
-	if err := json.Unmarshal([]byte(specJSON), &raw); err != nil || raw.CloudInit == nil {
-		return ""
-	}
-	return compose.CloudInitHash(raw.CloudInit.Userdata, raw.CloudInit.Networkconfig)
+	return compose.CloudInitHashFromSpec(specJSON)
 }
 
 // specImage extracts the image name from a JSON spec blob.

@@ -879,6 +879,27 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				continue
 			}
 		}
+		// The credential floor under `users`: refuse a peer's row that re-mints a
+		// live admin account (a different created_at under the same name), and say
+		// so. See users_admin_guard.go for why this is keyed on created_at and why
+		// it is not a customMergeTables entry.
+		if floor, ok := credentialMergeGuards[table.Name]; ok {
+			keepLocal, reason, kErr := floor.refuse(tx, table, row, pkCols, pkIdx)
+			if kErr != nil {
+				_ = tx.Rollback()
+				return merged, skipped, kErr
+			}
+			if keepLocal {
+				skipped++
+				pk := pkKeyAt(row, pkIdx)
+				c.deferAfterCommit(tx, func() {
+					c.noteAdminRemintRefused(pathAE)
+					slog.Warn("anti-entropy: kept the local credential row",
+						"table", "users", "pk", pk, "reason", reason)
+				})
+				continue
+			}
+		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two
 		// nodes that independently created different ids for one logical object converge

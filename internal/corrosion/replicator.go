@@ -2917,6 +2917,19 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 	if sh.Kind == KindInsert && r.client.canonicalIdentityOn() && hasIdentityKey(tableName) {
 		return r.applyIdentityInsert(ctx, tx, s, sh, tableName, pkCols)
 	}
+	// The credential floor under `users`, on the WAL lane. Both users shapes
+	// (DispPlainInsert and DispFullPKUpdate) route through here, so this one site
+	// covers the lane. See users_admin_guard.go.
+	if tableName == "users" {
+		refused, rErr := r.usersInsertRemintsALiveAdmin(ctx, tx, s, sh)
+		if rErr != nil {
+			return rErr
+		}
+		if refused {
+			r.client.noteAdminRemintRefused(pathWAL)
+			return nil
+		}
+	}
 	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
 	if err != nil {
 		return err

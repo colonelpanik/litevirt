@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -825,65 +826,6 @@ func TestSelfHealRestart_RefusedWithoutQuorumUnderOwnerEpoch(t *testing.T) {
 	}
 }
 
-func TestSelfHealRestart_RefusedOnSupersededMarker(t *testing.T) {
-	db := testReconcilerDB(t)
-	ctx := context.Background()
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	// The DB knows generation 9; this host's runtime marker is still at 5, so
-	// its local runtime state belongs to a generation that has been superseded.
-	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
-		t.Fatal(err)
-	}
-	// The domain is ABSENT (this host rebooted) but its marker survives — the
-	// rejoined-host shape: runtime gone, attestation of generation 5 retained.
-	fake := libvirtfake.New()
-	r := NewReconciler("node-a", t.TempDir(), db, &supersededMarkerFake{Fake: fake, epoch: 5})
-	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
-	r.reconcile(ctx)
-	if startedOrDefined(fake, "vm1") {
-		t.Fatal("a superseded runtime marker must refuse the self-heal restart")
-	}
-}
-
-// Positive control for the superseded check: a marker that AGREES with the DB
-// generation must not block the self-heal restart. Without this, "refuse
-// whenever a marker exists" would pass the refusal test while breaking every
-// legitimate restart of a marked VM.
-func TestSelfHealRestart_CurrentMarkerStillRestarts(t *testing.T) {
-	db := testReconcilerDB(t)
-	ctx := context.Background()
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 5 WHERE name = 'vm1'`); err != nil {
-		t.Fatal(err)
-	}
-	fake := libvirtfake.New()
-	r := NewReconciler("node-a", t.TempDir(), db, &supersededMarkerFake{Fake: fake, epoch: 5})
-	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
-	r.reconcile(ctx)
-	if !startedOrDefined(fake, "vm1") {
-		t.Fatal("a marker matching the DB generation must NOT block the self-heal restart")
-	}
-}
-
-// supersededMarkerFake reports a marker for a domain libvirt no longer has —
-// the rejoined-host shape (runtime gone, attestation retained).
-type supersededMarkerFake struct {
-	*libvirtfake.Fake
-	epoch int64
-}
-
-func (f *supersededMarkerFake) GetDomainOwnerEpoch(string) (int64, bool, error) {
-	return f.epoch, true, nil
-}
-
 // The lab found this on 2026-08-02: the superseded check guards the branch that
 // fires when libvirt has NO domain, but read its marker from the DOMAIN's
 // metadata — which is destroyed together with the domain. With the row at
@@ -952,7 +894,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T00:00:00Z",
 	}); err != nil {
 		t.Fatalf("seed condition: %v", err)
@@ -978,7 +920,7 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	if err := corrosion.UpsertHealthCondition(ctx, db, corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
 		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityCritical,
-		Hosts: []string{"node-b", "node-c"},
+		Hosts:     []string{"node-b", "node-c"},
 		FirstSeen: "2026-08-05T00:00:00Z", LastSeen: "2026-08-05T01:00:00Z",
 	}); err != nil {
 		t.Fatalf("resolve condition: %v", err)
@@ -987,5 +929,246 @@ func TestStartPendingVM_OwnershipDisputeRefuses(t *testing.T) {
 	r.startPendingVM(ctx, *fresh)
 	if !startedOrDefined(fake, "vm1") {
 		t.Fatal("vm1 should start once the condition is resolved")
+	}
+}
+
+// pendingProofFixture stands up a VM with a pending reschedule proof, exactly
+// as the coordinator's decide site leaves it.
+func pendingProofFixture(t *testing.T, term int64, key, coordinator string) (*corrosion.Client, *libvirtfake.Fake, *Reconciler, corrosion.VMRecord) {
+	t.Helper()
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-a", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	proof := corrosion.ActionProof{
+		ID: "p1", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "node-a", Coordinator: coordinator,
+		LeaseTerm: term, LeaseKey: key,
+	}
+	if err := corrosion.WriteVMRescheduleProof(ctx, db, proof, "vm1", "node-a"); err != nil {
+		t.Fatalf("WriteVMRescheduleProof: %v", err)
+	}
+	fake := libvirtfake.New()
+	r := NewReconciler("node-a", t.TempDir(), db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	fresh, _ := corrosion.GetVM(ctx, db, "vm1")
+	return db, fake, r, *fresh
+}
+
+// TestStartPendingVM_LeaseTermGateRefusesAStaleTenure is the test whose ABSENCE
+// let the whole regime miss the failover path.
+//
+// A reschedule proof never travels over an RPC: the coordinator writes the row
+// with a pending marker and THIS code claims it off replication. Every
+// lease-term check in internal/grpcapi is therefore unreachable from here, and
+// a unit test that calls claimCarriedProof directly proves nothing about the
+// path production actually takes for a reschedule.
+func TestStartPendingVM_LeaseTermGateRefusesAStaleTenure(t *testing.T) {
+	ctx := context.Background()
+	db, fake, r, vm := pendingProofFixture(t, 5, corrosion.LeaseKeyFailover, "node-z")
+
+	var gotReason string
+	r.SetGateRefusedObserver(func(_, reason string) { gotReason = reason })
+	r.SetLeaseTermGate(func(context.Context, corrosion.ProofRecord) (*corrosion.TermFence, string, error) {
+		return nil, ReasonStaleLeaseTerm, errStaleForTest
+	})
+
+	r.startPendingVM(ctx, vm)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a VM was started from a proof the lease-term gate refused; the superseded " +
+			"coordinator's reschedule executed exactly as it would have before the feature")
+	}
+	if gotReason != ReasonStaleLeaseTerm {
+		t.Errorf("refusal reason = %q, want %q", gotReason, ReasonStaleLeaseTerm)
+	}
+	// And the proof stays unclaimed, so the legitimate coordinator can still use it.
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofPrepared {
+		t.Errorf("proof status = %q (ok=%v), want prepared — a refused proof must not be "+
+			"consumed", pr.Status, ok)
+	}
+}
+
+var errStaleForTest = errors.New("stale lease term")
+
+// TestStartPendingVM_LeaseTermGateAcceptsAndFences: the ordinary path still
+// starts the VM, and the claim carries the fence the gate returned — so a
+// second coordinator at the same term is refused by the claim itself.
+func TestStartPendingVM_LeaseTermGateAcceptsAndFences(t *testing.T) {
+	ctx := context.Background()
+	db, fake, r, vm := pendingProofFixture(t, 7, corrosion.LeaseKeyFailover, "node-a")
+
+	r.SetLeaseTermGate(func(_ context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error) {
+		return &corrosion.TermFence{
+			Key: pr.LeaseKey, Term: pr.LeaseTerm, Coordinator: pr.Coordinator,
+		}, "", nil
+	})
+
+	r.startPendingVM(ctx, vm)
+
+	if !startedOrDefined(fake, "vm1") {
+		t.Fatal("the ordinary accepted path did not start the VM")
+	}
+	pr, ok, _ := corrosion.GetActionProof(ctx, db, "p1")
+	if !ok || pr.Status != corrosion.ProofCompleted {
+		t.Errorf("proof status = %q (ok=%v), want completed", pr.Status, ok)
+	}
+	// The claim recorded this host against term 7 for node-a, so a competing
+	// claimant's proof at the same term must now be refused by the fence.
+	if err := corrosion.WriteActionProof(ctx, db, corrosion.ActionProof{
+		ID: "p-z", Action: corrosion.ActionReschedule, TargetKind: "vm", TargetName: "vm2",
+		DestHost: "node-a", Coordinator: "node-z", LeaseTerm: 7, LeaseKey: corrosion.LeaseKeyFailover,
+	}); err != nil {
+		t.Fatalf("seed competing proof: %v", err)
+	}
+	err := corrosion.ClaimActionProofFenced(ctx, db, "p-z", "node-a",
+		&corrosion.TermFence{Key: corrosion.LeaseKeyFailover, Term: 7, Coordinator: "node-z"})
+	if !errors.Is(err, corrosion.ErrTermClaimantConflict) {
+		t.Errorf("competing claimant at term 7 got %v, want ErrTermClaimantConflict — the "+
+			"reconciler's claim must have bound this host to node-a", err)
+	}
+}
+
+// TestStartPendingVM_NoLeaseTermGateIsInert: an unwired gate is the
+// pre-Phase-2 daemon, not a refusal. Failing closed on nil here would break
+// every failover on a node whose daemon predates the wiring.
+func TestStartPendingVM_NoLeaseTermGateIsInert(t *testing.T) {
+	ctx := context.Background()
+	_, fake, r, vm := pendingProofFixture(t, 0, "", "node-a")
+	// No SetLeaseTermGate call at all.
+	r.startPendingVM(ctx, vm)
+	if !startedOrDefined(fake, "vm1") {
+		t.Error("an unwired lease-term gate refused a start; nil must be inert, not closed")
+	}
+}
+
+// metadataOnlyMarkerFake reports an owner-epoch in DOMAIN METADATA and nothing
+// on disk. Real libvirt cannot do this for an absent domain — which is the
+// point: it is the shape the deleted fallback needed in order to fire.
+type metadataOnlyMarkerFake struct {
+	*libvirtfake.Fake
+	epoch int64
+	reads int
+}
+
+func (f *metadataOnlyMarkerFake) GetDomainOwnerEpoch(string) (int64, bool, error) {
+	f.reads++
+	return f.epoch, true, nil
+}
+
+// TestRuntimeSuperseded_DoesNotConsultDomainMetadata pins the contract the
+// deleted fallback obscured.
+//
+// The check runs only from the `!DomainExists` branch, so its domain-metadata
+// read could never return a marker — DomainExists IS the same lookup
+// GetDomainOwnerEpoch performs first. It read as a second line of defence that
+// did not exist, and two unit tests "covered" it only because their fake served
+// metadata for a domain it did not have.
+//
+// The file marker is now the only input. A host with no readable marker is not
+// superseded, whatever domain metadata claims, and nothing reads that metadata
+// at all. Without this test, restoring the fallback would go unnoticed.
+func TestRuntimeSuperseded_DoesNotConsultDomainMetadata(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// The row is at generation 9; the metadata claims this runtime is still at 5.
+	// Were the metadata consulted, that would read as superseded.
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	virt := &metadataOnlyMarkerFake{Fake: libvirtfake.New(), epoch: 5}
+	r := NewReconciler("node-a", t.TempDir(), db, virt) // empty dataDir: no file marker
+
+	if r.runtimeSuperseded(ctx, "vm1") {
+		t.Error("superseded from domain metadata alone — the file marker must be the only input")
+	}
+	if virt.reads != 0 {
+		t.Errorf("GetDomainOwnerEpoch called %d time(s), want 0 — the metadata fallback is back", virt.reads)
+	}
+}
+
+// TestRuntimeSuperseded_DecidesFromTheFileMarker is the positive half: the one
+// input it does have must still work, in both directions.
+func TestRuntimeSuperseded_DecidesFromTheFileMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReconciler("node-a", dataDir, db, libvirtfake.New())
+
+	if err := WriteVMOwnerEpochMarker(dataDir, "vm1", 5); err != nil {
+		t.Fatal(err)
+	}
+	if !r.runtimeSuperseded(ctx, "vm1") {
+		t.Error("marker 5 behind row 9 must be superseded")
+	}
+
+	if err := WriteVMOwnerEpochMarker(dataDir, "vm1", 9); err != nil {
+		t.Fatal(err)
+	}
+	if r.runtimeSuperseded(ctx, "vm1") {
+		t.Error("marker 9 equal to row 9 must NOT be superseded")
+	}
+}
+
+// TestSelfHealRestart_RefusedOnALegacyZeroFileMarker: a marker asserting
+// generation 0 must refuse the self-heal restart, not license it.
+//
+// Regression guard for the reader now treating a 0 as corrupt. Before that, a 0
+// marker read back as (0, true, nil) and the row's generation 9 was plainly
+// greater, so runtimeSuperseded said "superseded" and the restart was refused.
+// Once the reader errored, the 0 collapsed into the SAME bucket as unparseable
+// garbage — and that bucket deliberately does NOT fail closed, because failing
+// closed on an unreadable marker would strand a legitimately-owned VM. The
+// refusal silently became a permission.
+//
+// The population that carries such a marker is precisely the one this check
+// exists for: a node returning from a build whose writer still emitted zeros.
+// Written with os.WriteFile because the writer now refuses to produce one.
+func TestSelfHealRestart_RefusedOnALegacyZeroFileMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "vms", "vm1"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "vms", "vm1", ownerEpochMarkerFile),
+		[]byte("0\n"), 0o600); err != nil {
+		t.Fatalf("seed legacy marker: %v", err)
+	}
+
+	fake := libvirtfake.New() // no domain — the rebooted/rejoined-host shape
+	r := NewReconciler("node-a", dataDir, db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a marker naming generation 0 against a row at generation 9 must refuse the " +
+			"self-heal restart — it is this host's own statement that its runtime belongs to " +
+			"no generation, which every real generation has superseded")
 	}
 }

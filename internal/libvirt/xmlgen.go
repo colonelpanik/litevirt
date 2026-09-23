@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -40,8 +41,16 @@ type VMConfig struct {
 	CloudInitISO string // path to cloud-init ISO, empty if not used
 	Boot         string // disk | cdrom
 
-	// CPU mode: host-passthrough | host-model | custom (empty = QEMU default)
-	CPUMode string
+	// CPU mode: host-passthrough | host-model | custom.
+	//
+	// Empty emits NO <cpu> element, which leaves the guest on QEMU's x86_64
+	// default (qemu64 — no sse4.2, no xsave, no AVX/AVX2). Create defaults the
+	// stored spec to DefaultCPUMode instead, so empty here means an older spec
+	// that predates it; the renderer keeps honoring it verbatim so a redefine
+	// never moves a guest's CPU underneath it. CPUModel names the model for
+	// mode=custom and must be empty otherwise (see ValidateCPUMode).
+	CPUMode  string
+	CPUModel string
 
 	// Resource tuning
 	HugePages  bool
@@ -135,6 +144,40 @@ func MachineTypeFromXML(domXML string) string {
 	}
 	return d.OS.Machine
 }
+
+// UUIDFromXML extracts a domain's <uuid> from its libvirt XML, lower-cased and
+// trimmed, or "" when absent or not a UUID.
+//
+// libvirt mints a UUID for every domain it defines, so the persistent XML is the
+// authority for a VM whose stored spec predates litevirt recording one. It is
+// read on the OWNING host, which is the only place that XML exists.
+//
+// Trimmed because libvirt pretty-prints its persistent XML, so the element body
+// arrives wrapped in whitespace; lower-cased because a UUID is compared as a
+// STRING everywhere it matters — most consequentially inside the NetBox identity
+// (`lv:<fingerprint>:<uuid>:<mac>`), where a differently-cased or padded value is
+// a different identity and would orphan the object it was meant to name.
+//
+// VALIDATED, not merely trimmed: a body that is not a UUID yields "" rather than
+// being written into a spec as though it were one. A wrong uuid is worse than an
+// absent one — absence is visible and skipped, while a bogus value mints a
+// confident, permanently wrong identity.
+func UUIDFromXML(domXML string) string {
+	var d struct {
+		UUID string `xml:"uuid"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return ""
+	}
+	u := strings.ToLower(strings.TrimSpace(d.UUID))
+	if !uuidRe.MatchString(u) {
+		return ""
+	}
+	return u
+}
+
+// uuidRe is the canonical 8-4-4-4-12 hex form libvirt emits.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // MaxVCPUFromXML returns a domain's MAXIMUM vCPU count from its XML — the <vcpu>
 // element's body (which is the hotplug ceiling when a current= attr is present, or
@@ -267,9 +310,16 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		dom.CurrentMemory = &memory{Value: cfg.MemoryMiB * 1024, Unit: "KiB"}
 	}
 
-	// CPU mode: host-passthrough, host-model, or custom.
+	// CPU mode: host-passthrough, host-model, or custom. A custom mode carries a
+	// <model> child; libvirt rejects <cpu mode='custom'/> without one, so the
+	// model is not optional (ValidateCPUMode enforces the pair upstream).
 	if cfg.CPUMode != "" {
-		dom.CPUDef = &cpuDef{Mode: cfg.CPUMode}
+		cd := &cpuDef{Mode: cfg.CPUMode}
+		if cfg.CPUMode == CPUModeCustom {
+			cd.Match = "exact"
+			cd.Model = &cpuModel{Fallback: "allow", Name: cfg.CPUModel}
+		}
+		dom.CPUDef = cd
 	}
 
 	// Hugepages: back guest memory with host hugepages.
@@ -696,7 +746,18 @@ type domain struct {
 }
 
 type cpuDef struct {
-	Mode string `xml:"mode,attr"`
+	// XMLName names the element explicitly so the type can also be marshaled on
+	// its own, outside a domain struct (see PatchInactiveCPUMode). Identical to
+	// the name the domain field tag already gives it.
+	XMLName xml.Name  `xml:"cpu"`
+	Mode    string    `xml:"mode,attr"`
+	Match   string    `xml:"match,attr,omitempty"`
+	Model   *cpuModel `xml:"model,omitempty"`
+}
+
+type cpuModel struct {
+	Fallback string `xml:"fallback,attr,omitempty"`
+	Name     string `xml:",chardata"`
 }
 
 type numaTune struct {

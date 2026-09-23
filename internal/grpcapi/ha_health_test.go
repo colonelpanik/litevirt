@@ -134,14 +134,14 @@ func TestEvaluateHADegraded_VIPNoHolder(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertLBConfig: %v", err)
 	}
-	if got := s.evaluateHADegraded(ctx); !got[haVIPNoHolder] {
+	if got, _ := s.evaluateHADegraded(ctx); !got[haVIPNoHolder] {
 		t.Fatalf("expected vip_no_holder degraded; got %v", got)
 	}
 	// With a claimant, no alarm.
 	s.probeHolder = func(context.Context, string, string) holderStatus {
 		return holderStatus{reachable: true, assigned: true}
 	}
-	if got := s.evaluateHADegraded(ctx); got[haVIPNoHolder] {
+	if got, _ := s.evaluateHADegraded(ctx); got[haVIPNoHolder] {
 		t.Fatalf("held VIP must not be vip_no_holder; got %v", got)
 	}
 }

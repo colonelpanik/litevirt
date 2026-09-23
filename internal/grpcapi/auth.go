@@ -362,6 +362,17 @@ func (s *Server) isTrustedHostCN(ctx context.Context, cn string) bool {
 // verified against the cluster CA by the handshake, so this cannot be asserted by
 // the caller — issuing one requires the CA private key, which lives in the
 // operator's config directory and on no node.
+//
+// The literal-constant match is deliberate and must NOT be widened to accept an
+// absent EKU extension or id-kp-anyExtendedKeyUsage, both of which Go's verifier
+// treats as valid for server auth. Every certificate this cluster uses comes from
+// internal/pki, which always sets an explicit EKU — ServerAuth+ClientAuth for a
+// host, ClientAuth alone for the distributable lv-cli certificate — so nothing
+// legitimate lands in that gap. Accepting it would promote any EKU-less CA-signed
+// certificate to a cluster PEER, which is the exact escalation the host-vs-client
+// discriminator exists to prevent. A certificate from some other CA is refused
+// here, and refusing is the safe direction: it loses peer trust and Ping posture,
+// neither of which fails open.
 func callerCertHasServerAuth(ctx context.Context) bool {
 	cert := peerLeafCert(ctx)
 	if cert == nil {

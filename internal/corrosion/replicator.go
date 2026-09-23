@@ -34,7 +34,12 @@ type Replicator struct {
 	relaySet       *RelaySet                     // current relay election result
 	isRelay        bool                          // cached: is this node a relay?
 	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
-	wg             sync.WaitGroup
+	// pushFailingSince records, per peer, when its CURRENT run of failed pushes
+	// began — cleared by the next success. A peer that cannot be pushed to is
+	// not consuming our log, however recent its watermark row looks, so the
+	// prune stops counting it once the run outlasts UnreachablePeerGrace.
+	pushFailingSince map[string]time.Time
+	wg               sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -393,6 +398,11 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 			if ctx.Err() != nil {
 				return
 			}
+			// A peer we cannot push to is not consuming our log. Record the run
+			// so the prune can stop counting its frozen watermark once the run
+			// outlasts UnreachablePeerGrace, instead of waiting out the whole
+			// LiveWatermarkWindow on a timestamp that will never advance again.
+			r.notePushFailure(peerName)
 			slog.Warn("replicator: error replicating to peer", "peer", peerName, "error", err, "backoff", backoff)
 			select {
 			case <-ctx.Done():
@@ -407,6 +417,10 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 			}
 			continue
 		}
+
+		// The peer is reachable again (or never stopped being): its watermark
+		// advances, so it protects its tail exactly as before.
+		r.notePushSuccess(peerName)
 
 		// Track successful relay push for fallback monitor.
 		r.mu.Lock()
@@ -583,13 +597,36 @@ func dropUnsupportedProofEntries(entries []mutationEntry) []mutationEntry {
 	return kept
 }
 
+// proofDropExemptTables are customMergeTables tables whose statements must NOT
+// make an entry droppable by dropUnsupportedProofEntries.
+//
+// The drop filter exists for the split_brain_gate_v1 proof capability: a proof
+// dropped to an unready peer reconverges via the sensitive anti-entropy net, so
+// dropping is safe for the tables it was written for. leader_lease_terms breaks
+// that assumption in one specific way: its mint is co-batched, in a single
+// mutation entry, with the leader_election upsert it must be atomic with — and
+// leader_election is anti-entropy EXCLUDED (merging it would corrupt
+// leadership), so it has NO repair path. Dropping the entry would therefore stop
+// replicating lease ownership itself to any peer lacking proof support, for the
+// whole rolling upgrade, silently. The comment on the drop site names
+// leader_election explicitly as something that must keep flowing.
+//
+// The term row itself is in tableNames, so it reconverges via ordinary
+// anti-entropy — it never needed the drop filter's protection. Un-batching to
+// dodge this instead would reopen the crash-between-writes window that
+// acquireLeaseWithTerm's guarded batch exists to close.
+var proofDropExemptTables = map[string]bool{
+	"leader_lease_terms": true,
+}
+
 // entryTouchesCustomMerge reports whether a serialized mutation entry contains ANY
-// statement targeting a customMergeTables table (runtime_action_proofs). Such an
-// entry must be replicated ATOMICALLY (proof + co-batched vms.pending_action_id
-// marker together) or DROPPED WHOLE for a peer that can't yet apply the proof —
-// never split (the dropped proof reconverges via the sensitive AE net). On a parse
-// error it returns true (conservative: treat as proof-bearing and drop, rather than
-// risk sending a partial to an unready peer).
+// statement targeting a proof-gated customMergeTables table (runtime_action_proofs).
+// Such an entry must be replicated ATOMICALLY (proof + co-batched
+// vms.pending_action_id marker together) or DROPPED WHOLE for a peer that can't yet
+// apply the proof — never split (the dropped proof reconverges via the sensitive AE
+// net). Tables in proofDropExemptTables are skipped; see there. On a parse error it
+// returns true (conservative: treat as proof-bearing and drop, rather than risk
+// sending a partial to an unready peer).
 func entryTouchesCustomMerge(stmtsJSON string) bool {
 	var stmts []Statement
 	if err := json.Unmarshal([]byte(stmtsJSON), &stmts); err != nil {
@@ -602,7 +639,7 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		// (non-custom → KEEP; crl_versions is AE-excluded, so dropping it would lose the update with
 		// no repair); the spent-proof-GC transformer targets runtime_action_proofs (custom → drop).
 		if lt, ok := legacyTransformerFor(s.SQL); ok {
-			if customMergeTables[lt.table] != nil {
+			if customMergeTables[lt.table] != nil && !proofDropExemptTables[lt.table] {
 				return true
 			}
 			continue
@@ -612,7 +649,10 @@ func entryTouchesCustomMerge(stmtsJSON string) bool {
 		// treated as proof-bearing (conservative — drop rather than risk a partial to an unready
 		// peer).
 		sh, err := parseStmtShape(s.SQL, nil)
-		if err != nil || customMergeTables[sh.Table] != nil {
+		if err != nil {
+			return true
+		}
+		if customMergeTables[sh.Table] != nil && !proofDropExemptTables[sh.Table] {
 			return true
 		}
 	}
@@ -680,6 +720,38 @@ func (r *Replicator) setWatermark(ctx context.Context, peerName string, seq int6
 	return err
 }
 
+// notePushFailure marks the start of a run of failed pushes to peerName. It is
+// idempotent: the recorded instant is the START of the current run, so the run
+// keeps ageing across repeated failures instead of resetting on each one.
+func (r *Replicator) notePushFailure(peerName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pushFailingSince == nil {
+		r.pushFailingSince = make(map[string]time.Time)
+	}
+	if _, failing := r.pushFailingSince[peerName]; !failing {
+		r.pushFailingSince[peerName] = time.Now()
+	}
+}
+
+// notePushSuccess clears any failure run for peerName: a peer we can push to is
+// consuming our log again, and its watermark protects its tail as before.
+func (r *Replicator) notePushSuccess(peerName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.pushFailingSince, peerName)
+}
+
+// pushStalled reports whether pushes to peerName have been failing for at least
+// UnreachablePeerGrace as of now. Such a peer's watermark can no longer advance,
+// so counting it would pin the log behind a sequence nothing will ever ack.
+func (r *Replicator) pushStalled(peerName string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	since, failing := r.pushFailingSince[peerName]
+	return failing && !now.Before(since.Add(UnreachablePeerGrace))
+}
+
 func (r *Replicator) peerGRPCClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
 	target, err := resolvePeerTarget(ctx, r.client, peerName)
 	if err != nil {
@@ -732,6 +804,25 @@ var (
 	// A peer offline longer than this recovers via anti-entropy.
 	MaxLogRetention = 24 * time.Hour
 
+	// UnreachablePeerGrace is how long a peer's pushes must have been failing
+	// continuously before its watermark stops pinning the prune.
+	//
+	// LiveWatermarkWindow cannot do this job. replication_watermarks.updated_at
+	// advances only on a SUCCESSFUL push, so a peer that has just gone
+	// unreachable keeps a timestamp from inside the window while its last_seq is
+	// frozen — it counts as live and pins MIN, and the prune reclaims nothing
+	// until the whole window elapses. Every daemon restart re-arms that, because
+	// the surviving timestamp is the last success before the restart. The
+	// replicator learns the truth in seconds (replicateOnce returns the push
+	// error), so the failing push is the signal and the window is only the
+	// backstop for a peer we never hear about again.
+	//
+	// The grace exists so one dropped connection does not cost a peer its tail
+	// and force an anti-entropy resync; it is deliberately short, because
+	// dropping the tail is safe by design (see LiveWatermarkWindow) and merely
+	// more expensive than log replay.
+	UnreachablePeerGrace = 90 * time.Second
+
 	// IncrementalVacuumPages caps how many freed pages are returned to the OS
 	// per prune tick, so a large reclaim is spread out instead of stalling
 	// under the client lock. No-op unless the DB was created with
@@ -745,32 +836,121 @@ var (
 	ClockSkewRetention = 1 * time.Hour
 )
 
+// servedPeers returns the peers this node currently replicates to — exactly the
+// set syncPeers keeps goroutines for. A peer outside it is never pushed to from
+// here, so its watermark can never advance and must not gate compaction.
+func (r *Replicator) servedPeers() map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.peers) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(r.peers))
+	for peer := range r.peers {
+		out[peer] = true
+	}
+	return out
+}
+
+// stalledPeers returns the peers whose pushes have been failing for at least
+// UnreachablePeerGrace as of now.
+func (r *Replicator) stalledPeers(now time.Time) map[string]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pushFailingSince) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(r.pushFailingSince))
+	for peer, since := range r.pushFailingSince {
+		if !now.Before(since.Add(UnreachablePeerGrace)) {
+			out[peer] = true
+		}
+	}
+	return out
+}
+
+// watermarkFloor returns the lowest last_seq among peers that gate compaction,
+// and whether any such peer exists. A peer gates only if all three hold: this
+// node serves it, it acked since liveCutoff, and its pushes are not stalled.
+// The MIN is taken in Go rather than SQL because two of those three live in
+// memory — who we serve and who we can reach are things this process knows,
+// not columns.
+//
+// No eligible peer yields ok=false, which leaves the watermark prune a no-op
+// and defers to the MaxLogRetention ceiling — the same outcome as an empty
+// live set before, and the safe direction: keeping log we might not need costs
+// disk, dropping log a peer still needs costs it a resync.
+//
+// Caller must hold r.client.mu.
+func (r *Replicator) watermarkFloor(ctx context.Context, liveCutoff string, served, stalled map[string]bool) (int64, bool) {
+	rows, err := r.client.db.QueryContext(ctx,
+		`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
+	if err != nil {
+		slog.Warn("replicator: read watermarks for prune", "error", err)
+		return 0, false
+	}
+	defer rows.Close()
+
+	var minSeq int64
+	found := false
+	for rows.Next() {
+		var peer string
+		var seq int64
+		if err := rows.Scan(&peer, &seq); err != nil {
+			slog.Warn("replicator: scan watermark for prune", "error", err)
+			return 0, false
+		}
+		if !served[peer] || stalled[peer] {
+			continue
+		}
+		if !found || seq < minSeq {
+			minSeq, found = seq, true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		slog.Warn("replicator: iterate watermarks for prune", "error", err)
+		return 0, false
+	}
+	return minSeq, found
+}
+
 // pruneMutationLog trims the replication log in three steps: (1) prune up to
 // the slowest *live* peer's watermark, (2) enforce an absolute age ceiling so
 // a dead/forgotten peer can't keep the log growing without bound, and (3)
 // return the freed pages to the OS. Steps 1+2 bound the row count; step 3
 // bounds the on-disk file size.
 func (r *Replicator) pruneMutationLog(ctx context.Context) {
+	now := time.Now()
+	// Snapshot push health BEFORE taking the client lock: pushStalled takes the
+	// replicator's own mutex, and every other path takes that one first, so
+	// nesting them the other way round here would invert the lock order.
+	stalled := r.stalledPeers(now)
+	// Who we actually push to. A watermark row outlives the topology that
+	// created it: syncPeers drops a peer from the target set without deleting
+	// its row, leaving a frozen seq that would otherwise gate compaction
+	// forever — or, right after a restart, for a whole LiveWatermarkWindow.
+	served := r.servedPeers()
+
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
-
-	now := time.Now()
 
 	// (1) Watermark-based prune over LIVE peers only. Previously this used
 	// MIN(last_seq) across *all* watermark rows, so one dead or long-
 	// partitioned peer (watermark never advancing) pinned the log forever.
+	// A peer counts toward the watermark only if it is BOTH recently-acked and
+	// currently pushable. The timestamp alone is not enough: it advances only on
+	// a successful push, so a peer that has just gone unreachable still looks
+	// recent while its seq is frozen — see UnreachablePeerGrace.
 	liveCutoff := now.Add(-LiveWatermarkWindow).UTC().Format(time.RFC3339)
-	var minSeq sql.NullInt64
-	if err := r.client.db.QueryRowContext(ctx,
-		`SELECT MIN(last_seq) FROM replication_watermarks WHERE updated_at > ?`,
-		liveCutoff).Scan(&minSeq); err == nil && minSeq.Valid {
+	minSeq, haveMin := r.watermarkFloor(ctx, liveCutoff, served, stalled)
+	if haveMin {
 		ageCutoff := now.Add(-PruneMinAge).UTC().Format(time.RFC3339)
 		if res, derr := r.client.db.ExecContext(ctx,
 			`DELETE FROM mutation_log WHERE seq <= ? AND created_at < ?`,
-			minSeq.Int64, ageCutoff); derr != nil {
+			minSeq, ageCutoff); derr != nil {
 			slog.Warn("replicator: prune error", "error", derr)
 		} else if n, _ := res.RowsAffected(); n > 0 {
-			slog.Info("replicator: pruned mutation_log", "deleted", n, "up_to_seq", minSeq.Int64)
+			slog.Info("replicator: pruned mutation_log", "deleted", n, "up_to_seq", minSeq)
 		}
 	}
 
@@ -1165,8 +1345,12 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	case DispAppendOnly:
 		// Immutable append-only INSERT (fencing_log/audit_log/mutation_log/vm_events):
 		// INSERT OR IGNORE, so it only creates the row when absent and never overwrites.
-		_, execErr := tx.ExecContext(ctx, setInsertOrIgnore(s.SQL, sh), s.Params...)
-		return execErr
+		res, execErr := tx.ExecContext(ctx, setInsertOrIgnore(s.SQL, sh), s.Params...)
+		if execErr != nil {
+			return execErr
+		}
+		r.noteIgnoredInsert(ctx, tx, res, s, sh, tableName, "append_only")
+		return nil
 
 	case DispCustomMerge:
 		// Monotone lifecycle / immutable journal (runtime_action_proofs, operations, …): an
@@ -1182,8 +1366,14 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		if sh.Kind == KindInsert {
 			sqlStmt = setInsertOrIgnore(sqlStmt, sh)
 		}
-		_, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
-		return execErr
+		res, execErr := tx.ExecContext(ctx, sqlStmt, s.Params...)
+		if execErr != nil {
+			return execErr
+		}
+		if sh.Kind == KindInsert {
+			r.noteIgnoredInsert(ctx, tx, res, s, sh, tableName, "custom_merge")
+		}
+		return nil
 
 	case DispGuardedReplace:
 		// One statement of a guarded VM-name replacement. The shared
@@ -3445,6 +3635,53 @@ func (r *Replicator) applyBulkUpdate(ctx context.Context, tx *sql.Tx, s Statemen
 		return r.applyBulkPerRowLWW(ctx, tx, s, sh, tableName, pkCols)
 	}
 	return invalidf("bulk update on %s has unsupported concurrency category %q", tableName, cat)
+}
+
+// noteIgnoredInsert reports a replicated INSERT that OR IGNORE silently dropped
+// for a reason other than the intended primary-key conflict.
+//
+// SQLite's OR IGNORE conflict resolution skips a row violating NOT NULL, CHECK
+// and UNIQUE exactly as it skips a PK conflict, and ValidateParamArity only
+// checks parameter COUNT — so a malformed peer statement was discarded with a
+// nil error and no signal at all. On an append-only or immutable table that is
+// permanent data loss, not a retryable fault: the receiver keeps a state the
+// sender believes it has, and because the merge keeps the local row, the sender
+// will never overwrite it.
+//
+// A zero-rows result whose primary key IS present is the ordinary idempotent
+// re-delivery this disposition exists for, and stays silent.
+func (r *Replicator) noteIgnoredInsert(ctx context.Context, tx *sql.Tx, res sql.Result, s Statement, sh StmtShape, tableName string, reason string) {
+	if res == nil || rowsChanged(res) {
+		return
+	}
+	pkVals, ok := pkValuesFromShape(sh, s)
+	if !ok || len(pkVals) == 0 {
+		return
+	}
+	// pkCols comes from this node's own tablePrimaryKeys registry, and an
+	// unregistered table yields none — so the length check below is also what
+	// keeps a peer-supplied table name out of the query built from it.
+	pkCols := tablePrimaryKeys[tableName]
+	if len(pkCols) == 0 || len(pkCols) != len(pkVals) {
+		return
+	}
+	preds := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		preds[i] = col + " = ?"
+	}
+	var present int
+	q := `SELECT COUNT(*) FROM ` + tableName + ` WHERE ` + strings.Join(preds, " AND ")
+	if err := tx.QueryRowContext(ctx, q, pkVals...).Scan(&present); err != nil {
+		return
+	}
+	if present > 0 {
+		return // idempotent re-delivery of a row we already hold
+	}
+	// boundedTableLabel, not tableName: the name came off a peer's statement and
+	// an unbounded string must never become a metric label.
+	r.client.observeMergeRejected(boundedTableLabel(tableName), string(pathWAL), "constraint_ignored")
+	slog.Warn("replication: replicated INSERT silently ignored and the row is absent — a constraint other than the primary key rejected it",
+		"table", tableName, "pk", fmt.Sprint(pkVals...), "disposition", reason)
 }
 
 // pkValuesFromShape returns the primary-key values a full-PK statement binds. For an INSERT the PK

@@ -41,8 +41,16 @@ type VMConfig struct {
 	CloudInitISO string // path to cloud-init ISO, empty if not used
 	Boot         string // disk | cdrom
 
-	// CPU mode: host-passthrough | host-model | custom (empty = QEMU default)
-	CPUMode string
+	// CPU mode: host-passthrough | host-model | custom.
+	//
+	// Empty emits NO <cpu> element, which leaves the guest on QEMU's x86_64
+	// default (qemu64 — no sse4.2, no xsave, no AVX/AVX2). Create defaults the
+	// stored spec to DefaultCPUMode instead, so empty here means an older spec
+	// that predates it; the renderer keeps honoring it verbatim so a redefine
+	// never moves a guest's CPU underneath it. CPUModel names the model for
+	// mode=custom and must be empty otherwise (see ValidateCPUMode).
+	CPUMode  string
+	CPUModel string
 
 	// Resource tuning
 	HugePages  bool
@@ -302,9 +310,16 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		dom.CurrentMemory = &memory{Value: cfg.MemoryMiB * 1024, Unit: "KiB"}
 	}
 
-	// CPU mode: host-passthrough, host-model, or custom.
+	// CPU mode: host-passthrough, host-model, or custom. A custom mode carries a
+	// <model> child; libvirt rejects <cpu mode='custom'/> without one, so the
+	// model is not optional (ValidateCPUMode enforces the pair upstream).
 	if cfg.CPUMode != "" {
-		dom.CPUDef = &cpuDef{Mode: cfg.CPUMode}
+		cd := &cpuDef{Mode: cfg.CPUMode}
+		if cfg.CPUMode == CPUModeCustom {
+			cd.Match = "exact"
+			cd.Model = &cpuModel{Fallback: "allow", Name: cfg.CPUModel}
+		}
+		dom.CPUDef = cd
 	}
 
 	// Hugepages: back guest memory with host hugepages.
@@ -741,7 +756,18 @@ type domain struct {
 }
 
 type cpuDef struct {
-	Mode string `xml:"mode,attr"`
+	// XMLName names the element explicitly so the type can also be marshaled on
+	// its own, outside a domain struct (see PatchInactiveCPUMode). Identical to
+	// the name the domain field tag already gives it.
+	XMLName xml.Name  `xml:"cpu"`
+	Mode    string    `xml:"mode,attr"`
+	Match   string    `xml:"match,attr,omitempty"`
+	Model   *cpuModel `xml:"model,omitempty"`
+}
+
+type cpuModel struct {
+	Fallback string `xml:"fallback,attr,omitempty"`
+	Name     string `xml:",chardata"`
 }
 
 type numaTune struct {

@@ -299,7 +299,11 @@ func (p *sqlParser) next() sqlTok {
 	t := p.peek()
 	if p.pos < len(p.toks) {
 		p.pos++
-		p.lastEnd = t.pos + len(t.text)
+		// The token's recorded span — NOT len(.text), which is the token's
+		// meaning and is shorter than the source for literals and quoted
+		// identifiers. lastEnd feeds SetClauseEnd, which the apply path slices
+		// the original SQL with.
+		p.lastEnd = t.end
 	}
 	return t
 }

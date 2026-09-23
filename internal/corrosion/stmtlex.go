@@ -39,6 +39,16 @@ type sqlTok struct {
 	strVal string // tokString
 	intVal int64  // tokInt
 	pos    int    // byte offset of the token's start in the original SQL
+	end    int    // byte offset just past the token's last byte in the original SQL
+
+	// pos/end are the token's SOURCE SPAN, and they are what the offsets in
+	// StmtShape are built from — applyBulkPerRowLWW slices the original SQL
+	// with them to rebuild a per-row UPDATE. They must never be derived from
+	// .text: .text carries the token's MEANING, and for a string literal it is
+	// the unescaped value, for a quoted identifier the content without its
+	// delimiters, and for a number nothing at all. A span short of the text it
+	// consumed silently truncates a rebuilt statement into invalid SQL, which
+	// fails the whole remote batch and stalls the replication watermark.
 }
 
 // lex tokenises sql. On an unterminated string/comment or an unsupported placeholder form
@@ -48,8 +58,9 @@ func lex(sql string) ([]sqlTok, error) {
 	i := 0
 	n := len(sql)
 	start := 0
-	emit := func(tk sqlTok) {
+	emit := func(tk sqlTok, end int) {
 		tk.pos = start
+		tk.end = end
 		toks = append(toks, tk)
 	}
 	for i < n {
@@ -101,7 +112,7 @@ func lex(sql string) ([]sqlTok, error) {
 			if !closed {
 				return nil, invalidf("unterminated string literal")
 			}
-			emit(sqlTok{kind: tokString, strVal: sb.String()})
+			emit(sqlTok{kind: tokString, strVal: sb.String()}, j)
 			i = j
 		case c == '"' || c == '[' || c == '`':
 			// quoted identifier — tokenise so the parser can reject it explicitly.
@@ -118,14 +129,14 @@ func lex(sql string) ([]sqlTok, error) {
 			if j >= n {
 				return nil, invalidf("unterminated quoted identifier")
 			}
-			emit(sqlTok{kind: tokQuotedIdent, text: sql[i+1 : j]})
+			emit(sqlTok{kind: tokQuotedIdent, text: sql[i+1 : j]}, j+1)
 			i = j + 1
 		case c == '?':
 			// Only the bare positional '?' is supported. Reject ?NNN / :name / @x / $x.
 			if i+1 < n && (isDigit(sql[i+1]) || isIdentStart(sql[i+1])) {
 				return nil, invalidf("unsupported parameter form at %q", sql[i:minInt(i+4, n)])
 			}
-			emit(sqlTok{kind: tokParam, text: "?"})
+			emit(sqlTok{kind: tokParam, text: "?"}, i+1)
 			i++
 		case c == ':' || c == '@' || c == '$':
 			return nil, invalidf("unsupported named-parameter form %q", string(c))
@@ -142,69 +153,69 @@ func lex(sql string) ([]sqlTok, error) {
 			if err != nil {
 				return nil, invalidf("bad integer literal %q", sql[i:j])
 			}
-			emit(sqlTok{kind: tokInt, intVal: v})
+			emit(sqlTok{kind: tokInt, intVal: v}, j)
 			i = j
 		case isIdentStart(c):
 			j := i
 			for j < n && isIdentPart(sql[j]) {
 				j++
 			}
-			emit(sqlTok{kind: tokIdent, text: sql[i:j]})
+			emit(sqlTok{kind: tokIdent, text: sql[i:j]}, j)
 			i = j
 		case c == '(':
-			emit(sqlTok{kind: tokLParen, text: "("})
+			emit(sqlTok{kind: tokLParen, text: "("}, i+1)
 			i++
 		case c == ')':
-			emit(sqlTok{kind: tokRParen, text: ")"})
+			emit(sqlTok{kind: tokRParen, text: ")"}, i+1)
 			i++
 		case c == ',':
-			emit(sqlTok{kind: tokComma, text: ","})
+			emit(sqlTok{kind: tokComma, text: ","}, i+1)
 			i++
 		case c == ';':
-			emit(sqlTok{kind: tokSemi, text: ";"})
+			emit(sqlTok{kind: tokSemi, text: ";"}, i+1)
 			i++
 		case c == '.':
-			emit(sqlTok{kind: tokDot, text: "."})
+			emit(sqlTok{kind: tokDot, text: "."}, i+1)
 			i++
 		case c == '*':
-			emit(sqlTok{kind: tokStar, text: "*"})
+			emit(sqlTok{kind: tokStar, text: "*"}, i+1)
 			i++
 		case c == '=':
 			// SQLite accepts '==' too; normalise both to '='.
 			if i+1 < n && sql[i+1] == '=' {
 				i++
 			}
-			emit(sqlTok{kind: tokEq, text: "="})
+			emit(sqlTok{kind: tokEq, text: "="}, i+1)
 			i++
 		case c == '<':
 			if i+1 < n && (sql[i+1] == '=' || sql[i+1] == '>') {
-				emit(sqlTok{kind: tokOp, text: sql[i : i+2]})
+				emit(sqlTok{kind: tokOp, text: sql[i : i+2]}, i+2)
 				i += 2
 			} else {
-				emit(sqlTok{kind: tokOp, text: "<"})
+				emit(sqlTok{kind: tokOp, text: "<"}, i+1)
 				i++
 			}
 		case c == '>':
 			if i+1 < n && sql[i+1] == '=' {
-				emit(sqlTok{kind: tokOp, text: ">="})
+				emit(sqlTok{kind: tokOp, text: ">="}, i+2)
 				i += 2
 			} else {
-				emit(sqlTok{kind: tokOp, text: ">"})
+				emit(sqlTok{kind: tokOp, text: ">"}, i+1)
 				i++
 			}
 		case c == '!':
 			if i+1 < n && sql[i+1] == '=' {
-				emit(sqlTok{kind: tokOp, text: "!="})
+				emit(sqlTok{kind: tokOp, text: "!="}, i+2)
 				i += 2
 			} else {
 				return nil, invalidf("unexpected %q", string(c))
 			}
 		case c == '+' || c == '-':
-			emit(sqlTok{kind: tokPlusMinus, text: string(c)})
+			emit(sqlTok{kind: tokPlusMinus, text: string(c)}, i+1)
 			i++
 		case c == '|':
 			if i+1 < n && sql[i+1] == '|' {
-				emit(sqlTok{kind: tokOther, text: "||"})
+				emit(sqlTok{kind: tokOther, text: "||"}, i+2)
 				i += 2
 			} else {
 				return nil, invalidf("unexpected %q", string(c))
@@ -213,7 +224,7 @@ func lex(sql string) ([]sqlTok, error) {
 			return nil, invalidf("unexpected character %q", string(c))
 		}
 	}
-	emit(sqlTok{kind: tokEOF})
+	emit(sqlTok{kind: tokEOF}, n)
 	return toks, nil
 }
 

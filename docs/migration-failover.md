@@ -25,6 +25,35 @@ Progress is streamed to the CLI in real-time.
 - Target host must be `active` and have sufficient resources
 - All disks must be on shared storage (NFS/Ceph/iSCSI), OR use `with-storage: true`
 - PCI passthrough devices block live migration (hot-detach first)
+- The target's CPU must be able to run the guest (see below)
+
+### CPU compatibility
+
+A guest whose CPU is derived from its host — `cpu-mode: host-model` (the create
+default) or `host-passthrough` — may be executing instructions the destination
+host does not have. litevirt checks this **before** provisioning anything on the
+target: the source reads the guest's CPU requirement from its live domain XML (for
+a `host-model` guest libvirt has already expanded that to a concrete model plus
+feature list; for `host-passthrough` the requirement is the source host's own CPU)
+and asks the target host whether it can satisfy it.
+
+A target that positively cannot refuses the migration up front:
+
+```
+target host "..." cannot run VM "...": its CPU does not provide what the guest is
+running on (cpu_mode=host-model, verdict=incompatible)
+```
+
+Migrate to a host with an equal-or-newer CPU, or stop the VM and pin a baseline
+both hosts support with `lv update <vm> --cpu-mode custom --cpu-model <model>`.
+
+The check is deliberately advisory in one direction only. It refuses **only** on a
+positive "cannot run" from the target; a target that cannot answer — a peer
+mid-rolling-upgrade that does not have the check yet, or one whose libvirt is
+briefly unhappy — is treated as *unverified*, not as incompatible, and the
+migration proceeds to libvirt's own check at cutover. A VM with an empty
+`cpu_mode` (QEMU's `qemu64`, identical on every host — see
+[`lv doctor cpu-mode`](diagnostics.md)) is not checked at all.
 
 ### Migration with local disks
 
@@ -318,6 +347,13 @@ row proven to be its own restore; `container_restore_timeout_sec`). See
 
 Scrape `http://<host>:7444/metrics` for:
 
+> That endpoint has **no authentication and no TLS**, and `metrics_bind`
+> defaults to all interfaces. Scraping it across a network means the cluster
+> inventory and this node's hardening posture are readable by anything that can
+> reach the port — see
+> [configuration.md → Metrics endpoint exposure](configuration.md#metrics-endpoint-exposure).
+
+
 - `litevirt_host_cpu_total`, `litevirt_host_memory_total_mib` — host resources
 - `litevirt_host_vm_count` — VMs per host
 - `litevirt_vm_state` — `1` if the VM is running, `0` otherwise
@@ -334,6 +370,11 @@ Scrape `http://<host>:7444/metrics` for:
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
   (`action` = `relocate`)
+- `litevirt_failover_stranded_workloads` — GAUGE: workloads still assigned to a host in state
+  `fenced`/`offline` that failover would move off a dead host. This node's view, so it reads `0`
+  unless the node holds the failover lease — alert on `max()` across instances, never `avg()`.
+  Zero is normal; the remedy for a sustained non-zero depends on why the host is down (see
+  [operating-model.md](operating-model.md))
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on

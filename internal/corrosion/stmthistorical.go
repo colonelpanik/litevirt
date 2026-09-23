@@ -216,5 +216,80 @@ func HistoricalShapes() []HistoricalShape {
 	add(`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
 		        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`, "complete_vm_start_pre_epoch_v47")
 
+	// The failover coordinator's lease upsert with the key as a LITERAL. Every
+	// release on this line emitted it unchanged from the initial commit through
+	// schema v50; at v52 all three lease consumers moved to the shared
+	// corrosion.AcquireLeaseWithTerm, which BINDS the key, so the literal form
+	// now has no emitter in this tree — but a prior-release coordinator still
+	// emits it on every poll cycle, and a receiver that stopped recognising it
+	// would back-pressure that peer's whole replication stream.
+	//
+	// The other two consumers (rebalancer, dual-run detector) already bound the
+	// key, so their shape is the one the shared helper matched and stays live in
+	// the generated ledger. This entry is the coordinator's alone.
+	add(`INSERT INTO leader_election (key, holder, expires_at, updated_at)
+		 VALUES ('failover', ?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE
+		   SET holder = excluded.holder,
+		       expires_at = excluded.expires_at,
+		       updated_at = excluded.updated_at
+		   WHERE leader_election.expires_at < ?
+		      OR leader_election.holder = excluded.holder`, "failover_lease_literal_key_v50")
+
+	// The lease-term mint's original INSERT OR IGNORE form. The writer now emits
+	// a plain INSERT: the receiver applies it as OR IGNORE anyway (the table is
+	// in customMergeTables, whose WAL branch calls setInsertOrIgnore), so the OR
+	// IGNORE bought nothing on receive and cost the LOCAL writer its error —
+	// SQLite's OR IGNORE skips a row violating NOT NULL or CHECK exactly as it
+	// skips a PK conflict, so a malformed row was dropped with a nil error.
+	//
+	// This shape is retained receive-only because a peer on the first
+	// term-ledger build still emits it, and dropping it would back-pressure that
+	// peer's stream. It applies identically to the new form.
+	//
+	// The `_v51`/`_v52` suffixes on the three lease-term family names below are
+	// FROZEN IDENTITIES, not schema versions. They were minted when this work
+	// sat at schema v51-v53; integrating upstream's NetBox IPAM PR took v51, so
+	// the lease-term versions moved up by one and the surrounding comments name
+	// the current numbers. The family names are deliberately NOT renumbered with
+	// them: a family name is part of the compatibility digest, and renaming one
+	// for cosmetics would spend a frozen identity on nothing.
+	add(`INSERT OR IGNORE INTO leader_lease_terms
+		   (key, term, holder, acquired_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`, "lease_term_mint_or_ignore_v51")
+
+	// The proof INSERT before the fencing term (v52 and earlier). A peer on a
+	// pre-v53 build emits this shape for every proof it mints, and a receiver
+	// that stopped recognising it would back-pressure that peer's entire
+	// replication stream mid-rolling-upgrade. It applies identically to the new
+	// form: the missing column takes its DEFAULT 0, which is exactly the
+	// "minted without a term" sentinel.
+	add(`INSERT OR IGNORE INTO runtime_action_proofs
+		(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+		 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token,
+		 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+		 created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
+		"proof_insert_pre_lease_term_v51")
+
+	// The proof INSERT at v53: lease_term present, lease_key not yet (v54). A
+	// peer on a v53 build emits this for every proof it mints, and a receiver
+	// that stopped recognising it would back-pressure that peer's entire
+	// replication stream mid-rolling-upgrade. It applies identically to the new
+	// form — the missing column takes its DEFAULT '', the "minted without a
+	// lease" sentinel that pairs with lease_term 0.
+	//
+	// Note there are now TWO retained proof-insert shapes, v52's and v53's, and
+	// both must stay while their emitters are supported. That is the cost of a
+	// second additive column on a replicated table in consecutive versions, not
+	// a sign either entry is redundant.
+	add(`INSERT OR IGNORE INTO runtime_action_proofs
+		(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+		 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term,
+		 status, step_state, result_code, result_detail, started_at, completed_at, executor_host,
+		 created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
+		"proof_insert_pre_lease_key_v52")
+
 	return out
 }

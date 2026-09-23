@@ -28,6 +28,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hooks"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/netbox"
@@ -80,7 +81,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
-	spec, err := normalizeCreateVMSpec(req.GetSpec())
+	spec, err := normalizeCreateVMSpec(req.GetSpec(), s.defaultCPUModeCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -963,6 +964,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
+	} else {
+		// Guarded on the insert having landed: with no row the graduation is a
+		// replicated no-op and a misleading log line. The invariant it maintains
+		// lives on assignOwnerEpochAtCreate; do not restate it here, or the two
+		// copies drift.
+		s.assignOwnerEpochAtCreate(ctx, spec.Name)
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -982,6 +989,77 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	hooks.Run(ctx, hooks.PostStart, stubVM, spec.Hooks)
 
 	return s.vmToProto(ctx, spec.Name)
+}
+
+// assignOwnerEpochAtCreate moves a freshly inserted VM row off the pre-epoch
+// default and stamps both runtime markers at the generation it assigned, so the
+// VM is provable before CreateVM returns instead of at the reconciler's next
+// sweep.
+//
+// Split out of the create path so the graduation failure is reachable in a test
+// without also failing the insert: the two share one *corrosion.Client, and a
+// test that breaks the client to fail the graduation breaks the insert too,
+// which skips this whole block and proves nothing.
+//
+// Nothing here is fatal. The VM is already running, and every outcome is one an
+// existing repair path handles — which is the whole reason for the ordering.
+func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
+	// Detached from the RPC context. The row is already committed and the guest is
+	// already running by the time this runs, so a client ^C or an RPC deadline that
+	// expired during the preceding image and disk work must not decide whether the
+	// VM is provable. With the failure path below correctly stamping nothing, an
+	// inherited cancellation would reliably leave a running VM at epoch 0 with no
+	// marker and no backstop unless enforcement.owner_epoch happens to be on. The
+	// same function already detaches its post-commit LB work for this reason.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
+		// Leave the row pre-epoch AND unmarked. That is exactly the state a create
+		// left behind before any of this existed, and the only one the repair paths
+		// can act on: convergeOwnerEpochMarker returns early for an epoch-0 row, so
+		// stamping a marker here would produce marker-1 against row-0 — a mismatch
+		// nothing converges, which assertRuntimeOwnership reads as
+		// marker_epoch_mismatch and which would refuse this VM's legitimate
+		// sole-holder re-key for good. It would also hold the row at 0, so
+		// OwnerEpochBackfillComplete keeps reporting this host unready and the
+		// fleet's owner_epoch_v1 latch never closes. The backfill sweep is the
+		// backstop, though only where enforcement.owner_epoch is on.
+		slog.Warn("vm create: could not assign the first owner epoch — leaving the VM "+
+			"unmarked for the backfill rather than stamping a marker the row cannot match",
+			"name", name, "error", gerr)
+		return
+	}
+	// Stamp both runtime markers now, at the epoch just assigned.
+	//
+	// A marker failure is not fatal. The row is already at a positive epoch, which
+	// is the precondition convergeOwnerEpochMarker needs, and its call site fires
+	// for any confirmed-running VM regardless of the enforcement flag — so the
+	// reconciler repairs a missing marker on its next sweep. That is also why the
+	// epoch is assigned BEFORE these writes and not after: the reverse order fails
+	// into marker-present against an epoch-0 row, which convergence returns early
+	// on and never repairs.
+	//
+	// The literal 1 rather than a re-read: the guarded UPDATE just applied to a row
+	// inserted at the column default, and a fresh read here would race the backfill
+	// for no gain.
+	if merr := s.virt.SetDomainOwnerEpoch(name, 1, true); merr != nil {
+		slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
+			"name", name, "error", merr)
+	}
+	// Skipped rather than written to a relative path when dataDir is unset:
+	// readVMMarker treats an empty dataDir as MarkerMissing, so writing anyway
+	// would create a marker tree under the daemon's cwd that no reader in this
+	// package will ever look at — a marker on disk while the inventory reports
+	// none.
+	if s.dataDir == "" {
+		slog.Warn("vm create: no data directory, so no owner-epoch file marker",
+			"name", name)
+		return
+	}
+	if merr := health.WriteVMOwnerEpochMarker(s.dataDir, name, 1); merr != nil {
+		slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
+			"name", name, "error", merr)
+	}
 }
 
 // pinMachineFromDomain upgrades a spec's machine ALIAS to the concrete
@@ -1069,6 +1147,9 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
+					//runningcheck:allow provably not running — this is the
+					// `vm.State == "running" && liveState == "stopped"` case, so liveState
+					// is "stopped" here. The guard cannot see through the switch.
 					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, err)
 					}
@@ -1103,19 +1184,25 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Anything added here ships for every VM in the cluster on every list,
 		// so it has to be a scalar a list-level caller reads. Labels render the
 		// table's tag chips and the ansible inventory's litevirt_label_* vars;
-		// Uuid and Machine are what `lv doctor vm-uuids` and
-		// `lv doctor machine-types` report on.
+		// Uuid, Machine and CpuMode are what `lv doctor vm-uuids`,
+		// `lv doctor machine-types` and `lv doctor cpu-mode` report on. CpuModel
+		// rides along with CpuMode so a list-level caller can render a custom
+		// mode without a per-VM InspectVM round trip.
 		if vm.Spec != "" {
 			var lite struct {
-				Labels  map[string]string `json:"labels"`
-				UUID    string            `json:"uuid"`
-				Machine string            `json:"machine"`
+				Labels   map[string]string `json:"labels"`
+				UUID     string            `json:"uuid"`
+				Machine  string            `json:"machine"`
+				CPUMode  string            `json:"cpu_mode"`
+				CPUModel string            `json:"cpu_model"`
 			}
 			if json.Unmarshal([]byte(vm.Spec), &lite) == nil {
 				pbVM.Spec = &pb.VMSpec{
-					Labels:  lite.Labels,
-					Uuid:    lite.UUID,
-					Machine: lite.Machine,
+					Labels:   lite.Labels,
+					Uuid:     lite.UUID,
+					Machine:  lite.Machine,
+					CpuMode:  lite.CPUMode,
+					CpuModel: lite.CPUModel,
 				}
 			}
 		}
@@ -2061,8 +2148,14 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// bus for the bus-resolution fallback below (vm_disks.bus is a v42 column
 	// not yet populated by every writer — see the Bus resolution comment in
 	// the Spec.Disks projection).
+	// Storage and Cache are compose-facing fields the vm_disks row does not
+	// carry in that form; the projection keeps the stored spec's values so a
+	// caller diffing a compose file against the inspected spec (`lv compose
+	// diff`) does not see an unchanged `storage:` disk as a topology change.
 	specDiskSizes := make(map[string]int64)
 	specDiskBuses := make(map[string]string)
+	specDiskStorage := make(map[string]string)
+	specDiskCache := make(map[string]string)
 	if spec != nil {
 		for _, ds := range spec.Disks {
 			if sz := parseDiskSizeBytes(ds.Size); sz > 0 {
@@ -2071,6 +2164,8 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 			if ds.Bus != "" {
 				specDiskBuses[ds.Name] = ds.Bus
 			}
+			specDiskStorage[ds.Name] = ds.Storage
+			specDiskCache[ds.Name] = ds.Cache
 		}
 	}
 	// Default root disk is 20G when no disks are specified.
@@ -2135,9 +2230,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 					sizeBytes = specSize
 				}
 				specDisks = append(specDisks, &pb.DiskSpec{
-					Name: disk.DiskName,
-					Size: formatDiskSizeBytes(sizeBytes),
-					Bus:  bus,
+					Name:    disk.DiskName,
+					Size:    formatDiskSizeBytes(sizeBytes),
+					Bus:     bus,
+					Storage: specDiskStorage[disk.DiskName],
+					Cache:   specDiskCache[disk.DiskName],
 				})
 			}
 			spec.Disks = specDisks
@@ -2975,7 +3072,16 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// write. ReplaceVM does it as ONE guarded transition — a single receiver
 	// decision over both VMs' incarnations and authority — which is why it needs
 	// vm_replace_v1 and why that was checked before any of the teardown above.
-	if err := corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared); err != nil {
+	//
+	// It is a MINTING transition — the row lands at a generation above both VMs —
+	// so it goes through publishRunningMinted, which marks the generation the
+	// commit produced. Left unmarked, the replaced VM's marker at this same name
+	// still names its own older generation, and runtimeSuperseded refuses the
+	// replacement's self-heal rebuild. Local by construction: CutoverVM forwarded
+	// to the replacement's host above.
+	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
+		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
+	}); err != nil {
 		return nil, status.Errorf(codes.Internal, "cutover: give %q the name %q: %v",
 			nextName, req.VmName, err)
 	}
@@ -3257,7 +3363,8 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 // the shape eligible for the live vCPU hot-add fast path.
 func isPureCPUGrowRequest(req *pb.UpdateVMRequest) bool {
 	return req.Cpu > 0 &&
-		req.MemoryMib == 0 && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+		req.MemoryMib == 0 && req.CpuMode == "" && req.CpuModel == "" &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.MinMemoryMib == nil && req.MaxMemoryMib == nil &&
 		req.SecureBoot == nil && req.Tpm == nil && req.MaxCpu == nil &&
 		req.Restart == nil && req.Onboot == nil && req.StartupOrder == nil &&
@@ -3352,19 +3459,26 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// REDEFINE-class fields bake into the domain XML, so they need the VM stopped.
 	// Only require stopped (and redefine) when one of them is actually changing —
 	// a metadata-only update applies live above.
-	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" ||
+	redefine := req.Cpu > 0 || req.MemoryMib > 0 || req.CpuMode != "" || req.CpuModel != "" ||
 		req.Machine != "" || req.Firmware != "" ||
 		req.GuestAgent != nil || req.MinMemoryMib != nil || req.MaxMemoryMib != nil ||
 		req.SecureBoot != nil || req.Tpm != nil || req.MaxCpu != nil
-	// A CPU/memory(+bounds)-only redefine can be applied by patching the inactive
-	// domain XML in place rather than regenerating it, so libvirt-assigned details
-	// (PCI slot addresses, controller models) survive — which matters for guests
-	// (e.g. Windows) that key licensing off stable hardware addresses. Any other
-	// redefine-class change (machine/firmware/SB/TPM/guest-agent/cpu-mode/VNC) needs
+	// A cpu/memory(+bounds)/cpu-mode redefine can be applied by patching the
+	// inactive domain XML in place rather than regenerating it, so libvirt-assigned
+	// details (PCI slot addresses, controller models) survive — which matters for
+	// guests (e.g. Windows) that key licensing off stable hardware addresses. Any
+	// other redefine-class change (machine/firmware/SB/TPM/guest-agent/VNC) needs
 	// full regeneration.
+	//
+	// cpu-mode is in the fast path because retrofitting a CPU mode onto an existing
+	// VM is the main reason to change one at all: a VM created before litevirt
+	// defaulted cpu_mode runs on QEMU's qemu64 (no AVX), and moving it forward
+	// should not also reshuffle its hardware addresses.
+	//
 	// max_cpu changes the vCPU-topology XML (<vcpu current=…>), which the value-only
 	// inactive-XML patch doesn't handle, so exclude it from the fast path.
-	cpuMemOnly := redefine && req.CpuMode == "" && req.Machine == "" && req.Firmware == "" &&
+	inPlaceEligible := redefine &&
+		req.Machine == "" && req.Firmware == "" &&
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	restartAfter := false
@@ -3522,9 +3636,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		if req.MemoryMib > 0 {
 			spec.MemoryMib = req.MemoryMib
 		}
-		if req.CpuMode != "" {
-			spec.CpuMode = req.CpuMode
+		cpuMode, cpuModel, cerr := mergeCPUModeUpdate(spec.CpuMode, spec.CpuModel, req.CpuMode, req.CpuModel)
+		if cerr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", cerr)
 		}
+		spec.CpuMode, spec.CpuModel = cpuMode, cpuModel
 		if req.Machine != "" {
 			spec.Machine = req.Machine
 		}
@@ -3723,9 +3839,20 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	// or the patch doesn't apply (both correct — regeneration now includes Min/Max
 	// memory + hostdevs).
 	var domXML string
-	if cpuMemOnly {
+	if inPlaceEligible {
 		if inactiveXML, derr := s.virt.DumpXMLInactive(req.Name); derr == nil {
-			if patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib)); perr == nil {
+			patched, perr := lv.PatchInactiveResources(inactiveXML, int(spec.Cpu), int(spec.MemoryMib), int(spec.MaxMemoryMib))
+			if perr == nil {
+				// Only call the CPU patch when this request asked to touch the CPU.
+				// PatchInactiveCPUMode is already a no-op on an empty mode — that is
+				// where the "a memory edit never moves the guest's CPU" guarantee
+				// actually lives and is tested — so this is belt-and-braces that also
+				// keeps the call-site intent obvious.
+				if req.CpuMode != "" || req.CpuModel != "" {
+					patched, perr = lv.PatchInactiveCPUMode(patched, spec.CpuMode, spec.CpuModel)
+				}
+			}
+			if perr == nil {
 				domXML = patched
 			} else {
 				slog.Warn("inactive-XML patch failed; regenerating", "vm", req.Name, "error", perr)

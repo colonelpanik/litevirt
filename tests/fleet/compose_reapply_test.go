@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -42,6 +44,7 @@ vms:
 // (plan + execute) rather than the planner in isolation, so the stored-spec
 // shape the planner reads is the one CreateVM actually writes.
 func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
+	stageFakeGenisoimage(t)
 	c := New(t, Options{Nodes: 1})
 	ctx := context.Background()
 	node := c.Nodes[0]
@@ -89,6 +92,23 @@ func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
 	if got := specUUID(t, second.Spec); got != firstUUID {
 		t.Errorf("VM identity changed across re-apply: uuid %s → %s", firstUUID, got)
 	}
+}
+
+// stageFakeGenisoimage puts a stand-in `genisoimage` first on PATH for the
+// test. A VM with an explicit cloud-init block has its NoCloud ISO generated at
+// create time by shelling out to genisoimage, and a failure there is fatal to
+// the create (unlike the auto-generated minimal ISO, which is best-effort). CI
+// runners do not ship the binary; the libvirt fake never reads the ISO, so an
+// empty file at the -output path is all the create needs.
+func stageFakeGenisoimage(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\n# test stand-in: create the -output file, ignore everything else\n" +
+		"while [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-output\" ]; then : > \"$2\"; shift; fi\n  shift\ndone\n"
+	if err := os.WriteFile(filepath.Join(dir, "genisoimage"), []byte(script), 0o755); err != nil {
+		t.Fatalf("stage fake genisoimage: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 // dryRunPlan runs DeployStack with DryRun and returns every progress message.

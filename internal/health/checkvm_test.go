@@ -53,7 +53,7 @@ func TestCheckVM_HealthyProbe_ResetsFailures(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// Pre-seed some failures.
 	v.mu.Lock()
 	v.failures["vm-healthy"] = 2
@@ -104,7 +104,7 @@ func TestCheckVM_FailedProbe_IncrementsFailures(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-failing", HostName: "node1", Spec: string(specJSON), State: "running"}
 
 	v.checkVM(ctx, vm, hspec)
@@ -156,7 +156,7 @@ func TestCheckVM_ThresholdCrossed_TriggersAction(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-action", HostName: "node1", Spec: string(specJSON), State: "running"}
 
 	// Fail twice (retries=2).
@@ -204,7 +204,7 @@ func TestCheckVM_AlertAction(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "vm-alert", HostName: "node1", Spec: string(specJSON), State: "running"}
 
 	// Should not panic — alert action just logs.
@@ -236,7 +236,7 @@ func TestTakeAction_OperatorStop_Skipped(t *testing.T) {
 	// Set operator-stop detail.
 	corrosion.UpdateVMState(ctx, db, "vm-opstop", "stopped", "operator-stop")
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Action: "restart"}
 	vm := corrosion.VMRecord{Name: "vm-opstop", HostName: "node1"}
 
@@ -265,7 +265,7 @@ func TestTakeAction_StateChanged_Skipped(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Action: "restart"}
 	vm := corrosion.VMRecord{Name: "vm-migrating", HostName: "node1"}
 
@@ -287,7 +287,7 @@ func TestTakeAction_DefaultAction_IsRestart(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	// Empty action should default to "restart".
 	hspec := &pb.HealthCheckSpec{Action: ""}
 	vm := corrosion.VMRecord{Name: "vm-default-action", HostName: "node1"}
@@ -310,7 +310,7 @@ func TestTakeAction_UnknownAction(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Action: "explode"}
 	vm := corrosion.VMRecord{Name: "vm-unknown-action", HostName: "node1"}
 
@@ -332,7 +332,7 @@ func TestTakeAction_MigrateAction_NilVirt(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Action: "migrate"}
 	vm := corrosion.VMRecord{Name: "vm-migrate-nil", HostName: "node1"}
 
@@ -354,7 +354,7 @@ func TestTakeAction_CorrelatedFailure_Suppressed(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	// Seed correlated failures (3 VMs with >= 2 failures each).
 	v.mu.Lock()
@@ -379,7 +379,7 @@ func TestTakeAction_CorrelatedFailure_Suppressed(t *testing.T) {
 func TestTakeAction_VMNotFound_Skipped(t *testing.T) {
 	db := testCheckVMDB(t)
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	hspec := &pb.HealthCheckSpec{Action: "restart"}
 	vm := corrosion.VMRecord{Name: "nonexistent-vm", HostName: "node1"}
 
@@ -413,7 +413,7 @@ func TestSweep_WithRunningVMAndHealthcheck(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	v.sweep(ctx)
 
 	// Give the goroutine a moment to run.
@@ -431,7 +431,7 @@ func TestSweep_WithRunningVMAndHealthcheck(t *testing.T) {
 
 func TestMigrateVM_NilVirt(t *testing.T) {
 	db := testCheckVMDB(t)
-	v := NewVMChecker("node1", db, nil)
+	v := NewVMChecker("node1", t.TempDir(), db, nil)
 
 	vm := corrosion.VMRecord{Name: "vm-mig", HostName: "node1"}
 	// Should not panic.
@@ -515,7 +515,7 @@ func TestPickMigrationTarget_PrefersMoreMemory(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("failing-host", db, nil)
+	v := NewVMChecker("failing-host", t.TempDir(), db, nil)
 	target, err := v.pickMigrationTarget(ctx, "failing-host", 2048)
 	if err != nil {
 		t.Fatalf("pickMigrationTarget: %v", err)
@@ -537,7 +537,7 @@ func TestPickMigrationTarget_ExcludesCurrentHost(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 	target, err := v.pickMigrationTarget(ctx, "host-a", 0)
 	if err != nil {
 		t.Fatalf("pickMigrationTarget: %v", err)
@@ -563,7 +563,7 @@ func TestPickMigrationTarget_InsufficientMemory_AllConsumed(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 	_, err := v.pickMigrationTarget(ctx, "host-a", 8192)
 	if err == nil {
 		t.Fatal("expected error for insufficient memory, got nil")
@@ -584,7 +584,7 @@ func TestPickMigrationTarget_SkipsInactiveHosts(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 	target, err := v.pickMigrationTarget(ctx, "host-a", 0)
 	if err != nil {
 		t.Fatalf("pickMigrationTarget: %v", err)
@@ -622,7 +622,7 @@ func TestMigrateVM_UsesCallback(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 
 	var calledVM, calledTarget string
 	v.SetMigrateFunc(func(ctx context.Context, vmName, targetHost string) error {
@@ -664,7 +664,7 @@ func TestMigrateVM_NoCallback_NilVirt(t *testing.T) {
 	}
 
 	// No migrateVMFunc registered and virt=nil.
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "migrate-novirt", HostName: "host-a", State: "running"}
 
 	// Should not crash — logs error and returns early.
@@ -698,7 +698,7 @@ func TestMigrateVM_NoTarget(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	v := NewVMChecker("host-a", db, nil)
+	v := NewVMChecker("host-a", t.TempDir(), db, nil)
 	vm := corrosion.VMRecord{Name: "migrate-notarget", HostName: "host-a", State: "running"}
 
 	v.migrateVM(ctx, vm)

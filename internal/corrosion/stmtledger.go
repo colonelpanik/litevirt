@@ -175,12 +175,26 @@ func relayStatement(s Statement, changed bool) bool {
 	return !createOnlyStatement(s.SQL)
 }
 
-// createOnlyStatement reports whether sql's registered shape is append-only —
-// INSERT OR IGNORE with no LWW rule.
+// createOnlyStatement reports whether sql's registered shape is one every
+// receiver applies as INSERT OR IGNORE with no LWW rule to heal a disagreement:
+//
+//   - DispAppendOnly, whatever the kind (the disposition is only ever derived
+//     for inserts);
+//   - a DispCustomMerge INSERT. The custom-merge tables — runtime_action_proofs,
+//     operations, operation_steps, project_authority_epochs — merge by their own
+//     rule, and for a create that rule is exactly INSERT OR IGNORE: the
+//     replicator's DispCustomMerge arm rewrites the verb on receipt. Recognising
+//     only DispAppendOnly left a duplicate action proof relaying its wrong
+//     content while the genuine row won locally, which is the hole
+//     WriteActionProofValidated was written around.
+//
+// A custom-merge UPDATE is NOT create-only. It travels with its guard and the
+// receiver applies it verbatim, so a zero-row update here may be the very
+// transition a peer whose row is behind still needs.
 //
 // DispositionAfter counts as well as Disposition. A capability-gated shape
 // reads DispReject until its token is active and its real disposition after, so
-// consulting only the first field would miss the append-only shapes during
+// consulting only the first field would miss the create-only shapes during
 // exactly the rollout window when peers are most likely to be missing rows.
 func createOnlyStatement(sql string) bool {
 	fp, err := FingerprintSQL(sql)
@@ -191,5 +205,16 @@ func createOnlyStatement(sql string) bool {
 	if !ok {
 		return false
 	}
-	return e.Disposition == DispAppendOnly || e.DispositionAfter == DispAppendOnly
+	return createOnlyDisposition(e, e.Disposition) || createOnlyDisposition(e, e.DispositionAfter)
+}
+
+// createOnlyDisposition is the per-disposition half of createOnlyStatement.
+func createOnlyDisposition(e LedgerEntry, d Disposition) bool {
+	switch d {
+	case DispAppendOnly:
+		return true
+	case DispCustomMerge:
+		return e.Kind == KindInsert.String()
+	}
+	return false
 }

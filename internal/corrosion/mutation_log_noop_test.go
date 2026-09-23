@@ -131,6 +131,12 @@ func TestCreateOnlyStatement_ClassifiesRegisteredShapes(t *testing.T) {
 		   (id, vm_name, host_name, type, result, severity, detail, username, ts)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, true},
 		{"hosts full-PK LWW update", `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, false},
+		{"runtime_action_proofs custom-merge insert", insertProofSQL, true},
+		{"runtime_action_proofs custom-merge guarded update", `UPDATE runtime_action_proofs
+		    SET step_state = TRIM(COALESCE(step_state,'') || ' ' || ?), updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL
+		    AND status NOT IN ('completed','failed')
+		    AND instr(' ' || COALESCE(step_state,'') || ' ', ' ' || ? || ' ') = 0`, false},
 		{"unparseable sql", `NOT SQL AT ALL`, false},
 		{"unregistered shape", `INSERT OR IGNORE INTO no_such_table (a) VALUES (?)`, false},
 	} {
@@ -139,5 +145,71 @@ func TestCreateOnlyStatement_ClassifiesRegisteredShapes(t *testing.T) {
 				t.Errorf("createOnlyStatement = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The filter recognised only DispAppendOnly, but a custom-merge INSERT applies
+// on every receiver as INSERT OR IGNORE too (replicator.go's DispCustomMerge
+// arm rewrites the verb), and runtime_action_proofs, operations and
+// operation_steps are custom-merge. So a duplicate action proof — same id,
+// different destination — changed nothing here, kept the genuine row locally,
+// and still relayed the wrong-host content. A peer that received that entry
+// before the genuine proof applied it and then dropped the real one on the
+// primary key, and no LWW rule heals a custom-merge row.
+//
+// This is the table WriteActionProofValidated exists to work around, so the
+// PR's claim that it becomes deletable rests on this case.
+func TestExecute_ACustomMergeCreateNoOpIsNotRelayed(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	genuine := ActionProof{
+		ID: "p1", Action: ActionPromote, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "host-b", Coordinator: "coord",
+	}
+	if err := WriteActionProof(ctx, c, genuine); err != nil {
+		t.Fatalf("seed the genuine proof: %v", err)
+	}
+	before := mutationLogCount(t, c)
+	if before == 0 {
+		t.Fatal("premise: the genuine proof logged nothing")
+	}
+
+	forged := genuine
+	forged.DestHost = "wrong-host"
+	if err := WriteActionProof(ctx, c, forged); err != nil {
+		t.Fatalf("duplicate proof: %v", err)
+	}
+
+	if after := mutationLogCount(t, c); after != before {
+		t.Errorf("a custom-merge create that changed no row queued %d statement(s); a peer "+
+			"that has not yet received the genuine proof applies the wrong-host one as "+
+			"INSERT OR IGNORE and then drops the genuine row on the primary key", after-before)
+	}
+	pr, ok, err := GetActionProof(ctx, c, "p1")
+	if err != nil || !ok {
+		t.Fatalf("GetActionProof: ok=%v err=%v", ok, err)
+	}
+	if pr.DestHost != "host-b" {
+		t.Errorf("local proof dest = %q, want the genuine host-b", pr.DestHost)
+	}
+}
+
+// A custom-merge UPDATE that matched no row here is still relayed. It travels
+// with its guard and the receiver applies it verbatim, so a peer whose row is
+// behind ours may be exactly the one that needs it — widening the filter to
+// every custom-merge no-op would silently stop lifecycle transitions.
+func TestExecute_ACustomMergeUpdateNoOpIsUnaffected(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	before := mutationLogCount(t, c)
+	if err := AppendProofStep(ctx, c, "no-such-proof", "defined"); err != nil {
+		t.Fatalf("AppendProofStep: %v", err)
+	}
+	if after := mutationLogCount(t, c); after <= before {
+		t.Error("a zero-row custom-merge UPDATE was suppressed; only the CREATE shape of a " +
+			"custom-merge table applies as INSERT OR IGNORE on the receiver, its guarded " +
+			"updates must keep travelling")
 	}
 }

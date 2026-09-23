@@ -30,6 +30,18 @@ type fakeServerGate struct {
 	// test assert on a token that is latched only in memory (not yet durable) —
 	// the case a plain Latched-mirroring default cannot express.
 	durablyLatchedTok map[string]bool
+
+	// quorum/needed back QuorumProof, which the lease-term barrier compares its
+	// own responder count against. The zero value is QuorumUnknown — the
+	// tri-state's fail-closed member — so a test that does not set it does not
+	// accidentally get quorum.
+	quorum health.QuorumState
+	live   int
+	needed int
+}
+
+func (f fakeServerGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
+	return f.quorum, f.live, f.needed
 }
 
 func (f fakeServerGate) ExecutionGate(context.Context) health.GateResult {

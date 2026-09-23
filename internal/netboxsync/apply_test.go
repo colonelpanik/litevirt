@@ -767,6 +767,9 @@ type stubVirt struct {
 	interfacesByIdentity map[string][]int
 	devices              map[string]int
 	deviceErr            error
+	// primaryIPs records every SetPrimaryIP4 call as {vmID, ipID}, so a test
+	// can assert the mirror set one and did not re-send it.
+	primaryIPs [][2]int
 
 	// dropMACOnCreate models a NetBox whose vminterface serializer does not know
 	// mac_address: DRF ignores an unknown write field silently, so the object
@@ -984,7 +987,14 @@ func (s *stubVirt) ClearIPAssignment(_ context.Context, ipID int) error {
 	return nil
 }
 
-func (s *stubVirt) FindDeviceByName(_ context.Context, name string) (int, error) {
+func (s *stubVirt) SetPrimaryIP4(_ context.Context, vmID, ipID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.primaryIPs = append(s.primaryIPs, [2]int{vmID, ipID})
+	return nil
+}
+
+func (s *stubVirt) FindDeviceInCluster(_ context.Context, name string, clusterID int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deviceLookups = append(s.deviceLookups, name)

@@ -19,7 +19,7 @@ func TestComputeRelays_Deterministic(t *testing.T) {
 
 	// Every node should compute the same relay set.
 	for _, self := range []string{"node-a", "node-b", "node-c", "node-d", "node-e"} {
-		rs := ComputeRelays(members, self, cfg)
+		rs := ComputeRelays(members, self, cfg, nil)
 		if got := len(rs.Relays()); got != 4 {
 			t.Errorf("self=%s: expected 4 relays (3 + ceil(5/50)), got %d", self, got)
 		}
@@ -38,7 +38,7 @@ func TestComputeRelays_SmallCluster(t *testing.T) {
 
 	// 2-node cluster: both should be relays (R = min(2, 3+1) = 2).
 	members := makePeers("node-b")
-	rs := ComputeRelays(members, "node-a", cfg)
+	rs := ComputeRelays(members, "node-a", cfg, nil)
 	if got := len(rs.Relays()); got != 2 {
 		t.Errorf("2-node cluster: expected 2 relays, got %d", got)
 	}
@@ -48,13 +48,13 @@ func TestComputeRelays_SmallCluster(t *testing.T) {
 
 	// 3-node cluster: all relays (R = min(3, 3+1) = 3).
 	members = makePeers("node-b", "node-c")
-	rs = ComputeRelays(members, "node-a", cfg)
+	rs = ComputeRelays(members, "node-a", cfg, nil)
 	if got := len(rs.Relays()); got != 3 {
 		t.Errorf("3-node cluster: expected 3 relays, got %d", got)
 	}
 
 	// 1-node cluster: self is relay.
-	rs = ComputeRelays(nil, "node-a", cfg)
+	rs = ComputeRelays(nil, "node-a", cfg, nil)
 	if got := len(rs.Relays()); got != 1 {
 		t.Errorf("1-node cluster: expected 1 relay, got %d", got)
 	}
@@ -79,7 +79,7 @@ func TestComputeRelays_Scaling(t *testing.T) {
 
 	for _, tt := range tests {
 		members := makePeersN(tt.nodes - 1) // -1 because self is added
-		rs := ComputeRelays(members, "node-0000", cfg)
+		rs := ComputeRelays(members, "node-0000", cfg, nil)
 		if got := len(rs.Relays()); got != tt.wantRelay {
 			t.Errorf("n=%d: expected %d relays, got %d", tt.nodes, tt.wantRelay, got)
 		}
@@ -91,11 +91,11 @@ func TestComputeRelays_MembershipChange(t *testing.T) {
 
 	// Start with 5 nodes: relays are node-a, node-b, node-c, node-d
 	members := makePeers("node-a", "node-b", "node-c", "node-d", "node-e")
-	rs1 := ComputeRelays(members, "node-e", cfg)
+	rs1 := ComputeRelays(members, "node-e", cfg, nil)
 
 	// node-a departs: relays should be re-elected from remaining 4
 	members = makePeers("node-b", "node-c", "node-d", "node-e")
-	rs2 := ComputeRelays(members, "node-e", cfg)
+	rs2 := ComputeRelays(members, "node-e", cfg, nil)
 
 	if rs2.IsRelay("node-a") {
 		t.Error("departed node-a should not be relay")
@@ -112,7 +112,7 @@ func TestLeafAssignment_Deterministic(t *testing.T) {
 
 	// 6 nodes, 4 relays, 2 leaves
 	members := makePeers("node-a", "node-b", "node-c", "node-d", "node-e", "node-f")
-	rs := ComputeRelays(members, "node-a", cfg)
+	rs := ComputeRelays(members, "node-a", cfg, nil)
 
 	// Leaves are node-e, node-f (alphabetically after the 4 relays)
 	if rs.IsRelay("node-e") || rs.IsRelay("node-f") {
@@ -133,7 +133,7 @@ func TestLeafAssignment_Overlap(t *testing.T) {
 
 	// 10 nodes
 	members := makePeersN(10)
-	rs := ComputeRelays(members, "node-0000", cfg)
+	rs := ComputeRelays(members, "node-0000", cfg, nil)
 
 	// Every leaf should have exactly 2 assigned relays.
 	for _, m := range members {
@@ -154,7 +154,7 @@ func TestTargetsFor_Relay(t *testing.T) {
 	cfg := RelayConfig{BaseRelays: 3, NodesPerRelay: 50}
 
 	members := makePeers("node-a", "node-b", "node-c", "node-d", "node-e", "node-f")
-	rs := ComputeRelays(members, "node-a", cfg)
+	rs := ComputeRelays(members, "node-a", cfg, nil)
 
 	targets := rs.TargetsFor("node-a", false, nil)
 	// Relay should target: assigned leaves + other relays
@@ -174,7 +174,7 @@ func TestTargetsFor_Leaf(t *testing.T) {
 	cfg := RelayConfig{BaseRelays: 3, NodesPerRelay: 50}
 
 	members := makePeers("node-a", "node-b", "node-c", "node-d", "node-e", "node-f")
-	rs := ComputeRelays(members, "node-e", cfg)
+	rs := ComputeRelays(members, "node-e", cfg, nil)
 
 	targets := rs.TargetsFor("node-e", false, nil)
 	// Leaf should only target its 2 assigned relays.
@@ -629,7 +629,7 @@ func TestFallbackActivation(t *testing.T) {
 	// Simulate leaf mode with stale relay push.
 	r.mu.Lock()
 	r.isRelay = false
-	r.relaySet = ComputeRelays(makePeers("relay-1", "relay-2", "relay-3"), "leaf-1", r.relayCfg)
+	r.relaySet = ComputeRelays(makePeers("relay-1", "relay-2", "relay-3"), "leaf-1", r.relayCfg, nil)
 	r.mu.Unlock()
 	r.lastRelayPush.Store(time.Now().Add(-1 * time.Second).UnixMilli())
 

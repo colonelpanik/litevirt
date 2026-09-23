@@ -32,6 +32,7 @@ type Replicator struct {
 	mu             sync.Mutex
 	peers          map[string]context.CancelFunc // peer name → cancel for its goroutine
 	relaySet       *RelaySet                     // current relay election result
+	lastEligible   map[string]bool               // last successfully-read relay eligibility
 	isRelay        bool                          // cached: is this node a relay?
 	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
 	// pushFailingSince records, per peer, when its CURRENT run of failed pushes
@@ -284,11 +285,65 @@ func (r *Replicator) cleanupDepartedWatermark(name string) {
 	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
 }
 
+// relayEligibility is RelayEligibleHosts for the REPLICATION path, which needs
+// a stronger failure mode than the self-upgrade caller does.
+//
+// RelayEligibleHosts returns nil on a read error, and ComputeRelays reads nil
+// as "no information" and reproduces the plain sorted-hostname ordering. For a
+// single-node question that is right. Here it is the exact divergence
+// ComputeRelays forbids: a local query failure is THIS node's opinion, and
+// acting on it makes this one node elect a relay set no peer agrees with.
+//
+// The damage is asymmetric, which is what makes it worth retaining state to
+// avoid. Only a node that believes itself a relay re-records forwarded
+// mutations for fan-out, so a diverged node pushes to hosts that apply its
+// writes locally and forward nothing: its mutations reach nowhere else until
+// anti-entropy catches up, while every backlog gauge reads healthy because the
+// pushes themselves succeed.
+//
+// So a failed read RETAINS the last eligibility this node successfully
+// computed. Before anything has been proved — the first read at startup — it
+// yields no information, which is the honest answer and the documented nil
+// behaviour.
+func (r *Replicator) relayEligibility(ctx context.Context) map[string]bool {
+	if got := RelayEligibleHosts(ctx, r.client); got != nil {
+		r.mu.Lock()
+		r.lastEligible = got
+		r.mu.Unlock()
+		return got
+	}
+	r.mu.Lock()
+	last := r.lastEligible
+	r.mu.Unlock()
+	if last == nil {
+		return nil
+	}
+	// Copy: the caller must not be able to mutate the retained map, and the
+	// next successful read replaces it wholesale.
+	out := make(map[string]bool, len(last))
+	for k, v := range last {
+		out[k] = v
+	}
+	return out
+}
+
+// peerIsRelay reports whether THIS node's current relay election makes peerName
+// a relay. It is the sender half of the claim carried on every push.
+func (r *Replicator) peerIsRelay(peerName string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.relaySet != nil && r.relaySet.IsRelay(peerName)
+}
+
 func (r *Replicator) syncPeers() {
 	members := r.client.Members()
 
-	// Compute relay set from current membership.
-	rs := ComputeRelays(members, r.client.HostName(), r.relayCfg)
+	// Compute the relay set from current membership, restricted to hosts the
+	// REPLICATED state says are fit to relay. Memberlist liveness is not used:
+	// it is this node's own view, and of the gossip port rather than the
+	// replication one, so two nodes could disagree about the topology.
+	rs := ComputeRelays(members, r.client.HostName(), r.relayCfg,
+		r.relayEligibility(context.Background()))
 
 	r.mu.Lock()
 	oldIsRelay := r.isRelay
@@ -548,6 +603,10 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		// a node whose DB was pre-staged forward but whose binary hasn't swapped
 		// yet still reports the real (forward) schema and replication keeps flowing.
 		SenderSchemaVersion: int32(r.client.EffectiveDBSchema()),
+		// This node's belief that the PEER is a relay, carried so the peer can
+		// fan out even if its own copy of hosts.state disagrees with ours. The
+		// relay set is read under the lock because syncPeers replaces it.
+		ReceiverIsRelay: r.peerIsRelay(peerName),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("push mutations: %w", err)
@@ -1068,13 +1127,41 @@ func isSchemaMissingError(err error) bool {
 	return false
 }
 
-// ApplyRemoteMutations applies mutation entries received from a remote peer.
+// ApplyRemoteMutations applies a push that carries no relay claim.
+//
+// Every existing caller means this: a test, or a sender on a released build
+// whose request has the field at its zero value.
+func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.MutationEntry) (int64, error) {
+	return r.ApplyRemoteMutationsFrom(ctx, entries, false)
+}
+
+// ApplyRemoteMutationsFrom applies mutation entries received from a remote peer.
 // It uses LWW (Last-Writer-Wins) based on HLC timestamps for conflict resolution.
 // Entries already seen (via mutation_seen dedup table) are skipped.
-// If this node is a relay, applied entries are also recorded in mutation_log
-// (preserving original origin) for fan-out to assigned leaves.
 // Returns the highest sequence number successfully applied.
-func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.MutationEntry) (int64, error) {
+//
+// pushedAsRelay is the SENDER's belief that this node is a relay, and it is
+// honoured alongside this node's own.
+//
+// Fan-out used to be gated on r.isRelay alone, and that belief is derived from
+// hosts.state — replicated data, which converges asynchronously. Two nodes can
+// therefore hold different rows for the same host at the same instant (a member
+// whose row has not arrived yet; one that is 'draining' here and still 'active'
+// there) and compute different relay sets. No rule over asynchronously
+// replicated state can avoid that, so the consequence is what gets fixed rather
+// than the disagreement.
+//
+// The consequence was silent. A node pushed to as a relay by a peer that
+// believes it is one, while it does not, applied those mutations locally and
+// forwarded nothing; the sender's backlog gauges stayed green because the push
+// itself succeeded, and every leaf behind that relay simply stopped receiving
+// until anti-entropy caught up.
+//
+// Honouring the claim cannot loop and cannot duplicate. recordInMutationLog
+// preserves each entry's ORIGINAL origin and hlc, and filterUnseen dedups on
+// exactly that pair, so a peer that has already seen an entry skips it however
+// it arrives. The cost of an unnecessary claim is one wasted push.
+func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb.MutationEntry, pushedAsRelay bool) (int64, error) {
 	if len(entries) == 0 {
 		return 0, nil
 	}
@@ -1197,12 +1284,14 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 		return 0, err
 	}
 
-	// If this node is a relay, record in mutation_log for fan-out.
-	// Preserves original origin so readMutationLog's origin filter works correctly.
+	// Record in mutation_log for fan-out if EITHER side believes this node is a
+	// relay. Preserves original origin so readMutationLog's origin filter works
+	// correctly -- and so the (origin, hlc) dedup keeps working downstream.
 	r.mu.Lock()
 	isRelay := r.isRelay
 	r.mu.Unlock()
-	if isRelay {
+	fanOut := isRelay || pushedAsRelay
+	if fanOut {
 		if err := r.recordInMutationLog(ctx, tx, unseen); err != nil {
 			_ = tx.Rollback()
 			slog.Error("replicator: failed to record forwarded mutations — back-pressuring replication", "error", err)
@@ -1215,8 +1304,8 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	}
 	r.client.runDeferredEffects(tx) // the batch committed → apply the deferred tracker/orphan effects
 
-	// If relay and we recorded entries, wake the replicator to fan out.
-	if isRelay && len(unseen) > 0 {
+	// If we recorded entries for fan-out, wake the replicator to send them.
+	if fanOut && len(unseen) > 0 {
 		r.client.notifyReplicator()
 	}
 

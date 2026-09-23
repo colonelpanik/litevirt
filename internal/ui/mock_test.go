@@ -32,56 +32,61 @@ type mockGRPC struct {
 	pb.LiteVirtClient
 
 	mu sync.Mutex
+	// whoamiRole overrides the role Whoami reports (default "admin"), and
+	// whoamiErr makes Whoami fail — both so a test can drive the UI's
+	// authorization gate rather than only its happy path.
+	whoamiRole string
+	whoamiErr  error
 	// Response fields
-	listHostsResp        *pb.ListHostsResponse
-	listHostNetworksResp *pb.ListHostNetworksResponse
+	listHostsResp         *pb.ListHostsResponse
+	listHostNetworksResp  *pb.ListHostNetworksResponse
 	lastUpsertHostNetwork *pb.UpsertHostNetworkRequest
 	lastApplyHostNetwork  *pb.ApplyHostNetworkRequest
 	lastDeleteHostNetwork *pb.DeleteHostNetworkRequest
 	planHostNetworkResp   *pb.PlanHostNetworkResponse
-	inspectHostResp      *pb.Host
-	inspectHostErr       error
-	listVMsResp          *pb.ListVMsResponse
-	inspectVMResp        *pb.VM
-	inspectVMErr         error
-	listStacksResp       *pb.ListStacksResponse
-	listImagesResp       *pb.ListImagesResponse
-	listContainersResp   *pb.ListContainersResponse
-	listSchedulesResp    *pb.ListBackupSchedulesResponse
-	listUsersResp        *pb.ListUsersResponse
-	listNetworksResp     *pb.ListNetworksResponse
-	listLBsResp          *pb.ListLBResponse
-	inspectLBResp        *pb.LoadBalancer
-	inspectLBErr         error
-	auditLogResp         *pb.ListAuditLogResponse
-	loginResp            *pb.LoginResponse
-	loginErr             error
-	vmStatsResp          *pb.VMStats
-	vmStatsErr           error
-	hostStatsResp        *pb.HostResourceStats
-	hostStatsErr         error
-	lbStatsResp          *pb.LBStatsResponse
-	lbStatsErr           error
-	fenceHostResp        *pb.FenceResult
-	listHostDevicesResp  *pb.ListHostDevicesResponse
-	configureHostResp    *pb.Host
-	listSnapshotsResp    *pb.ListSnapshotsResponse
-	createNetworkResp    *pb.NetworkInfo
-	diffStackResp        *pb.DiffStackResponse
-	diffStackErr         error
-	clusterStatusResp    *pb.ClusterStatus
-	listStoragePoolsResp *pb.ListStoragePoolsResponse
-	spiceInfoResp        *pb.GetSpiceInfoResponse
-	spiceInfoErr         error
-	lastSetLabelsVMReq   *pb.SetVMLabelsRequest
-	setLabelsVMErr       error
-	poolContentsResp     *pb.ListStoragePoolContentsResponse
-	poolContentsErr      error
-	lastPoolContentsReq  *pb.ListStoragePoolContentsRequest
-	listVMHardwareResp   *pb.ListVMHardwareResponse
-	listVMHardwareErr    error
-	uploadStream         *fakeUploadStream
-	uploadStreamErr      error
+	inspectHostResp       *pb.Host
+	inspectHostErr        error
+	listVMsResp           *pb.ListVMsResponse
+	inspectVMResp         *pb.VM
+	inspectVMErr          error
+	listStacksResp        *pb.ListStacksResponse
+	listImagesResp        *pb.ListImagesResponse
+	listContainersResp    *pb.ListContainersResponse
+	listSchedulesResp     *pb.ListBackupSchedulesResponse
+	listUsersResp         *pb.ListUsersResponse
+	listNetworksResp      *pb.ListNetworksResponse
+	listLBsResp           *pb.ListLBResponse
+	inspectLBResp         *pb.LoadBalancer
+	inspectLBErr          error
+	auditLogResp          *pb.ListAuditLogResponse
+	loginResp             *pb.LoginResponse
+	loginErr              error
+	vmStatsResp           *pb.VMStats
+	vmStatsErr            error
+	hostStatsResp         *pb.HostResourceStats
+	hostStatsErr          error
+	lbStatsResp           *pb.LBStatsResponse
+	lbStatsErr            error
+	fenceHostResp         *pb.FenceResult
+	listHostDevicesResp   *pb.ListHostDevicesResponse
+	configureHostResp     *pb.Host
+	listSnapshotsResp     *pb.ListSnapshotsResponse
+	createNetworkResp     *pb.NetworkInfo
+	diffStackResp         *pb.DiffStackResponse
+	diffStackErr          error
+	clusterStatusResp     *pb.ClusterStatus
+	listStoragePoolsResp  *pb.ListStoragePoolsResponse
+	spiceInfoResp         *pb.GetSpiceInfoResponse
+	spiceInfoErr          error
+	lastSetLabelsVMReq    *pb.SetVMLabelsRequest
+	setLabelsVMErr        error
+	poolContentsResp      *pb.ListStoragePoolContentsResponse
+	poolContentsErr       error
+	lastPoolContentsReq   *pb.ListStoragePoolContentsRequest
+	listVMHardwareResp    *pb.ListVMHardwareResponse
+	listVMHardwareErr     error
+	uploadStream          *fakeUploadStream
+	uploadStreamErr       error
 
 	// Error injection for actions
 	startVMErr         error
@@ -738,7 +743,16 @@ func (m *mockGRPC) Logout(context.Context, *emptypb.Empty, ...grpc.CallOption) (
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) Whoami(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.WhoamiResponse, error) {
-	return &pb.WhoamiResponse{Username: "admin", Role: "admin", Realm: "local"}, nil
+	m.mu.Lock()
+	role, err := m.whoamiRole, m.whoamiErr
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		role = "admin"
+	}
+	return &pb.WhoamiResponse{Username: role, Role: role, Realm: "local"}, nil
 }
 func (m *mockGRPC) ChangePassword(context.Context, *pb.ChangePasswordRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil

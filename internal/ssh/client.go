@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/crypto/ssh"
@@ -72,6 +73,26 @@ func (c *Client) Run(cmd string) error {
 	return session.Run(cmd)
 }
 
+// RunWithInput runs a command with data on its stdin.
+//
+// This is how a provisioning script should reach a remote host: `bash -s` with
+// the script on stdin never creates a file, so there is no path for a local
+// user on the target to pre-create, no window between writing and executing,
+// and nothing to clean up if the process dies in between.
+func (c *Client) RunWithInput(cmd string, input []byte) error {
+	session, err := c.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session: %w", err)
+	}
+	defer session.Close()
+
+	session.Stdin = bytesReader(input)
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	return session.Run(cmd)
+}
+
 // RunOutput executes a command and returns stdout.
 func (c *Client) RunOutput(cmd string) ([]byte, error) {
 	session, err := c.conn.NewSession()
@@ -105,6 +126,42 @@ func (c *Client) CopyFileMode(localPath, remotePath string, mode os.FileMode) er
 	return c.WriteFile(remotePath, data, mode)
 }
 
+// shellQuote renders s as a single-quoted POSIX shell word.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// writeFileCmd builds the remote shell command that materialises a file.
+//
+// The content is staged in a mktemp file beside the destination, chmod'd there,
+// and only then moved into place. The obvious `cat > path && chmod mode path`
+// leaves the file complete and world-readable at the remote umask for the whole
+// transfer — and permanently if the connection drops between the two commands.
+// The payload here is host.key.
+//
+// Staging also fixes the case a leading chmod would not: redirecting into an
+// EXISTING file truncates it but keeps its old mode, so re-provisioning over a
+// loose file would write the new key at the old permissions. mv replaces the
+// destination wholesale, mode included, and does so atomically.
+//
+// mktemp in the destination's own directory keeps the rename on one filesystem.
+//
+// -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
+// DIRECTORY moves src INSIDE it — so a local user who can see the destination
+// path (process command lines are world-readable on a default Linux) can
+// mkdir it first, let the staged file land inside, then rename their directory
+// away and leave their own file at the path root is about to read. -T makes
+// that case an error instead. -- stops a path that begins with "-" being read
+// as options.
+func writeFileCmd(remotePath string, mode os.FileMode) string {
+	q := shellQuote(remotePath)
+	return fmt.Sprintf(
+		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
+			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
+			"mv -fT -- \"$t\" %s; trap - EXIT",
+		q, mode.Perm(), q)
+}
+
 // WriteFile writes data to a remote file.
 func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) error {
 	session, err := c.conn.NewSession()
@@ -113,10 +170,8 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 	}
 	defer session.Close()
 
-	// Use cat to write file — simple and reliable
 	session.Stdin = bytesReader(data)
-	cmd := fmt.Sprintf("cat > %s && chmod %o %s", remotePath, mode, remotePath)
-	return session.Run(cmd)
+	return session.Run(writeFileCmd(remotePath, mode))
 }
 
 // Interactive runs a command on the remote host with a PTY attached,

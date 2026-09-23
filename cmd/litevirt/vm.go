@@ -319,6 +319,18 @@ func newVNCCmd() *cobra.Command {
 	}
 }
 
+// execExitError maps a guest command's exit status onto the CLI's own, using
+// the same silent typed exit the health command uses.
+func execExitError(code int32) error {
+	if code == 0 {
+		return nil
+	}
+	// Silent: the guest already wrote whatever it had to say to stdout/stderr,
+	// and a "Error: exit status 1" line from the CLI on top of it is noise in a
+	// script's output.
+	return silentExitError{code: int(code)}
+}
+
 func newExecCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "exec <vm> <command> [args...]",
@@ -343,7 +355,7 @@ func newExecCmd() *cobra.Command {
 				if len(resp.Stderr) > 0 {
 					os.Stderr.Write(resp.Stderr)
 				}
-				return nil
+				return execExitError(resp.ExitCode)
 			})
 		},
 	}

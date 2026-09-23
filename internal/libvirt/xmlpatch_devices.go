@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // ErrDeviceCardinality is returned when a hostdev alias referenced in the desired
@@ -270,6 +271,13 @@ func scanDeviceElements(doc string) ([]deviceElement, int, error) {
 				}
 				endOff := int(dec.InputOffset())
 				raw := doc[lt:endOff]
+				// A cdrom/floppy/lun is a <disk> element the reconciler does not
+				// own. Leaving it unrecorded is what "not reconciled" means: it
+				// can be neither deleted as unwanted nor matched against a
+				// desired data disk that happens to share its target dev.
+				if name == "disk" && !isReconciledDisk(raw) {
+					continue
+				}
 				elems = append(elems, deviceElement{
 					kind:  name,
 					key:   deviceKey(name, raw),
@@ -299,7 +307,30 @@ var (
 	reDiskTargetDev = regexp.MustCompile(`<target\b[^>]*\bdev=(['"])([^'"]*)['"]`)
 	reIfaceMAC      = regexp.MustCompile(`<mac\b[^>]*\baddress=(['"])([^'"]*)['"]`)
 	reHostdevAlias  = regexp.MustCompile(`<alias\b[^>]*\bname=(['"])([^'"]*)['"]`)
+	// The <disk device=…> attribute, read off the OPENING tag only — a nested
+	// <source>/<target> never carries one, and `[^>]*` cannot cross the tag.
+	reDiskDeviceAttr = regexp.MustCompile(`\A\s*<disk\b[^>]*\bdevice=(['"])([^'"]*)['"]`)
 )
+
+// isReconciledDisk reports whether a <disk> element is one the device
+// reconciler owns.
+//
+// scanDeviceElements classifies by element NAME, and a CDROM is a <disk> too —
+// so a cloud-init or installer ISO was collected as a "disk", looked up in a
+// want set that deliberately excludes CDROMs, missed, and DELETED. The caller
+// that builds the want set skips any DeviceKind != "disk" and says so:
+// "cdrom/etc. are not reconciled". Not reconciled has to mean left alone.
+//
+// Neither ISO is a vm_disks row at all — the cloud-init ISO travels as
+// VMConfig.CloudInitISO and the installer ISO as spec.Iso — so no want set can
+// ever describe them and no amount of matching would have saved them.
+//
+// libvirt defaults a missing device attribute to "disk", so an element without
+// one is still ours. Anything else (cdrom, floppy, lun) is not.
+func isReconciledDisk(raw string) bool {
+	m := reDiskDeviceAttr.FindStringSubmatch(raw)
+	return m == nil || m[2] == "disk"
+}
 
 // deviceKey extracts the stable match key from a device element's raw XML.
 //
@@ -393,13 +424,42 @@ func replaceAttrIfPresent(s, attr, val string) string {
 	})
 }
 
-var attrRegexCache = map[string]*regexp.Regexp{}
+// attrRegexCache memoises the per-attribute patterns. It is guarded because
+// PatchInactiveDevices holds only a PER-VM lock, so two reconciles on two
+// different VMs reach here at the same time.
+//
+// An unguarded map is not just a benign race: the Go runtime detects concurrent
+// map writes and calls fatal error, which no recover() can catch. It kills the
+// whole PROCESS, immediately.
+//
+// PatchInactiveDevices itself is a pure transform that finishes before its
+// caller touches libvirt, so the crash cannot leave THIS VM half-applied. The
+// damage is to everyone else: a process-wide abort takes down every other
+// reconcile in flight, including any that is between
+// UndefineDomainPreservingState and DefineDomain for a different VM — and that
+// one is left undefined.
+var (
+	attrRegexMu    sync.RWMutex
+	attrRegexCache = map[string]*regexp.Regexp{}
+)
 
 func attrRegex(attr string) *regexp.Regexp {
-	if re, ok := attrRegexCache[attr]; ok {
+	attrRegexMu.RLock()
+	re, ok := attrRegexCache[attr]
+	attrRegexMu.RUnlock()
+	if ok {
 		return re
 	}
-	re := regexp.MustCompile(`(\b` + regexp.QuoteMeta(attr) + `=)(['"])[^'"]*(['"])`)
+
+	re = regexp.MustCompile(`(\b` + regexp.QuoteMeta(attr) + `=)(['"])[^'"]*(['"])`)
+
+	attrRegexMu.Lock()
+	defer attrRegexMu.Unlock()
+	// Another goroutine may have compiled it while we were unlocked. Keep the
+	// first one so the pointer stays stable for a given attr.
+	if existing, raced := attrRegexCache[attr]; raced {
+		return existing
+	}
 	attrRegexCache[attr] = re
 	return re
 }
@@ -407,11 +467,17 @@ func attrRegex(attr string) *regexp.Regexp {
 // ── new-device fragment generation (added devices carry NO <address>) ──
 
 func marshalNewDisk(childIndent string, d WantDisk) (string, error) {
+	// Same rule as the generator: a zvol, an LV or an rbd image is not a qcow2
+	// file, and a disk added here goes straight into a live domain.
+	diskType, source, driverType, dbErr := diskBacking(d.Path)
+	if dbErr != nil {
+		return "", dbErr
+	}
 	disk := diskDevice{
-		Type:   "file",
+		Type:   diskType,
 		Device: "disk",
-		Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
-		Source: diskSource{File: d.Path},
+		Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache},
+		Source: source,
 		Target: diskTarget{Dev: d.TargetDev, Bus: d.Bus},
 	}
 	return marshalFragment(childIndent, disk)

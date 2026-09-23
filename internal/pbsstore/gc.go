@@ -13,12 +13,12 @@ import (
 
 // GCStats summarises a mark-and-sweep pass.
 type GCStats struct {
-	ManifestsScanned int
-	ChunksReferenced int   // unique chunks reached from any manifest
-	ChunksOnDisk     int   // chunks present in chunks/ at scan time
-	ChunksDeleted    int   // chunks removed because no manifest pointed at them
-	ChunksSkippedYoung int // unreferenced chunks retained because within the grace window
-	BytesReclaimed   int64 // total bytes of deleted chunks
+	ManifestsScanned   int
+	ChunksReferenced   int   // unique chunks reached from any manifest
+	ChunksOnDisk       int   // chunks present in chunks/ at scan time
+	ChunksDeleted      int   // chunks removed because no manifest pointed at them
+	ChunksSkippedYoung int   // unreferenced chunks retained because within the grace window
+	BytesReclaimed     int64 // total bytes of deleted chunks
 }
 
 // DefaultChunkGracePeriod is how long an unreferenced chunk is retained
@@ -175,7 +175,14 @@ func Verify(ctx context.Context, r *Repo) (VerifyStats, error) {
 }
 
 // RetentionPolicy expresses Proxmox-style keep N daily/weekly/monthly/yearly.
-// Zero means unlimited for that bucket.
+//
+// Zero means that bucket keeps NOTHING of its own — it is not applied, which is
+// what selectByPolicy has always implemented and what the cascade depends on.
+// This comment used to say "unlimited", which is the opposite; read that way,
+// --keep-yearly would retain every daily forever.
+//
+// A policy where every field is zero therefore keeps nothing at all. That is a
+// mistake rather than a policy, and PlanPrune refuses it — see KeepsNothing.
 type RetentionPolicy struct {
 	KeepLast    int
 	KeepDaily   int
@@ -195,6 +202,17 @@ type PrunePlan struct {
 // PlanPrune applies the policy per VM+disk pair and returns the plan
 // without touching anything on disk.
 func PlanPrune(r *Repo, policy RetentionPolicy) (PrunePlan, error) {
+	// Refused here rather than in each caller. The scheduled path already
+	// checked before calling, but `lv backup repo prune <path> --apply` with no
+	// --keep flags and the blank web form both reached the planner directly and
+	// were handed a plan that deleted the entire repository. Chunks survive to
+	// the next GC, so there is a recovery window — but the manifests go
+	// immediately, and a manifest is what makes a pile of chunks restorable.
+	if policy.KeepsNothing() {
+		return PrunePlan{}, fmt.Errorf("retention policy keeps nothing: set at least one of " +
+			"--keep-last, --keep-daily, --keep-weekly, --keep-monthly or --keep-yearly")
+	}
+
 	manifests, err := r.ListManifests()
 	if err != nil {
 		return PrunePlan{}, err
@@ -213,6 +231,13 @@ func PlanPrune(r *Repo, policy RetentionPolicy) (PrunePlan, error) {
 		plan.Delete = append(plan.Delete, drop...)
 	}
 	return plan, nil
+}
+
+// KeepsNothing reports whether the policy sets no keep at all, in which case
+// applying it would delete every manifest in the repository.
+func (p RetentionPolicy) KeepsNothing() bool {
+	return p.KeepLast <= 0 && p.KeepDaily <= 0 && p.KeepWeekly <= 0 &&
+		p.KeepMonthly <= 0 && p.KeepYearly <= 0
 }
 
 // ApplyPrune deletes the manifests in plan.Delete from disk. Chunks

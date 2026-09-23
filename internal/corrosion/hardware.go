@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -228,6 +229,26 @@ func MergedVMNICs(ctx context.Context, c *Client, vmName string) ([]NICRecord, e
 			out = append(out, cand.rec)
 		}
 	}
+	// Ranging a map gives the runtime's randomised order, and this order reaches
+	// the guest: xmlgen emits <interface> elements in the order it is handed and
+	// Linux names NICs by the order the devices appear, so an untouched VM could
+	// come back with eth0 and eth1 swapped. GetVMInterfaces has ordered by
+	// ordinal all along; the merged path is what never did.
+	//
+	// MAC breaks an ordinal tie — it is the join key, so it is present and
+	// unique within a VM — which makes the order total rather than merely
+	// less random.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Ordinal != out[j].Ordinal {
+			return out[i].Ordinal < out[j].Ordinal
+		}
+		// Folded, because nicJoinKey folds it. Comparing the raw MAC would make
+		// the tiebreak depend on a spelling the merge itself treats as
+		// insignificant: "AA:BB.." and "aa:bb.." are one NIC to the join and two
+		// different sort keys here, so a row rewritten in the other case could
+		// reorder the guest's interfaces with nothing else having changed.
+		return strings.ToLower(out[i].MAC) < strings.ToLower(out[j].MAC)
+	})
 	return out, nil
 }
 

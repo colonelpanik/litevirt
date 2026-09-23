@@ -142,6 +142,7 @@ type LibvirtBackend interface {
 
 	// In-guest exec (qemu-guest-agent).
 	ExecInGuest(name, command string, args []string) (string, error)
+	ExecInGuestDetailed(name, command string, args []string) ([]byte, []byte, int32, error)
 
 	// Storage pool ensure (CreateVM path).
 	EnsureStoragePool(name, driver, source, target string, opts map[string]string) error

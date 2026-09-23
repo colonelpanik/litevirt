@@ -15,3 +15,6 @@ func armWatchdog(uintptr, int)             {}
 func petWatchdog(uintptr) error            { return errors.New("watchdog ioctls unsupported off linux") }
 func watchdogTimeLeft(uintptr) (int, bool) { return 0, false }
 func disarmWatchdog(uintptr)               {}
+
+// watchdogOptions cannot be read off Linux, so nothing is proven.
+func watchdogOptions(uintptr) (uint32, bool) { return 0, false }

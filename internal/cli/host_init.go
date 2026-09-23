@@ -133,11 +133,11 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 		return fmt.Errorf("read setup script: %w", err)
 	}
 
-	if err := sc.WriteFile("/tmp/litevirt-setup.sh", []byte(setupScript), 0755); err != nil {
-		return fmt.Errorf("push setup script: %w", err)
-	}
-
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s bash /tmp/litevirt-setup.sh", hostName)); err != nil {
+	// bash -s with the script on stdin: it never lands on the remote filesystem,
+	// so there is no path for a local user on the target to pre-create, no window
+	// between writing it and running it, and nothing to clean up if this process
+	// dies in between.
+	if err := sc.RunWithInput(fmt.Sprintf("HOST_NAME=%s bash -s", hostName), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -251,9 +251,6 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read setup script: %w", err)
 	}
-	if err := sc.WriteFile("/tmp/litevirt-setup.sh", []byte(setupScript), 0755); err != nil {
-		return fmt.Errorf("push setup script: %w", err)
-	}
 	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
 	peersYAML := "[]"
 	if len(joinPeers) > 0 {
@@ -285,8 +282,8 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := sc.Run(fmt.Sprintf("%s bash /tmp/litevirt-setup.sh",
-		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " "))); err != nil {
+	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
+		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " ")), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -477,12 +474,10 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 		return fmt.Errorf("read setup script: %w", err)
 	}
 
-	scriptPath := "/tmp/litevirt-setup.sh"
-	if err := os.WriteFile(scriptPath, []byte(setupScript), 0755); err != nil {
-		return fmt.Errorf("write setup script: %w", err)
-	}
-
-	cmd := execCommand("bash", scriptPath)
+	// Streamed on stdin, same as the remote form: no file means no path for a
+	// local user to pre-create and no write-then-execute window.
+	cmd := execCommand("bash", "-s")
+	cmd.Stdin = strings.NewReader(setupScript)
 	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

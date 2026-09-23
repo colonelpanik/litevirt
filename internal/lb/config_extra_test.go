@@ -183,12 +183,11 @@ func TestRenderKeepalived_LowPriority(t *testing.T) {
 }
 
 func TestParseVIP_EdgeCases(t *testing.T) {
-	ip, prefix, err := ParseVIP("")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ip != "" || prefix != 32 {
-		t.Errorf("ParseVIP(\"\") = %q/%d", ip, prefix)
+	// The empty string used to come back as ""/32 with no error, because nothing
+	// validated the address half. It is not an address, and it reaches
+	// keepalived and nftables as one.
+	if ip, prefix, err := ParseVIP(""); err == nil {
+		t.Errorf("ParseVIP(\"\") = %q/%d, want an error", ip, prefix)
 	}
 }
 

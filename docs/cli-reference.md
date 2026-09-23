@@ -722,7 +722,7 @@ lv user passwd [username]           # Change your own password (or, as admin, an
 lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
-lv user reset-admin                # Re-mint the admin password
+lv user reset-admin                # Reset the EXISTING admin password (does not create one)
 ```
 
 ## Roles (path-based RBAC)

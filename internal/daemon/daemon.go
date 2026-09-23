@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
+	"github.com/litevirt/litevirt/internal/secretfile"
 	"log/slog"
 	"net"
 	"os"
@@ -109,6 +110,11 @@ type Daemon struct {
 	// exitFunc terminates the process on a watchdog rollback. Defaults to os.Exit;
 	// overridable in tests.
 	exitFunc func(int)
+
+	// adminPasswordPath is where a freshly seeded admin password is written.
+	// Empty means adminPasswordFile; overridable in tests, which must not write
+	// to /etc — and must not silently pass on a machine where that write fails.
+	adminPasswordPath string
 
 	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Assigned
 	// once in Run, BEFORE the upgrade watchdog is armed — the watchdog
@@ -1817,14 +1823,61 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 
 const adminPasswordFile = "/etc/litevirt/admin-password"
 
-// seedAdminUser creates a default admin user with a random password if no users exist.
-// The password is written to /etc/litevirt/admin-password (mode 0600).
+// seedAdminUser creates a default admin user with a random password if this node
+// is founding a cluster and no users exist. The password is written to
+// adminPasswordPath (adminPasswordFile by default) with mode 0600.
+//
+// A node JOINING a cluster mints nothing and writes no password file — its admin
+// credential replicates in. See the join_peers guard below for why an empty
+// `users` table is not proof that the cluster has no admin.
 func (d *Daemon) seedAdminUser(ctx context.Context) error {
-	users, err := corrosion.ListUsers(ctx, d.db)
+	// Tombstones count. ListUsers filters `deleted_at IS NULL`, so a deliberately
+	// deleted admin would read as an empty cluster — and InsertUser reactivates a
+	// soft-deleted row rather than inserting, so seeding here would un-delete a
+	// revoked account, give it a fresh password, and replicate that cluster-wide.
+	everExisted, err := corrosion.UsersEverExisted(ctx, d.db)
 	if err != nil {
-		return fmt.Errorf("list users: %w", err)
+		return fmt.Errorf("check whether any user row exists: %w", err)
 	}
-	if len(users) > 0 {
+	if everExisted {
+		return nil
+	}
+
+	// An empty `users` table is not proof that the cluster has no admin. On a
+	// joining node it only means replication has not started yet: this runs 163
+	// lines before repl.Start, so a joiner reads nothing, mints an `admin` row
+	// with a current updated_at, and publishes it the moment replication comes up.
+	//
+	// Nothing in the replication layer will stop that row, on either lane.
+	// `users` resolves under policyChain() — [ruleTombstone(),
+	// ruleUnresolved(TieCategoryPolicy)] — which reads like a fail-to-human guard
+	// and is not one here, because it is a TIE chain: lwwOrder settles every
+	// non-tie conflict itself and only an exact-instant tie ever reaches
+	// resolveTie (corrosion/sync.go, `lwwOrder` and mergeChunk). A freshly minted
+	// row is strictly NEWER, so anti-entropy applies it on the `ord < 0`
+	// fall-through without consulting the resolver at all, and the WAL lane
+	// applies it through applyLWWGated. The cluster's credential is replaced
+	// silently, on every node ever added — which is exactly why the mint must not
+	// happen here.
+	//
+	// join_peers is the one thing on disk that tells a joiner from a founder
+	// before replication can answer. `lv host add` writes the cluster's gossip
+	// peers into the new node's config.yaml and refuses outright to provision with
+	// an empty list; `lv host init` leaves it empty. It is populated on founder
+	// nodes too, but only once something was added TO them — long after their own
+	// first start, and a founder that already seeded returned above.
+	if len(d.cfg.JoinPeers) > 0 {
+		// Says what did NOT happen and where the credential is instead. Naming a
+		// password file here would send the operator looking for one this branch
+		// never writes, and from there to `lv user reset-admin`, which on a node
+		// that has not converged yet mints and publishes a fresh credential — the
+		// very thing this guard exists to prevent.
+		slog.Info("this node is joining an existing cluster (join peers are configured and "+
+			"no admin user has replicated in yet), so no admin account is created and no "+
+			"password file is written here; the credential replicates in from the cluster. "+
+			"Running `lv user reset-admin` on this node before it converges mints a NEW "+
+			"credential and replaces the cluster's",
+			"join_peers", len(d.cfg.JoinPeers))
 		return nil
 	}
 
@@ -1833,7 +1886,7 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 		return fmt.Errorf("generate password: %w", err)
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
@@ -1842,11 +1895,19 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 		return fmt.Errorf("insert admin: %w", err)
 	}
 
-	if err := os.WriteFile(adminPasswordFile, []byte(password+"\n"), 0600); err != nil {
+	pwFile := d.adminPasswordPath
+	if pwFile == "" {
+		pwFile = adminPasswordFile
+	}
+	// secretfile, not os.WriteFile: this is the cluster admin's plaintext
+	// password, and a WriteFile over a file left loose by a restore would keep the
+	// loose mode — while a Chmod afterwards is too late, the secret is already in
+	// the readable inode.
+	if err := secretfile.Write(pwFile, []byte(password+"\n"), 0600); err != nil {
 		return fmt.Errorf("write password file: %w", err)
 	}
 
-	slog.Info("seeded admin user", "password_file", adminPasswordFile)
+	slog.Info("seeded admin user", "password_file", pwFile)
 	return nil
 }
 

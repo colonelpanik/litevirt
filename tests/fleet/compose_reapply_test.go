@@ -1,0 +1,125 @@
+package fleet
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"testing"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+const composeCloudInit = `name: ci-stack
+
+images:
+  test:
+    source: file:///dev/null
+
+vms:
+  box-1:
+    image: test
+    cpu: 2
+    memory: 1024
+    placement:
+      host: node-0
+    cloud-init:
+      userdata: |
+        #cloud-config
+        users:
+          - name: ubuntu
+            ssh_authorized_keys:
+              - ssh-ed25519 AAAAexample someone@laptop
+`
+
+// Re-applying an UNCHANGED compose file to a stack whose VMs carry cloud-init
+// must be a no-op. The regression: the planner compared the file's cloud-init
+// against a `cloud_init_hash` spec field nothing ever wrote, so every existing
+// VM planned as "cloud-init added" → update → delete + recreate under the
+// default strategy, wiping its root disk. This drives the REAL DeployStack RPC
+// (plan + execute) rather than the planner in isolation, so the stored-spec
+// shape the planner reads is the one CreateVM actually writes.
+func TestFleet_ComposeReapplyWithCloudInitDoesNotRecreate(t *testing.T) {
+	c := New(t, Options{Nodes: 1})
+	ctx := context.Background()
+	node := c.Nodes[0]
+
+	if err := node.DB.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES ('test', 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`); err != nil {
+		t.Fatalf("seed image: %v", err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests("test")); err != nil {
+		t.Fatalf("stage image file: %v", err)
+	}
+	client := c.SelfClient(node)
+
+	deployAndDrain(t, ctx, client, &pb.DeployStackRequest{ComposeYaml: composeCloudInit})
+	first, err := corrosion.GetVM(ctx, node.DB, "box-1")
+	if err != nil || first == nil {
+		t.Fatalf("GetVM after first deploy: vm=%v err=%v", first, err)
+	}
+	firstUUID := specUUID(t, first.Spec)
+	if firstUUID == "" {
+		t.Fatal("first deploy stored a spec without a uuid")
+	}
+	eventsBefore := len(node.Virt.EventLog())
+
+	// The server's own plan for the same file must be a no-op for the VM.
+	for _, op := range dryRunPlan(t, ctx, client, composeCloudInit) {
+		if op.VmName == "box-1" && op.Phase != string(compose.OpNoChange) {
+			t.Fatalf("dry-run re-apply planned %q for box-1 (%s); want %s",
+				op.Phase, op.Detail, compose.OpNoChange)
+		}
+	}
+
+	// And executing it must not touch the domain.
+	deployAndDrain(t, ctx, client, &pb.DeployStackRequest{ComposeYaml: composeCloudInit})
+	for _, e := range node.Virt.EventLog()[eventsBefore:] {
+		if e.Domain == "box-1" && (e.Op == "undefine" || e.Op == "destroy" || e.Op == "define") {
+			t.Errorf("re-apply of an unchanged stack recorded a %q on box-1 — the VM was recreated", e.Op)
+		}
+	}
+	second, err := corrosion.GetVM(ctx, node.DB, "box-1")
+	if err != nil || second == nil {
+		t.Fatalf("GetVM after second deploy: vm=%v err=%v", second, err)
+	}
+	if got := specUUID(t, second.Spec); got != firstUUID {
+		t.Errorf("VM identity changed across re-apply: uuid %s → %s", firstUUID, got)
+	}
+}
+
+// dryRunPlan runs DeployStack with DryRun and returns every progress message.
+func dryRunPlan(t *testing.T, ctx context.Context, client pb.LiteVirtClient, yaml string) []*pb.DeployProgress {
+	t.Helper()
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	stream, err := client.DeployStack(dctx, &pb.DeployStackRequest{ComposeYaml: yaml, DryRun: true})
+	if err != nil {
+		t.Fatalf("DeployStack dry-run: %v", err)
+	}
+	var out []*pb.DeployProgress
+	for {
+		p, err := stream.Recv()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("dry-run stream: %v", err)
+		}
+		out = append(out, p)
+	}
+}
+
+func specUUID(t *testing.T, specJSON string) string {
+	t.Helper()
+	var s struct {
+		UUID string `json:"uuid"`
+	}
+	if err := json.Unmarshal([]byte(specJSON), &s); err != nil {
+		t.Fatalf("unmarshal spec: %v", err)
+	}
+	return s.UUID
+}

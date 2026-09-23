@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -453,7 +454,7 @@ func TestResolve_WarningLocalDiskRestartAny(t *testing.T) {
 	f := makeFile("mystack", map[string]compose.VMDef{
 		"db": {
 			Image: "ubuntu", CPU: 1, Memory: 512,
-			Disks: map[string]compose.DiskDef{"data": {Size: "10G"}},
+			Disks:   map[string]compose.DiskDef{"data": {Size: "10G"}},
 			Migrate: &compose.MigrateDef{OnHostFailure: "restart-any"},
 		},
 	})
@@ -505,7 +506,7 @@ func TestSpecField(t *testing.T) {
 		{`{"image":"ubuntu","cpu":2}`, "image", "ubuntu"},
 		{`{"image":"ubuntu","cpu":2}`, "missing", ""},
 		{`{}`, "image", ""},
-		{`{"cloud_init_hash":"abc123"}`, "cloud_init_hash", "abc123"},
+		{`{"uuid":"abc123"}`, "uuid", "abc123"},
 	}
 	for _, tt := range tests {
 		got := specField(tt.spec, tt.field)
@@ -646,4 +647,78 @@ func TestResolve_UpdatePinsToCurrentHost(t *testing.T) {
 	if !found {
 		t.Fatal("expected an OpUpdate for web")
 	}
+}
+
+// A stack whose VMs carry cloud-init must plan as no-change when the same file
+// is applied again. The stored spec records the block under `cloud_init`; the
+// planner used to look for a `cloud_init_hash` field nothing ever wrote, so every
+// re-apply of a cloud-init stack planned an update — which the default strategy
+// executes as delete + create, destroying the VM's disks.
+func TestResolve_ReapplyCloudInitStackIsNoChange(t *testing.T) {
+	userdata := "#cloud-config\nusers:\n  - name: ubuntu\n"
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 1, Memory: 512,
+			CloudInit: &compose.CloudInitDef{UserData: userdata}},
+	})
+	state := makeState(
+		[]corrosion.HostRecord{makeHost("h1", 16, 32768)},
+		[]corrosion.VMRecord{{
+			Name: "web", StackName: "mystack", HostName: "h1",
+			Spec:      `{"image":"ubuntu","cpu":1,"cloud_init":{"userdata":` + jsonString(userdata) + `}}`,
+			State:     "running",
+			CPUActual: 1, MemActual: 512,
+		}},
+		nil,
+	)
+
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	for _, vm := range plan.VMs {
+		if vm.Kind != OpNoChange {
+			t.Errorf("re-applying an unchanged cloud-init stack planned %s for %s (%s); want no-change",
+				vm.Kind, vm.VMName, vm.Detail)
+		}
+	}
+}
+
+// The converse: an edited userdata IS a change (it recreates the VM), and a
+// VM whose stored spec has no cloud-init gains one → update.
+func TestResolve_CloudInitEditIsUpdate(t *testing.T) {
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Image: "ubuntu", CPU: 1, Memory: 512,
+			CloudInit: &compose.CloudInitDef{UserData: "#cloud-config\npackages: [git]\n"}},
+	})
+	for name, spec := range map[string]string{
+		"edited": `{"image":"ubuntu","cloud_init":{"userdata":"#cloud-config\n{}\n"}}`,
+		"added":  `{"image":"ubuntu"}`,
+	} {
+		state := makeState(
+			[]corrosion.HostRecord{makeHost("h1", 16, 32768)},
+			[]corrosion.VMRecord{{
+				Name: "web", StackName: "mystack", HostName: "h1",
+				Spec: spec, State: "running", CPUActual: 1, MemActual: 512,
+			}},
+			nil,
+		)
+		plan, err := Resolve(context.Background(), f, state)
+		if err != nil {
+			t.Fatalf("%s: Resolve: %v", name, err)
+		}
+		found := false
+		for _, vm := range plan.VMs {
+			if vm.VMName == "web" && vm.Kind == OpUpdate {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: expected an OpUpdate for web, got %+v", name, plan.VMs)
+		}
+	}
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

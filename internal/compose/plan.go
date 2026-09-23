@@ -2,6 +2,7 @@ package compose
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -10,9 +11,9 @@ import (
 type OpKind string
 
 const (
-	OpCreate  OpKind = "create"
-	OpUpdate  OpKind = "update"
-	OpDelete  OpKind = "delete"
+	OpCreate   OpKind = "create"
+	OpUpdate   OpKind = "update"
+	OpDelete   OpKind = "delete"
 	OpNoChange OpKind = "no-change"
 )
 
@@ -74,7 +75,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			cur, exists := currentByName[instanceName]
 			if !exists {
 				op := Op{Kind: OpCreate, VMName: instanceName,
-					Detail:    fmt.Sprintf("create %s (image=%s cpu=%d mem=%dMiB)",
+					Detail: fmt.Sprintf("create %s (image=%s cpu=%d mem=%dMiB)",
 						instanceName, vmDef.Image, vmDef.CPU, int(vmDef.Memory)),
 					DependsOn: vmDef.DependsOn}
 
@@ -218,6 +219,32 @@ func CloudInitHash(userdata, networkconfig string) string {
 	h.Write([]byte{0})
 	h.Write([]byte(networkconfig))
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// CloudInitHashFromSpec returns the CurrentVM.CloudInitHash for a stored VM
+// spec (the JSON the daemon persists for a VM), or "" when the spec carries no
+// cloud-init. It hashes the same two fields as cloudInitHash does for the
+// compose definition, so an unchanged file re-applied to the VM it created
+// compares equal.
+//
+// The spec stores the block itself, under `cloud_init`; no precomputed hash
+// field exists in it. A planner that read one anyway saw "" for every VM and
+// planned "cloud-init added" — an update, executed as delete + create — on
+// every re-apply of a cloud-init stack.
+func CloudInitHashFromSpec(specJSON string) string {
+	if specJSON == "" {
+		return ""
+	}
+	var raw struct {
+		CloudInit *struct {
+			Userdata      string `json:"userdata"`
+			Networkconfig string `json:"networkconfig"`
+		} `json:"cloud_init"`
+	}
+	if err := json.Unmarshal([]byte(specJSON), &raw); err != nil || raw.CloudInit == nil {
+		return ""
+	}
+	return CloudInitHash(raw.CloudInit.Userdata, raw.CloudInit.Networkconfig)
 }
 
 // TopologicalSortOps reorders OpCreate operations in dependency order.

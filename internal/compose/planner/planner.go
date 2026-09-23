@@ -324,7 +324,7 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 			MemMiB:        vm.MemActual,
 			State:         vm.State,
 			HostName:      vm.HostName,
-			CloudInitHash: specField(vm.Spec, "cloud_init_hash"),
+			CloudInitHash: compose.CloudInitHashFromSpec(vm.Spec),
 		})
 	}
 	return current

@@ -295,20 +295,32 @@ func newDiffCmd() *cobra.Command {
 					return fmt.Errorf("list VMs: %w", err)
 				}
 
+				// ListVMs ships a PROJECTION of each spec (labels, uuid, machine,
+				// cpu mode) — no image and no cloud-init. Diffing against the
+				// projection made every VM of a cloud-init stack read as
+				// "image →X cloud-init added", so the full spec comes from
+				// InspectVM. A VM that cannot be inspected fails the diff rather
+				// than being reported as changed.
 				current := make([]compose.CurrentVM, 0, len(resp.Vms))
 				for _, vm := range resp.Vms {
-					img := ""
-					if vm.Spec != nil {
-						img = vm.Spec.Image
+					full, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: vm.Name})
+					if err != nil {
+						return fmt.Errorf("inspect %s: %w", vm.Name, err)
 					}
-					current = append(current, compose.CurrentVM{
+					cur := compose.CurrentVM{
 						Name:     vm.Name,
-						Image:    img,
 						CPU:      int(vm.CpuActual),
 						MemMiB:   int(vm.MemActualMib),
 						State:    vm.State.String(),
 						HostName: vm.HostName,
-					})
+					}
+					if full.Spec != nil {
+						cur.Image = full.Spec.Image
+						if ci := full.Spec.CloudInit; ci != nil {
+							cur.CloudInitHash = compose.CloudInitHash(ci.Userdata, ci.Networkconfig)
+						}
+					}
+					current = append(current, cur)
 				}
 
 				plan, err := compose.Build(f, current)

@@ -36,14 +36,17 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	// A pool is GLOBAL (req.Project == "" → admin-managed, RBAC-anchored at root) or
 	// OWNED by a project (RBAC at /projects/<p>/...). Empty project is NOT normalized
 	// to "_default" — that would make it owned, not global.
+	// Operator role floor BEFORE any lookup, so a viewer cannot probe pool
+	// existence through the authorization checks below. Same order as
+	// DeleteStoragePool.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
 	project := req.Project
 	if project != "" {
 		if _, err := safename.CanonicalProjectName(project); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid project %q: %v", project, err)
 		}
-	}
-	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
-		return nil, err
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name is required")
@@ -62,6 +65,30 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	host := req.Host
 	if host == "" {
 		host = s.hostName
+	}
+	// Authorize the project the request CLAIMS — this is where the pool is going.
+	if err := s.RequirePerm(ctx, poolRBACPathFor(project, req.Name), "storage.pool.write", "operator"); err != nil {
+		return nil, err
+	}
+	// …and, when a pool of that (host, name) already exists, ALSO authorize its
+	// STORED project. The persist below is an INSERT OR REPLACE keyed on
+	// (host_name, name), so a create against an existing name is a rewrite of
+	// that row: without this, a tenant holding write only in their own project
+	// could submit `--project acme` for a global (or another tenant's) pool,
+	// pass the claimed-path check, and repoint the stored row at storage they
+	// control. DeleteStoragePool authorizes the stored project for the same
+	// reason. Fail closed on a read error.
+	//
+	// When the stored project equals the claim this is the same path that was
+	// just checked, so an ordinary re-apply costs nothing.
+	existing, found, err := corrosion.GetStoragePool(ctx, s.db, host, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "lookup: %v", err)
+	}
+	if found && existing.Project != project {
+		if err := s.RequirePerm(ctx, poolRBACPathFor(existing.Project, req.Name), "storage.pool.write", "operator"); err != nil {
+			return nil, err
+		}
 	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)

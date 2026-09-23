@@ -191,7 +191,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if ctQuota := (corrosion.QuotaAmount{
 		VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib), NIC: len(plan.ifaces),
 	}); !ctQuota.IsZero() {
-		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
+		// Normalize before admission. project_quotas is keyed "_default", and
+		// UpsertContainer normalizes the stored row the same way — so passing the
+		// raw "" that `lv ct create` sends without --project found no quota row,
+		// skipped quotaVerdict entirely, and then counted the container against a
+		// budget that had never admitted it. It also wrote the reservation with
+		// Project "", where a concurrent VM create in _default cannot see it.
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, tenancy.NormalizeProject(req.Project),
 			corrosion.WorkloadContainer, req.Name, ctQuota, ctQuota, intentContainerResident)
 		if aerr != nil {
 			_ = s.releaseContainerNICs(ctx, req.Name)
@@ -490,18 +496,46 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.exec", "operator"); err != nil {
+	// Operator role floor BEFORE the lookup, so a caller who holds nothing
+	// cannot probe container existence through the resolution outcome.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
-	if req.HostName != "" && req.HostName != s.hostName {
-		c, conn, err := s.peerClient(ctx, req.HostName)
+	// Resolve the container the way every other lifecycle RPC does, and
+	// authorize against the row that resolution actually returned.
+	//
+	// This used to be containerProject(ctx, req.HostName, req.Name), which on an
+	// empty host scans the cluster and returns the FIRST name match — while the
+	// forward below only fires when host_name is non-empty. Authorization read
+	// one host's row and execution used a different host's container: an
+	// attacker owning a same-named container on a host that sorts earlier
+	// (ORDER BY host_name, name) got ct.exec inside the victim's. With no
+	// matching row at all the fallback was "_default", so ct.exec on _default
+	// authorized an exec against any local container of that name.
+	//
+	// resolveContainerHost refuses an ambiguous name and is NotFound on an
+	// unknown one, which is why the siblings do not have this hole.
+	host, rec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
+	if err != nil {
+		s.audit(ctx, "ct.exec", req.Name, "unresolved: "+strings.Join(req.Argv, " "), "error")
+		return nil, err
+	}
+	if err := s.RequirePerm(ctx, ctRBACPathFor(rec.Project, req.Name), "ct.exec", "operator"); err != nil {
+		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
+		return nil, err
+	}
+	if host != s.hostName {
+		c, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "forward exec: %v", err)
 		}
 		defer conn.Close()
-		return c.ExecContainer(ctx, req)
+		// Pin the resolved host on the forwarded request so the peer does not
+		// re-run the cluster-wide name resolution (same as StartContainer).
+		return c.ExecContainer(ctx, &pb.ExecContainerRequest{
+			Name: req.Name, HostName: host, Argv: req.Argv,
+		})
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")

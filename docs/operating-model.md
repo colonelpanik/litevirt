@@ -392,6 +392,20 @@ peer still running a binary that did not narrow it, so the row is not trusted on
 the strength of where it came from. A negative term is refused outright at the
 same places.
 
+The stamp also has to SURVIVE being persisted, which is not automatic while the
+cluster is still activating. Latches form on each node independently, so a
+coordinator whose `lease_term_ledger_v1` latch has formed can hand a stamped
+proof to a receiver whose own latch has not. That receiver may put only the
+previous release's proof shape on the wire, and that shape has no term columns:
+seeding the row through it would strip the stamp — on that node and, because the
+seed replicates, on every peer — and the retry of the identical proof, which is
+how an interrupted action recovers, would then be refused as divergent. So a
+receiver that cannot yet emit the stamp refuses the proof before writing
+anything, with a **retryable** error rather than a divergence. During activation
+you may see a direct action refused once or twice with a message about a stamp
+the node cannot yet emit; it clears on its own when that node's latch forms,
+which happens from the same peer set the coordinator's did.
+
 Membership in the three lease names is **not** sufficient, and treating it as
 sufficient was a real hole. The key SELECTS which ledger the threshold is
 computed against, and the three advance independently, so naming a quieter

@@ -881,11 +881,18 @@ func TestWriteActionProof_PreLatchEmitsTheReleasedShape(t *testing.T) {
 		t.Helper()
 		c := apTestClient(t)
 		c.SetLeaseTermLedgerGate(func() bool { return open })
-		if err := WriteActionProof(ctx, c, ActionProof{
+		p := ActionProof{
 			ID: "p1", Action: ActionReschedule, TargetKind: "vm", TargetName: "vm1",
 			DestHost: "node-b", Coordinator: "node-a",
-			LeaseTerm: 7, LeaseKey: LeaseKeyFailover,
-		}); err != nil {
+		}
+		if open {
+			// A term exists to carry only once the latch has formed: the mint
+			// is gated on the same predicate. Pre-latch the proof is unstamped,
+			// and a STAMPED proof pre-latch is refused outright rather than
+			// written in a shape that strips it (see proofStampEmittable).
+			p.LeaseTerm, p.LeaseKey = 7, LeaseKeyFailover
+		}
+		if err := WriteActionProof(ctx, c, p); err != nil {
 			t.Fatalf("WriteActionProof: %v", err)
 		}
 		var stmts string

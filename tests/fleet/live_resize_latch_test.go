@@ -2,10 +2,13 @@
 //
 // live_resize does NOT follow the config-uniformity shape that operation_protocol
 // and hardware_v2 use, and the difference is easy to get backwards. Its
-// advertisement is build-STATIC: advertisedCapabilities withholds only
-// operation_protocol_v1, canonical_identity_v1, canonical_registry_v1 and
-// hardware_v2 (server.go:381-413), so live_resize_v1 latches as soon as every
-// voting-eligible member is running a build that understands it. That is the
+// advertisement is build-STATIC: advertisedCapabilities withholds a specific
+// list (operation_protocol_v1 and its dependent capacity_admission_v1,
+// isolation_epoch_v1, canonical_identity_v1, canonical_registry_v1,
+// project_authority_v1, audit_signature_v1, hardware_v2, owner_epoch_v1 — read
+// the function, not this comment, for the current set), and live_resize_v1 is
+// not on it, so it latches as soon as every voting-eligible member is running a
+// build that understands it. That is the
 // right latch for the risk being managed — an old peer rewriting a spec would
 // DROP max_cpu and strand a guest that had hot-added CPUs above its boot count
 // (vm.go:2780) — and understanding max_cpu is a property of the build, not of a

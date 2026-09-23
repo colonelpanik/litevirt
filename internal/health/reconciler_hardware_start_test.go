@@ -150,7 +150,7 @@ func TestReconciler_HardwarePreStart_ReleaseOnStartFailure(t *testing.T) {
 // reconciler's (covered above).
 func TestVMChecker_HwPrepareStart_Wrapper(t *testing.T) {
 	db := testStartDB(t)
-	v := NewVMChecker("node-a", db, nil)
+	v := NewVMChecker("node-a", t.TempDir(), db, nil)
 
 	// Unwired → no-op, non-nil release, no error.
 	rel, err := v.hwPrepareStart(context.Background(), &corrosion.VMRecord{Name: "vm1"})

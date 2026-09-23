@@ -268,8 +268,18 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if firmware == "" {
 		firmware = "uefi"
 	}
+	// A clone DEFINES a brand-new domain, so it takes the node's cpu_mode default
+	// when the source names none — the same reasoning as the machine-type pin
+	// below: a clone must not start life carrying the hazard its source had. An
+	// empty mode defines the guest with no <cpu> element, i.e. QEMU's qemu64,
+	// which has no SSE4.2/AVX/AVX2 whatever the host can do. A source that DOES
+	// name a mode is reproduced exactly.
+	if srcSpec.CpuMode == "" && srcSpec.CpuModel == "" {
+		srcSpec.CpuMode = s.effectiveDefaultCPUMode()
+		specJSON, _ = json.Marshal(&srcSpec)
+	}
 	vmCfg := lv.VMConfig{
-		Name: req.Target, UUID: srcSpec.Uuid, CPU: cpu, CPUMode: srcSpec.CpuMode, MemoryMiB: mem,
+		Name: req.Target, UUID: srcSpec.Uuid, CPU: cpu, CPUMode: srcSpec.CpuMode, CPUModel: srcSpec.CpuModel, MemoryMiB: mem,
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,
 		EnableVNC: !srcSpec.DisableVnc, EnableSPICE: srcSpec.EnableSpice,
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
@@ -346,6 +356,12 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
+	}
+	// Guarded on the state actually inserted: a clone started with req.Start is
+	// born running at epoch 0 and needs its first generation, while a stopped
+	// one is graduated by whatever later starts it.
+	if state == "running" {
+		s.assignOwnerEpochAtCreate(ctx, req.Target)
 	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "host", s.hostName)

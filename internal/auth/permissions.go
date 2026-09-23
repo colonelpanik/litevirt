@@ -332,6 +332,13 @@ var BuiltinRoles = []BuiltinRole{
 			"storage.pool.read", "storage.pool.write",
 			"storage.content.read", "storage.content.write",
 			"resourcemap.read", "resourcemap.write",
+			// The ONLY cluster.* verb Operator holds, and deliberately not
+			// cluster.update: acknowledging a contested lease term clears
+			// evidence tracking on one node and picks no winner, so it is a
+			// day-to-day remedy for the ha.lww.unresolved condition rather
+			// than a cluster mutation. Granting cluster.update here would
+			// hand Operator every cluster verb added later.
+			"cluster.lww.acknowledge",
 		},
 		Description: "Day-to-day VM operations: create, start, stop, snapshot, backup, attach networks/LBs.",
 	},

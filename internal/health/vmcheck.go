@@ -26,9 +26,14 @@ const healthCheckGracePeriod = 5 * time.Minute
 // VMChecker runs per-VM health checks defined in each VM's HealthCheckSpec.
 type VMChecker struct {
 	hostName string
-	db       *corrosion.Client
-	virt     *lv.Client
-	bus      *events.Bus
+	// dataDir is the host data root the owner-epoch file marker lives under.
+	// Taken positionally like NewReconciler's rather than through a setter: a
+	// setter would leave every existing construction at "", and an empty dataDir
+	// SKIPS the file marker — so the path would be untested by construction.
+	dataDir string
+	db      *corrosion.Client
+	virt    *lv.Client
+	bus     *events.Bus
 
 	mu          sync.Mutex
 	failures    map[string]int       // vmName → consecutive failures
@@ -120,9 +125,10 @@ func (v *VMChecker) publish(action, target, detail string) {
 }
 
 // NewVMChecker creates a VM-level health checker for the local host.
-func NewVMChecker(hostName string, db *corrosion.Client, virt *lv.Client) *VMChecker {
+func NewVMChecker(hostName, dataDir string, db *corrosion.Client, virt *lv.Client) *VMChecker {
 	return &VMChecker{
 		hostName:      hostName,
+		dataDir:       dataDir,
 		db:            db,
 		virt:          virt,
 		failures:      make(map[string]int),
@@ -130,6 +136,14 @@ func NewVMChecker(hostName string, db *corrosion.Client, virt *lv.Client) *VMChe
 		actionCount:   make(map[string]int),
 		activeActions: make(map[string]int),
 	}
+}
+
+// publishRunning routes a NON-MINTING transition through the marker chokepoint.
+// v.virt is a *lv.Client that is nil in most tests; a nil CONCRETE pointer boxed
+// into an interface is not a nil interface, which is what DomainEpochSetter's
+// usable() check exists for.
+func (v *VMChecker) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
+	return PublishRunningVia(ctx, v.virt, v.db, v.dataDir, v.hostName, name, state, commit)
 }
 
 // Start begins the sweep loop. Blocks until ctx is cancelled.
@@ -210,16 +224,18 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		// operator's intent wins even if a stop didn't fully take effect.
 		if vm.StateDetail != "operator-stop" && v.virt != nil {
 			if st, err := v.virt.DomainState(vm.Name); err == nil && st == "running" {
-				if werr := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running",
-					"reconciled from libvirt: domain running"); werr != nil {
+				if werr := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+					return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running",
+						"reconciled from libvirt: domain running")
+				}); werr != nil {
 					if errors.Is(werr, corrosion.ErrNoRowsAffected) {
 						// Row vanished between the list and here (concurrent delete)
 						// — nothing to reconcile, not a write fault.
 						slog.Debug("vmcheck: reconcile target row gone; skipping", "vm", vm.Name)
 						continue
 					}
-					slog.Error("vmcheck: reconcile write failed — NOT publishing reconciled event",
-						"vm", vm.Name, "error", werr)
+					LogPublishRefusal("vmcheck: reconcile write failed — NOT publishing reconciled event",
+						vm.Name, werr)
 					v.noteStateWriteFail(corrosion.OpVMState, werr)
 					continue
 				}
@@ -513,8 +529,10 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			}
 			return
 		}
-		if err := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restarted by health checker"); err != nil {
-			slog.Error("vmcheck: restart state write failed — NOT publishing restarted event", "vm", vm.Name, "error", err)
+		if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restarted by health checker")
+		}); err != nil {
+			LogPublishRefusal("vmcheck: restart state write failed — NOT publishing restarted event", vm.Name, err)
 			v.noteStateWriteFail(corrosion.OpVMState, err)
 			return
 		}
@@ -574,7 +592,17 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
-		if werr := corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err)); werr != nil {
+		// A LOCAL publish, unlike the successful handoff below, which repoints the
+		// row to another host while running on this one.
+		//
+		// No DomainState guard here, unlike migrate.go's twin: a migration that
+		// failed after libvirt destroyed the source domain makes the domain-marker
+		// write fail, and writeBothMarkers publishes on the strength of the file
+		// marker instead of refusing. The state-detail write is what matters on
+		// this path and it is no longer gated on a domain that may be gone.
+		if werr := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err))
+		}); werr != nil {
 			v.noteStateWriteFail(corrosion.OpVMState, werr)
 		}
 		return
@@ -588,6 +616,8 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 		// Phase 4: the post-migration re-home is an ownership transition —
 		// fresh-read CAS + epoch increment. Re-reading inside the retry loop
 		// keeps a transient CAS loss (a concurrent transition) retryable.
+		//runningcheck:allow ownership handoff — names target.Name while running on this
+		// host, whose domain the migration has undefined. The destination marks its own.
 		if werr = corrosion.TransferVMOwnerFresh(ctx, v.db, vm.Name, target.Name, "running"); werr == nil {
 			break
 		}
@@ -755,8 +785,10 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 		}
 		return
 	}
-	if err := corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restart policy: "+decision); err != nil {
-		slog.Error("vmcheck: restart-policy state write failed — NOT publishing restart event", "vm", vm.Name, "error", err)
+	if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+		return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restart policy: "+decision)
+	}); err != nil {
+		LogPublishRefusal("vmcheck: restart-policy state write failed — NOT publishing restart event", vm.Name, err)
 		v.noteStateWriteFail(corrosion.OpVMState, err)
 		return
 	}

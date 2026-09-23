@@ -244,6 +244,23 @@ type NetBoxConfig struct {
 	// the operator's to hold. The mirror logs the name it resolved at startup so
 	// a disagreement is one comparison across the fleet's logs.
 	ClusterName string `yaml:"cluster_name,omitempty"`
+	// Site is the NetBox SITE NAME this installation's cluster is scoped to.
+	//
+	// Every VM in a NetBox cluster inherits that cluster's site, and a VM with
+	// no site is invisible to anything that scopes by one — NetBox's own
+	// filters, and the DNS and inventory integrations built on them. litevirt
+	// cannot derive which site the hardware sits in, so like ClusterName it is
+	// operator-supplied.
+	//
+	// Empty leaves the cluster's scope UNMANAGED rather than clearing it: the
+	// scope was settable by hand long before this key existed, and writing an
+	// empty value through would strip the site off a working cluster and take
+	// every VM's inherited site with it.
+	//
+	// A name that does not exist in NetBox FAILS the sweep rather than being
+	// treated as unset — silently mirroring VMs with no site is the outcome this
+	// setting exists to prevent, so a typo has to be loud.
+	Site string `yaml:"site,omitempty"`
 	// MirrorInventory opts this node into the INVENTORY MIRROR — the half of the
 	// integration that creates NetBox `virtual_machine` and `vminterface`
 	// objects and assigns addresses to them. Default FALSE: NetBox is pure IPAM.

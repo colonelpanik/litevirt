@@ -371,6 +371,25 @@ netbox:
                             # with no bound network — there is no binding row
                             # to pin — so compare the mirror's startup log line
                             # across nodes there.
+  site: ""                  # NetBox SITE NAME the cluster is scoped to, e.g.
+                            # "DC-01". Every VM in a NetBox cluster inherits
+                            # that cluster's site, and a VM with no site is
+                            # invisible to anything that scopes by one — NetBox's
+                            # own filters, and the DNS and inventory
+                            # integrations built on them. litevirt cannot derive
+                            # which site the hardware sits in, so like
+                            # cluster_name it is operator-supplied.
+                            # Empty leaves the cluster's scope UNMANAGED rather
+                            # than clearing it: the scope was settable by hand
+                            # long before this key existed, and writing an empty
+                            # value through would strip the site off a working
+                            # cluster and take every VM's inherited site with
+                            # it. A name that does NOT exist in NetBox fails the
+                            # sweep with the name it could not find, rather than
+                            # being treated as unset — silently mirroring VMs
+                            # with no site is the outcome this prevents, so a
+                            # typo is loud. Applied on every sweep, so correcting
+                            # it takes effect on the next pass with no restart.
   mirror_inventory: false   # opt into the INVENTORY MIRROR — the half that
                             # creates NetBox virtual_machine / vminterface
                             # objects and assigns addresses to them. Default

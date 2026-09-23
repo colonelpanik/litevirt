@@ -131,6 +131,10 @@ type Options struct {
 	// means "the local cluster name", which is the default every
 	// single-installation deployment runs.
 	ClusterName string
+	// Site is the NetBox site NAME the cluster is scoped to; empty leaves the
+	// cluster's scope unmanaged. Every VM inherits its cluster's site, and a VM
+	// with none is invisible to anything that scopes by site.
+	Site string
 	// AcquireLease and HoldsLease gate the sweep on the cluster's `netbox`
 	// leader lease. Leaving either nil makes this reconciler write NOTHING —
 	// the fail-closed direction, so an incomplete wiring is inert rather than
@@ -220,6 +224,7 @@ func New(o Options) *Reconciler {
 		pollInterval: poll,
 		sweepPhase:   o.SweepPhase,
 		clusterName:  o.ClusterName,
+		site:         o.Site,
 		acquireLease: o.AcquireLease,
 		holdsLease:   o.HoldsLease,
 		latched:      o.Latched,
@@ -1279,7 +1284,11 @@ func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, err := r.nb.EnsureCluster(ctx, name, typeID)
+	siteID, err := r.resolveSite(ctx)
+	if err != nil {
+		return 0, err
+	}
+	id, err := r.nb.EnsureCluster(ctx, name, typeID, siteID)
 	if err != nil {
 		return 0, fmt.Errorf("cluster %q: %w", name, err)
 	}
@@ -1288,6 +1297,33 @@ func (r *Reconciler) ensureCluster(ctx context.Context) (int, error) {
 		// which has no filter meaning — and diff every object in the install
 		// against this cluster's desired set.
 		return 0, fmt.Errorf("netboxsync: NetBox returned no id for cluster %q", name)
+	}
+	return id, nil
+}
+
+// resolveSite turns the configured site NAME into the id the cluster scope
+// needs, or 0 when no site is configured.
+//
+// A configured site that does not EXIST is an error, not a 0. Silently treating
+// it as unmanaged is the failure mode this whole setting exists to remove: the
+// operator would see mirrored VMs with no site and no indication that the name
+// they typed was never found.
+//
+// Resolved per sweep rather than cached, so fixing a typo in NetBox takes effect
+// on the next pass instead of requiring a daemon restart. It is one GET against
+// a handful of objects, on the same 15-minute cadence as the sweep itself.
+func (r *Reconciler) resolveSite(ctx context.Context) (int, error) {
+	if r.site == "" {
+		return 0, nil
+	}
+	id, err := r.nb.FindSiteByName(ctx, r.site)
+	if err != nil {
+		return 0, fmt.Errorf("resolve netbox.site %q: %w", r.site, err)
+	}
+	if id == 0 {
+		return 0, fmt.Errorf("netboxsync: netbox.site %q does not exist in NetBox — "+
+			"mirrored VMs would carry no site and be invisible to anything that "+
+			"scopes by one; create it or correct the name", r.site)
 	}
 	return id, nil
 }

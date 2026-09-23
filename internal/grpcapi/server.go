@@ -84,6 +84,7 @@ type Server struct {
 	// name" — see netboxsync.ClusterName, which is the single place that
 	// resolves it for both the mirror and the CA re-key.
 	netboxClusterName string
+	netboxSite        string
 
 	// defaultCPUModeCfg is the node's `vm.default_cpu_mode` — the cpu_mode a
 	// create materializes into a spec that did not name one. Empty means
@@ -945,6 +946,10 @@ func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
 // which cluster object every mirrored VM hangs off, and changing it later
 // strands everything written under the previous one.
 func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name }
+
+// SetNetBoxSite sets the NetBox site the cluster is scoped to (config
+// `netbox.site`). Empty leaves the cluster's scope unmanaged.
+func (s *Server) SetNetBoxSite(name string) { s.netboxSite = name }
 
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same

@@ -23,7 +23,7 @@ import (
 // err is nil — nothing to do.
 //
 // Used to keep a stack's stored compose YAML in sync after a disk pool move so
-// `lv stack export` reflects the new placement and a re-deploy is idempotent.
+// `lv compose export` reflects the new placement and a re-deploy is idempotent.
 func PatchDiskStorage(yamlStr, vmKey, diskName, pool string) (string, bool, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(yamlStr), &doc); err != nil {

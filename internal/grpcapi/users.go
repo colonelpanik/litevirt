@@ -101,7 +101,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 	// External realms (OIDC/LDAP) may surface users not yet in the
 	// local users table. Auto-shadow them so sessions / RBAC have a
 	// stable subject. Default role is viewer; admins promote via
-	// `lv user promote`.
+	// `lv role grant`.
 	if realmName != "local" {
 		if err := auth.EnsureUserShadow(ctx, s.db, principal, "viewer"); err != nil {
 			return nil, status.Errorf(codes.Internal, "shadow user: %v", err)

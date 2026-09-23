@@ -40,7 +40,7 @@ func TestReconciler_RunsImmediatelyAndOnTick(t *testing.T) {
 }
 
 // TestReconciler_LoaderErrorRecorded surfaces the latest load failure
-// for `lv firewall status`.
+// for `lv firewall show`.
 func TestReconciler_LoaderErrorRecorded(t *testing.T) {
 	want := errors.New("corrosion down")
 	loader := func(_ context.Context) (Plan, error) { return Plan{}, want }

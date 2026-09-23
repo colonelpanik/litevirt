@@ -72,7 +72,9 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	if depth >= snapshotDepthWarning {
 		slog.Warn("snapshot chain depth is deep — disk I/O performance may degrade",
 			"vm", req.VmName, "depth", depth,
-			"hint", "consolidate with 'lv snapshot flatten "+req.VmName+"'")
+			"hint", "consolidate by removing snapshots with 'lv snapshot rm "+req.VmName+
+				" <name>' — removing the LAST one from a running VM block-commits the "+
+				"overlay back down into its base")
 	}
 
 	// Firmware-state capture (G1): a Secure-Boot/vTPM VM's NVRAM + swtpm must be

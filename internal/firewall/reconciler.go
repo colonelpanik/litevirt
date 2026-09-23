@@ -99,7 +99,7 @@ func (r *Reconciler) Stop() {
 }
 
 // LastError returns the most recent reconcile error (or nil). Useful
-// for `lv firewall status` — surfaces "Corrosion unreachable" without
+// for `lv firewall show` — surfaces "Corrosion unreachable" without
 // the operator needing to dig through logs.
 func (r *Reconciler) LastError() error {
 	r.mu.Lock()

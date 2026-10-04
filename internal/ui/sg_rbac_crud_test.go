@@ -30,11 +30,9 @@ func authReq(t *testing.T, method, path string, form url.Values) *http.Request {
 }
 
 func TestSGCreate_PersistsAndRedirects(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
+	s, db := newUIOverRealDaemon(t, "admin", "admin")
 
-	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups", url.Values{"name": {"web"}}))
+	w := serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups", url.Values{"name": {"web"}}))
 	assertStatus(t, w, http.StatusOK)
 	assertToast(t, w, "created")
 	if w.Header().Get("HX-Redirect") != "/security-groups" {
@@ -47,23 +45,20 @@ func TestSGCreate_PersistsAndRedirects(t *testing.T) {
 }
 
 func TestSGCreate_NameRequired(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	s.SetCorrosionDB(newCorrosionForUITest(t))
-	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups", url.Values{}))
+	s, _ := newUIOverRealDaemon(t, "admin", "admin")
+	w := serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups", url.Values{}))
 	assertStatus(t, w, http.StatusBadRequest)
 	assertToast(t, w, "required")
 }
 
 func TestSGRuleAddAndDelete(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
+	s, db := newUIOverRealDaemon(t, "admin", "admin")
 	ctx := context.Background()
 	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg1", Name: "web"}); err != nil {
 		t.Fatalf("seed SG: %v", err)
 	}
 
-	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups/sg1/rules", url.Values{
+	w := serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups/sg1/rules", url.Values{
 		"direction": {"ingress"}, "proto": {"tcp"}, "port_range": {"443"}, "action": {"accept"}, "priority": {"100"},
 	}))
 	assertStatus(t, w, http.StatusOK)
@@ -73,7 +68,7 @@ func TestSGRuleAddAndDelete(t *testing.T) {
 	}
 
 	// Delete the rule.
-	w = serveRequest(s, authReq(t, "DELETE", "/ui/security-groups/rules/"+rules[0].ID, nil))
+	w = serveRequest(s, uiSessionReq(t, "DELETE", "/ui/security-groups/rules/"+rules[0].ID, nil))
 	assertStatus(t, w, http.StatusOK)
 	rules, _ = corrosion.ListSGRules(ctx, db, "sg1")
 	if len(rules) != 0 {
@@ -82,13 +77,11 @@ func TestSGRuleAddAndDelete(t *testing.T) {
 }
 
 func TestSGDelete_RemovesGroup(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
+	s, db := newUIOverRealDaemon(t, "admin", "admin")
 	ctx := context.Background()
 	_ = corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg1", Name: "web"})
 
-	w := serveRequest(s, authReq(t, "DELETE", "/ui/security-groups/sg1", nil))
+	w := serveRequest(s, uiSessionReq(t, "DELETE", "/ui/security-groups/sg1", nil))
 	assertStatus(t, w, http.StatusOK)
 	sgs, _ := corrosion.ListSecurityGroups(ctx, db, "")
 	if len(sgs) != 0 {

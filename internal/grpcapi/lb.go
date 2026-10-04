@@ -728,18 +728,22 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			proof := s.mintLBProof(ctx, req.Name, host)
-			if s.gateActive(ctx) && proof == nil {
+			proof := s.mintLBProof(fctx, req.Name, host)
+			if s.gateActive(fctx) && proof == nil {
 				slog.Error("CreateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
 					"host", host, "lb", req.Name)
 				return
 			}
-			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
+			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
 				LbName: req.Name, Vip: req.Vip, Algorithm: algorithm,
 				Backends: pbBackends, Ports: req.Ports, Hosts: req.Hosts, Proof: proof,
 			}); aerr != nil {
@@ -1406,6 +1410,16 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
+	// A changed VIP is validated HERE, at ingress, the way CreateLoadBalancer
+	// does it. This RPC used to persist req.Vip unchecked and then call ParseVIP
+	// with the error discarded, so a malformed VIP became an EMPTY one: the
+	// firewall exception carried "" and internal/firewall then failed the whole
+	// plan, taking every later reconcile on that host with it.
+	if req.Vip != "" {
+		if _, _, err := lb.ParseVIP(req.Vip); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid vip: %v", err)
+		}
+	}
 	// Validate any newly-added backends before persisting — they render into
 	// the root-run HAProxy/keepalived configs (same as CreateLoadBalancer).
 	for _, b := range req.AddBackends {
@@ -1633,7 +1647,20 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 		}
 	}
 
-	vipIP, vipPrefix, _ := lb.ParseVIP(vip)
+	// Stored value, so ParseStoredVIP: a row written by an older build may hold
+	// a form this parser refuses, and refusing to apply it would silently strand
+	// a working LB. Ingress above rejects a NEW bad VIP, so anything repaired
+	// here came from an earlier release.
+	vipIP, vipPrefix, vipRepaired, err := lb.ParseStoredVIP(vip)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"load balancer %q has an unusable stored VIP %q: %v", req.Name, vip, err)
+	}
+	if vipRepaired {
+		slog.Warn("load balancer has a malformed stored VIP; applying the recovered value. "+
+			"Re-set it with `lv lb update --vip` to clear this",
+			"lb", req.Name, "stored", vip, "applied", fmt.Sprintf("%s/%d", vipIP, vipPrefix))
+	}
 	// hosts is the LB's durable holder set — CreateLoadBalancer records a concrete
 	// holder, and a legacy no-holder row was either repaired to its proven
 	// participant above or the update was refused. So the local apply loop runs on
@@ -1674,22 +1701,42 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			proof := s.mintLBProof(ctx, req.Name, host)
-			if s.gateActive(ctx) && proof == nil {
+			proof := s.mintLBProof(fctx, req.Name, host)
+			if s.gateActive(fctx) && proof == nil {
 				slog.Error("UpdateLoadBalancer: cannot mint LB proof under enforcement; skipping remote apply",
 					"host", host, "lb", req.Name)
 				return
 			}
-			if _, aerr := client.ApplyLB(ctx, &pb.ApplyLBRequest{
-				LbName: req.Name, Vip: vip, Algorithm: algorithm,
+			// The REPAIRED vip, not the raw stored one. ParseStoredVIP above
+			// accepts a form an older build persisted (e.g. a trailing extra
+			// field) and hands back the recovered address; sending `vip` sent
+			// that original string, and the peer parses with the tightened
+			// ParseVIP and answers InvalidArgument. The local host applied the
+			// LB and every other holder silently did not, so keepalived/VRRP
+			// failover for the VIP was gone — the same "upgrade becomes a silent
+			// outage" regression ParseStoredVIP exists to prevent (see the note
+			// on the read path below), relocated to the peer fan-out.
+			if _, aerr := client.ApplyLB(fctx, &pb.ApplyLBRequest{
+				LbName: req.Name, Vip: vipForWire(vip), Algorithm: algorithm,
 				Backends: pbBackends, Ports: parsedPorts, Hosts: lbHosts, Proof: proof,
 			}); aerr != nil {
-				slog.Warn("UpdateLoadBalancer: remote apply failed", "host", host, "lb", req.Name, "error", aerr)
+				// Error, not Warn. A holder that did not receive the config is
+				// not participating in VRRP for this VIP, so the LB is one host
+				// away from having no failover at all — and nothing else reports
+				// it. The fan-out stays best-effort by design; what changes here
+				// is that the consequence is legible in the log.
+				slog.Error("UpdateLoadBalancer: remote apply failed — this host is NOT serving the LB "+
+					"and will not participate in VRRP failover for its VIP; re-run `lv lb update`",
+					"host", host, "lb", req.Name, "error", aerr)
 			}
 		}(h)
 	}
@@ -1761,12 +1808,16 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			client.RemoveLB(ctx, &pb.RemoveLBRequest{LbName: req.Name})
+			client.RemoveLB(fctx, &pb.RemoveLBRequest{LbName: req.Name})
 		}(h)
 	}
 
@@ -2124,6 +2175,27 @@ func (s *Server) mintLBProof(ctx context.Context, lbName, destHost string) *pb.R
 	}
 }
 
+// vipForWire is the VIP to send a peer, given the one this node has stored.
+//
+// Split out and named so the two fan-out sites cannot drift, and so the rule is
+// testable without standing up a peer: ApplyLB parses with the STRICT
+// lb.ParseVIP, while a row persisted by an older Sscanf-era build can hold a
+// form only lb.ParseStoredVIP accepts. Sending the stored string meant the
+// coordinating host applied the LB and every other holder refused it with
+// InvalidArgument, which the fan-out only logged — silent config drift that
+// reads as a successful update.
+//
+// A well-formed value round-trips unchanged. One ParseStoredVIP cannot recover
+// is returned as-is, so the peer's own error names the real value rather than
+// this node inventing a substitute.
+func vipForWire(stored string) string {
+	ip, prefix, _, err := lb.ParseStoredVIP(stored)
+	if err != nil {
+		return stored
+	}
+	return fmt.Sprintf("%s/%d", ip, prefix)
+}
+
 // forwardLBApply asks a remote host to apply the LB. resolvedHosts is the RESOLVED
 // target host set (implicit stack LBs derive it from VM placement) — it MUST be passed
 // so the remote computes the same VRRP priority the local apply did; sending the raw
@@ -2173,9 +2245,15 @@ func (s *Server) forwardLBApply(ctx context.Context, hostName string, spec *pb.V
 			"host", hostName, "lb", lbName)
 		return
 	}
+	// Repair the VIP before it goes on the wire, for the same reason
+	// UpdateLoadBalancer's fan-out does: ApplyLB parses with the strict
+	// ParseVIP, so a legacy form an older build persisted is accepted locally
+	// and refused by the peer. A well-formed value round-trips unchanged, and a
+	// value ParseStoredVIP cannot recover is forwarded as-is so the peer's own
+	// error message is what the operator sees.
 	if _, err := client.ApplyLB(ctx, &pb.ApplyLBRequest{
 		LbName:    lbName,
-		Vip:       lbSpec.Vip,
+		Vip:       vipForWire(lbSpec.Vip),
 		Algorithm: lbSpec.Algorithm,
 		Backends:  pbBackends,
 		Ports:     pbPorts,
@@ -2404,12 +2482,16 @@ func (s *Server) refreshLBForStack(ctx context.Context, stackName string) {
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			client.RefreshLB(ctx, &pb.RefreshLBRequest{StackName: stackName})
+			client.RefreshLB(fctx, &pb.RefreshLBRequest{StackName: stackName})
 		}(h)
 	}
 }
@@ -2584,10 +2666,22 @@ func (s *Server) reconcileDeadLBs(ctx context.Context) {
 // reapplyExplicitLB rebuilds an explicit (non-stack) LB's lb.Config from its stored row +
 // backends and re-applies it locally (idempotent; the Phase-1 exec gate still guards it).
 func (s *Server) reapplyExplicitLB(ctx context.Context, cfg corrosion.LBConfigRecord) {
-	vipIP, vipPrefix, err := lb.ParseVIP(cfg.VIP)
+	// ParseStoredVIP, not ParseVIP. This is a read path over rows an older build
+	// wrote, and a stricter parser here does not reject bad input — it stops
+	// re-applying a load balancer that has been working for months. Tightening
+	// ParseVIP without this turned an upgrade into a silent outage: the LB is
+	// never restored after a restart or a failover, and one Warn line is the
+	// only trace.
+	vipIP, vipPrefix, vipRepaired, err := lb.ParseStoredVIP(cfg.VIP)
 	if err != nil {
-		slog.Warn("reapplyExplicitLB: parse vip", "lb", cfg.Name, "error", err)
+		slog.Error("reapplyExplicitLB: stored VIP is unusable; this load balancer will NOT be re-applied "+
+			"until it is corrected with `lv lb update --vip`", "lb", cfg.Name, "stored", cfg.VIP, "error", err)
 		return
+	}
+	if vipRepaired {
+		slog.Warn("reapplyExplicitLB: stored VIP is malformed; re-applying the recovered value. "+
+			"Re-set it with `lv lb update --vip` to clear this",
+			"lb", cfg.Name, "stored", cfg.VIP, "applied", fmt.Sprintf("%s/%d", vipIP, vipPrefix))
 	}
 	hosts, ok := parseHostsJSON(cfg.Hosts)
 	if !ok {

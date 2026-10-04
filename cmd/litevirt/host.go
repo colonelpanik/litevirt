@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func newHostCmd() *cobra.Command {
@@ -112,11 +113,22 @@ func newHostAddCmd() *cobra.Command {
 					"become %s's gossip peers: %w", name, lerr)
 			}
 			for _, h := range resp.Hosts {
-				if h.Address != "" {
-					// JoinHostPort, not Sprintf("%s:%d"): h.Address is a bare host
-					// from the hosts table and lands in the new node's join_peers.
-					peerAddrs = append(peerAddrs, net.JoinHostPort(h.Address, "7946"))
+				if h.Address == "" {
+					continue
 				}
+				// hosts.address is replicated and peer-writable, and this value
+				// lands in the new node's join_peers AND in the remote setup
+				// command line. A row that is not a bare IPv4 literal cannot be
+				// a real gossip peer, so skipping it loses nothing and keeps a
+				// poisoned row from reaching either consumer.
+				if !corrosion.ValidHostAddress(h.Address) {
+					fmt.Fprintf(os.Stderr, "warning: skipping peer %q: address %q is not a bare IPv4 literal\n",
+						h.Name, h.Address)
+					continue
+				}
+				// JoinHostPort, not Sprintf("%s:%d"): h.Address is a bare host
+				// from the hosts table and lands in the new node's join_peers.
+				peerAddrs = append(peerAddrs, net.JoinHostPort(h.Address, "7946"))
 			}
 			defer closer()
 			return cli.HostAdd(cmd.Context(), c, args[0], name, peerAddrs)

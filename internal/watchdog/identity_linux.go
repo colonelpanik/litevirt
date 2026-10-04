@@ -74,3 +74,14 @@ func watchdogTimeLeft(fd uintptr) (secs int, ok bool) {
 func disarmWatchdog(fd uintptr) {
 	_ = unix.IoctlSetPointerInt(int(fd), wdiocSetOptions, wdiosDisableCard)
 }
+
+// watchdogOptions reports the driver's WDIOF_* capability flags via
+// WDIOC_GETSUPPORT. known=false when the identity cannot be read, which callers
+// must treat as "no capability proven" rather than as zero flags.
+func watchdogOptions(fd uintptr) (options uint32, known bool) {
+	info, err := unix.IoctlGetWatchdogInfo(int(fd))
+	if err != nil {
+		return 0, false
+	}
+	return info.Options, true
+}

@@ -657,11 +657,54 @@ func peerCommonName(ctx context.Context) string {
 // fallback used by handlers we haven't migrated yet, and as the bridge
 // fallback when no role-bindings exist in the cluster.
 func RequireRole(ctx context.Context, minRole string) error {
+	// A role gate has NO path, so there is nothing to intersect a token scope
+	// against — and a credential carrying a restriction this code path cannot
+	// evaluate must not pass it.
+	//
+	// Scope used to be consulted only in RequirePerm, while RequireRole guarded
+	// over a hundred handlers including CreateToken, GrantRole, PublishCRL,
+	// RemoveHost, FenceHost and DeleteUser. The holder of a token scoped to
+	// /projects/acme could therefore call CreateToken with no scopes and receive
+	// an unscoped admin token, making docs/auth.md's promise ("even if the bound
+	// user is Admin, a token scoped to /projects/acme cannot touch
+	// /projects/other") decorative across the whole admin surface.
+	//
+	// Refusing here is a migration cost, deliberately taken: a scoped token
+	// cannot drive a handler that has not been moved to RequirePerm yet. The
+	// alternative is to keep honouring a restriction we cannot check.
+	if scopes := callerScopePaths(ctx); len(scopes) > 0 && !scopesIncludeRoot(scopes) {
+		return status.Errorf(codes.PermissionDenied,
+			"this operation is not scope-aware, so a scoped token cannot authorize it; "+
+				"use an unscoped credential (token scopes: %v)", scopes)
+	}
+	return requireRoleLevel(ctx, minRole)
+}
+
+// requireRoleLevel is the role comparison alone, with no token-scope guard.
+//
+// It exists for the callers that have ALREADY resolved the scope question, or
+// that must defer it: RequirePerm checks the scope against the real request
+// path before falling back here, and requirePermPrecheck runs before the path
+// is known and leaves the check to the RequirePerm that follows. Routing those
+// through RequireRole would deny every scoped token twice over — once
+// correctly, once for a path that was already allowed.
+func requireRoleLevel(ctx context.Context, minRole string) error {
 	role := callerRole(ctx)
 	if roleLevel(role) < roleLevel(minRole) {
 		return status.Errorf(codes.PermissionDenied, "role %q required, caller has %q", minRole, role)
 	}
 	return nil
+}
+
+// scopesIncludeRoot reports whether any scope is the root path, which is a
+// token that carries no restriction at all.
+func scopesIncludeRoot(scopes []string) bool {
+	for _, sc := range scopes {
+		if canonicalScopePath(sc) == "/" {
+			return true
+		}
+	}
+	return false
 }
 
 // RequirePerm checks whether the caller may perform `verb` at `path` in
@@ -702,8 +745,11 @@ func (s *Server) RequirePerm(ctx context.Context, path, verb, fallbackRole strin
 		}
 	}
 
-	// No bindings → legacy fallback.
-	return RequireRole(ctx, fallbackRole)
+	// No bindings → legacy fallback. requireRoleLevel, not RequireRole: the
+	// scope was already checked against `path` at the top of this function, and
+	// re-checking it path-blind here would refuse a token acting inside its own
+	// scope.
+	return requireRoleLevel(ctx, fallbackRole)
 }
 
 // requirePermPrecheck is a path-independent gate used by handlers that must
@@ -730,7 +776,11 @@ func (s *Server) requirePermPrecheck(ctx context.Context, fallbackRole string) e
 			return nil
 		}
 	}
-	return RequireRole(ctx, fallbackRole)
+	// requireRoleLevel: this runs BEFORE the path is known, and its contract is
+	// explicitly that a pass is not an authorization grant. The scope check
+	// belongs to the RequirePerm that follows, once there is a path to check it
+	// against.
+	return requireRoleLevel(ctx, fallbackRole)
 }
 
 // callerScopePaths returns the token-scope path prefixes attached to the

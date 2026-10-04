@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 )
@@ -118,9 +119,33 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 // issued a different certificate for the same name. A daemon cannot use its old
 // certificate to resurrect itself: the old serial is retained in the tombstone
 // and an equal serial is refused.
+// ValidHostAddress reports whether s is a bare IPv4 literal, which is the only
+// thing hosts.address is allowed to be.
+//
+// The column is replicated and peer-writable, and it is consumed by code that
+// builds remote command lines and dial targets from it. `lv host add`
+// interpolated it into an SSH exec request, which sshd runs through the login
+// shell, so a row containing `$(...)` executed as root on every host added
+// afterwards. That call site is quoted now; this makes the value unable to
+// carry a payload at all.
+//
+// Requiring IPv4 costs nothing that was ever supported: cluster transport is
+// IPv4-only, and the daemon already refuses to start on a hostname, a
+// host:port or an IPv6 literal.
+func ValidHostAddress(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.To4() != nil
+}
+
 func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
 		return fmt.Errorf("host admission requires name, address, and certificate serial")
+	}
+	// The address is consumed by code that builds dial targets and remote
+	// command lines from it, so it must not be able to carry anything but an
+	// address. See ValidHostAddress.
+	if !ValidHostAddress(h.Address) {
+		return fmt.Errorf("host admission: address %q is not a bare IPv4 literal", h.Address)
 	}
 	rows, err := c.Query(ctx, `SELECT cert_serial, deleted_at FROM hosts WHERE name = ?`, h.Name)
 	if err != nil {

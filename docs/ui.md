@@ -147,7 +147,8 @@ The **Resource Mappings** page (admin nav) manages cluster-wide aliases for
 equivalent passthrough devices: create a mapping, then add one device per host
 (host + PCI address + optional vendor/device). VMs reference a mapping by name so
 they can run on / migrate to any host registered under it. CRDT-replicated; mirrors
-the `lv mapping` CLI.
+the `lv mapping` CLI. Changes go through the daemon's resource-mapping RPCs with
+the session's credential, so they need `resourcemap.write`, as from the CLI.
 
 ## VM Backup & Restore
 

@@ -5,6 +5,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -62,15 +64,111 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return false
 	}
-	if _, err := s.grpc.Whoami(s.uiBearerCtx(r), &emptypb.Empty{}); err != nil {
+
+	// A mutating request is held to the same bar as the equivalent RPC. The UI's
+	// write handlers reach the replicated DB in-process rather than through
+	// gRPC, so they never passed the operator check the RPC applies
+	// (firewall_rules.go) — and this gate, the only one in front of them, looked
+	// at the cookie and never at the role. A VIEWER could flip the cluster
+	// default firewall policy, delete security-group rules for every VM, and
+	// repoint cluster notifications.
+	mutating := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+
+	who, err := s.grpc.Whoami(s.uiBearerCtx(r), &emptypb.Empty{})
+	if err != nil {
 		if status.Code(err) == codes.Unauthenticated {
 			clearSessionCookie(w)
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return false
 		}
-		slog.Warn("ui: session validation hit a transient error; allowing through", "error", err)
+		// Fail OPEN for a read and CLOSED for a write. Letting a read through a
+		// brief daemon blip avoids locking an operator out of the dashboard, and
+		// that trade is deliberate. Letting a WRITE through means the one
+		// component that knows the caller's role is unreachable and the write
+		// lands anyway, which is not a trade — it is the check being optional.
+		if mutating {
+			slog.Warn("ui: refusing a mutation because the caller's role could not be verified",
+				"method", r.Method, "path", r.URL.Path, "error", err)
+			http.Error(w, "cannot verify your permissions right now; try again shortly",
+				http.StatusServiceUnavailable)
+			return false
+		}
+		slog.Warn("ui: session validation hit a transient error; allowing the READ through", "error", err)
+		return true
+	}
+
+	// A mutation is authorized by the DAEMON, not here. The write handlers now
+	// call their gRPC twins, whose RequirePerm consults the token's scope paths
+	// and the caller's RBAC bindings — neither of which is visible in the
+	// coarse role string this layer can see.
+	//
+	// What remains here is a cheap early refusal for the one case the coarse
+	// role settles on its own: a session with no role at all. It must not be
+	// the only check, and it deliberately does NOT refuse a low role, because
+	// an external-realm user is shadowed as "viewer" while their real
+	// authority comes from a binding the daemon holds.
+	if mutating && !selfServiceMutation(r.URL.Path) && who.GetRole() == "" {
+		slog.Warn("ui: refusing a mutation from a session with no role",
+			"user", who.GetUsername(), "method", r.Method, "path", r.URL.Path)
+		http.Error(w, "your credentials do not permit this change", http.StatusForbidden)
+		return false
 	}
 	return true
+}
+
+// selfServiceMutation reports whether path is a user acting on their OWN
+// credentials.
+//
+// These carry no authority beyond the session that already authenticated, and
+// the handlers behind them scope themselves to the caller. Holding them to the
+// cluster-write bar would stop a Viewer changing their own password or
+// enrolling a security key -- which is the thing to break, not the thing to
+// secure.
+//
+// path.Clean first: "/account/../ui/firewall/cluster-rules" must not be
+// laundered into the exempt set by a prefix match.
+func selfServiceMutation(p string) bool {
+	switch cleaned := path.Clean(p); {
+	case cleaned == "/account/password":
+		return true
+	case cleaned == "/account/2fa" || strings.HasPrefix(cleaned, "/account/2fa/"):
+		return true
+	}
+	return false
+}
+
+// httpStatusFor maps a gRPC error to the HTTP status the page should return.
+//
+// It exists because the write handlers now call their gRPC twins, so the
+// daemon's PermissionDenied has to arrive at the browser as 403 rather than
+// being flattened into 500 with the rest. A refusal that reads as a server
+// fault sends the operator to the logs instead of to their permissions.
+func httpStatusFor(err error) int {
+	switch status.Code(err) {
+	case codes.PermissionDenied:
+		return http.StatusForbidden
+	case codes.Unauthenticated:
+		return http.StatusUnauthorized
+	case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists:
+		return http.StatusBadRequest
+	case codes.NotFound:
+		return http.StatusNotFound
+	case codes.Unavailable:
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
+}
+
+// uiRoleLevels mirrors the daemon's admin > operator > viewer ordering. It is a
+// local copy because internal/grpcapi does not export one; the two must agree,
+// and the UI is deliberately the more permissive of the pair only in that it
+// never grants more than the RPC behind it would.
+var uiRoleLevels = map[string]int{"viewer": 1, "operator": 2, "admin": 3}
+
+// uiRoleAtLeast reports whether role meets minRole. An unknown or empty role
+// scores 0, so it never satisfies anything.
+func uiRoleAtLeast(role, minRole string) bool {
+	return uiRoleLevels[role] >= uiRoleLevels[minRole] && uiRoleLevels[role] > 0
 }
 
 // clearSessionCookie expires the session cookie in the browser.

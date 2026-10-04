@@ -203,6 +203,10 @@ const (
 	LiteVirt_DeleteIpSet_FullMethodName                = "/litevirt.v1.LiteVirt/DeleteIpSet"
 	LiteVirt_SetFirewallDefault_FullMethodName         = "/litevirt.v1.LiteVirt/SetFirewallDefault"
 	LiteVirt_ListFirewallDefaults_FullMethodName       = "/litevirt.v1.LiteVirt/ListFirewallDefaults"
+	LiteVirt_CreateSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/CreateSecurityGroup"
+	LiteVirt_DeleteSecurityGroup_FullMethodName        = "/litevirt.v1.LiteVirt/DeleteSecurityGroup"
+	LiteVirt_AddSecurityGroupRule_FullMethodName       = "/litevirt.v1.LiteVirt/AddSecurityGroupRule"
+	LiteVirt_RemoveSecurityGroupRule_FullMethodName    = "/litevirt.v1.LiteVirt/RemoveSecurityGroupRule"
 	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
 	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
 	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
@@ -533,6 +537,11 @@ type LiteVirtClient interface {
 	DeleteIpSet(ctx context.Context, in *DeleteIpSetRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SetFirewallDefault(ctx context.Context, in *SetFirewallDefaultRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListFirewallDefaults(ctx context.Context, in *ListFirewallDefaultsRequest, opts ...grpc.CallOption) (*ListFirewallDefaultsResponse, error)
+	// ── Security groups: the per-NIC tier ──
+	CreateSecurityGroup(ctx context.Context, in *CreateSecurityGroupRequest, opts ...grpc.CallOption) (*SecurityGroup, error)
+	DeleteSecurityGroup(ctx context.Context, in *DeleteSecurityGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AddSecurityGroupRule(ctx context.Context, in *AddSecurityGroupRuleRequest, opts ...grpc.CallOption) (*SecurityGroupRule, error)
+	RemoveSecurityGroupRule(ctx context.Context, in *RemoveSecurityGroupRuleRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	DeleteStoragePoolContent(ctx context.Context, in *DeleteStoragePoolContentRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error)
@@ -2748,6 +2757,46 @@ func (c *liteVirtClient) ListFirewallDefaults(ctx context.Context, in *ListFirew
 	return out, nil
 }
 
+func (c *liteVirtClient) CreateSecurityGroup(ctx context.Context, in *CreateSecurityGroupRequest, opts ...grpc.CallOption) (*SecurityGroup, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SecurityGroup)
+	err := c.cc.Invoke(ctx, LiteVirt_CreateSecurityGroup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteSecurityGroup(ctx context.Context, in *DeleteSecurityGroupRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteSecurityGroup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AddSecurityGroupRule(ctx context.Context, in *AddSecurityGroupRuleRequest, opts ...grpc.CallOption) (*SecurityGroupRule, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SecurityGroupRule)
+	err := c.cc.Invoke(ctx, LiteVirt_AddSecurityGroupRule_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RemoveSecurityGroupRule(ctx context.Context, in *RemoveSecurityGroupRuleRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_RemoveSecurityGroupRule_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) DeleteStoragePoolContent(ctx context.Context, in *DeleteStoragePoolContentRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -3655,6 +3704,11 @@ type LiteVirtServer interface {
 	DeleteIpSet(context.Context, *DeleteIpSetRequest) (*emptypb.Empty, error)
 	SetFirewallDefault(context.Context, *SetFirewallDefaultRequest) (*emptypb.Empty, error)
 	ListFirewallDefaults(context.Context, *ListFirewallDefaultsRequest) (*ListFirewallDefaultsResponse, error)
+	// ── Security groups: the per-NIC tier ──
+	CreateSecurityGroup(context.Context, *CreateSecurityGroupRequest) (*SecurityGroup, error)
+	DeleteSecurityGroup(context.Context, *DeleteSecurityGroupRequest) (*emptypb.Empty, error)
+	AddSecurityGroupRule(context.Context, *AddSecurityGroupRuleRequest) (*SecurityGroupRule, error)
+	RemoveSecurityGroupRule(context.Context, *RemoveSecurityGroupRuleRequest) (*emptypb.Empty, error)
 	DeleteStoragePoolContent(context.Context, *DeleteStoragePoolContentRequest) (*emptypb.Empty, error)
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error
@@ -4381,6 +4435,18 @@ func (UnimplementedLiteVirtServer) SetFirewallDefault(context.Context, *SetFirew
 }
 func (UnimplementedLiteVirtServer) ListFirewallDefaults(context.Context, *ListFirewallDefaultsRequest) (*ListFirewallDefaultsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListFirewallDefaults not implemented")
+}
+func (UnimplementedLiteVirtServer) CreateSecurityGroup(context.Context, *CreateSecurityGroupRequest) (*SecurityGroup, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSecurityGroup not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteSecurityGroup(context.Context, *DeleteSecurityGroupRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSecurityGroup not implemented")
+}
+func (UnimplementedLiteVirtServer) AddSecurityGroupRule(context.Context, *AddSecurityGroupRuleRequest) (*SecurityGroupRule, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddSecurityGroupRule not implemented")
+}
+func (UnimplementedLiteVirtServer) RemoveSecurityGroupRule(context.Context, *RemoveSecurityGroupRuleRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveSecurityGroupRule not implemented")
 }
 func (UnimplementedLiteVirtServer) DeleteStoragePoolContent(context.Context, *DeleteStoragePoolContentRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteStoragePoolContent not implemented")
@@ -7638,6 +7704,78 @@ func _LiteVirt_ListFirewallDefaults_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_CreateSecurityGroup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSecurityGroupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CreateSecurityGroup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CreateSecurityGroup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CreateSecurityGroup(ctx, req.(*CreateSecurityGroupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteSecurityGroup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSecurityGroupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteSecurityGroup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteSecurityGroup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteSecurityGroup(ctx, req.(*DeleteSecurityGroupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AddSecurityGroupRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddSecurityGroupRuleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AddSecurityGroupRule(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AddSecurityGroupRule_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AddSecurityGroupRule(ctx, req.(*AddSecurityGroupRuleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_RemoveSecurityGroupRule_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveSecurityGroupRuleRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RemoveSecurityGroupRule(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RemoveSecurityGroupRule_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RemoveSecurityGroupRule(ctx, req.(*RemoveSecurityGroupRuleRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_DeleteStoragePoolContent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DeleteStoragePoolContentRequest)
 	if err := dec(in); err != nil {
@@ -9301,6 +9439,22 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListFirewallDefaults",
 			Handler:    _LiteVirt_ListFirewallDefaults_Handler,
+		},
+		{
+			MethodName: "CreateSecurityGroup",
+			Handler:    _LiteVirt_CreateSecurityGroup_Handler,
+		},
+		{
+			MethodName: "DeleteSecurityGroup",
+			Handler:    _LiteVirt_DeleteSecurityGroup_Handler,
+		},
+		{
+			MethodName: "AddSecurityGroupRule",
+			Handler:    _LiteVirt_AddSecurityGroupRule_Handler,
+		},
+		{
+			MethodName: "RemoveSecurityGroupRule",
+			Handler:    _LiteVirt_RemoveSecurityGroupRule_Handler,
 		},
 		{
 			MethodName: "DeleteStoragePoolContent",

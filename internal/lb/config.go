@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -24,15 +26,15 @@ func deriveAuthPass(name string) string {
 
 // Config holds everything needed to render HAProxy + keepalived configs for one LB instance.
 type Config struct {
-	Name      string   // e.g. "app-server"
-	VIP       string   // e.g. "10.0.100.100"
-	VIPPrefix int      // CIDR prefix length
-	Interface string   // network interface for VRRP (e.g. "eth0")
-	VRID      int      // VRRP virtual router ID (1–255, unique per VIP)
-	Priority  int      // 100 = master, 50 = backup
+	Name      string // e.g. "app-server"
+	VIP       string // e.g. "10.0.100.100"
+	VIPPrefix int    // CIDR prefix length
+	Interface string // network interface for VRRP (e.g. "eth0")
+	VRID      int    // VRRP virtual router ID (1–255, unique per VIP)
+	Priority  int    // 100 = master, 50 = backup
 	Backends  []Backend
 	Ports     []Port
-	Algorithm string   // roundrobin | leastconn | source
+	Algorithm string        // roundrobin | leastconn | source
 	Health    *HealthConfig // backend health check (nil = default tcp-check)
 
 	// SNAT fields — set when LB provides outbound NAT for host-isolated VMs.
@@ -261,14 +263,94 @@ esac
 `))
 
 // ParseVIP splits "10.0.100.100/24" into IP and prefix length.
-func ParseVIP(vip string) (ip string, prefix int, err error) {
-	parts := strings.SplitN(vip, "/", 2)
-	if len(parts) != 2 {
-		return vip, 32, nil
+// ParseStoredVIP reads a VIP that is ALREADY in the database, written by a
+// build whose parser accepted things this one refuses.
+//
+// Read paths need this and ingress paths must not use it. Tightening ParseVIP
+// without it turned an upgrade into a silent outage: reapplyExplicitLB bails on
+// a parse error, so an LB stored as "10.0.0.1/24/extra" — which the old
+// Sscanf-based parser accepted and persisted, and which has been serving
+// 10.0.0.1/24 ever since — simply stopped being re-applied after any daemon
+// restart or failover, with a single Warn line as the only trace.
+//
+// So a row that still NAMES a real address is repaired, and reports repaired=true
+// so the caller can tell the operator to correct it. A row that never named one
+// ("*", "", "/24", an IPv6 literal) is refused, because there is nothing to
+// recover and guessing would put an unintended address on the wire.
+func ParseStoredVIP(vip string) (ip string, prefix int, repaired bool, err error) {
+	if ip, prefix, err = ParseVIP(vip); err == nil {
+		return ip, prefix, false, nil
 	}
-	ip = parts[0]
-	if _, err := fmt.Sscanf(parts[1], "%d", &prefix); err != nil {
+
+	// Recover the address half only. Everything after the first "/" is a prefix
+	// the old parser read with Sscanf("%d"), which stopped at the first
+	// non-digit — so "24/extra" and "3.5" were taken as 24 and 3, and that is
+	// the value the cluster has actually been running with.
+	head, rest, hasPrefix := strings.Cut(vip, "/")
+	addr := net.ParseIP(head)
+	if addr == nil || addr.To4() == nil {
+		return "", 0, false, fmt.Errorf("stored VIP %q does not name an IPv4 address and cannot be repaired", vip)
+	}
+	if !hasPrefix {
+		return head, 32, true, nil
+	}
+	digits := rest
+	for i, r := range rest {
+		if r < '0' || r > '9' {
+			digits = rest[:i]
+			break
+		}
+	}
+	n, convErr := strconv.Atoi(digits)
+	if convErr != nil || n < 0 || n > 32 {
+		return "", 0, false, fmt.Errorf("stored VIP %q has no recoverable prefix", vip)
+	}
+	return head, n, true, nil
+}
+
+func ParseVIP(vip string) (ip string, prefix int, err error) {
+	// net.ParseIP, not a bare split. Without it anything lacking a "/" came back
+	// verbatim as an address, so `--vip '*'` was accepted — and that string is
+	// rendered into keepalived's virtual_ipaddress (where the failure is only
+	// logged, so the VIP silently never comes up) and, on an isolated bridge,
+	// into an nftables rule, where `nft -f` rejects the WHOLE ruleset and every
+	// later firewall reconcile on that host fails with it.
+	ip, cidr, hasPrefix := strings.Cut(vip, "/")
+
+	addr := net.ParseIP(ip)
+	if addr == nil {
+		return "", 0, fmt.Errorf("invalid VIP address %q", vip)
+	}
+	// IPv4 only, and not as a style preference. internal/firewall refuses any
+	// exception VIP containing ":" and fails the ENTIRE plan when it sees one,
+	// so an IPv6 VIP does not degrade — it breaks every later firewall
+	// reconcile on that host, which is the same blast radius this validator
+	// exists to prevent. keepalived's rendering here is IPv4-shaped too, and
+	// the rest of the tree already refuses IPv6 at its entry points
+	// (advertise_address, resolveHost).
+	// strings.Contains(ip, ":"), not just To4() == nil. A v4-mapped literal like
+	// "::ffff:10.0.0.1" HAS a To4() form, so a family check alone lets it
+	// through — and it is the textual value that gets stored and handed to
+	// internal/firewall, whose refusal is literally
+	// `strings.Contains(exc.VIP, ":")`. Match that test exactly.
+	if addr.To4() == nil || strings.Contains(ip, ":") {
+		return "", 0, fmt.Errorf("invalid VIP %q: must be IPv4 (the firewall and keepalived paths cannot carry IPv6)", vip)
+	}
+
+	// Width of the address family, which is both the default and the ceiling.
+	const width = 32
+	if !hasPrefix {
+		return ip, width, nil
+	}
+
+	// strconv, not Sscanf("%d"): Sscanf stops at the first non-digit and reports
+	// success, so "/3.5" and "/24junk" were read as 3 and 24.
+	prefix, err = strconv.Atoi(cidr)
+	if err != nil {
 		return "", 0, fmt.Errorf("invalid VIP CIDR %q", vip)
+	}
+	if prefix < 0 || prefix > width {
+		return "", 0, fmt.Errorf("invalid VIP CIDR %q: prefix must be between 0 and %d", vip, width)
 	}
 	return ip, prefix, nil
 }

@@ -55,16 +55,18 @@ type Event struct {
 
 // Fake satisfies grpcapi.LibvirtBackend.
 type Fake struct {
-	mu          sync.Mutex
-	domains     map[string]State
-	xml         map[string]string
-	activeXML   map[string]string              // domain → live-view override (see DumpXML)
-	snapshots   map[string]map[string]struct{} // domain → snapshot names
-	diskSources map[string]map[string]string   // domain → target-dev → source file
-	stats       map[string]*libvirt.DomainStats
-	reasons     map[string]string // domain → injected DomainStateReason.Reason
-	ownerEpochs map[string]int64  // domain → Phase 4 owner-epoch metadata marker
-	events      []Event
+	execStdout, execStderr string
+	execExitCode           int32
+	mu                     sync.Mutex
+	domains                map[string]State
+	xml                    map[string]string
+	activeXML              map[string]string              // domain → live-view override (see DumpXML)
+	snapshots              map[string]map[string]struct{} // domain → snapshot names
+	diskSources            map[string]map[string]string   // domain → target-dev → source file
+	stats                  map[string]*libvirt.DomainStats
+	reasons                map[string]string // domain → injected DomainStateReason.Reason
+	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
+	events                 []Event
 
 	// eventCB is the domain lifecycle callback registered by
 	// RegisterDomainEventCallback; nil until something registers. FireEvent
@@ -1387,11 +1389,32 @@ func (f *Fake) GetAllDomainStats() ([]*libvirt.DomainStats, error) {
 	return out, nil
 }
 
-func (f *Fake) ExecInGuest(name, command string, args []string) (string, error) {
+// SetExecResult programs what the next ExecInGuestDetailed calls report. A
+// non-zero code is a command that RAN and failed, not a failure to run it —
+// the distinction `lv exec` depends on.
+func (f *Fake) SetExecResult(stdout, stderr string, exitCode int32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execStdout, f.execStderr, f.execExitCode = stdout, stderr, exitCode
+}
+
+func (f *Fake) ExecInGuestDetailed(name, command string, args []string) ([]byte, []byte, int32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("exec-in-guest", name, command)
-	return "", nil
+	return []byte(f.execStdout), []byte(f.execStderr), f.execExitCode, nil
+}
+
+func (f *Fake) ExecInGuest(name, command string, args []string) (string, error) {
+	out, errOut, code, err := f.ExecInGuestDetailed(name, command, args)
+	combined := string(out) + string(errOut)
+	if err != nil {
+		return combined, err
+	}
+	if code != 0 {
+		return combined, fmt.Errorf("guest command exited %d", code)
+	}
+	return combined, nil
 }
 
 func (f *Fake) EnsureStoragePool(name, driver, source, target string, opts map[string]string) error {

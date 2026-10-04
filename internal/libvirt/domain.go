@@ -435,12 +435,16 @@ func (c *Client) GetVMMACs(name string) ([]string, error) {
 	return macs, nil
 }
 
-// ExecInGuest runs a command inside the VM via the QEMU guest agent.
-// Returns stdout of the command.
-func (c *Client) ExecInGuest(name, command string, args []string) (string, error) {
+// ExecInGuestDetailed runs a command inside the VM via the QEMU guest agent
+// and returns its stdout, stderr and exit code SEPARATELY.
+//
+// A non-zero exit is not an error here: the command ran and reported a
+// result. The error return is reserved for a failure to run it at all — no
+// agent, a dead domain, a malformed reply.
+func (c *Client) ExecInGuestDetailed(name, command string, args []string) ([]byte, []byte, int32, error) {
 	dom, err := c.virt.DomainLookupByName(name)
 	if err != nil {
-		return "", fmt.Errorf("lookup domain %s: %w", name, err)
+		return nil, nil, 0, fmt.Errorf("lookup domain %s: %w", name, err)
 	}
 
 	// Build guest-exec JSON payload.
@@ -460,7 +464,7 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 
 	resp, err := c.virt.QEMUDomainAgentCommand(dom, execReq, guestAgentTimeoutSec, 0)
 	if err != nil {
-		return "", fmt.Errorf("guest-exec %s: %w", name, err)
+		return nil, nil, 0, fmt.Errorf("guest-exec %s: %w", name, err)
 	}
 
 	var execRes struct {
@@ -469,7 +473,7 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 		} `json:"return"`
 	}
 	if len(resp) == 0 || json.Unmarshal([]byte(resp[0]), &execRes) != nil || execRes.Return.PID == 0 {
-		return "", fmt.Errorf("parse guest-exec response: %q", strings.Join(resp, ""))
+		return nil, nil, 0, fmt.Errorf("parse guest-exec response: %q", strings.Join(resp, ""))
 	}
 
 	// Poll guest-exec-status until the command has exited — guest-exec is
@@ -488,13 +492,13 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 	for attempt := 0; attempt < 60; attempt++ { // ~30s ceiling
 		statusResp, serr := c.virt.QEMUDomainAgentCommand(dom, statusReq, guestAgentTimeoutSec, 0)
 		if serr != nil {
-			return "", fmt.Errorf("guest-exec-status: %w", serr)
+			return nil, nil, 0, fmt.Errorf("guest-exec-status: %w", serr)
 		}
 		if len(statusResp) == 0 {
-			return "", nil
+			return nil, nil, 0, nil
 		}
 		if err := json.Unmarshal([]byte(statusResp[0]), &st); err != nil {
-			return "", fmt.Errorf("parse guest-exec-status: %w", err)
+			return nil, nil, 0, fmt.Errorf("parse guest-exec-status: %w", err)
 		}
 		if st.Return.Exited {
 			exited = true
@@ -503,7 +507,7 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !exited {
-		return "", fmt.Errorf("guest command on %s did not exit within ~30s", name)
+		return nil, nil, 0, fmt.Errorf("guest command on %s did not exit within ~30s", name)
 	}
 
 	// Decode the base64 stdout/stderr the agent captured and return the real
@@ -512,9 +516,25 @@ func (c *Client) ExecInGuest(name, command string, args []string) (string, error
 	// error while still returning whatever output was produced.
 	out, _ := base64.StdEncoding.DecodeString(st.Return.OutData)
 	errOut, _ := base64.StdEncoding.DecodeString(st.Return.ErrData)
+	return out, errOut, int32(st.Return.ExitCode), nil
+}
+
+// ExecInGuest runs a command in the guest and returns its combined output,
+// reporting a non-zero exit as an error.
+//
+// That collapse is right for a caller asking "did this succeed?" — the health
+// checker's probes — and wrong for one asking "what did it return?". `lv exec`
+// is the second kind, and this is why its exit status was always 1: the guest's
+// code is spent producing the error string and cannot be recovered from it.
+// Callers that need the code take ExecInGuestDetailed.
+func (c *Client) ExecInGuest(name, command string, args []string) (string, error) {
+	out, errOut, code, err := c.ExecInGuestDetailed(name, command, args)
 	combined := string(out) + string(errOut)
-	if st.Return.ExitCode != 0 {
-		return combined, fmt.Errorf("guest command exited %d: %s", st.Return.ExitCode, strings.TrimSpace(string(errOut)))
+	if err != nil {
+		return combined, err
+	}
+	if code != 0 {
+		return combined, fmt.Errorf("guest command exited %d: %s", code, strings.TrimSpace(string(errOut)))
 	}
 	return combined, nil
 }

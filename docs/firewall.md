@@ -183,6 +183,19 @@ reconciler picks them up on its next poll (or immediately via
 rules, host-tier rules, ipsets, and default-deny policy are also persisted in
 cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
 
+### Security groups in the web UI
+
+The web UI's security-group pages read groups and rules from the local
+database, but every change goes through the daemon's `CreateSecurityGroup`,
+`DeleteSecurityGroup`, `AddSecurityGroupRule` and `RemoveSecurityGroupRule`
+RPCs with the session's own credential. The daemon therefore decides who the
+caller is and what they may do, as for any other RPC: each change needs the
+`sg.write` verb at `/`, which Admin and NetworkAdmin hold and Operator and
+Viewer do not (a cluster with no role bindings falls back to the operator
+role). Each change leaves an audit row (`sg.add`, `sg.rm`, `sg.rule.add`,
+`sg.rule.rm`) naming the session's user, with the group or rule before and
+after, as `before=<state> after=<state>`.
+
 ## Default-deny rollout
 
 Switching a running cluster to default-deny is risky if a rule is

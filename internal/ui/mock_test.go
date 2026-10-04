@@ -12,7 +12,9 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -32,56 +34,62 @@ type mockGRPC struct {
 	pb.LiteVirtClient
 
 	mu sync.Mutex
+	// whoamiRole overrides the role Whoami reports (default "admin"), and
+	// whoamiErr makes Whoami fail — both so a test can drive the UI's
+	// authorization gate rather than only its happy path.
+	whoamiRole string
+	whoamiErr  error
 	// Response fields
-	listHostsResp        *pb.ListHostsResponse
-	listHostNetworksResp *pb.ListHostNetworksResponse
-	lastUpsertHostNetwork *pb.UpsertHostNetworkRequest
-	lastApplyHostNetwork  *pb.ApplyHostNetworkRequest
-	lastDeleteHostNetwork *pb.DeleteHostNetworkRequest
-	planHostNetworkResp   *pb.PlanHostNetworkResponse
-	inspectHostResp      *pb.Host
-	inspectHostErr       error
-	listVMsResp          *pb.ListVMsResponse
-	inspectVMResp        *pb.VM
-	inspectVMErr         error
-	listStacksResp       *pb.ListStacksResponse
-	listImagesResp       *pb.ListImagesResponse
-	listContainersResp   *pb.ListContainersResponse
-	listSchedulesResp    *pb.ListBackupSchedulesResponse
-	listUsersResp        *pb.ListUsersResponse
-	listNetworksResp     *pb.ListNetworksResponse
-	listLBsResp          *pb.ListLBResponse
-	inspectLBResp        *pb.LoadBalancer
-	inspectLBErr         error
-	auditLogResp         *pb.ListAuditLogResponse
-	loginResp            *pb.LoginResponse
-	loginErr             error
-	vmStatsResp          *pb.VMStats
-	vmStatsErr           error
-	hostStatsResp        *pb.HostResourceStats
-	hostStatsErr         error
-	lbStatsResp          *pb.LBStatsResponse
-	lbStatsErr           error
-	fenceHostResp        *pb.FenceResult
-	listHostDevicesResp  *pb.ListHostDevicesResponse
-	configureHostResp    *pb.Host
-	listSnapshotsResp    *pb.ListSnapshotsResponse
-	createNetworkResp    *pb.NetworkInfo
-	diffStackResp        *pb.DiffStackResponse
-	diffStackErr         error
-	clusterStatusResp    *pb.ClusterStatus
-	listStoragePoolsResp *pb.ListStoragePoolsResponse
-	spiceInfoResp        *pb.GetSpiceInfoResponse
-	spiceInfoErr         error
-	lastSetLabelsVMReq   *pb.SetVMLabelsRequest
-	setLabelsVMErr       error
-	poolContentsResp     *pb.ListStoragePoolContentsResponse
-	poolContentsErr      error
-	lastPoolContentsReq  *pb.ListStoragePoolContentsRequest
-	listVMHardwareResp   *pb.ListVMHardwareResponse
-	listVMHardwareErr    error
-	uploadStream         *fakeUploadStream
-	uploadStreamErr      error
+	listHostsResp          *pb.ListHostsResponse
+	listHostNetworksResp   *pb.ListHostNetworksResponse
+	lastUpsertHostNetwork  *pb.UpsertHostNetworkRequest
+	lastApplyHostNetwork   *pb.ApplyHostNetworkRequest
+	lastDeleteHostNetwork  *pb.DeleteHostNetworkRequest
+	lastSetFirewallDefault *pb.SetFirewallDefaultRequest
+	planHostNetworkResp    *pb.PlanHostNetworkResponse
+	inspectHostResp        *pb.Host
+	inspectHostErr         error
+	listVMsResp            *pb.ListVMsResponse
+	inspectVMResp          *pb.VM
+	inspectVMErr           error
+	listStacksResp         *pb.ListStacksResponse
+	listImagesResp         *pb.ListImagesResponse
+	listContainersResp     *pb.ListContainersResponse
+	listSchedulesResp      *pb.ListBackupSchedulesResponse
+	listUsersResp          *pb.ListUsersResponse
+	listNetworksResp       *pb.ListNetworksResponse
+	listLBsResp            *pb.ListLBResponse
+	inspectLBResp          *pb.LoadBalancer
+	inspectLBErr           error
+	auditLogResp           *pb.ListAuditLogResponse
+	loginResp              *pb.LoginResponse
+	loginErr               error
+	vmStatsResp            *pb.VMStats
+	vmStatsErr             error
+	hostStatsResp          *pb.HostResourceStats
+	hostStatsErr           error
+	lbStatsResp            *pb.LBStatsResponse
+	lbStatsErr             error
+	fenceHostResp          *pb.FenceResult
+	listHostDevicesResp    *pb.ListHostDevicesResponse
+	configureHostResp      *pb.Host
+	listSnapshotsResp      *pb.ListSnapshotsResponse
+	createNetworkResp      *pb.NetworkInfo
+	diffStackResp          *pb.DiffStackResponse
+	diffStackErr           error
+	clusterStatusResp      *pb.ClusterStatus
+	listStoragePoolsResp   *pb.ListStoragePoolsResponse
+	spiceInfoResp          *pb.GetSpiceInfoResponse
+	spiceInfoErr           error
+	lastSetLabelsVMReq     *pb.SetVMLabelsRequest
+	setLabelsVMErr         error
+	poolContentsResp       *pb.ListStoragePoolContentsResponse
+	poolContentsErr        error
+	lastPoolContentsReq    *pb.ListStoragePoolContentsRequest
+	listVMHardwareResp     *pb.ListVMHardwareResponse
+	listVMHardwareErr      error
+	uploadStream           *fakeUploadStream
+	uploadStreamErr        error
 
 	// Error injection for actions
 	startVMErr         error
@@ -738,7 +746,16 @@ func (m *mockGRPC) Logout(context.Context, *emptypb.Empty, ...grpc.CallOption) (
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) Whoami(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.WhoamiResponse, error) {
-	return &pb.WhoamiResponse{Username: "admin", Role: "admin", Realm: "local"}, nil
+	m.mu.Lock()
+	role, err := m.whoamiRole, m.whoamiErr
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		role = "admin"
+	}
+	return &pb.WhoamiResponse{Username: role, Role: role, Realm: "local"}, nil
 }
 func (m *mockGRPC) ChangePassword(context.Context, *pb.ChangePasswordRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
@@ -1375,12 +1392,18 @@ func (m *mockGRPC) TestNotificationTarget(_ context.Context, _ *pb.TestNotificat
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) CreateNotificationRoute(_ context.Context, in *pb.CreateNotificationRouteRequest, _ ...grpc.CallOption) (*pb.NotificationRoute, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
 	return &pb.NotificationRoute{Id: "r1", EventPattern: in.EventPattern, TargetId: in.TargetId, MinSeverity: in.MinSeverity, Enabled: in.Enabled}, nil
 }
 func (m *mockGRPC) ListNotificationRoutes(_ context.Context, _ *pb.ListNotificationRoutesRequest, _ ...grpc.CallOption) (*pb.ListNotificationRoutesResponse, error) {
 	return &pb.ListNotificationRoutesResponse{}, nil
 }
 func (m *mockGRPC) DeleteNotificationRoute(_ context.Context, _ *pb.DeleteNotificationRouteRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
 	return &emptypb.Empty{}, nil
 }
 
@@ -1420,5 +1443,78 @@ func (m *mockGRPC) DeleteHostNetwork(ctx context.Context, in *pb.DeleteHostNetwo
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastDeleteHostNetwork = in
+	return &emptypb.Empty{}, nil
+}
+
+// ── Firewall / notification write twins ────────────────────────────────────
+//
+// The UI's write handlers go through these RPCs now, so the mock has to answer
+// them — and it answers the way the daemon does, by applying the role check the
+// real handlers apply (RequireRole "operator"). Returning success unconditionally
+// would make the mutation tests assert nothing: the whole point of routing these
+// through gRPC is that the DAEMON decides, so the mock must decide too.
+
+func (m *mockGRPC) requireOperator() error {
+	m.mu.Lock()
+	role := m.whoamiRole
+	m.mu.Unlock()
+	if role == "" {
+		role = "admin"
+	}
+	if role != "operator" && role != "admin" {
+		return status.Errorf(codes.PermissionDenied, "role %q required, caller has %q", "operator", role)
+	}
+	return nil
+}
+
+func (m *mockGRPC) SetFirewallDefault(_ context.Context, req *pb.SetFirewallDefaultRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.lastSetFirewallDefault = req
+	m.mu.Unlock()
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockGRPC) CreateClusterFirewallRule(_ context.Context, req *pb.CreateClusterFirewallRuleRequest, _ ...grpc.CallOption) (*pb.FirewallRule, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	return req.GetRule(), nil
+}
+
+func (m *mockGRPC) DeleteClusterFirewallRule(_ context.Context, _ *pb.DeleteClusterFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockGRPC) CreateHostFirewallRule(_ context.Context, req *pb.CreateHostFirewallRuleRequest, _ ...grpc.CallOption) (*pb.FirewallRule, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	return req.GetRule(), nil
+}
+
+func (m *mockGRPC) DeleteHostFirewallRule(_ context.Context, _ *pb.DeleteHostFirewallRuleRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockGRPC) CreateIpSet(_ context.Context, req *pb.CreateIpSetRequest, _ ...grpc.CallOption) (*pb.IpSet, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
+	return &pb.IpSet{Name: req.GetName(), Cidrs: req.GetCidrs()}, nil
+}
+
+func (m *mockGRPC) DeleteIpSet(_ context.Context, _ *pb.DeleteIpSetRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	if err := m.requireOperator(); err != nil {
+		return nil, err
+	}
 	return &emptypb.Empty{}, nil
 }

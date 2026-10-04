@@ -369,6 +369,26 @@ message FirewallDefault {
     string stack_name   = 3;
 }
 
+// SecurityGroup is a named set of per-NIC rules, bound to NICs by name.
+message SecurityGroup {
+    string id         = 1;
+    string name       = 2;
+    string stack_name = 3;  // empty = cluster-wide
+    string created_at = 4;
+}
+
+// SecurityGroupRule is one rule of a security group.
+message SecurityGroupRule {
+    string id        = 1;
+    string sg_id     = 2;
+    string direction = 3;  // ingress | egress
+    string proto     = 4;  // tcp | udp | icmp | all
+    string port      = 5;  // "80" | "8000-9000" | ""
+    string cidr      = 6;  // CIDR or "@<ipset>"; empty = any
+    string action    = 7;  // accept | drop | reject
+    int32  priority  = 8;  // lower runs first
+}
+
 message PCIDevice {
     string host_name       = 1;
     string address         = 2;  // "0000:41:00.0"

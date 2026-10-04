@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/crypto/ssh"
@@ -34,8 +36,16 @@ func NewClient(target string) (*Client, error) {
 
 	hostKeyCallback, err := defaultHostKeyCallback()
 	if err != nil {
-		// Fall back to insecure if no known_hosts
-		hostKeyCallback = ssh.InsecureIgnoreHostKey()
+		// No usable known_hosts (no HOME, unreadable file). Accept-new still
+		// applies -- there is nothing to compare against, and refusing here
+		// would make provisioning impossible on a fresh workstation -- but say
+		// so, because this connection carries the cluster CA-signed host key
+		// and nothing is pinning the far end.
+		fmt.Fprintf(os.Stderr,
+			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
+				"against a previous one. This connection carries the cluster CA-signed "+
+				"host key.\n", err, host)
+		hostKeyCallback = firstContactOnlyCallback(host)
 	}
 
 	config := &ssh.ClientConfig{
@@ -66,6 +76,26 @@ func (c *Client) Run(cmd string) error {
 	}
 	defer session.Close()
 
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	return session.Run(cmd)
+}
+
+// RunWithInput runs a command with data on its stdin.
+//
+// This is how a provisioning script should reach a remote host: `bash -s` with
+// the script on stdin never creates a file, so there is no path for a local
+// user on the target to pre-create, no window between writing and executing,
+// and nothing to clean up if the process dies in between.
+func (c *Client) RunWithInput(cmd string, input []byte) error {
+	session, err := c.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("SSH session: %w", err)
+	}
+	defer session.Close()
+
+	session.Stdin = bytesReader(input)
 	session.Stdout = os.Stdout
 	session.Stderr = os.Stderr
 
@@ -105,6 +135,46 @@ func (c *Client) CopyFileMode(localPath, remotePath string, mode os.FileMode) er
 	return c.WriteFile(remotePath, data, mode)
 }
 
+// ShellQuote renders s as a single-quoted POSIX shell word.
+//
+// Exported because every caller that builds a remote command line from data
+// needs it, not only this package: an SSH exec request is run by the login
+// shell, so anything interpolated into one is shell input.
+func ShellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// writeFileCmd builds the remote shell command that materialises a file.
+//
+// The content is staged in a mktemp file beside the destination, chmod'd there,
+// and only then moved into place. The obvious `cat > path && chmod mode path`
+// leaves the file complete and world-readable at the remote umask for the whole
+// transfer — and permanently if the connection drops between the two commands.
+// The payload here is host.key.
+//
+// Staging also fixes the case a leading chmod would not: redirecting into an
+// EXISTING file truncates it but keeps its old mode, so re-provisioning over a
+// loose file would write the new key at the old permissions. mv replaces the
+// destination wholesale, mode included, and does so atomically.
+//
+// mktemp in the destination's own directory keeps the rename on one filesystem.
+//
+// -T is load-bearing, not tidiness. Without it, `mv src dest` where dest is a
+// DIRECTORY moves src INSIDE it — so a local user who can see the destination
+// path (process command lines are world-readable on a default Linux) can
+// mkdir it first, let the staged file land inside, then rename their directory
+// away and leave their own file at the path root is about to read. -T makes
+// that case an error instead. -- stops a path that begins with "-" being read
+// as options.
+func writeFileCmd(remotePath string, mode os.FileMode) string {
+	q := ShellQuote(remotePath)
+	return fmt.Sprintf(
+		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
+			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+
+			"mv -fT -- \"$t\" %s; trap - EXIT",
+		q, mode.Perm(), q)
+}
+
 // WriteFile writes data to a remote file.
 func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) error {
 	session, err := c.conn.NewSession()
@@ -113,10 +183,8 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 	}
 	defer session.Close()
 
-	// Use cat to write file — simple and reliable
 	session.Stdin = bytesReader(data)
-	cmd := fmt.Sprintf("cat > %s && chmod %o %s", remotePath, mode, remotePath)
-	return session.Run(cmd)
+	return session.Run(writeFileCmd(remotePath, mode))
 }
 
 // Interactive runs a command on the remote host with a PTY attached,
@@ -268,6 +336,53 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey(data)
 }
 
+// hostKeyVerdict decides what to do with the knownhosts callback's answer.
+//
+// The old policy accepted unknown hosts AND key mismatches, on the stated
+// grounds that "litevirt manages its own trust via mTLS -- SSH is just a
+// transport for setup/upgrade operations". That is exactly backwards for the
+// operation it is used by: `lv host init` and `lv host add` use SSH to carry
+// the cluster CA-signed HOST PRIVATE KEY to a machine that has no mTLS
+// identity yet. There is no other anchor at that moment, so accepting a
+// changed key hands that key to whoever answered.
+//
+// knownhosts.KeyError distinguishes the two cases by Want:
+//
+//   - empty  -- the host is UNKNOWN. Unavoidable: provisioning a new machine
+//     is always first contact. Accepted (the documented
+//     StrictHostKeyChecking=accept-new behaviour).
+//   - non-empty -- the host is KNOWN and the key CHANGED. Refused. Nothing
+//     about provisioning requires this, and it is the whole MITM.
+func hostKeyVerdict(hostname string, err error) error {
+	if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
+		if len(keyErr.Want) == 0 {
+			return nil // unknown host: accept-new
+		}
+		return fmt.Errorf("host key for %s CHANGED (known key at %s:%d) -- refusing: "+
+			"this connection would carry the cluster CA-signed host key, and a changed "+
+			"key means something other than the host we trusted is answering. If the "+
+			"host was genuinely rebuilt, remove its known_hosts entry first",
+			hostname, keyErr.Want[0].Filename, keyErr.Want[0].Line)
+	}
+	return err
+}
+
+// firstContactOnlyCallback is used when no known_hosts is usable at all.
+//
+// It accepts, because with no store there is no previous key to contradict and
+// refusing would make `lv host init` impossible on a fresh workstation. It is a
+// named function rather than ssh.InsecureIgnoreHostKey so the two cases cannot
+// be confused: this one has been reported to the operator, and it is reached
+// only when the store itself is missing -- never to paper over a MISMATCH,
+// which hostKeyVerdict refuses even here.
+func firstContactOnlyCallback(host string) ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		slog.Warn("ssh: host key not verified (no known_hosts store)",
+			"host", host, "remote", remote.String(), "key_type", key.Type())
+		return nil
+	}
+}
+
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -278,18 +393,10 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Wrap the callback to accept unknown hosts (equivalent to
-	// StrictHostKeyChecking=accept-new). Mismatched keys for known
-	// hosts are still accepted since litevirt manages its own trust
-	// via mTLS — SSH is just a transport for setup/upgrade operations.
+	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
+	// key is refused even though an unknown one is not.
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		err := cb(hostname, remote, key)
-		if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
-			// Accept unknown hosts and key mismatches — litevirt
-			// manages trust via mTLS, SSH is just a transport.
-			return nil
-		}
-		return err
+		return hostKeyVerdict(hostname, cb(hostname, remote, key))
 	}, nil
 }
 

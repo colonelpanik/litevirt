@@ -2374,13 +2374,21 @@ func (s *Server) ExecVM(ctx context.Context, req *pb.ExecVMRequest) (*pb.ExecVMR
 	if len(req.Command) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "command required")
 	}
-	output, err := s.virt.ExecInGuest(req.Name, req.Command[0], req.Command[1:])
+	// Detailed, not ExecInGuest: the latter folds a non-zero exit into an error,
+	// which spends the guest's status producing an error string nothing can
+	// recover it from. A command that RAN and returned non-zero is a result to
+	// report — the RPC error is for failing to run it at all.
+	stdout, stderr, exitCode, err := s.virt.ExecInGuestDetailed(req.Name, req.Command[0], req.Command[1:])
 	if err != nil {
 		s.audit(ctx, "vm.exec", req.Name, strings.Join(req.Command, " "), "error")
 		return nil, status.Errorf(codes.Internal, "exec in guest: %v", err)
 	}
-	s.audit(ctx, "vm.exec", req.Name, strings.Join(req.Command, " "), "ok")
-	return &pb.ExecVMResponse{Stdout: []byte(output)}, nil
+	result := "ok"
+	if exitCode != 0 {
+		result = "nonzero-exit"
+	}
+	s.audit(ctx, "vm.exec", req.Name, strings.Join(req.Command, " "), result)
+	return &pb.ExecVMResponse{ExitCode: exitCode, Stdout: stdout, Stderr: stderr}, nil
 }
 
 // vmHooks extracts the HooksSpec from a stored VMRecord's JSON spec.

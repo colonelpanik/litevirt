@@ -1,19 +1,21 @@
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
-	"github.com/litevirt/litevirt/internal/randid"
 )
 
-// Notification CRUD runs in-process against the host-local Corrosion handle
-// (same as `lv notify`), CRDT-replicated cluster-wide. Behind the UI session.
+// Notification targets and routes are READ in-process against the host-local
+// Corrosion handle; every action on them, the test send included, goes through
+// the daemon's notification RPCs with the session's bearer.
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Notifications", "notifications")
@@ -63,12 +65,13 @@ func (s *Server) handleCreateNotifyTarget(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	id := randid.New()
-	if err := corrosion.InsertNotificationTarget(r.Context(), s.db, corrosion.NotificationTarget{
-		ID: id, Name: name, Type: typ, Config: string(cfg), Enabled: true,
+	// Through the twin: it authorizes against the session's own credential.
+	// The ID is allocated there, not here.
+	if _, err := s.grpc.CreateNotificationTarget(s.uiBearerCtx(r), &pb.CreateNotificationTargetRequest{
+		Name: name, Type: typ, Config: string(cfg), Enabled: true,
 	}); err != nil {
-		sendToast(w, "create failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		sendToast(w, "create failed: "+grpcMsg(err), "error")
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Target "+name+" created", "success")
@@ -82,9 +85,10 @@ func (s *Server) handleDeleteNotifyTarget(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteNotificationTarget(r.Context(), s.db, r.PathValue("id")); err != nil {
-		sendToast(w, "delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+	if _, err := s.grpc.DeleteNotificationTarget(s.uiBearerCtx(r),
+		&pb.DeleteNotificationTargetRequest{Id: r.PathValue("id")}); err != nil {
+		sendToast(w, "delete failed: "+grpcMsg(err), "error")
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Target deleted", "success")
@@ -98,34 +102,22 @@ func (s *Server) handleTestNotifyTarget(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	id := r.PathValue("id")
-	targets, _ := corrosion.ListNotificationTargets(r.Context(), s.db)
-	for _, t := range targets {
-		if t.ID != id {
-			continue
-		}
-		target, err := notify.NewTarget(t.Name, t.Type, t.Config)
-		if err != nil {
-			sendToast(w, "bad target: "+err.Error(), "error")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
-		defer cancel()
-		if err := target.Send(ctx, notify.Notification{
-			Kind: "test.notification", Severity: notify.SevInfo, Subject: t.Name,
-			Detail: "litevirt test notification", Cluster: s.cluster, Timestamp: time.Now().UTC(),
-		}); err != nil {
-			sendToast(w, "send failed: "+err.Error(), "error")
+	// Through the twin, like the CRUD above. Sending in-process let any session
+	// with a role, a Viewer included, make the daemon load a target's stored
+	// credentials and fire at its endpoint; the RPC requires operator.
+	if _, err := s.grpc.TestNotificationTarget(s.uiBearerCtx(r),
+		&pb.TestNotificationTargetRequest{Id: r.PathValue("id")}); err != nil {
+		sendToast(w, "send failed: "+grpcMsg(err), "error")
+		if status.Code(err) == codes.Unavailable {
+			// The target refused or timed out: the page worked, the endpoint did not.
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		sendToast(w, "Test notification sent to "+t.Name, "success")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	sendToast(w, "target not found", "error")
-	w.WriteHeader(http.StatusNotFound)
+	sendToast(w, "Test notification sent", "success")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleNotifyRouteModal(w http.ResponseWriter, r *http.Request) {
@@ -154,9 +146,11 @@ func (s *Server) handleCreateNotifyRoute(w http.ResponseWriter, r *http.Request)
 	if minSev == "" {
 		minSev = "info"
 	}
-	rid := randid.New()
-	if err := corrosion.InsertNotificationRoute(r.Context(), s.db, corrosion.NotificationRoute{
-		ID: rid, EventPattern: pattern, TargetID: target, MinSeverity: minSev, Enabled: true,
+	// Through the gRPC twin, not the local DB handle: a notification route is
+	// cluster state, and RequirePerm/RequireRole on the far side is the only
+	// thing that sees the caller's token scopes and RBAC bindings.
+	if _, err := s.grpc.CreateNotificationRoute(s.uiBearerCtx(r), &pb.CreateNotificationRouteRequest{
+		EventPattern: pattern, TargetId: target, MinSeverity: minSev, Enabled: true,
 	}); err != nil {
 		sendToast(w, "create failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -173,9 +167,10 @@ func (s *Server) handleDeleteNotifyRoute(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteNotificationRoute(r.Context(), s.db, r.PathValue("id")); err != nil {
+	if _, err := s.grpc.DeleteNotificationRoute(s.uiBearerCtx(r),
+		&pb.DeleteNotificationRouteRequest{Id: r.PathValue("id")}); err != nil {
 		sendToast(w, "delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Route deleted", "success")

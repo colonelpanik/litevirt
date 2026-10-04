@@ -68,12 +68,16 @@ func (s *Server) broadcastFDBUpdate(ctx context.Context, networkName string, vni
 			continue
 		}
 		go func(host string) {
-			client, conn, err := s.peerClient(ctx, host)
+			// The handler returns before this runs, and gRPC cancels its
+			// context the moment it does. See detachedFanout.
+			fctx, cancel := detachedFanout(ctx)
+			defer cancel()
+			client, conn, err := s.peerClient(fctx, host)
 			if err != nil {
 				return
 			}
 			defer conn.Close()
-			client.UpdateFDB(ctx, &pb.UpdateFDBRequest{
+			client.UpdateFDB(fctx, &pb.UpdateFDBRequest{
 				Vni:       int32(vni),
 				Mac:       mac,
 				OldVtepIp: oldVTEP,

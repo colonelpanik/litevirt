@@ -4,12 +4,14 @@ import (
 	"net/http"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// Resource-mapping CRUD runs in-process against the host-local Corrosion handle
-// (same as the `lv mapping` CLI), CRDT-replicating cluster-wide. These handlers
-// sit behind the UI's authenticated session (see docs/ui.md).
+// Resource mappings are READ in-process against the host-local Corrosion
+// handle; every mutation goes through the daemon's resource-mapping RPCs with
+// the session's bearer, so the page is held to the same resourcemap.write check
+// as any other caller of those RPCs.
 
 // handleResourceMappings renders /resource-mappings: each mapping with its
 // per-host devices, plus create / add-device / delete actions (#14).
@@ -50,9 +52,13 @@ func (s *Server) handleCreateMapping(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	if err := corrosion.CreateResourceMapping(r.Context(), s.db, name, strings.TrimSpace(r.FormValue("description"))); err != nil {
+	// Through the twin, like delete: it checks resourcemap.write against the
+	// caller's own credential, exactly as for the CLI, and audits.
+	if _, err := s.grpc.CreateResourceMapping(s.uiBearerCtx(r), &pb.CreateResourceMappingRequest{
+		Name: name, Description: strings.TrimSpace(r.FormValue("description")),
+	}); err != nil {
 		sendToast(w, "Create failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Resource mapping "+name+" created", "success")
@@ -66,9 +72,12 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteResourceMapping(r.Context(), s.db, r.PathValue("name")); err != nil {
+	// Through the twin, like create: it checks resourcemap.write against the
+	// session's own credential, exactly as for the CLI.
+	if _, err := s.grpc.DeleteResourceMapping(s.uiBearerCtx(r),
+		&pb.DeleteResourceMappingRequest{Name: r.PathValue("name")}); err != nil {
 		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Resource mapping deleted", "success")
@@ -98,10 +107,12 @@ func (s *Server) handleAddMappingDeviceUI(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	if err := corrosion.AddMappingDevice(r.Context(), s.db, mapping, host, address,
-		strings.TrimSpace(r.FormValue("vendor")), strings.TrimSpace(r.FormValue("device"))); err != nil {
+	if _, err := s.grpc.AddMappingDevice(s.uiBearerCtx(r), &pb.AddMappingDeviceRequest{
+		Mapping: mapping, Host: host, Address: address,
+		Vendor: strings.TrimSpace(r.FormValue("vendor")), Device: strings.TrimSpace(r.FormValue("device")),
+	}); err != nil {
 		sendToast(w, "Add device failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Device added to "+mapping, "success")
@@ -118,9 +129,11 @@ func (s *Server) handleRemoveMappingDeviceUI(w http.ResponseWriter, r *http.Requ
 	mapping := r.PathValue("name")
 	host := r.URL.Query().Get("host")
 	address := r.URL.Query().Get("address")
-	if err := corrosion.RemoveMappingDevice(r.Context(), s.db, mapping, host, address); err != nil {
+	if _, err := s.grpc.RemoveMappingDevice(s.uiBearerCtx(r), &pb.RemoveMappingDeviceRequest{
+		Mapping: mapping, Host: host, Address: address,
+	}); err != nil {
 		sendToast(w, "Remove device failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Device removed", "success")

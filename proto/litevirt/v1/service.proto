@@ -1517,6 +1517,14 @@ message SetFirewallDefaultRequest        { string scope = 1; bool default_deny =
 message ListFirewallDefaultsRequest      {}
 message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
 
+// ── Security groups: the per-NIC tier ──
+// The web UI's security-group writes go through these, so the daemon authorizes
+// and audits them as the session's own user (colonelpanik/litevirt#182).
+message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; }
+message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
+message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored
+message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
+
 // ── Storage ──
 message ListStoragePoolsRequest {}
 message ListStoragePoolsResponse { repeated StoragePool pools = 1; }
@@ -2454,6 +2462,12 @@ service LiteVirt {
     rpc DeleteIpSet(DeleteIpSetRequest)                             returns (google.protobuf.Empty);
     rpc SetFirewallDefault(SetFirewallDefaultRequest)               returns (google.protobuf.Empty);
     rpc ListFirewallDefaults(ListFirewallDefaultsRequest)           returns (ListFirewallDefaultsResponse);
+
+    // ── Security groups: the per-NIC tier ──
+    rpc CreateSecurityGroup(CreateSecurityGroupRequest)             returns (SecurityGroup);
+    rpc DeleteSecurityGroup(DeleteSecurityGroupRequest)             returns (google.protobuf.Empty);
+    rpc AddSecurityGroupRule(AddSecurityGroupRuleRequest)           returns (SecurityGroupRule);
+    rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);

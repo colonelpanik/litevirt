@@ -68,6 +68,13 @@ lv host init root@10.0.50.10 --name host-a
 
 This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs a systemd unit.
 
+`lv host init` is for the first host only. It refuses a target that is already a
+member: one whose `join_peers` lists peers, or one whose address the cluster this
+CLI is configured for lists beside other hosts. The second check is what catches
+the first host itself, whose `join_peers` stays empty when later hosts are added
+from a workstation. A member that lost its disk is removed with `lv host rm` and
+added back with `lv host add`.
+
 3. SSH into the host and start the daemon:
 
 ```bash

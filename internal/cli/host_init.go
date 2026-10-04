@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -32,12 +34,7 @@ var (
 // 2. Generate host certificate
 // 3. Push CA + host cert + litevirtd binary + setup script via SSH
 // 4. Run setup script to install deps and start litevirtd
-func HostInit(ctx context.Context, sshTarget string, hostName string) error {
-	pkiDir := PKIDir()
-	if err := os.MkdirAll(pkiDir, 0700); err != nil {
-		return fmt.Errorf("create PKI dir: %w", err)
-	}
-
+func HostInit(ctx context.Context, sshTarget string, hostName string, force bool) error {
 	// Parse SSH target to get IP for cert SAN
 	parsedHost, _, err := parseSSHTarget(sshTarget)
 	if err != nil {
@@ -46,6 +43,30 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 	hostAddr, err := resolveHost(parsedHost)
 	if err != nil {
 		return err
+	}
+
+	// Connect and inspect the target BEFORE anything is minted or pushed, so a
+	// refusal leaves both this machine's PKI dir and the target untouched.
+	slog.Info("connecting to host", "target", sshTarget)
+	sc, err := ssh.NewClient(sshTarget)
+	if err != nil {
+		return fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+
+	// `cat ... || true` so an absent config reads as empty rather than as an
+	// error: a node with no config is exactly the node init is for.
+	existingCfg, err := sc.RunOutput(fmt.Sprintf("cat %s 2>/dev/null || true", daemonConfigPath))
+	if err != nil {
+		return fmt.Errorf("read the target's existing %s: %w", daemonConfigPath, err)
+	}
+	if err := refuseIfAlreadyAMember(sshTarget, existingCfg, force); err != nil {
+		return err
+	}
+
+	pkiDir := PKIDir()
+	if err := os.MkdirAll(pkiDir, 0700); err != nil {
+		return fmt.Errorf("create PKI dir: %w", err)
 	}
 
 	// 1. Generate CA if it doesn't exist
@@ -80,12 +101,6 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 
 	// 4. Push files to host
 	slog.Info("pushing files to host", "target", sshTarget)
-	sc, err := ssh.NewClient(sshTarget)
-	if err != nil {
-		return fmt.Errorf("SSH connect: %w", err)
-	}
-	defer sc.Close()
-
 	remotePKIDir := "/etc/litevirt/pki"
 	if err := sc.Run(fmt.Sprintf("mkdir -p %s", remotePKIDir)); err != nil {
 		return fmt.Errorf("create remote PKI dir: %w", err)
@@ -290,11 +305,28 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
-	// Ensure the new host is listed as a gossip peer in the local daemon config.
-	// This is a best-effort update — the daemon needs a restart to pick it up,
-	// but memberlist may also discover the peer via existing gossip members.
-	if err := ensureLocalPeer(hostAddr, 7946); err != nil {
-		slog.Warn("could not update local config with new peer", "error", err)
+	// Back-fill the new host into THIS machine's gossip seed list. The daemon
+	// needs a restart to pick it up, and memberlist may discover the peer through
+	// existing members anyway — but the seed list is now load-bearing for more
+	// than gossip, so only one failure here is benign.
+	//
+	// Running `lv` from a workstation is supported, and a workstation has no
+	// daemon config to update. That is errNotALocalNode, and it is fine.
+	//
+	// Anything else means this machine IS a cluster node whose join_peers could
+	// not be updated, and a slog.Warn is not enough: an empty join_peers is what
+	// makes a node look like a FOUNDER, so leaving it wrong sets up a later
+	// state.db rebuild to mint a fresh admin credential over the cluster's.
+	if err := ensureLocalPeer(daemonConfigPath, hostAddr, 7946); err != nil {
+		if errors.Is(err, errNotALocalNode) {
+			slog.Info("this machine is not a cluster node, so it has no join_peers to back-fill",
+				"config", daemonConfigPath)
+		} else {
+			return fmt.Errorf("host %s WAS added to the cluster, but this machine's own "+
+				"join_peers in %s could not be updated (%w) — add %s to it by hand before "+
+				"restarting the daemon, or this node still looks like a founder",
+				hostName, daemonConfigPath, err, net.JoinHostPort(hostAddr, strconv.Itoa(7946)))
+		}
 	}
 
 	fmt.Printf("Host %s added to cluster at %s\n", hostName, hostAddr)
@@ -302,10 +334,12 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 }
 
 // ensureLocalPeer adds a gossip peer address to the local daemon config if not already present.
-func ensureLocalPeer(addr string, gossipPort int) error {
-	cfgPath := "/etc/litevirt/config.yaml"
+func ensureLocalPeer(cfgPath string, addr string, gossipPort int) error {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errNotALocalNode
+		}
 		return err
 	}
 
@@ -407,7 +441,18 @@ func mintLocalHostCert(pkiDir, hostName, addr string) error {
 		hostName, ip)
 }
 
-func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
+func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bool) error {
+	// Same hazard as the remote form: the setup script rewrites config.yaml and
+	// passes an explicit empty join_peers, so re-running --local against a node
+	// that is already in a cluster erases its peer list.
+	existingCfg, err := os.ReadFile(daemonConfigPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read the existing %s: %w", daemonConfigPath, err)
+	}
+	if err := refuseIfAlreadyAMember("this host", existingCfg, force); err != nil {
+		return err
+	}
+
 	pkiDir := PKIDir()
 	if err := os.MkdirAll(pkiDir, 0700); err != nil {
 		return fmt.Errorf("create PKI dir: %w", err)
@@ -833,3 +878,54 @@ systemctl restart litevirt.service
 
 echo "=== litevirt setup complete ==="
 `
+
+// errNotALocalNode reports that this machine carries no daemon config, so it is
+// a workstation running `lv` rather than a cluster node. It is the ONLY reason
+// ensureLocalPeer is allowed to fail quietly: there is nothing to back-fill.
+// Every other failure means this node IS a member whose seed list is now wrong.
+var errNotALocalNode = errors.New("this machine has no litevirt daemon config, so it is not a cluster node")
+
+// refuseIfAlreadyAMember stops `lv host init` from re-initialising a node that
+// already belongs to a cluster.
+//
+// host init rewrites the target's whole config.yaml from the setup-script
+// template, and that template writes `join_peers: ${JOIN_PEERS:-[]}` while host
+// init sets no JOIN_PEERS. Pointed at a member, it silently erases that node's
+// peer list.
+//
+// The peer list is not only gossip seeding. It is also what distinguishes a node
+// that is JOINING a cluster from one FOUNDING it: the daemon declines to mint an
+// admin credential when peers are configured. Erasing the field puts the node
+// back on the mint path, so a later state.db rebuild mints a fresh admin and
+// replicates it over the cluster's own credential.
+//
+// cfgYAML is the target's current config, or empty when it has none.
+func refuseIfAlreadyAMember(target string, cfgYAML []byte, force bool) error {
+	if force || len(bytes.TrimSpace(cfgYAML)) == 0 {
+		return nil
+	}
+
+	var cfg struct {
+		JoinPeers []string `yaml:"join_peers"`
+	}
+	if err := yaml.Unmarshal(cfgYAML, &cfg); err != nil {
+		// Not evidence the node is fresh. host init is about to overwrite this
+		// file, so "I cannot read what I am replacing" is a reason to stop.
+		return fmt.Errorf("%s already has %s and it could not be parsed (%v); "+
+			"`lv host init` rewrites that file, so it will not run against a node whose "+
+			"current join_peers it cannot read — re-run with --force to overwrite it anyway",
+			target, daemonConfigPath, err)
+	}
+	if len(cfg.JoinPeers) == 0 {
+		// A founder legitimately carries an empty list, and re-running init
+		// against a half-finished first node is the normal repair.
+		return nil
+	}
+
+	return fmt.Errorf("%s is already a cluster member: %s lists join_peers (%s). "+
+		"`lv host init` rewrites that file from the setup template and would reset "+
+		"join_peers to [], which also removes the signal that stops this node minting "+
+		"an admin credential of its own. Use `lv host add` to add a node to a cluster, "+
+		"or re-run with --force to re-initialise this one anyway",
+		target, daemonConfigPath, strings.Join(cfg.JoinPeers, ", "))
+}

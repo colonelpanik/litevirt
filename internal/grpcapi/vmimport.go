@@ -40,13 +40,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.InvalidArgument, "no import metadata received: %v", err)
 	}
 
-	// Forward to the destination host before consuming the stream, so bytes land
-	// directly on the host that will own the VM (a concurrent stream proxy).
-	if first.TargetHost != "" && first.TargetHost != s.hostName {
-		return s.proxyImportVM(ctx, stream, first)
-	}
-
-	// ── RBAC + name-uniqueness early (before accepting any bytes) ──
+	// ── RBAC BEFORE anything else, including the forward ──
+	//
+	// The forward below hands the request to a peer, and the peer leg
+	// authenticates as admin unless forwarded identity is BOTH configured and
+	// latched (default-off for each). Authorizing after it would therefore let
+	// an unauthorized caller reach the target host with the second leg's
+	// privileges — including resolveStagedPath's admin-only arbitrary-path read.
+	// Every other forwarding handler here (MigrateVM, MoveVolume,
+	// CreateSnapshot) authorizes first; this one did not.
+	//
+	// The name is validated here too, because vmRBACPathFor is built from it and
+	// an unvalidated name must not shape the path a permission is checked
+	// against.
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
@@ -59,6 +65,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, name), "vm.create", "operator"); err != nil {
 		return err
 	}
+
+	// Forward to the destination host without consuming more of the stream, so
+	// bytes land directly on the host that will own the VM (a concurrent stream
+	// proxy). The target re-runs every check below for itself.
+	if first.TargetHost != "" && first.TargetHost != s.hostName {
+		return s.proxyImportVM(ctx, stream, first)
+	}
+
 	if project != tenancy.Default {
 		if p, perr := corrosion.GetProject(ctx, s.db, project); perr != nil || p == nil {
 			return status.Errorf(codes.NotFound, "project %q not found", project)

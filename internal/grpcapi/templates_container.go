@@ -84,6 +84,24 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	if !validResourceName(req.Target) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid target name %q", req.Target)
 	}
+	// Authorize the SOURCE as well as the destination — see CloneVM. A container
+	// clone copies the source rootfs, so the destination check alone leaves the
+	// read of another tenant's filesystem unguarded.
+	//
+	// Authorized BEFORE the source is resolved, through requirePermResolved, so
+	// a caller without rights on it gets one answer whether it exists or not —
+	// resolving first returned NotFound for a free name and a PermissionDenied
+	// naming the owner's project for a foreign one (see CloneVM).
+	srcProject, known := s.cloneSourceProject(ctx, req.HostName, req.Source)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(srcProject, req.Source), ctRBACPathFor("", req.Source),
+		"backup.create", "operator", containerWhat(req.Source)); err != nil {
+		detail := "source project=" + srcProject
+		if !known {
+			detail = "source project=unresolved"
+		}
+		s.audit(ctx, "ct.clone", req.Source, detail, "denied")
+		return nil, err
+	}
 	host, src, err := s.resolveContainerHost(ctx, req.HostName, req.Source)
 	if err != nil {
 		return nil, err
@@ -223,4 +241,30 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	s.audit(ctx, "ct.clone", req.Target, fmt.Sprintf("project=%s source=%s", project, req.Source), "ok")
 	slog.Info("container cloned", "source", req.Source, "target", req.Target, "host", s.hostName)
 	return toPbContainer(rec), nil
+}
+
+// cloneSourceProject resolves a clone source's project for requirePermResolved.
+// known is false when no row was found here (or the read failed): the project
+// is then unknown, NOT "_default", and requirePermResolved refuses to guess.
+// The "_default" returned alongside known=false is only for audit text.
+// containerProject cannot answer this: it returns "_default" for a missing
+// row, which is indistinguishable from a row that really is in _default.
+func (s *Server) cloneSourceProject(ctx context.Context, host, name string) (project string, known bool) {
+	if host != "" {
+		ct, err := corrosion.GetContainer(ctx, s.db, host, name)
+		if err != nil || ct == nil {
+			return tenancy.Default, false
+		}
+		return tenancy.NormalizeProject(ct.Project), true
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return tenancy.Default, false
+	}
+	for _, ct := range cts {
+		if ct.Name == name {
+			return tenancy.NormalizeProject(ct.Project), true
+		}
+	}
+	return tenancy.Default, false
 }

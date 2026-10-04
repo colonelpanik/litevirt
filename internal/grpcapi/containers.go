@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -49,6 +50,9 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 	}
 	return "_default"
 }
+
+// containerWhat names a container in requirePermResolved's NotFound.
+func containerWhat(name string) string { return "container " + strconv.Quote(name) }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {

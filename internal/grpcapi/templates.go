@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -35,8 +36,45 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.InvalidArgument,
 			"invalid target name %q: only letters, digits, '_', '.', '-' are allowed", req.Target)
 	}
+	// Path-independent precheck BEFORE the source is resolved. The real
+	// per-path check is below, once the source's project is known -- but
+	// resolving first and authorizing second turns the handler into an
+	// existence oracle: NotFound means the name is free, PermissionDenied
+	// means another tenant owns a VM by that name, and VM names routinely
+	// encode customer and service identity. Same shape as CloneContainer and
+	// the other fetch-then-authorize handlers.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
 	src, err := corrosion.GetVM(ctx, s.db, req.Source)
-	if err != nil || src == nil {
+	if err != nil {
+		src = nil
+	}
+	// Authorize the SOURCE as well as the destination. A clone READS the source
+	// VM's disks and writes a full copy into the caller's project, so checking
+	// only the destination authorizes the write and leaves the read unguarded —
+	// a tenant who may create VMs in their own project could otherwise lift
+	// another tenant's data into it. Same rule and same verb as BuildImage
+	// (imageops.go), which calls this out as "a cross-project data-exposure
+	// surface"; cloning is that operation with a VM as the destination instead
+	// of an image.
+	//
+	// requirePermResolved, not RequirePerm: the precheck above lets every
+	// binding-holder through, so a tenant with a grant on their own project
+	// reached this point either way. A plain NotFound for an absent source and
+	// RequirePerm's PermissionDenied (naming the source's project) for a
+	// foreign one was the oracle the precheck was meant to close. The resolved
+	// form answers both with one PermissionDenied, and a NotFound only to a
+	// caller who could have seen the name anyway.
+	var srcPath string
+	if src != nil {
+		srcPath = vmRBACPath(src)
+	}
+	if err := s.requirePermResolved(ctx, src != nil, srcPath, vmRBACPathFor("", req.Source),
+		"backup.create", "operator", "vm "+strconv.Quote(req.Source)); err != nil {
+		return nil, err
+	}
+	if src == nil {
 		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)
 	}
 	project := tenancy.NormalizeProject(req.Project)

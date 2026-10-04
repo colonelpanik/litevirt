@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
@@ -307,6 +308,42 @@ func TestRebalanceExecutor_ReapsStale(t *testing.T) {
 	}
 	if detail != "execution timed out" {
 		t.Errorf("stale reap detail = %q", detail)
+	}
+}
+
+// updated_at is the replicated LWW key, which is an HLC string once hlc_lww is
+// on. The reaper must read its age as an instant: a lexical compare against an
+// RFC3339 cutoff sorts every HLC "17…" stamp below "20…", so it would fail an
+// in-flight migration the moment it was claimed.
+func TestRebalanceExecutor_ReapStaleReadsHLCStampsAsInstants(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+
+	now := time.Now()
+	wall := now.UTC().Format(time.RFC3339)
+	seed := func(id string, at time.Time) {
+		t.Helper()
+		stamp := hlc.Timestamp{PhysicalMS: at.UnixMilli(), NodeID: "exec-host"}.String()
+		if err := s.db.Execute(ctx,
+			`INSERT INTO rebalance_proposals
+			   (id, vm_name, src_host, dst_host, policy, expected_gain, status, proposed_at, expires_at, detail, updated_at)
+			 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			id, "vm-"+id, "src", "dst", "balance", 20.0, "applying", wall, wall, "", stamp); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("fresh", now)
+	seed("stuck", now.Add(-time.Hour))
+
+	e := NewRebalanceExecutor(s, "exec-host", s.db)
+	e.StaleTimeout = 30 * time.Minute
+	e.reapStale(ctx)
+
+	if st, _, _ := proposalStatus(t, ctx, s.db, "fresh"); st != "applying" {
+		t.Errorf("a just-claimed row with an HLC updated_at was reaped: status %q, want applying", st)
+	}
+	if st, detail, _ := proposalStatus(t, ctx, s.db, "stuck"); st != "failed" || detail != "execution timed out" {
+		t.Errorf("an hour-old HLC applying row: status %q detail %q, want failed / execution timed out", st, detail)
 	}
 }
 

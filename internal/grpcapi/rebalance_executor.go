@@ -130,7 +130,7 @@ func (e *RebalanceExecutor) RunOnce(ctx context.Context) {
 			e.markFailed(ctx, p.ID, "proposal expired before execution")
 			continue
 		}
-		if !e.claim(ctx, p.ID, nowStr) {
+		if !e.claim(ctx, p.ID, e.db.NowWallTS()) {
 			continue
 		}
 		if reason := e.validate(ctx, p); reason != "" {
@@ -145,7 +145,10 @@ func (e *RebalanceExecutor) RunOnce(ctx context.Context) {
 
 // claim atomically transitions a row approved→applying. It stamps a unique
 // updated_at and re-reads to confirm THIS loop won the row (Execute reports no
-// rows-affected, so we verify by marker).
+// rows-affected, so we verify by marker). The marker is the row's LWW key, so
+// it must come from the replicated clock (db.NowWallTS): a wall-second stamp
+// ties the approval that landed in the same second, and the peer drops the
+// claim. Wall, not HLC: see recordProposal.
 func (e *RebalanceExecutor) claim(ctx context.Context, id, marker string) bool {
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='applying', updated_at=?
@@ -228,20 +231,21 @@ func (e *RebalanceExecutor) doMigrate(ctx context.Context, vmName, dstHost strin
 	}, &discardMigrateStream{ctx: authCtx})
 }
 
+// markApplied and markFailed stamp applied_at as wall time on e.now() and
+// updated_at as the LWW key from the replicated clock (see claim).
 func (e *RebalanceExecutor) markApplied(ctx context.Context, id string) {
 	now := e.now().UTC().Format(time.RFC3339)
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='applied', applied_at=?, updated_at=?
-		 WHERE id=? AND status='applying'`, now, now, id); err != nil {
+		 WHERE id=? AND status='applying'`, now, e.db.NowWallTS(), id); err != nil {
 		slog.Warn("rebalance executor: mark applied", "id", id, "error", err)
 	}
 }
 
 func (e *RebalanceExecutor) markFailed(ctx context.Context, id, reason string) {
-	now := e.now().UTC().Format(time.RFC3339)
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='failed', detail=?, updated_at=? WHERE id=?`,
-		reason, now, id); err != nil {
+		reason, e.db.NowWallTS(), id); err != nil {
 		slog.Warn("rebalance executor: mark failed", "id", id, "error", err)
 	}
 }
@@ -249,19 +253,31 @@ func (e *RebalanceExecutor) markFailed(ctx context.Context, id, reason string) {
 // reapStale fails `applying` rows whose goroutine never recorded a terminal
 // status within StaleTimeout (e.g. the daemon was killed mid-migration).
 //
-// The lexical `updated_at < ?` (RFC3339-vs-RFC3339) compare is valid ONLY because
-// rebalance_proposals stamps updated_at as WALL RFC3339 (leader-gated single-writer;
-// see recordProposal). It is NOT an HLC LWW key here. If those writers ever move to
-// NowLWW/HLC, this MUST switch to the tsMsSQL both-format helper first, else an HLC
-// "175…" sorts below every RFC3339 cutoff and every in-flight row insta-times-out.
-// Allowlisted in updated_at_consumer_guard_test.go.
+// updated_at is the LWW key from the replicated clock, so it is RFC3339 or HLC
+// depending on the writer and whether hlc_lww is on. The age test therefore
+// reads it through corrosion.TsMsSQL in a LOCAL select — a lexical
+// `updated_at < cutoff` would read every HLC "175…" stamp as ancient — and each
+// aged row is then failed by primary key. The parser rejects the CASE
+// expression in a replicated write, which is why the select and the write are
+// separate.
+//
+// The write is markFailed's statement, deliberately not a new status-guarded
+// one: a receiver back-pressures a statement shape it has no ledger entry for,
+// so a new shape here would stall every not-yet-upgraded peer's stream from
+// this leader during a rolling upgrade. The cost is that a migration finishing
+// in the instant between the select and the write is recorded failed, after
+// running past StaleTimeout.
 func (e *RebalanceExecutor) reapStale(ctx context.Context) {
-	cutoff := e.now().Add(-e.StaleTimeout).UTC().Format(time.RFC3339)
-	now := e.now().UTC().Format(time.RFC3339)
-	if err := e.db.Execute(ctx,
-		`UPDATE rebalance_proposals SET status='failed', detail='execution timed out', updated_at=?
-		 WHERE status='applying' AND updated_at < ?`, now, cutoff); err != nil {
+	cutoff := e.now().Add(-e.StaleTimeout).UnixMilli()
+	rows, err := e.db.Query(ctx,
+		`SELECT id FROM rebalance_proposals
+		 WHERE status='applying' AND `+corrosion.TsMsSQL("updated_at")+` < ?`, cutoff)
+	if err != nil {
 		slog.Warn("rebalance executor: reap stale", "error", err)
+		return
+	}
+	for _, r := range rows {
+		e.markFailed(ctx, r.String("id"), "execution timed out")
 	}
 }
 

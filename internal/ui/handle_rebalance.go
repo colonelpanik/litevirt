@@ -3,22 +3,46 @@ package ui
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
+
+// uiQueryInt reads a non-negative integer query parameter; absent or
+// unparseable reads as 0, so a hand-edited URL lands on the first page rather
+// than an error.
+func uiQueryInt(r *http.Request, key string) int {
+	n, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
 
 // handleRebalance renders /rebalance — the placement rebalancer's proposal queue
 // with run/approve/reject actions. Mirrors `lv rebalance list/run/approve/reject`.
 func (s *Server) handleRebalance(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Rebalance", "rebalance")
 	statusFilter := r.URL.Query().Get("status")
+	offset := uiQueryInt(r, "offset")
 	data["StatusFilter"] = statusFilter
+	data["Offset"] = offset
 	resp, err := s.grpc.ListRebalanceProposals(s.uiBearerCtx(r),
-		&pb.ListRebalanceProposalsRequest{StatusFilter: statusFilter})
+		&pb.ListRebalanceProposalsRequest{
+			StatusFilter: statusFilter,
+			Offset:       int32(offset),
+		})
 	if err != nil {
 		data["Error"] = err.Error()
 	} else {
 		data["Proposals"] = resp.Proposals
+		// The page header counts the whole table, not this page: rendering
+		// len(Proposals) as the count would report 200 on a 60k-row table.
+		data["TotalCount"] = int(resp.GetTotalCount())
+		data["Truncated"] = resp.GetTruncated()
+		data["NextOffset"] = offset + len(resp.GetProposals())
+		data["PrevOffset"] = max(0, offset-len(resp.GetProposals()))
+		data["ShowFrom"] = offset + 1
 	}
 	s.renderPage(w, "rebalance.html", data)
 }

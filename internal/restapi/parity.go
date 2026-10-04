@@ -7,9 +7,13 @@
 package restapi
 
 import (
+	"bytes"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -52,6 +56,18 @@ func (s *Server) registerParityRoutes() {
 	s.mux.HandleFunc("/api/v1/backup/schedules", s.wrap(s.handleBackupSchedules))
 }
 
+// queryInt reads a non-negative integer query parameter. An absent or
+// unparseable value reads as 0, which every caller treats as "unset" — a
+// malformed ?limit= gives the server default rather than an error the caller
+// cannot act on.
+func queryInt(r *http.Request, key string) int {
+	n, err := strconv.Atoi(r.URL.Query().Get(key))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 // ── Rebalance proposals ────────────────────────────────────────────────────
 
 func (s *Server) handleRebalanceProposals(w http.ResponseWriter, r *http.Request) {
@@ -59,8 +75,12 @@ func (s *Server) handleRebalanceProposals(w http.ResponseWriter, r *http.Request
 		jsonError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	// limit/offset page through history; the response carries total_count and
+	// truncated so a client can tell a page from the whole table.
 	resp, err := s.grpc.ListRebalanceProposals(s.grpcCtx(r), &pb.ListRebalanceProposalsRequest{
 		StatusFilter: r.URL.Query().Get("status"),
+		Limit:        int32(queryInt(r, "limit")),
+		Offset:       int32(queryInt(r, "offset")),
 	})
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
@@ -107,10 +127,20 @@ func (s *Server) handleRebalanceRun(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	// An empty body is a real run. A body that does not parse is refused: read
+	// as an empty request it would turn a mistyped dry run into a real one,
+	// which auto-approves mode=auto VMs.
 	var req pb.RunRebalanceRequest
-	if err := protoFromJSON(r, &req); err != nil {
-		// Empty body is fine — RunRebalance accepts no args by default.
-		req = pb.RunRebalanceRequest{}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := protojson.Unmarshal(body, &req); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
 	}
 	resp, err := s.grpc.RunRebalance(s.grpcCtx(r), &req)
 	if err != nil {

@@ -19,6 +19,13 @@ func tsMsSQL(col string) string {
 		" ELSE CAST((julianday(substr((" + col + "),1,19))-2440587.5)*86400000 AS INTEGER) END)"
 }
 
+// TsMsSQL is tsMsSQL for a local read outside this package: an age cutoff on an
+// updated_at column, which holds RFC3339 or HLC depending on the writer. Use it in
+// a LOCAL SELECT only — the strict statement parser rejects the CASE expression in
+// a replicated write, so select the aged rows by it and write each by primary key
+// (see ReapSpentProofs).
+func TsMsSQL(col string) string { return tsMsSQL(col) }
+
 // gcVacuumPages bounds the post-sweep incremental vacuum (mirrors the
 // mutation_log prune). Best-effort: only returns pages to the OS when the DB was
 // created with incremental auto_vacuum; otherwise it's a no-op and the win is

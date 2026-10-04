@@ -636,15 +636,24 @@ func (s *Server) handleListAuditLog(ctx context.Context, args map[string]any) *m
 }
 
 func (s *Server) handleListRebalanceProposals(ctx context.Context, args map[string]any) *mcp.CallToolResult {
+	// Push the limit down to the server rather than fetching the whole table
+	// and trimming here: the response itself is what outgrows the gRPC
+	// message limit, so a client-side truncate never sees the rows it was
+	// meant to protect against.
+	limit := s.limit(args, "limit")
 	out, err := s.rpc(ctx, true, func(ctx context.Context, c pb.LiteVirtClient) (any, error) {
-		return c.ListRebalanceProposals(ctx, &pb.ListRebalanceProposalsRequest{StatusFilter: stringArg(args, "status")})
+		return c.ListRebalanceProposals(ctx, &pb.ListRebalanceProposalsRequest{
+			StatusFilter: stringArg(args, "status"),
+			Limit:        int32(limit),
+		})
 	})
 	if err != nil {
 		return s.fail(err)
 	}
-	items := out.(*pb.ListRebalanceProposalsResponse).GetProposals()
-	limit := s.limit(args, "limit")
-	return s.ok("rebalance proposals", mapProposals(truncate(items, limit)), len(items) > limit)
+	resp := out.(*pb.ListRebalanceProposalsResponse)
+	items := resp.GetProposals()
+	return s.ok("rebalance proposals", mapProposals(truncate(items, limit)),
+		resp.GetTruncated() || len(items) > limit)
 }
 
 func (s *Server) handleListProjects(ctx context.Context, args map[string]any) *mcp.CallToolResult {

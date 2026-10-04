@@ -291,5 +291,14 @@ func HistoricalShapes() []HistoricalShape {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`,
 		"proof_insert_pre_lease_key_v52")
 
+	// The rebalance executor's bulk reap of stale `applying` rows, which tested age with a
+	// lexical `updated_at < ?` against an RFC3339 cutoff. updated_at is now the LWW key
+	// (NowTS, HLC once hlc_lww is on), so the current tree selects aged rows locally through
+	// tsMsSQL and fails each by primary key with markFailed's shape. Every release since the
+	// executor landed emits the bulk form, so it stays recognised for the rolling-upgrade
+	// horizon; it applies as the per-row LWW bulk update it always was.
+	add(`UPDATE rebalance_proposals SET status='failed', detail='execution timed out', updated_at=?
+		 WHERE status='applying' AND updated_at < ?`, "rebalance_reap_stale_bulk_v130")
+
 	return out
 }

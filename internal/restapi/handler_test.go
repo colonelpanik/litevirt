@@ -30,6 +30,11 @@ type mockGRPC struct {
 	// firewall management calls) are satisfied without a hand-written stub.
 	pb.LiteVirtClient
 
+	// RunRebalance records what it was asked, so a test can tell a dry run
+	// from a real one.
+	runRebalanceCalls   int
+	lastRunRebalanceReq *pb.RunRebalanceRequest
+
 	pingResp        *pb.PingResponse
 	listHostsResp   *pb.ListHostsResponse
 	inspectHostResp *pb.Host
@@ -681,7 +686,9 @@ func (m *mockGRPC) PromoteReplica(context.Context, *pb.PromoteReplicaRequest, ..
 func (m *mockGRPC) ListRebalanceProposals(context.Context, *pb.ListRebalanceProposalsRequest, ...grpc.CallOption) (*pb.ListRebalanceProposalsResponse, error) {
 	return &pb.ListRebalanceProposalsResponse{}, nil
 }
-func (m *mockGRPC) RunRebalance(context.Context, *pb.RunRebalanceRequest, ...grpc.CallOption) (*pb.RunRebalanceResponse, error) {
+func (m *mockGRPC) RunRebalance(_ context.Context, in *pb.RunRebalanceRequest, _ ...grpc.CallOption) (*pb.RunRebalanceResponse, error) {
+	m.runRebalanceCalls++
+	m.lastRunRebalanceReq = in
 	return &pb.RunRebalanceResponse{}, nil
 }
 func (m *mockGRPC) ApproveRebalanceProposal(context.Context, *pb.ApproveRebalanceProposalRequest, ...grpc.CallOption) (*pb.RebalanceProposal, error) {

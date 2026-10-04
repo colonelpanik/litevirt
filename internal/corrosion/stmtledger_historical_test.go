@@ -90,7 +90,14 @@ import (
 // supported: that is the cost of additive columns on a replicated table in
 // consecutive versions, not a sign either is redundant. No previously accepted
 // historical identity was removed or changed.
-const compatibilityDigest = "cd2639959dd96ef59d619518f747dd5c51749a33bc55bbddbe4fc7f69234fe69"
+// Updated again when rebalance_proposals.updated_at became the LWW key: the
+// executor's bulk stale reap (`WHERE status='applying' AND updated_at < ?`,
+// a lexical cutoff that misreads HLC) moved from the current ledger to the
+// rebalance_reap_stale_bulk_v130 family, receive-only, with the per-row-LWW
+// disposition it already had. The current tree reaps by primary key with
+// markFailed's shape. An ADDITION; no previously accepted historical identity
+// was removed or changed.
+const compatibilityDigest = "4301b50d8425ca3dff97f1c78ea19ab690e75ae20c0d73758c6554455dfdad0e"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -155,6 +162,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"lease_term_mint_or_ignore_v51":         1,   // lease-term mint's original INSERT OR IGNORE form, before the writer needed local constraint errors
 	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
 	"proof_insert_pre_lease_key_v52":        1,   // proof insert with lease_term but before lease_key (v52)
+	"rebalance_reap_stale_bulk_v130":        1,   // executor's bulk stale reap with a lexical updated_at cutoff, before updated_at became the LWW key
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

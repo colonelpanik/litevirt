@@ -89,6 +89,13 @@ type Rebalancer struct {
 	// Lease handle: rebalancer must hold this lease to act.
 	LeaseKey string
 
+	// ForceDryRun records every proposal as pending, whatever each VM's
+	// resolved mode is: a VM in mode=auto is proposed but not approved, so the
+	// rebalance executor has nothing to move. It is what `lv rebalance run
+	// --dry-run` and the UI's Dry-run button ask for (RunRebalanceRequest.
+	// dry_run). It only withholds approval; a VM in mode=off is still skipped.
+	ForceDryRun bool
+
 	// leaseTerm is the fencing term of the lease incarnation this rebalancer
 	// LAST OBSERVED itself holding, 0 when it held none. Phase 1 records it;
 	// nothing enforces on it yet.
@@ -178,7 +185,7 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 			slog.Warn("rebalancer: record proposal", "vm", p.VMName, "error", err)
 			continue
 		}
-		if p.Mode == ModeAuto {
+		if r.autoApproves(p) {
 			// Auto-mode is a placeholder for the actual migration trigger.
 			// We mark the row "approved" so the migration controller picks
 			// it up; budget gating inside that controller does the real work.
@@ -188,6 +195,12 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// autoApproves reports whether p is approved as it is recorded, rather than
+// left pending for `lv rebalance approve`. A forced dry run approves nothing.
+func (r *Rebalancer) autoApproves(p Proposal) bool {
+	return p.Mode == ModeAuto && !r.ForceDryRun
 }
 
 // Proposal is one suggested live-migration produced by RunOnce.
@@ -584,15 +597,18 @@ func vmBaseName(name string) string {
 
 // recordProposal writes a pending proposal to the rebalance_proposals table.
 //
-// LWW-key exception (deliberate): updated_at here is stamped as WALL RFC3339 via the
-// rebalancer's injected clock (r.now()), NOT via the corrosion client's NowLWW, so it
-// is never an HLC LWW key. That is safe because rebalance_proposals is LEADER-GATED
-// single-writer (both the proposing loop and the executor gate on the same lease), so
-// there is no concurrent multi-writer LWW conflict to protect against, and the reaper
-// (rebalance_executor.go reapStale) compares updated_at lexically as RFC3339. If these
-// writers are ever switched to NowLWW/HLC, reapStale MUST move to the tsMsSQL helper
-// FIRST (an HLC "175…" sorts below every RFC3339 cutoff → every in-flight row insta-
-// times-out). The pair is allowlisted in updated_at_consumer_guard_test.go.
+// updated_at is the row's LWW key and comes from the replicated clock
+// (db.NowWallTS), never from r.now(): a cycle inserts a proposal and approves
+// it within the same second, and a peer drops a partial UPDATE whose
+// updated_at ties the row it lands on. A whole-second wall stamp left the peer
+// pending forever. The wall columns (proposed_at, expires_at) stay on r.now(),
+// the virtual clock fleet scenarios drive.
+//
+// NowWallTS rather than NowTS, which emits HLC once hlc_lww is latched: an
+// older release mid-roll reads this updated_at lexically (its reaper, its
+// prune, the receiver-side bulk reap), and an HLC "17…" key sorts below every
+// RFC3339 cutoff there. Readers in this tree still go through
+// corrosion.TsMsSQL (see the executor's reapStale), which reads either form.
 func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 	rNow := r.now()
 	now := rNow.UTC().Format(time.RFC3339)
@@ -603,17 +619,17 @@ func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 			 proposed_at, expires_at, detail, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
 		p.ID, p.VMName, p.Src, p.Dst, string(p.Policy), p.ExpectedGain,
-		now, expires, p.Detail, now,
+		now, expires, p.Detail, r.db.NowWallTS(),
 	)
 }
 
 // markApproved transitions a proposal to "approved" so the migration
-// controller (out-of-scope for v1) can pick it up.
+// controller (out-of-scope for v1) can pick it up. updated_at is the LWW key:
+// see recordProposal.
 func (r *Rebalancer) markApproved(ctx context.Context, id string) error {
-	now := r.now().UTC().Format(time.RFC3339)
 	return r.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='approved', updated_at=? WHERE id=? AND status='pending'`,
-		now, id,
+		r.db.NowWallTS(), id,
 	)
 }
 
@@ -651,14 +667,15 @@ func (r *Rebalancer) appliedInLastHour(ctx context.Context) (int, error) {
 	return rows[0].Int("cnt"), nil
 }
 
-// expireOldProposals transitions stale pending rows to expired.
+// expireOldProposals transitions stale pending rows to expired. expires_at is
+// wall time on r.now(); updated_at is the LWW key (see recordProposal).
 func (r *Rebalancer) expireOldProposals(ctx context.Context) error {
 	now := r.now().UTC().Format(time.RFC3339)
 	return r.db.Execute(ctx,
 		`UPDATE rebalance_proposals
 		 SET status = 'expired', updated_at = ?
 		 WHERE status = 'pending' AND expires_at < ?`,
-		now, now,
+		r.db.NowWallTS(), now,
 	)
 }
 

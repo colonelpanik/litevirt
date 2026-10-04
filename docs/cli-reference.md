@@ -315,6 +315,7 @@ lv migrate <vm> <target-host> --with-storage   # Copy disks to the target during
 
 ```bash
 lv rebalance list [--status pending]                    # List proposals (pending|approved|applying|applied|failed|rejected|expired)
+lv rebalance list [--limit N] [--offset N]              # Page through history; the server bounds the page
 lv rebalance run [--dry-run]                            # Force one evaluation cycle
 lv rebalance approve <proposal-id>                      # Approve → leader's executor live-migrates it
 lv rebalance reject  <proposal-id> [--reason "text"]    # Reject a pending proposal

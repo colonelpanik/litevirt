@@ -12,7 +12,10 @@ func TestCurrentLedgerCategories(t *testing.T) {
 	// v50 raised this from 33: TombstoneResolvedHealthConditions is a deliberate
 	// retention bulk-update (tombstoning resolved conditions past the 30-day
 	// window), the same class as every other retention sweep counted here.
-	const wantBulk = 34
+	// Back to 33: the rebalance executor's stale reap stopped being a bulk update
+	// (its lexical updated_at cutoff misread HLC). It now reaps by primary key, and
+	// the bulk shape lives on, receive-only, in the historical ledger.
+	const wantBulk = 33
 	bulk := 0
 	for fp, e := range stmtLedger {
 		if e.Disposition == DispBulkUpdate {

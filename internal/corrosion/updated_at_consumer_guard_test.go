@@ -32,11 +32,10 @@ var (
 // RFC3339 and is never emitted as an HLC LWW key, so a raw `updated_at < ?` compare is
 // safe:
 //   - replication_watermarks / clock_skew: LOCAL-only (never replicated) wall bookkeeping.
-//   - rebalance_proposals: replicated but LEADER-GATED single-writer; its updated_at is
-//     stamped wall RFC3339 via the rebalancer's injected clock (NOT NowLWW). If those
-//     writers ever move to NowLWW/HLC, the reaper MUST switch to tsMsSQL first (see
-//     recordProposal / reapStale).
-var allowedLocalUpdatedAt = []string{"replication_watermarks", "clock_skew", "rebalance_proposals"}
+//
+// rebalance_proposals was here while its writers stamped wall RFC3339. They now stamp
+// the LWW key (NowTS), and its reaper reads age through TsMsSQL.
+var allowedLocalUpdatedAt = []string{"replication_watermarks", "clock_skew"}
 
 // nearAllowedTable reports whether the SQL statement around line index i (a short
 // backward window bounding it to the current query literal) references an allowlisted
@@ -72,6 +71,12 @@ func TestUpdatedAtConsumersUseBothFormatHelper(t *testing.T) {
 			return rerr
 		}
 		rel, _ := filepath.Rel(root, path)
+		// stmthistorical.go holds the frozen text of shapes PRIOR releases emit, kept
+		// so this tree still recognises them on receive. They are not consumers in
+		// this tree, and their SQL cannot be changed to match today's helpers.
+		if rel == filepath.Join("corrosion", "stmthistorical.go") {
+			return nil
+		}
 		lines := strings.Split(string(src), "\n")
 		for i, line := range lines {
 			// Skip comment-only lines: explanatory comments legitimately mention these

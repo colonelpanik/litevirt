@@ -119,3 +119,26 @@ func mustContainAll(t *testing.T, haystack string, needles ...string) {
 		}
 	}
 }
+
+// A container's cpu limit is N CORES — the meaning compose `cpu:`, `lv ct
+// create --cpu`, project vCPU quota and host pressure all give it. cpu.max was
+// written as N*1000 per 100000 period, i.e. N/100 of a core: `cpu: 2` capped a
+// container at 2% of one core, while the shares line beside it said 2 cores.
+func TestResourceConfig_CPULimitIsCores(t *testing.T) {
+	for _, c := range []struct {
+		cores       int
+		max, shares string
+	}{
+		{1, "lxc.cgroup2.cpu.max = 100000 100000\n", "lxc.cgroup.cpu.shares = 1024\n"},
+		{2, "lxc.cgroup2.cpu.max = 200000 100000\n", "lxc.cgroup.cpu.shares = 2048\n"},
+	} {
+		got := ResourceConfig(c.cores, 0)
+		if !strings.Contains(got, c.max) || !strings.Contains(got, c.shares) {
+			t.Errorf("ResourceConfig(%d cores) =\n%s\nwant %q and %q", c.cores, got, c.max, c.shares)
+		}
+		cpu, _, err := parseResourceConfig(got)
+		if err != nil || cpu != c.cores {
+			t.Errorf("parse(ResourceConfig(%d)) = %d, %v; want %d cores back", c.cores, cpu, err, c.cores)
+		}
+	}
+}

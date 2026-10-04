@@ -765,15 +765,21 @@ type fakeCT struct {
 	states  map[string]string
 	// limits maps name → {cpu, memMiB}; absent means 0/0 (fully unlimited).
 	limits map[string][2]int
+	// mem overrides the memory limit for a name, so a test can express a
+	// FINITE zero-byte cap — which limits cannot, since its 0 means unlimited.
+	mem map[string]ContainerMemoryLimit
 }
 
 func (f *fakeCT) ListContainers(context.Context) ([]string, error) { return f.names, f.listErr }
 func (f *fakeCT) StateContainer(_ context.Context, n string) (string, error) {
 	return f.states[n], nil
 }
-func (f *fakeCT) ContainerLimits(_ context.Context, n string) (int, int, error) {
+func (f *fakeCT) ContainerLimits(_ context.Context, n string) (int, ContainerMemoryLimit, error) {
 	l := f.limits[n]
-	return l[0], l[1], nil
+	if m, ok := f.mem[n]; ok {
+		return l[0], m, nil
+	}
+	return l[0], ContainerMemoryLimit{MiB: l[1], Unlimited: l[1] == 0}, nil
 }
 
 // TestLocalRuntimeSnapshot_NonLXCHost_NotPartial: on a host without lxc-* tooling the CT

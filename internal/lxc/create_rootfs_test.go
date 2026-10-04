@@ -242,7 +242,7 @@ func TestCreateFromRootfs_AppliesResourceLimits(t *testing.T) {
 	cfg := string(raw)
 	// cgroup limits must reach the live config — the bug was that they never did.
 	for _, want := range []string{
-		"lxc.cgroup2.cpu.max = 2000 100000",
+		"lxc.cgroup2.cpu.max = 200000 100000", // 2 cores
 		"lxc.cgroup.cpu.shares = 2048",
 		"lxc.cgroup2.memory.max = 512M",
 		"lxc.cgroup.memory.limit_in_bytes = 512M",

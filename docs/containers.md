@@ -260,17 +260,44 @@ cluster-root network authority: a **project-scoped** caller must use a managed
 
 ## Resource limits
 
-`lv ct create --cpu <shares> --memory <MiB>` (and compose `cpu:`/`memory:`)
-translate to cgroup limits written into the container's config at create time.
-We emit both v1 and v2 keys so the same config works on either kernel —
-irrelevant keys are simply ignored:
+`lv ct create --cpu <cores> --memory <MiB>` (and compose `cpu:`/`memory:`, and
+the UI's create form) translate to cgroup limits written into the container's
+config at create time. `--cpu N` caps the container at N whole cores — the same
+meaning as a VM's cpu count and Docker's `cpus` — and `0` leaves it uncapped.
+It is a limit, not a reservation: placement and host admission charge a
+container its memory only. Cores are whole numbers. We emit both v1 and v2 keys
+so the same config works on either kernel — irrelevant keys are simply ignored.
+For `--cpu 2 --memory 512`:
 
 ```
-lxc.cgroup2.cpu.max = 2000 100000
+lxc.cgroup2.cpu.max = 200000 100000
 lxc.cgroup.cpu.shares = 2048
 lxc.cgroup2.memory.max = 512M
 lxc.cgroup.memory.limit_in_bytes = 512M
 ```
+
+`--memory 0` means "no cap", and litevirt expresses that by **omitting** the
+key rather than writing a zero. That distinction matters when the limits are
+read back, because the config is root-editable and cgroup2 accepts both
+spellings of a very different thing:
+
+| In the config | Read back as |
+|---|---|
+| key absent | unlimited |
+| `memory.max = max` | unlimited |
+| `memory.max = 0` | a **finite** zero-byte cap |
+| `memory.max = 512M` | a 512 MiB cap |
+
+A hand-written `memory.max = 0` is a legal cgroup2 value and the most
+restrictive cap there is, so it is read as finite rather than rejected or
+treated as unlimited. Reading it as unlimited would flag the container as
+uncapped, which trips the uncapped gate and blocks new admission on the host.
+
+A container created by an earlier release keeps the cgroup limits it was created
+with until it is recreated (a compose update, a restore, a relocation or a
+clone writes a fresh config): those releases wrote `cpu.max` as `N*1000 100000`,
+N/100 of a core. Its recorded `cpu` is read as N cores everywhere else — quota,
+`lv ct ls`, `litevirt_container_cpu_limit` — as it always was.
 
 ## Restart policy
 

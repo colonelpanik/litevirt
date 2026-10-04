@@ -79,14 +79,20 @@ func lxcConfigSafe(v string) error {
 	return nil
 }
 
-// ResourceConfig renders cgroup limits as LXC keys.
+// cpuPeriod is the cgroup cpu.max period litevirt writes, in microseconds.
+const cpuPeriod = 100000
+
+// ResourceConfig renders cgroup limits as LXC keys. cpuLimit is a cap in CORES
+// — the meaning compose `cpu:`, `lv ct create --cpu`, project vCPU quota and
+// host pressure give it — so N cores is a quota of N whole periods, and the v1
+// shares line carries the same N at the conventional 1024 per core.
 func ResourceConfig(cpuLimit, memMiB int) string {
 	var b strings.Builder
 	if cpuLimit > 0 {
 		// cgroup v2 cpu.max syntax: "<quota> <period>"
 		// LXC accepts either v1 or v2; we emit both for cross-distro
 		// portability — the kernel ignores irrelevant keys.
-		fmt.Fprintf(&b, "lxc.cgroup2.cpu.max = %d 100000\n", cpuLimit*1000)
+		fmt.Fprintf(&b, "lxc.cgroup2.cpu.max = %d %d\n", cpuLimit*cpuPeriod, cpuPeriod)
 		fmt.Fprintf(&b, "lxc.cgroup.cpu.shares = %d\n", cpuLimit*1024)
 	}
 	if memMiB > 0 {

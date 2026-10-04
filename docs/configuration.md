@@ -740,8 +740,8 @@ missing telemetry would break every cluster whose pools have not been sampled ye
 **Containers count too, for memory.** A running container's memory cap is
 subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
 start` are admitted against it. Container CPU is *not* counted: `--cpu` on a
-container is cgroup **shares** — a relative weight, not a vCPU reservation — so
-adding it to a vCPU total would be meaningless. An **uncapped** container
+container is a **cap** in cores — a ceiling the cgroup enforces, not a vCPU
+reservation — so it is not added to the host's vCPU total. An **uncapped** container
 (`--memory 0`) is not accounted at all: litevirt knows the cap, not the
 footprint. Cap your containers if you want them to count.
 

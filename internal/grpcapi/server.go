@@ -1411,10 +1411,11 @@ type ContainerRuntime interface {
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
 	// ContainerLimits reads the container's configured cgroup limits back from
-	// the runtime's own on-disk config (0 = unlimited). The runtime-inventory
-	// collector reports these so capacity accounting can charge runtime-only
-	// containers and flag uncapped ones.
-	ContainerLimits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
+	// the runtime's own on-disk config. The runtime-inventory collector
+	// reports these so capacity accounting can charge runtime-only containers
+	// and flag uncapped ones — which is why memory carries Unlimited as its
+	// own field and not as a zero.
+	ContainerLimits(ctx context.Context, name string) (cpuLimit int, mem ContainerMemoryLimit, err error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	// ContainerExists reports whether the on-disk container artifact (dir) exists —
@@ -1469,6 +1470,16 @@ type ContainerInfo struct {
 	Name  string
 	State string
 	Image string
+}
+
+// ContainerMemoryLimit mirrors lxc.MemoryLimit at the gRPC boundary.
+//
+// Unlimited is a field rather than MiB==0 because cgroup2 accepts both "max"
+// and "0": collapsing them reported a finite zero-byte cap as uncapped, which
+// trips the uncapped gate and blocks new admission.
+type ContainerMemoryLimit struct {
+	MiB       int
+	Unlimited bool
 }
 
 // ContainerExecResult mirrors lxc.ExecResult.

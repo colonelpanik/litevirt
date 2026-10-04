@@ -273,7 +273,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/2fa` | DELETE | `DisableTwoFactor` (body: `{method, label}`) |
 | `/api/v1/2fa/totp/enroll` | POST | `EnrollTOTP` |
 | `/api/v1/containers` | GET | `ListContainers` (?host=&page_size=&page_token=) |
-| `/api/v1/containers/create` | POST | `CreateContainer` |
+| `/api/v1/containers/create` | POST | `CreateContainer` (`cpu` is a cap in whole cores, 0 = unlimited; see [containers.md](containers.md#resource-limits)) |
 | `/api/v1/containers/start` | POST | `StartContainer` (name in body) |
 | `/api/v1/containers/stop` | POST | `StopContainer` (name in body) |
 | `/api/v1/containers/delete` | POST / DELETE | `DeleteContainer` (name in body) |

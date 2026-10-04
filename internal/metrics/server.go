@@ -373,7 +373,7 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			[]string{"container", "state"}, nil,
 		),
 		ctCPULimit: prometheus.NewDesc(
-			"litevirt_container_cpu_limit", "Container CPU-shares limit (0=unlimited)",
+			"litevirt_container_cpu_limit", "Container CPU limit in cores (0=unlimited)",
 			[]string{"container"}, nil,
 		),
 		ctMemLimit: prometheus.NewDesc(

@@ -268,7 +268,7 @@ func newCTCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&distro, "distro", "alpine", "Distribution for download template")
 	cmd.Flags().StringVar(&release, "release", "3.21", "Release for download template (must be currently published on the LXC image server)")
 	cmd.Flags().StringVar(&arch, "arch", "amd64", "Architecture for download template")
-	cmd.Flags().IntVar(&cpu, "cpu", 0, "CPU shares (0 = unlimited)")
+	cmd.Flags().IntVar(&cpu, "cpu", 0, "CPU limit in cores (0 = unlimited)")
 	cmd.Flags().IntVar(&memMiB, "memory", 0, "Memory cap MiB (0 = unlimited)")
 	cmd.Flags().StringArrayVar(&networks, "network", nil, "Attach a NIC: network=<managed-net> (IPAM/DNS/SG) OR bridge=<br> (raw)[,name=eth0][,ip=10.0.0.5/24][,mac=..][,security-groups=web;db] (repeatable; default: lxcbr0)")
 	cmd.Flags().StringVar(&host, "host", "", "Target host (default: the daemon you're connected to)")

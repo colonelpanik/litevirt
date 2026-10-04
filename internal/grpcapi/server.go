@@ -1592,6 +1592,21 @@ func (s *Server) SetLiveMover(m LiveMover) { s.liveMover = m }
 // not configured in this build / fips-only build all share that path.
 func (s *Server) SetWebAuthnService(w *auth.WebAuthnService) { s.webauthn = w }
 
+// releaseOnce makes a lock release safe to call more than once, so a handler can
+// release BEFORE forwarding to a peer and still `defer` the release for every
+// other path.
+//
+// The per-VM lock must not be held across a peer RPC. lockVM returns a plain
+// sync.Mutex release with no context, so waiting on it cannot be interrupted:
+// holding it across a forward pins that VM's lock for the whole remote call, and
+// on divergent vms.host_name replicas — A thinks B owns it, B thinks A does — the
+// two nodes lock, call each other, and each blocks forever on the mutex it
+// already holds. Neither call returns and the VM is wedged.
+func releaseOnce(unlock func()) func() {
+	var once sync.Once
+	return func() { once.Do(unlock) }
+}
+
 // lockVM acquires a per-VM mutex. Returns an unlock function. Lazily
 // initialises the map so test servers built without NewServer don't
 // panic on first lock.

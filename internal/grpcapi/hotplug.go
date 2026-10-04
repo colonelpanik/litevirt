@@ -169,6 +169,31 @@ func (s *Server) AttachDevice(ctx context.Context, req *pb.AttachDeviceRequest) 
 		return client.AttachDevice(ctx, req)
 	}
 	// Mutation barrier: don't hot-plug while a resource operation holds the VM.
+	// Serialize the LEGACY (non-address-selector) path with every other mutator
+	// of this VM. The journaled paths take this lock inside attachPCIOwner /
+	// detachPCIOwner; this one never did, so two concurrent attaches raced —
+	// and beginDeviceLease keys the durable crash anchor per-VM, so the second
+	// overwrote the only record recovery has of the first's claimed devices.
+	//
+	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
+	// operation barrier and running-state checks below are read under it too;
+	// unlocked, those are a read-then-act both callers pass.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
+	// RE-READ under the lock. Taking the lock and then testing the row fetched
+	// before it closes nothing: the barrier and running-state checks would
+	// still be evaluating a pre-lock snapshot, which is the read-then-act the
+	// lock was added to prevent. The sibling lock sites added alongside this
+	// one (StartVM, RebuildVM, attachPCIOwner) all re-read; these did not.
+	vmRec, err = corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "re-read VM %q under lock: %v", req.VmName, err)
+	}
+	if vmRec == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot attach a device to %q: an operation is in progress", req.VmName)
 	}
@@ -252,6 +277,28 @@ func (s *Server) DetachDevice(ctx context.Context, req *pb.DetachDeviceRequest) 
 		return client.DetachDevice(ctx, req)
 	}
 	// Mutation barrier: don't hot-unplug while a resource operation holds the VM.
+	// Serialize the LEGACY (non-address-selector) path with every other mutator
+	// of this VM. The journaled paths take this lock inside attachPCIOwner /
+	// detachPCIOwner; this one never did, so two concurrent attaches raced —
+	// and beginDeviceLease keys the durable crash anchor per-VM, so the second
+	// overwrote the only record recovery has of the first's claimed devices.
+	//
+	// Taken HERE rather than inside attachPCIDevice/detachPCIDevice so the
+	// operation barrier and running-state checks below are read under it too;
+	// unlocked, those are a read-then-act both callers pass.
+	unlock := s.lockVM(req.VmName)
+	defer unlock()
+
+	// RE-READ under the lock — see AttachDevice for why testing the pre-lock
+	// row leaves the race the lock was added to close.
+	vmRec, err = corrosion.GetVM(ctx, s.db, req.VmName)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "re-read VM %q under lock: %v", req.VmName, err)
+	}
+	if vmRec == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+
 	if vmRec.ActiveOperationID != "" {
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot detach a device from %q: an operation is in progress", req.VmName)
 	}

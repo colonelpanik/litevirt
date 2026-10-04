@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,12 +14,13 @@ import (
 
 // GCStats summarises a mark-and-sweep pass.
 type GCStats struct {
-	ManifestsScanned int
-	ChunksReferenced int   // unique chunks reached from any manifest
-	ChunksOnDisk     int   // chunks present in chunks/ at scan time
-	ChunksDeleted    int   // chunks removed because no manifest pointed at them
-	ChunksSkippedYoung int // unreferenced chunks retained because within the grace window
-	BytesReclaimed   int64 // total bytes of deleted chunks
+	ManifestsScanned   int
+	ChunksReferenced   int   // unique chunks reached from any manifest
+	ChunksOnDisk       int   // chunks present in chunks/ at scan time
+	ChunksDeleted      int   // chunks removed because no manifest pointed at them
+	ChunksSkippedYoung int   // unreferenced chunks retained because within the grace window
+	ManifestsInvalid   int   // manifests that parsed but failed validation; their chunks are RETAINED
+	BytesReclaimed     int64 // total bytes of deleted chunks
 }
 
 // DefaultChunkGracePeriod is how long an unreferenced chunk is retained
@@ -64,7 +66,11 @@ func GC(ctx context.Context, r *Repo) (GCStats, error) {
 // passes racing each other, but is no longer required for push safety.
 func GCWithOptions(ctx context.Context, r *Repo, opts GCOptions) (GCStats, error) {
 	var stats GCStats
-	manifests, err := r.ListManifests()
+	// Reachability counts EVERY manifest that parsed, valid or not. An invalid
+	// manifest is not restorable, but it still names real chunks and it is
+	// repairable by hand — so treating it as referencing nothing is what turned
+	// one damaged field into permanent data loss on the next sweep.
+	manifests, invalid, err := r.listParsedManifests()
 	if err != nil {
 		return stats, fmt.Errorf("list manifests: %w", err)
 	}
@@ -74,6 +80,17 @@ func GCWithOptions(ctx context.Context, r *Repo, opts GCOptions) (GCStats, error
 		for _, c := range m.AllChunks() {
 			live[c.ID] = struct{}{}
 		}
+	}
+	for _, m := range invalid {
+		stats.ManifestsScanned++
+		stats.ManifestsInvalid++
+		for _, c := range m.AllChunks() {
+			live[c.ID] = struct{}{}
+		}
+	}
+	if stats.ManifestsInvalid > 0 {
+		slog.Warn("pbsstore: GC retained the chunks of invalid manifests; repair or delete them",
+			"invalid_manifests", stats.ManifestsInvalid)
 	}
 	stats.ChunksReferenced = len(live)
 

@@ -699,11 +699,19 @@ func nullIfEmpty(s string) interface{} {
 // move: a file is safe to remove only if no other disk still depends on it
 // (a shared disk file, or a base/backing image other overlays read from).
 func DisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRecord, error) {
+	// Three ways a row can depend on this path, and all three have to be here:
+	// it IS the disk, it is the disk's backing_image (full-clone provenance), or
+	// it is the disk's backing_disk (a linked-clone overlay). backing_disk was
+	// missing, so a base whose only referrers were linked clones read as
+	// unreferenced and its file was deleted — destroying every overlay's chain
+	// at once, unrecoverably. LinkedCloneNames queries backing_disk correctly,
+	// which is what this guard was meant to be consulting.
 	rows, err := c.Query(ctx,
 		`SELECT vm_name, disk_name, host_name, path, size_bytes,
-			backing_image, storage_type, storage_volume, target_dev
-		 FROM vm_disks WHERE (path = ? OR backing_image = ?) AND deleted_at IS NULL`,
-		path, path)
+			backing_image, storage_type, storage_volume, target_dev, backing_disk
+		 FROM vm_disks
+		 WHERE (path = ? OR backing_image = ? OR backing_disk = ?) AND deleted_at IS NULL`,
+		path, path, path)
 	if err != nil {
 		return nil, err
 	}
@@ -719,6 +727,7 @@ func DisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRe
 			StorageType:   r.String("storage_type"),
 			StorageVolume: r.String("storage_volume"),
 			TargetDev:     r.String("target_dev"),
+			BackingDisk:   r.String("backing_disk"),
 		}
 	}
 	return disks, nil

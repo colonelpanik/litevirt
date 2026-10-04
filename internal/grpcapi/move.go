@@ -372,6 +372,22 @@ func (s *Server) rollbackCutover(cs cutoverState, vmName, origXML string) (safeT
 	}
 }
 
+// referenceKind names HOW d depends on path, for the message an operator reads
+// when a disk is kept. The three kinds are the three DisksReferencingPath
+// matches on, and they are not interchangeable: "linked clone" says the file is
+// a backing chain that other disks are layered on, which is the case where
+// deleting it destroys data that is not its own.
+func referenceKind(d *corrosion.DiskRecord, path string) string {
+	switch {
+	case d.BackingDisk == path:
+		return "linked clone"
+	case d.BackingImage == path:
+		return "backing image"
+	default:
+		return "disk file"
+	}
+}
+
 // deleteSourceIfUnreferenced removes the moved disk's old file after a
 // successful cutover — but ONLY if no other disk still references that exact
 // path, either as its own file or as a backing image. This guards against the
@@ -398,12 +414,12 @@ func (s *Server) pathStillReferenced(ctx context.Context, path, excludeVM, exclu
 		if d.VMName == excludeVM && d.DiskName == excludeDisk {
 			continue // the disk being moved/migrated (record repointed)
 		}
-		rel := "disk file"
-		if d.BackingImage == path {
-			rel = "backing image"
-		}
-		return true, fmt.Sprintf("%s/%s (as %s)", d.VMName, d.DiskName, rel), nil
+		return true, fmt.Sprintf("%s/%s (as %s)", d.VMName, d.DiskName,
+			referenceKind(&d, path)), nil
 	}
+	// Redundant since DisksReferencingPath gained its backing_disk clause — the
+	// loop above now reports a linked clone itself. Kept deliberately: this is a
+	// destructive path, and a second, independent query costs one SELECT.
 	clones, err := corrosion.LinkedCloneNames(ctx, s.db, path)
 	if err != nil {
 		return true, "linked-clone check failed: " + err.Error(), err
@@ -534,6 +550,55 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 // VM other than vmName — as either a disk file or another disk's backing image.
 // If so (or if the check itself fails) the caller must keep the file: deleting a
 // shared volume or a base image other overlays depend on would be destructive.
+// protectedDiskPaths returns the disk paths of vmName that another VM still
+// depends on, so the default-dir glob can skip them.
+//
+// The recorded-volume pass already consults diskPathReferencedByOtherVM per
+// disk; this exists because the glob that runs AFTER it does not look at
+// records at all. It matches every <vm>-*.qcow2 in the shared disk dir, which
+// is how a base still carrying linked-clone overlays was deleted even once the
+// recorded pass had correctly declined to free it.
+//
+// Fails CLOSED in both directions: an unreadable disk list protects nothing it
+// cannot name, but diskPathReferencedByOtherVM itself already answers "yes" on
+// a read error, so an unreadable REFERENCE check keeps the file. The remaining
+// gap — we cannot list this VM's own disks — is logged rather than silent.
+// protectedDiskPathsFrom takes the candidate list the caller already holds, so
+// that ONE listing drives both the protection and the deletion.
+//
+// There is deliberately no listing variant of this. The old one returned an
+// EMPTY keep set on a listing failure — protecting nothing — and every caller
+// that paired it with a re-listing delete was one transient error away from
+// sweeping a live clone base. Removing it rather than guarding it is what makes
+// that pairing unwriteable instead of merely discouraged.
+func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, candidates []string) map[string]bool {
+	keep := make(map[string]bool, len(candidates))
+	for _, path := range candidates {
+		referrers, rerr := corrosion.DisksReferencingPath(ctx, s.db, path)
+		if rerr != nil {
+			// FAIL CLOSED, which is what this function's comment always claimed
+			// and its old `return nil` did the opposite of: a read that failed is
+			// not evidence that nothing references this file. A transient
+			// SQLITE_BUSY was enough to sweep a live clone base.
+			slog.Error("delete: cannot tell whether a disk file is still referenced; "+
+				"protecting it rather than deleting on a guess",
+				"vm", vmName, "path", path, "error", rerr)
+			keep[path] = true
+			continue
+		}
+		for i := range referrers {
+			// Another VM still names it — as its own disk, its backing_image, or
+			// its linked-clone backing_disk. Our OWN live rows are not a reason to
+			// keep anything: deleting them is the point.
+			if referrers[i].VMName != vmName {
+				keep[path] = true
+				break
+			}
+		}
+	}
+	return keep
+}
+
 func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string, d *corrosion.DiskRecord) bool {
 	refs, err := corrosion.DisksReferencingPath(ctx, s.db, d.Path)
 	if err != nil {
@@ -545,10 +610,7 @@ func (s *Server) diskPathReferencedByOtherVM(ctx context.Context, vmName string,
 		if r.VMName == vmName {
 			continue // our own record(s) for this VM
 		}
-		rel := "disk file"
-		if r.BackingImage == d.Path {
-			rel = "backing image"
-		}
+		rel := referenceKind(&r, d.Path)
 		slog.Warn("delete: disk path still referenced by another VM — NOT deleting",
 			"vm", vmName, "path", d.Path,
 			"referenced_by_vm", r.VMName, "referenced_by_disk", r.DiskName, "as", rel)
@@ -838,3 +900,40 @@ func copyFileWithProgress(ctx context.Context, src, dst string, emit func(*pb.Mo
 
 // _ touches the context import used only when qemu-img is present.
 var _ context.Context
+
+// sweepVMDiskDebris removes leftover <vm>-*.qcow2 files, protecting any a live
+// row still references.
+//
+// The two steps go together: the keep set is derived from the same candidate
+// list the glob walks, and if that list cannot be built there is nothing to
+// derive protection FROM — so the sweep is skipped rather than run with an empty
+// keep set. Callers used to pass protectedDiskPaths straight into DeleteVMDisks,
+// which on a listing failure meant "delete everything, protect nothing", and was
+// survivable only because DeleteVMDisks re-listed and failed identically.
+func (s *Server) sweepVMDiskDebris(ctx context.Context, vmName string) {
+	candidates, err := s.images.VMDiskCandidates(vmName)
+	if err != nil {
+		slog.Error("delete: skipping the disk debris sweep; its candidate list is unreadable",
+			"vm", vmName, "error", err)
+		return
+	}
+	s.sweepVMDiskDebrisIn(ctx, vmName, candidates)
+}
+
+// sweepVMDiskDebrisIn is the sweep over a candidate list, which is also the
+// seam its test drives.
+//
+// Taking the list is what lets a test show WHICH list the deletion walks,
+// without a package-level hook sitting in the live delete path of createVM,
+// DeleteVM and RebuildVM. The first version of this used such a hook; a
+// test-only mutable global steering production deletes is a worse trade than
+// one more parameter.
+func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candidates []string) {
+	// ONE list, used for both halves. Deriving the keep set from a second
+	// listing and deleting against a third left the guarantee resting on all
+	// three agreeing: a file appearing after the keep set was built is in no
+	// keep set and would be swept with no reference check ever run against it.
+	if err := s.images.DeleteVMDisksIn(vmName, candidates, s.protectedDiskPathsFrom(ctx, vmName, candidates)); err != nil {
+		slog.Warn("delete: disk debris sweep failed", "vm", vmName, "error", err)
+	}
+}

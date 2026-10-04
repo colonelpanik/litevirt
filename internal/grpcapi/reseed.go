@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	"google.golang.org/grpc/codes"
@@ -150,11 +152,34 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	if err != nil {
 		return nil, err
 	}
-	peer, conn, err := s.peerClient(ctx, source)
+	// dialPeer rather than peerClient: production behaviour is identical (it
+	// falls through to the same mTLS dial), and it is the seam that lets the
+	// preflight below be tested against a source this node never had to reach.
+	peer, closePeer, err := s.dialPeer(ctx, source)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "reach reseed source %s: %v", source, err)
 	}
-	defer conn.Close()
+	defer closePeer()
+
+	// PREFLIGHT the source before anything is destroyed. The same check runs
+	// again in verifyReseedConvergence, and the repetition is deliberate: these
+	// guard different things. Here it protects this node's STATE — an unfit
+	// source is refused while the local rows are still intact, so a reseed that
+	// was never going to work costs nothing. There it guards the EPOCH CLEAR,
+	// which is a claim about the cluster and must be re-established against the
+	// source as it is at that moment, not as it was before the transfer.
+	//
+	// Without this the order was backwards: discard, merge from the unfit source,
+	// and only then decline to certify it — leaving the node strictly worse off
+	// than before it asked, and needing a repeat reseed to become usable.
+	if mismatch, cerr := s.checkReseedSource(ctx, source, peer); cerr != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", cerr)
+	} else if mismatch != "" {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source+" unfit="+mismatch, "error")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s is not a usable reseed source: %s. Nothing was discarded — %s is unchanged "+
+				"and still isolated at epoch %d", source, mismatch, s.hostName, epoch)
+	}
 
 	s.audit(ctx, "host.reseed", s.hostName, "source="+source+" epoch="+fmt.Sprint(epoch), "started")
 
@@ -166,11 +191,61 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Unavailable, "pull state from %s: %v", source, err)
 	}
+	// The sensitive lane travels with the operator one. The discard below clears
+	// the secret-bearing tables too (they used to survive a reseed, which is how
+	// a quarantined credential reached the whole fleet), so they have to be
+	// repopulated here and not left to anti-entropy: a node with no 2FA rows has
+	// no 2FA at all, because the API reads "no factors" as "no 2FA". Fetching
+	// BEFORE the discard keeps the no-state window as short as it already was.
+	//
+	// A source on an older build has no sensitive RPC. Refuse rather than reseed
+	// into a node with its secrets deleted and nothing to restore them.
+	sensitiveDump, err := s.fetchPeerSensitiveDump(ctx, peer)
+	if err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Unavailable,
+			"pull sensitive state from %s: %v", source, err)
+	}
+
 	// DISCARD, then merge — with the dump already in hand. A merge alone is
 	// additive, so the rows this node produced outside the regime (precisely
 	// what the quarantine contains) would survive and be re-injected once the
 	// epoch cleared. The lab proved it: a merge-only reseed failed its own
 	// convergence check because the stale rows were still there.
+	// MARK before the first DELETE. The three steps below cannot be one
+	// transaction, and the gap between the operator merge and the sensitive merge
+	// is a fail-OPEN window: users and their password hashes come back in the
+	// first, user_2fa only in the second, and LocalRealm.Authenticate reads an
+	// empty user_2fa as "nobody enrolled". A process that dies in between used to
+	// come back authenticating every enrolled account by password alone.
+	//
+	// The marker is durable and local-only, so it survives both the death and the
+	// discard, and the pre-session login paths refuse while it is set. It is
+	// cleared once the sensitive merge has committed — not after convergence,
+	// because by then the window is already shut and holding it longer would
+	// refuse logins on a node whose secrets are fully restored.
+	// ONE at a time in this process. Two concurrent ReseedHost calls on the same
+	// node both reach BeginReseed, the second REPLACES the first's marker (the
+	// row is keyed id = 1), and whichever calls FinishReseed first clears the
+	// login gate while the other is still discarding — user_2fa empty, the gate
+	// open, and the generation unchanged between admission and mint. See
+	// reseedInFlight for why this refuses rather than represents the overlap.
+	releaseReseed, admitted := s.reseeding.acquire()
+	if !admitted {
+		return nil, status.Error(codes.FailedPrecondition,
+			"a reseed is already running on this node; wait for it to finish or fail before "+
+				"starting another (two at once would clear each other's login gate)")
+	}
+	defer releaseReseed()
+
+	reseedGeneration, err := s.db.BeginReseed(ctx, source)
+	if err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"could not mark this node as mid-reseed, so the reseed was not started "+
+				"(nothing was discarded): %v", err)
+	}
+
 	cleared, err := s.db.DiscardReplicatedStateForReseed(ctx)
 	if err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
@@ -182,11 +257,25 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal, "merge state from %s: %v", source, err)
 	}
+	if err := s.db.MergeSensitiveStateBytesLWW(sensitiveDump); err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"merge sensitive state from %s (this node's secret-bearing tables are now "+
+				"EMPTY and it needs a repeat reseed before it can serve): %v", source, err)
+	}
+
+	// The window is shut: user_2fa is restored, so the login gate may lift.
+	if err := s.db.FinishReseed(ctx, reseedGeneration); err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"state was restored from %s but this node could not clear its reseed marker, so it "+
+				"will keep refusing logins until it does: %v", source, err)
+	}
 
 	// VERIFY convergence before clearing anything. Only a verified reseed earns
 	// the epoch clear; anything else leaves the node isolated with the reason
 	// intact, which is the safe direction.
-	converged, mismatch, err := s.verifyReseedConvergence(ctx, peer)
+	converged, mismatch, err := s.verifyReseedConvergence(ctx, source, peer)
 	if err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal, "verify convergence: %v", err)
@@ -306,22 +395,118 @@ var reseedConvergenceExempt = map[string]bool{
 	"hosts": true,
 }
 
-// verifyReseedConvergence compares this node against the source on the three
-// axes the design names: schema version, capability set, and state digest.
-// Returns the number of tables verified and a human-readable mismatch (” when
-// converged).
-func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtClient) (int, string, error) {
-	local, err := s.db.StateDigest(ctx)
+// fetchPeerSensitiveDump pulls the source's secret-bearing tables over the
+// peer-mTLS lane, the same one anti-entropy repairs them on. It is a hard
+// requirement of a reseed: the discard now empties these tables, so a node that
+// cannot refill them would come back with no credentials, no 2FA factors and no
+// recovery codes.
+func (s *Server) fetchPeerSensitiveDump(ctx context.Context, peer pb.LiteVirtClient) ([]byte, error) {
+	stream, err := peer.StreamSensitiveStateDump(ctx, &pb.SensitiveStateRequest{Sender: s.hostName})
 	if err != nil {
-		return 0, "", err
+		if status.Code(err) == codes.Unimplemented {
+			return nil, fmt.Errorf("the source has no sensitive state dump RPC (older build); " +
+				"reseeding from it would delete this node's secret-bearing tables with " +
+				"nothing to restore them")
+		}
+		return nil, err
 	}
+	var buf []byte
+	for {
+		chunk, rerr := stream.Recv()
+		if errors.Is(rerr, io.EOF) {
+			return buf, nil
+		}
+		if rerr != nil {
+			return nil, rerr
+		}
+		buf = append(buf, chunk.GetData()...)
+	}
+}
+
+// reseedLocalDigests returns every table digest a reseed must converge on:
+// the operator set AND the peer-only sensitive set.
+//
+// The sensitive tables were missing, so a reseed compared the operator lane,
+// declared itself verified and cleared the isolation epoch while the
+// quarantined credentials, 2FA factors, recovery codes, notification targets
+// and runtime action proofs were still sitting in it — and a healthy peer then
+// pulled them fleet-wide. A reseed that cannot show those tables match its
+// source has not converged with it.
+func (s *Server) reseedLocalDigests(ctx context.Context) ([]corrosion.TableDigest, error) {
+	digests, err := s.db.StateDigest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sensitive, err := s.db.SensitiveStateDigest(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("sensitive digest: %w", err)
+	}
+	return append(digests, sensitive...), nil
+}
+
+// reseedRemoteDigests reads the same two sets from the source.
+//
+// A source on an older build without the sensitive RPC returns Unimplemented.
+// That is not fatal — reseedDigestsConverged skips any table the source does
+// not report, which is the existing rule for a version difference — but it is
+// logged, because it means the sensitive half went unverified.
+func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient) (map[string]string, error) {
+	remote := map[string]string{}
 	resp, err := peer.GetStateDigest(ctx, &emptypb.Empty{})
 	if err != nil {
-		return 0, "", err
+		return nil, err
 	}
-	remote := map[string]string{}
 	for _, t := range resp.GetTables() {
 		remote[t.GetName()] = t.GetHash()
+	}
+	sens, err := peer.GetSensitiveStateDigest(ctx, &pb.SensitiveStateRequest{Sender: s.hostName})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			// The SAME capability gap fetchPeerSensitiveDump already refuses, and
+			// it is refused here for the same reason. This used to warn and carry
+			// on, which let a source get past the dump fetch and then skip the
+			// sensitive half of the verification — the epoch cleared on the
+			// operator lane alone, with the secret-bearing tables uncompared.
+			// Since both RPCs shipped together, a source answering one and not the
+			// other is an anomaly, not a version difference.
+			return nil, fmt.Errorf("the source has no sensitive state digest RPC, so the " +
+				"secret-bearing tables cannot be verified against it; a reseed that cannot " +
+				"compare them must not clear a quarantine")
+		}
+		return nil, fmt.Errorf("sensitive digest from source: %w", err)
+	}
+	for _, t := range sens.GetTables() {
+		remote[t.GetName()] = t.GetHash()
+	}
+	return remote, nil
+}
+
+// verifyReseedConvergence decides whether this node has converged with its
+// source closely enough to earn an epoch clear. It returns the number of tables
+// verified and a human-readable mismatch ("" when converged).
+//
+// Two axes, in this order. The SOURCE is checked first — schema version and its
+// own quarantine self-report (reseedSourceCompatible) — because the digest
+// comparison cannot see either: an unfit source reports fewer tables, and every
+// one it omits is skipped as a benign version difference. Then the STATE, table
+// by table, across the operator and sensitive lanes both.
+//
+// The comment this replaced claimed three axes, naming a capability-set
+// comparison that was never implemented; reseedSourceCompatible says why
+// comparing capability sets would be wrong rather than merely missing.
+func (s *Server) verifyReseedConvergence(ctx context.Context, source string, peer pb.LiteVirtClient) (int, string, error) {
+	if mismatch, err := s.checkReseedSource(ctx, source, peer); err != nil {
+		return 0, "", err
+	} else if mismatch != "" {
+		return 0, mismatch, nil
+	}
+	local, err := s.reseedLocalDigests(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	remote, err := s.reseedRemoteDigests(ctx, peer)
+	if err != nil {
+		return 0, "", err
 	}
 	verified, mismatch := reseedDigestsConverged(local, remote)
 	return verified, mismatch, nil
@@ -350,5 +535,68 @@ func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]str
 		}
 		verified++
 	}
+	// A comparison that compared NOTHING is not a convergence. Every rule above
+	// skips rather than blocks — a kept table, an exempt one, a table the source
+	// does not report — and each is right on its own, but together they have a
+	// degenerate case: a source sharing no comparable table yields verified=0
+	// with no mismatch, which the caller reads as success and clears the
+	// quarantine on. The count was already computed and returned here; nothing
+	// gated it. See TestReseedDigestsConverged_RefusesWhenNothingWasCompared.
+	if verified == 0 {
+		return 0, "the source reported none of the tables this reseed replaced"
+	}
 	return verified, ""
+}
+
+// checkReseedSource asks the source what build it is running and judges the
+// answer. Ping is deliberately FRESH on each call rather than cached: the two
+// callers are separated by the whole state transfer, and the second one exists
+// to re-establish the fact rather than to remember it.
+func (s *Server) checkReseedSource(ctx context.Context, source string, peer pb.LiteVirtClient) (string, error) {
+	ping, err := peer.Ping(ctx, &pb.PingRequest{})
+	if err != nil {
+		return "", fmt.Errorf("ping reseed source %s: %w", source, err)
+	}
+	return reseedSourceCompatible(int32(corrosion.CurrentSchemaVersion), source, ping), nil
+}
+
+// reseedSourceCompatible decides whether a source is fit to end a quarantine,
+// split from the RPC so the rule is directly testable — the same reason
+// reseedDigestsConverged is.
+//
+// The digest comparison structurally cannot answer this. Every table the source
+// does not report is skipped as a benign version difference, which is exactly
+// the shape an older source produces: fewer tables, all of them skipped, and a
+// reseed that verifies against a partial comparison and clears the epoch. So
+// the source's build has to be checked directly, not inferred from what its
+// digests happened to cover.
+//
+// Both directions are refused. A source BEHIND this binary cannot supply the
+// state this node's schema expects; a source AHEAD holds rows this node cannot
+// store, which the merge would silently drop and the digest comparison would
+// then skip. Ping reports the BINARY constant (see Ping), which is the right
+// question here: reseed is about which build generation the state comes from.
+//
+// Capability sets are deliberately NOT compared. Advertising is partly a
+// function of local config — a token is withheld while its enforcement flag is
+// off whenever a peer relies on it — so two nodes on one build can legitimately
+// advertise different sets, and requiring equality would refuse reseeds that are
+// perfectly safe. Schema version answers the question capabilities were being
+// asked to answer, and answers it unambiguously.
+//
+// The quarantine self-report is the second check here, and it closes a real gap:
+// pickReseedSource reads the RECORDED isolation row, while a node that has just
+// detected its own rollback is quarantined before any peer has written that row.
+// Its own Ping is the only thing that says so.
+func reseedSourceCompatible(localSchema int32, source string, p *pb.PingResponse) string {
+	if p.GetWalQuarantined() {
+		return fmt.Sprintf("source %s reports itself WAL-quarantined; reseeding from it "+
+			"would copy the state the compatibility regime exists to contain", source)
+	}
+	if got := p.GetSchemaVersion(); got != localSchema {
+		return fmt.Sprintf("source %s is on schema %d, this node expects %d; a reseed across "+
+			"a schema difference compares only the tables both happen to have and would "+
+			"clear the quarantine on a partial comparison", source, got, localSchema)
+	}
+	return ""
 }

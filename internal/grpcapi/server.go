@@ -33,6 +33,8 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
+	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
+	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
 
 	hostName string

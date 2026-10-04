@@ -147,6 +147,12 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 // by password Login and the WebAuthn login flow so both produce identical
 // session semantics.
 func (s *Server) mintSession(ctx context.Context, username, realm, clientIP, userAgent string) (token, expiresAt, role string, err error) {
+	// Fail closed if a reseed ran while these credentials were being checked.
+	// See refuseIfReseedMovedSinceEntry: the interceptor's gate cannot drain a
+	// request that was already inside when the reseed started.
+	if err := s.refuseIfReseedMovedSinceEntry(ctx); err != nil {
+		return "", "", "", err
+	}
 	user, gerr := corrosion.GetUser(ctx, s.db, username)
 	if gerr != nil || user == nil {
 		return "", "", "", status.Errorf(codes.Internal, "post-auth user lookup: %v", gerr)

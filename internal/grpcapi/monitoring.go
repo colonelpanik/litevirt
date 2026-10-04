@@ -27,7 +27,7 @@ func (s *Server) GetClusterStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Cl
 
 	// Single query for per-host VM counts instead of N+1.
 	vmCounts, _ := corrosion.CountVMsByHost(ctx, s.db)
-	// Aggregate CPU/memory/disk allocated per host, containers included.
+	// Aggregate CPU/memory and declared disk allocation per host, containers included.
 	resUsage := s.hostUsageWithContainers(ctx)
 
 	cs := &pb.ClusterStatus{
@@ -40,18 +40,21 @@ func (s *Server) GetClusterStatus(ctx context.Context, _ *emptypb.Empty) (*pb.Cl
 			cs.HostsActive++
 		}
 		usage := resUsage[h.Name]
+		pools := s.storagePoolsForHost(ctx, h.Name)
+		diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 		cs.Hosts = append(cs.Hosts, &pb.Host{
-			Name:         h.Name,
-			Address:      h.Address,
-			State:        hostStateToPB(h.State),
-			CpuTotal:     int32(h.CPUTotal),
-			MemTotalMib:  int32(h.MemTotal),
-			DiskTotalGib: int64(h.DiskTotal),
-			CpuUsed:      int32(usage.CpuUsed),
-			MemUsedMib:   int32(usage.MemUsedMiB),
-			DiskUsedGib:  int64(usage.DiskUsedGiB),
-			VmCount:      int32(vmCounts[h.Name]),
-			StoragePools: s.storagePoolsForHost(ctx, h.Name),
+			Name:             h.Name,
+			Address:          h.Address,
+			State:            hostStateToPB(h.State),
+			CpuTotal:         int32(h.CPUTotal),
+			MemTotalMib:      int32(h.MemTotal),
+			DiskTotalGib:     diskTotal,
+			CpuUsed:          int32(usage.CpuUsed),
+			MemUsedMib:       int32(usage.MemUsedMiB),
+			DiskUsedGib:      diskUsed,
+			DiskAllocatedGib: int64(usage.DiskAllocatedGiB),
+			VmCount:          int32(vmCounts[h.Name]),
+			StoragePools:     pools,
 		})
 	}
 

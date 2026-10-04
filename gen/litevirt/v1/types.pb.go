@@ -3861,12 +3861,17 @@ func (x *HardwarePCI) GetState() string {
 }
 
 type Host struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Address       string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
-	State         HostState              `protobuf:"varint,3,opt,name=state,proto3,enum=litevirt.v1.HostState" json:"state,omitempty"`
-	CpuTotal      int32                  `protobuf:"varint,4,opt,name=cpu_total,json=cpuTotal,proto3" json:"cpu_total,omitempty"`
-	MemTotalMib   int32                  `protobuf:"varint,5,opt,name=mem_total_mib,json=memTotalMib,proto3" json:"mem_total_mib,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Name        string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Address     string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	State       HostState              `protobuf:"varint,3,opt,name=state,proto3,enum=litevirt.v1.HostState" json:"state,omitempty"`
+	CpuTotal    int32                  `protobuf:"varint,4,opt,name=cpu_total,json=cpuTotal,proto3" json:"cpu_total,omitempty"`
+	MemTotalMib int32                  `protobuf:"varint,5,opt,name=mem_total_mib,json=memTotalMib,proto3" json:"mem_total_mib,omitempty"`
+	// disk_total_gib and disk_used_gib are one measurement: statfs (what `df`
+	// reports) summed over this host's storage pools, each filesystem counted
+	// once. Their ratio is the host's real disk fill. When no pool row carries
+	// capacity yet, total falls back to the figure the host recorded at startup
+	// and used is 0 (unknown, not empty).
 	DiskTotalGib  int64                  `protobuf:"varint,6,opt,name=disk_total_gib,json=diskTotalGib,proto3" json:"disk_total_gib,omitempty"`
 	CpuUsed       int32                  `protobuf:"varint,7,opt,name=cpu_used,json=cpuUsed,proto3" json:"cpu_used,omitempty"`
 	MemUsedMib    int32                  `protobuf:"varint,8,opt,name=mem_used_mib,json=memUsedMib,proto3" json:"mem_used_mib,omitempty"`
@@ -3886,9 +3891,15 @@ type Host struct {
 	// identifier of a public certificate — and `lv host rm` needs it to revoke that
 	// certificate at the moment of removal, after which the row is tombstoned and
 	// the serial is no longer readable.
-	CertSerial    string `protobuf:"bytes,21,opt,name=cert_serial,json=certSerial,proto3" json:"cert_serial,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	CertSerial string `protobuf:"bytes,21,opt,name=cert_serial,json=certSerial,proto3" json:"cert_serial,omitempty"`
+	// Sum of the DECLARED sizes of every disk of every VM on this host, stopped
+	// VMs included: what has been promised, not what is consumed. Thin
+	// provisioning lets it exceed disk_total_gib by design, so it is not a
+	// numerator for disk_total_gib. Daemons before this field carried this
+	// figure in disk_used_gib.
+	DiskAllocatedGib int64 `protobuf:"varint,22,opt,name=disk_allocated_gib,json=diskAllocatedGib,proto3" json:"disk_allocated_gib,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Host) Reset() {
@@ -4066,6 +4077,13 @@ func (x *Host) GetCertSerial() string {
 		return x.CertSerial
 	}
 	return ""
+}
+
+func (x *Host) GetDiskAllocatedGib() int64 {
+	if x != nil {
+		return x.DiskAllocatedGib
+	}
+	return 0
 }
 
 type Image struct {
@@ -5827,7 +5845,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\rselector_kind\x18\x02 \x01(\tR\fselectorKind\x121\n" +
 	"\adesired\x18\x03 \x01(\v2\x17.litevirt.v1.DeviceSpecR\adesired\x128\n" +
 	"\amembers\x18\x04 \x03(\v2\x1e.litevirt.v1.HardwarePCIMemberR\amembers\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\xe5\x06\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\x93\a\n" +
 	"\x04Host\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12,\n" +
@@ -5855,7 +5873,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\fwatchdog_dev\x18\x13 \x01(\tR\vwatchdogDev\x12\x16\n" +
 	"\x06region\x18\x14 \x01(\tR\x06region\x12\x1f\n" +
 	"\vcert_serial\x18\x15 \x01(\tR\n" +
-	"certSerial\x1a9\n" +
+	"certSerial\x12,\n" +
+	"\x12disk_allocated_gib\x18\x16 \x01(\x03R\x10diskAllocatedGib\x1a9\n" +
 	"\vLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x99\x02\n" +

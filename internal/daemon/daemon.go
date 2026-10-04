@@ -437,7 +437,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	cpus, memMiB, niErr := d.virt.NodeInfo()
 	diskGiB := 0
 	if niErr == nil {
-		diskGiB = d.sumPoolDiskTotalGiB()
+		diskGiB = d.sumPoolDiskTotalGiB(ctx)
 	} else {
 		slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
 	}
@@ -1496,7 +1496,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 	}
 
 	// Get disk total summed across all configured storage pools.
-	diskTotalGiB := d.sumPoolDiskTotalGiB()
+	diskTotalGiB := d.sumPoolDiskTotalGiB(ctx)
 
 	// Get cert serial
 	serial, err := pki.CertSerial(d.cfg.PKIDir + "/host.crt")
@@ -1581,33 +1581,71 @@ func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 		want, d.db.NowTS(), d.cfg.HostName)
 }
 
-// localDiskTotalGiB returns the total disk capacity in GiB for the filesystem
-// containing the given path (typically the litevirt data directory).
-func localDiskTotalGiB(path string) int {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0
-	}
-	return int(st.Blocks * uint64(st.Bsize) / (1024 * 1024 * 1024))
-}
+// statfsFn is syscall.Statfs, held in a variable so a test can give distinct
+// paths distinct filesystems — every temp dir a test can make sits on one.
+var statfsFn = syscall.Statfs
 
-// sumPoolDiskTotalGiB returns the total disk capacity in GiB summed across all
-// configured storage pool targets. Falls back to localDiskTotalGiB if no pools.
-func (d *Daemon) sumPoolDiskTotalGiB() int {
-	pools := d.cfg.StoragePools
-	if len(pools) == 0 {
-		return localDiskTotalGiB(d.cfg.DataDir)
+// sumPoolDiskTotalGiB returns this host's disk capacity in GiB: the statfs
+// total of every filesystem holding one of its storage pools, each filesystem
+// counted once. It is the hosts.disk_total recorded at startup, and the
+// fallback pb.Host reports before any pool row carries capacity.
+//
+// The pools are the config pools (or the data directory when config names
+// none, as registerStoragePools does) PLUS this host's file-based rows in the
+// replicated storage_pools table. Walking config alone left out every pool
+// created through the API, which never appears in config.yaml: a host with a
+// 7 TiB API pool reported its 438 GiB root filesystem as its whole capacity
+// (colonelpanik/litevirt#142).
+//
+// A config pool also has a row of its own, and two pools on different paths
+// can share one filesystem, so targets are deduplicated by the filesystem
+// statfs reports (fsid), not by path. A filesystem reporting no fsid falls
+// back to its cleaned path, so missing identities never collapse distinct
+// paths into one.
+func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
+	var targets []string
+	if len(d.cfg.StoragePools) == 0 {
+		targets = append(targets, d.cfg.DataDir)
 	}
-	seen := make(map[string]bool)
-	total := 0
-	for _, p := range pools {
-		if p.Target == "" || seen[p.Target] {
+	for _, p := range d.cfg.StoragePools {
+		if p.Target != "" {
+			targets = append(targets, p.Target)
+		}
+	}
+	if d.db != nil {
+		rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+		if err != nil {
+			slog.Warn("host disk total: list storage pools; counting config pools only", "error", err)
+		}
+		for _, p := range rows {
+			if fileBasedPoolDriver(p.Driver) && p.Target != "" {
+				targets = append(targets, p.Target)
+			}
+		}
+	}
+
+	type fsKey struct {
+		fsid syscall.Fsid
+		path string
+	}
+	seen := make(map[fsKey]bool)
+	var totalBytes uint64
+	for _, t := range targets {
+		var st syscall.Statfs_t
+		if err := statfsFn(t, &st); err != nil {
 			continue
 		}
-		seen[p.Target] = true
-		total += localDiskTotalGiB(p.Target)
+		key := fsKey{fsid: st.Fsid}
+		if st.Fsid == (syscall.Fsid{}) {
+			key = fsKey{path: filepath.Clean(t)}
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		totalBytes += st.Blocks * uint64(st.Bsize)
 	}
-	return total
+	return int(totalBytes / (1024 * 1024 * 1024))
 }
 
 // registerStoragePools upserts all configured storage pools into the cluster DB

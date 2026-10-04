@@ -495,6 +495,11 @@ message Host {
     HostState                      state         = 3;
     int32                          cpu_total     = 4;
     int32                          mem_total_mib = 5;
+    // disk_total_gib and disk_used_gib are one measurement: statfs (what `df`
+    // reports) summed over this host's storage pools, each filesystem counted
+    // once. Their ratio is the host's real disk fill. When no pool row carries
+    // capacity yet, total falls back to the figure the host recorded at startup
+    // and used is 0 (unknown, not empty).
     int64                          disk_total_gib = 6;
     int32                          cpu_used      = 7;
     int32                          mem_used_mib  = 8;
@@ -515,6 +520,12 @@ message Host {
     // certificate at the moment of removal, after which the row is tombstoned and
     // the serial is no longer readable.
     string                         cert_serial    = 21;
+    // Sum of the DECLARED sizes of every disk of every VM on this host, stopped
+    // VMs included: what has been promised, not what is consumed. Thin
+    // provisioning lets it exceed disk_total_gib by design, so it is not a
+    // numerator for disk_total_gib. Daemons before this field carried this
+    // figure in disk_used_gib.
+    int64                          disk_allocated_gib = 22;
 }
 
 message Image {

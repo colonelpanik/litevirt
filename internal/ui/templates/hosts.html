@@ -29,7 +29,7 @@
       <td>{{memGiB .MemUsedMib}}G / {{memGiB .MemTotalMib}}G</td>
       <td>
         {{- with index $.DiskActual .Name}}{{formatBytes .UsedBytes}} / {{formatBytes .TotalBytes}}{{end}}
-        <span style="color:var(--muted);font-size:11px">· {{.DiskUsedGib}}G alloc</span>
+        <span style="color:var(--muted);font-size:11px">· {{.DiskAllocatedGib}}G alloc</span>
       </td>
       <td>{{.VmCount}}</td>
     </tr>

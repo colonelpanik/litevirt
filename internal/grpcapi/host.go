@@ -40,23 +40,25 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 	for _, h := range hosts {
 		usage := resUsage[h.Name]
 		pools := s.storagePoolsForHost(ctx, h.Name)
+		diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 		host := &pb.Host{
-			Name:         h.Name,
-			Address:      h.Address,
-			State:        hostStateToPB(h.State),
-			CpuTotal:     int32(h.CPUTotal),
-			MemTotalMib:  int32(h.MemTotal),
-			DiskTotalGib: int64(h.DiskTotal),
-			CpuUsed:      int32(usage.CpuUsed),
-			MemUsedMib:   int32(usage.MemUsedMiB),
-			DiskUsedGib:  int64(usage.DiskUsedGiB),
-			VmCount:      int32(vmCounts[h.Name]),
-			Version:      h.Version,
-			StoragePools: pools,
-			Region:       h.Region,
-			CertSerial:   h.CertSerial,
-			CreatedAt:    parseTimestamp(h.CreatedAt),
-			UpdatedAt:    parseTimestamp(h.UpdatedAt),
+			Name:             h.Name,
+			Address:          h.Address,
+			State:            hostStateToPB(h.State),
+			CpuTotal:         int32(h.CPUTotal),
+			MemTotalMib:      int32(h.MemTotal),
+			DiskTotalGib:     diskTotal,
+			CpuUsed:          int32(usage.CpuUsed),
+			MemUsedMib:       int32(usage.MemUsedMiB),
+			DiskUsedGib:      diskUsed,
+			DiskAllocatedGib: int64(usage.DiskAllocatedGiB),
+			VmCount:          int32(vmCounts[h.Name]),
+			Version:          h.Version,
+			StoragePools:     pools,
+			Region:           h.Region,
+			CertSerial:       h.CertSerial,
+			CreatedAt:        parseTimestamp(h.CreatedAt),
+			UpdatedAt:        parseTimestamp(h.UpdatedAt),
 		}
 		resp.Hosts = append(resp.Hosts, host)
 	}
@@ -78,30 +80,33 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", h.Name)
 
-	// Sum allocated CPU/memory/disk from VMs on this host.
-	cpuUsed, memUsed, diskUsed := s.hostAllocatedResources(ctx, h.Name)
+	// Sum allocated CPU/memory and declared disk size from VMs on this host.
+	cpuUsed, memUsed, diskAllocated := s.hostAllocatedResources(ctx, h.Name)
+	pools := s.storagePoolsForHost(ctx, h.Name)
+	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 
 	return &pb.Host{
-		Name:          h.Name,
-		Address:       h.Address,
-		State:         hostStateToPB(h.State),
-		CpuTotal:      int32(h.CPUTotal),
-		MemTotalMib:   int32(h.MemTotal),
-		DiskTotalGib:  int64(h.DiskTotal),
-		CpuUsed:       cpuUsed,
-		MemUsedMib:    memUsed,
-		DiskUsedGib:   diskUsed,
-		VmCount:       int32(len(vms)),
-		Labels:        h.Labels,
-		Version:       h.Version,
-		StoragePools:  s.storagePoolsForHost(ctx, h.Name),
-		FenceStrategy: h.FenceStrategy,
-		IpmiAddress:   h.IPMIAddress,
-		WatchdogDev:   h.WatchdogDev,
-		Region:        h.Region,
-		CertSerial:    h.CertSerial,
-		CreatedAt:     parseTimestamp(h.CreatedAt),
-		UpdatedAt:     parseTimestamp(h.UpdatedAt),
+		Name:             h.Name,
+		Address:          h.Address,
+		State:            hostStateToPB(h.State),
+		CpuTotal:         int32(h.CPUTotal),
+		MemTotalMib:      int32(h.MemTotal),
+		DiskTotalGib:     diskTotal,
+		CpuUsed:          cpuUsed,
+		MemUsedMib:       memUsed,
+		DiskUsedGib:      diskUsed,
+		DiskAllocatedGib: diskAllocated,
+		VmCount:          int32(len(vms)),
+		Labels:           h.Labels,
+		Version:          h.Version,
+		StoragePools:     pools,
+		FenceStrategy:    h.FenceStrategy,
+		IpmiAddress:      h.IPMIAddress,
+		WatchdogDev:      h.WatchdogDev,
+		Region:           h.Region,
+		CertSerial:       h.CertSerial,
+		CreatedAt:        parseTimestamp(h.CreatedAt),
+		UpdatedAt:        parseTimestamp(h.UpdatedAt),
 	}, nil
 }
 
@@ -992,7 +997,10 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 	return &emptypb.Empty{}, nil
 }
 
-func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (cpuUsed, memUsed int32, diskUsedGiB int64) {
+// hostAllocatedResources returns running-VM CPU and memory, and the DECLARED
+// disk size of every VM on the host (stopped VMs included). The disk figure is
+// allocation, not usage — hostDiskFromPools is the usage pb.Host reports.
+func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (cpuUsed, memUsed int32, diskAllocatedGiB int64) {
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", hostName)
 	for _, vm := range vms {
 		if vm.State == "running" {
@@ -1005,7 +1013,7 @@ func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (c
 		`SELECT COALESCE(SUM(size_bytes),0) as disk_bytes FROM vm_disks WHERE host_name = ? AND deleted_at IS NULL`,
 		hostName)
 	if err == nil && len(rows) > 0 {
-		diskUsedGiB = int64(rows[0].Int("disk_bytes")) / (1024 * 1024 * 1024)
+		diskAllocatedGiB = int64(rows[0].Int("disk_bytes")) / (1024 * 1024 * 1024)
 	}
 	return
 }

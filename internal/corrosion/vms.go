@@ -740,9 +740,13 @@ func CountVMsByHost(ctx context.Context, c *Client) (map[string]int, error) {
 
 // HostResourceUsage holds aggregated CPU, memory, and disk allocated to VMs on a host.
 type HostResourceUsage struct {
-	CpuUsed     int
-	MemUsedMiB  int
-	DiskUsedGiB int
+	CpuUsed    int
+	MemUsedMiB int
+	// DiskAllocatedGiB is the DECLARED size of every disk of every VM on the
+	// host, stopped VMs included — what has been promised, not what is on disk.
+	// Thin provisioning lets it exceed the host's capacity, so it is never a
+	// numerator for a statfs total (colonelpanik/litevirt#142).
+	DiskAllocatedGiB int
 	// VMCount is how many RUNNING VMs the host carries. Capacity policy charges
 	// a per-VM qemu overhead on top of configured guest memory, so the count is
 	// part of usage, not a display detail.
@@ -775,7 +779,7 @@ func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResour
 		for _, r := range diskRows {
 			host := r.String("host_name")
 			usage := m[host]
-			usage.DiskUsedGiB = r.Int("disk_bytes") / (1024 * 1024 * 1024)
+			usage.DiskAllocatedGiB = r.Int("disk_bytes") / (1024 * 1024 * 1024)
 			m[host] = usage
 		}
 	}

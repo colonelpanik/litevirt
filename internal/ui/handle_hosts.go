@@ -94,7 +94,7 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 		memPct = float64(host.MemUsedMib) / float64(host.MemTotalMib) * 100
 	}
 	// Actual on-disk usage (statfs, matches `df`) summed across the host's
-	// storage pools. Distinct from host.DiskUsedGib (sum of VMs' allocated
+	// storage pools. Distinct from host.DiskAllocatedGib (sum of VMs' declared
 	// virtual sizes) — both are shown so a same-host pool move (which doesn't
 	// change allocation) is still visible as freed real space.
 	diskActualUsed, diskActualTotal := sumPoolActual(host.GetStoragePools())

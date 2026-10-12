@@ -336,9 +336,11 @@ func (s *Server) autoDefineRestoredVM(
 	// moves — the same guest-ABI hazard create/import/promote/clone pin against.
 	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
+	// Inserted "creating": assignOwnerEpochAtCreate publishes it running only
+	// once it holds a positive epoch and a marker names it.
 	vmRecord := corrosion.VMRecord{
 		Name: targetName, HostName: s.hostName, Spec: string(specJSON),
-		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
+		State: "creating", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
 	// PCI intents: NONE. The restored domain built above (GenerateDomainXML)
@@ -361,11 +363,12 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
 	} else {
-		// Born running at the column default of 0, exactly like CreateVM was
-		// before the create path graduated. Nothing else does it: convergence
-		// early-returns on a zero epoch, and the backfill that would graduate it
-		// is gated behind enforcement.owner_epoch, which is off by default.
-		s.assignOwnerEpochAtCreate(ctx, targetName)
+		// Graduates, marks, and only then publishes running; a failure leaves the
+		// row "creating" for the reconciler to finish.
+		//
+		// In the else on purpose: a non-firmware insert failure is NOT fatal on
+		// this path, so an unguarded call would act on a row that does not exist.
+		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	}
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")

@@ -300,11 +300,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	// adopt=false: best-effort-populate vm_nics/vm_pci_intent, but don't
 	// self-certify adoption — the Phase-6 backfill audit confirms/reconciles
 	// against the just-defined inactive domain.
+	//
+	// An import that will be started is inserted "creating", not "stopped":
+	// assignOwnerEpochAtCreate publishes it running only once it holds a
+	// positive epoch and a marker names it.
+	insertState := "stopped"
+	if first.Start {
+		insertState = "creating"
+	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
 		Name:      name,
 		HostName:  s.hostName,
 		Spec:      string(specJSON),
-		State:     "stopped",
+		State:     insertState,
 		CPUActual: fv.CPUs,
 		MemActual: fv.MemoryMiB,
 		Project:   project,
@@ -335,29 +343,16 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}
-		// Graduate BEFORE publishing. The import inserts at "stopped" with
-		// vm_owner_epoch at the column default of 0, and the chokepoint writes
-		// nothing for a pre-epoch row (a marker against an epoch-0 row is the one
-		// mismatch convergence never repairs). Without this the routed publish
-		// below is a no-op on the markers, and an imported-and-started VM is
-		// exactly as unprovable as it was before — for as long as the
-		// default-off backfill stays off.
-		//
-		// Graduation is best-effort and reports a failure only in its own log
-		// line, so this ordering makes the markers POSSIBLE, not certain. When it
-		// does fail the publish below warns that it is publishing an unprovable
-		// runtime, rather than skipping the markers in silence.
-		s.assignOwnerEpochAtCreate(ctx, name)
-		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
-			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")
-		}); err != nil {
-			slog.Warn("import: recording running state failed — reconciler will heal", "vm", name, "error", err)
-			s.noteStateWriteFail(corrosion.OpVMState, err)
-		}
+		// Graduates, marks, and only then publishes running. A failure leaves the
+		// row "creating" for the reconciler to finish, never running at epoch 0.
+		s.assignOwnerEpochAtCreate(ctx, name, true)
 		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
 			s.reapplyVLANTaps(ctx, vm) // best-effort
 		}
 		stateMsg = "imported + started"
+	} else {
+		// A stopped import is graduated too, or it starts later at epoch 0.
+		s.assignOwnerEpochAtCreate(ctx, name, false)
 	}
 
 	s.recordVMEvent(ctx, name, "vm.imported", "ok", fmt.Sprintf("format=%s disks=%d", first.SourceFormat, len(convertedPaths)))

@@ -3,9 +3,9 @@
 // runtime belongs to.
 //
 // A row that says running while no marker names its generation is a workload
-// nobody can prove. That window is what the dual-run detector's newborn grace
-// exists to tolerate, so closing it everywhere is what eventually makes that
-// grace deletable — and a new unrouted call site would silently reopen it.
+// nobody can prove, and the dual-run detector pages it with no newborn grace —
+// so a new unrouted call site would reopen a window the detector no longer
+// tolerates.
 //
 // There are two publish orderings — mark-then-commit for a writer that leaves
 // the ownership generation alone, commit-then-mark for one that advances it in
@@ -29,7 +29,9 @@
 //     at runtime — must be graduated by an assignOwnerEpochAtCreate call in the
 //     same function. An insert lands at the vm_owner_epoch column default of 0,
 //     convergence early-returns on zero, and the backfill that would graduate it
-//     is gated behind enforcement.owner_epoch, which is off by default.
+//     is gated behind enforcement.owner_epoch, which is off by default. The
+//     production create paths insert a VM that will run as "creating" and let
+//     assignOwnerEpochAtCreate publish it running after the markers.
 //  5. Every SQL statement in production code that writes the vms.state column
 //     must be registered in the stateWritingStatements inventory below. Rules 1-4
 //     police call sites against hand-maintained maps of writer NAMES, and a map
@@ -169,6 +171,14 @@ func main() {
 		var wv []violation
 		wv, err = checkWriters(*root)
 		violations = append(violations, wv...)
+
+		// Rule 7: an allow-directive that excuses a statement because its
+		// function has only one caller must still have only one caller.
+		if err == nil {
+			var cv []violation
+			cv, err = checkOnlyCallerClaims(*root)
+			violations = append(violations, cv...)
+		}
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runningcheck: %v\n", err)

@@ -350,9 +350,16 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// default 'pending' for the Phase-6 backfill audit to confirm/reconcile.
 	// pciIntents is always nil: srcSpec.Devices was dropped above (v1 clones
 	// never carry PCI passthrough).
+	//
+	// A started clone is inserted "creating": assignOwnerEpochAtCreate publishes
+	// it running only once it holds a positive epoch and a marker names it.
+	insertState := state
+	if state == "running" {
+		insertState = "creating"
+	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, corrosion.VMRecord{
 		Name: req.Target, StackName: src.StackName, HostName: s.hostName, Spec: string(specJSON),
-		State: state, CPUActual: cpu, MemActual: mem, Project: project,
+		State: insertState, CPUActual: cpu, MemActual: mem, Project: project,
 	}, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
@@ -361,7 +368,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// born running at epoch 0 and needs its first generation, while a stopped
 	// one is graduated by whatever later starts it.
 	if state == "running" {
-		s.assignOwnerEpochAtCreate(ctx, req.Target)
+		s.assignOwnerEpochAtCreate(ctx, req.Target, true)
 	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "host", s.hostName)

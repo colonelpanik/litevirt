@@ -75,20 +75,19 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.
-- **A VM created through `CreateVM` is normally provable immediately.** It is
-  assigned its first ownership generation and both runtime markers (libvirt
-  domain metadata and the host-local marker file) are stamped before the call
-  returns. Previously the row was born at the pre-epoch default and carried no
-  marker until the reconciler's next backfill sweep, so for up to that interval
-  a running VM could not prove which generation it belonged to.
-  **This narrows that window; it does not close it**, and it covers only that
-  one path. The row is still published as `running` before the markers are
-  written, so a crash or a failure in between still leaves a running VM that
-  cannot prove its generation — now for the width of a few calls inside one RPC
-  rather than a sweep interval. The dual-run detector's newborn grace remains
-  the backstop for that residue, and closing it needs the create path reordered
-  to record the row before the runtime exists. All containers are unchanged:
-  they graduate on the backfill sweep as before.
+- **A new VM is never published `running` before it can prove its
+  generation.** Every path that creates a VM row — `CreateVM`, template
+  instantiation, import, live-restore autostart and a renamed replica
+  promotion — records it as `creating`, assigns its first ownership generation,
+  stamps both runtime markers (libvirt domain metadata and the host-local marker
+  file), and only then flips it to `running`. When any step fails the VM keeps
+  running and its row stays `creating`: it is neither published at generation 0
+  nor torn down. The owning host's reconciler finishes such a row on its next
+  sweep — when the domain is running there and no create operation, pending
+  start proof or VM lock holds the row. The dual-run detector therefore has no
+  newborn grace: a VM running on its owner at generation 0 with no marker pages
+  as an owner-epoch mismatch, however recently it was created. Containers do not
+  take this path: they graduate on the backfill sweep.
 - **A VM published as `running` is marked at the same time, on the host that
   runs it.** Every local transition that sets a VM to `running` — start,
   snapshot restore, import, a failed migration healing back, the reconciler's

@@ -493,6 +493,9 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		case "pending":
 			r.startPendingVM(ctx, vm)
 
+		case "creating":
+			r.finishNewbornVM(ctx, vm.Name)
+
 		case "starting":
 			// "starting" is an INTERMEDIATE state written only by startPendingVM (just
 			// before the libvirt define+start). A VM left here means a start didn't
@@ -1680,6 +1683,53 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
 		vmName, r.hostName); err != nil {
 		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
+	}
+}
+
+// finishNewbornVM completes a create that stopped short of publishing its VM
+// running: the row is "creating", the guest already runs here, and the create
+// path's graduate → mark → publish did not finish (a store fault on the
+// graduation, no marker landing, a failed flip). It runs the same
+// PublishNewbornVMRunning the create path does, so a retry can only take the
+// row through the same ordering, never to running at epoch 0.
+//
+// "creating" is not only a stranded newborn, so the finish is keyed narrowly:
+//
+//   - the domain runs on THIS host — a create still defining or starting its
+//     domain (an import starts it after the insert) is not stranded, and a row
+//     with no runtime here has nothing to publish;
+//   - no active_operation_id — the journaled create protocol holds its
+//     provisional row "creating" under that barrier and commits it itself;
+//   - no pending_action_id — a proof-gated action owns the transition;
+//   - no live vm_locks lease — an operation holds the VM.
+//
+// The create path can reach the same row at the same moment; that race is
+// benign, because every step is idempotent — the graduation is guarded on
+// epoch 0, the markers name the one epoch the row holds, and the flip is
+// guarded on that epoch.
+func (r *Reconciler) finishNewbornVM(ctx context.Context, name string) {
+	if r.virt == nil {
+		return
+	}
+	if st, err := r.virt.DomainState(name); err != nil || st != "running" {
+		return
+	}
+	row, err := corrosion.GetVM(ctx, r.db, name)
+	if err != nil || row == nil || row.State != "creating" || row.HostName != r.hostName {
+		return
+	}
+	if row.ActiveOperationID != "" || row.PendingActionID != "" {
+		return
+	}
+	if r.activeVMLock(ctx, name) {
+		return
+	}
+	slog.Info("reconciler: finishing a created VM that was never published running",
+		"vm", name, "epoch", row.OwnerEpoch)
+	if err := PublishNewbornVMRunning(ctx, r.virt, r.db, r.dataDir, r.hostName, name); err != nil {
+		slog.Warn("reconciler: could not finish a created VM — it stays \"creating\" and is retried next sweep",
+			"vm", name, "error", err)
+		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 }
 

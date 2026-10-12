@@ -13,9 +13,9 @@ import (
 
 // Publishing a VM as running is the moment its ownership generation becomes a
 // claim other nodes act on. A row that says "running" while no marker names its
-// generation is a workload nobody can prove, and that window is what the
-// dual-run detector's newborn grace exists to tolerate — so closing it
-// everywhere is what eventually makes that grace deletable.
+// generation is a workload nobody can prove, and the dual-run detector pages
+// it: there is no newborn grace, because no path publishes a VM running before
+// it is marked. A new VM is finished by PublishNewbornVMRunning.
 //
 // There are TWO orderings here, not one, because a running write is one of two
 // kinds and a single ordering is wrong for one of them:
@@ -172,13 +172,11 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 	res := writeBothMarkers(virt, dataDir, name, epoch)
 	if res.skipped {
 		// A pre-epoch row publishes unmarked BY DESIGN, but silently is wrong.
-		// Every routed site upstream of a graduation assumes the graduation
-		// worked: the import path's own comment says "graduate BEFORE publishing
-		// … without this the routed publish is a no-op on the markers", and
-		// assignOwnerEpochAtCreate reports a failed graduation only in its own
-		// log line, with no way for the publish to know. So the publish says it:
-		// this VM is running and unprovable until the backfill graduates it, and
-		// the backfill is off by default.
+		// A new VM never reaches here — PublishNewbornVMRunning refuses an
+		// epoch-0 row — so this is an existing row nothing graduated, such as a
+		// stopped VM from before the create paths graduated, being started. The
+		// publish says it: this VM is running and unprovable until the backfill
+		// graduates it, and the backfill is off by default.
 		slog.Warn("publish: publishing a running VM that has no ownership generation — the row is "+
 			"pre-epoch, so no marker is written and the runtime cannot be proven until the "+
 			"owner-epoch backfill graduates it (enforcement.owner_epoch is off by default)",
@@ -386,4 +384,56 @@ func PublishRunningVia(ctx context.Context, virt DomainEpochSetter, db *corrosio
 			name, hostName, ErrOwnershipMoved, row.HostName, row.OwnerEpoch)
 	}
 	return PublishVMRunning(ctx, virt, dataDir, name, state, row.OwnerEpoch, commit)
+}
+
+// PublishNewbornVMRunning finishes a create: it takes a row inserted as
+// "creating" at the pre-epoch default, assigns its first ownership generation,
+// stamps both runtime markers at that generation, and only then flips the row
+// to "running". It is the one finish for every create path and for the owner's
+// reconciler, so a new VM is never published running at epoch 0
+// (colonelpanik/litevirt#157).
+//
+// The order is graduate, mark, commit — the NON-MINTING ordering, because the
+// flip itself leaves vm_owner_epoch alone and the generation it runs at already
+// exists by the time the markers are written.
+//
+// Every failure leaves the row "creating", never running and never torn down:
+//
+//   - a failed graduation leaves it at epoch 0 and unmarked, the state the
+//     reconciler's finish keys on;
+//   - no marker landing leaves it at a positive epoch and unmarked, which the
+//     same finish retries, since PublishVMRunning refuses the commit;
+//   - a failed commit leaves it marked and "creating", which the finish
+//     completes by re-marking (idempotent) and committing.
+//
+// A graduation that matched no row is not a failure by itself: the owner's
+// reconciler and the create path can both reach the same newborn, and the
+// second graduation is then a no-op against a row already at 1. The re-read
+// below decides — a row still at 0 is refused, a row already running is done.
+func PublishNewbornVMRunning(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string) error {
+	if err := corrosion.GraduateVMOwnerEpoch(ctx, db, name); err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) {
+		return fmt.Errorf("assign the first owner epoch to %q: %w", name, err)
+	}
+	row, err := RowForPublish(ctx, db, name)
+	if err != nil {
+		return err
+	}
+	if hostName != "" && row.HostName != hostName {
+		return fmt.Errorf("refusing to publish %q running on %q: %w (row names %q at generation %d)",
+			name, hostName, ErrOwnershipMoved, row.HostName, row.OwnerEpoch)
+	}
+	switch row.State {
+	case "creating":
+	case "running":
+		return nil // another finisher got here first
+	default:
+		return fmt.Errorf("refusing to publish %q running: it is %q, not a newborn", name, row.State)
+	}
+	if row.OwnerEpoch < 1 {
+		return fmt.Errorf("refusing to publish %q running at the pre-epoch generation 0", name)
+	}
+	epoch := row.OwnerEpoch
+	return PublishVMRunning(ctx, virt, dataDir, name, "running", epoch, func(ctx context.Context) error {
+		return corrosion.UpdateVMStateAtEpoch(ctx, db, name, "running", "", epoch)
+	})
 }

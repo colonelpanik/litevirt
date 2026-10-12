@@ -310,6 +310,12 @@ func TestGetVMLogs_EmptyLog(t *testing.T) {
 	}
 }
 
+// TestGetVMLogs_InsufficientRole exercises the path-blind floor with no
+// authenticated principal at all. GetVMLogs moved from RequireRole to
+// requirePermPrecheck (this task's RBAC-scope fix), which reports
+// Unauthenticated for no principal rather than RequireRole's PermissionDenied
+// — a more precise code for the same "no credentials" case, consistent with
+// every other precheck-gated RPC (see RequirePerm's identical check).
 func TestGetVMLogs_InsufficientRole(t *testing.T) {
 	s, _ := logsTestServer(t)
 
@@ -319,11 +325,11 @@ func TestGetVMLogs_InsufficientRole(t *testing.T) {
 
 	err := s.GetVMLogs(req, stream)
 	if err == nil {
-		t.Fatal("expected permission denied error")
+		t.Fatal("expected an error")
 	}
 	st, _ := status.FromError(err)
-	if st.Code() != codes.PermissionDenied {
-		t.Errorf("code = %v, want PermissionDenied", st.Code())
+	if st.Code() != codes.Unauthenticated {
+		t.Errorf("code = %v, want Unauthenticated", st.Code())
 	}
 }
 

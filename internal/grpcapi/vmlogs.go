@@ -12,18 +12,23 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // GetVMLogs streams the libvirt QEMU log for a VM.
 func (s *Server) GetVMLogs(req *pb.GetVMLogsRequest, stream grpc.ServerStreamingServer[pb.VMLogChunk]) error {
-	if err := RequireRole(stream.Context(), "viewer"); err != nil {
+	ctx := stream.Context()
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return err
 	}
 
-	ctx := stream.Context()
-	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil || vm == nil {
+	// vm.read on the VM's own path (requireVMReadByName): GetVMLogs used to
+	// check only the cluster-wide viewer floor above, so a caller scoped to
+	// one project could stream the QEMU console log of any VM in the cluster.
+	vm, err := s.requireVMReadByName(ctx, req.Name)
+	if err != nil {
+		return err
+	}
+	if vm == nil {
 		return status.Errorf(codes.NotFound, "VM %q not found", req.Name)
 	}
 

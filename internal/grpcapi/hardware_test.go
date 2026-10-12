@@ -278,13 +278,17 @@ func TestListVMHardware_NotFound(t *testing.T) {
 	}
 }
 
+// TestListVMHardware_InsufficientRole exercises the path-blind floor with no
+// authenticated principal at all. ListVMHardware moved from RequireRole to
+// requirePermPrecheck (this task's RBAC-scope fix), which reports
+// Unauthenticated for no principal rather than RequireRole's PermissionDenied.
 func TestListVMHardware_InsufficientRole(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 
 	_, err := s.ListVMHardware(ctx, &pb.ListVMHardwareRequest{VmName: "hw-vm"})
-	if status.Code(err) != codes.PermissionDenied {
-		t.Errorf("code = %v, want PermissionDenied (err=%v)", status.Code(err), err)
+	if status.Code(err) != codes.Unauthenticated {
+		t.Errorf("code = %v, want Unauthenticated (err=%v)", status.Code(err), err)
 	}
 }
 

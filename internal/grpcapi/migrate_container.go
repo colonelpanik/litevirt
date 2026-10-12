@@ -42,8 +42,8 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	if req.Name == "" || req.TargetHost == "" || req.RepoPath == "" {
 		return status.Error(codes.InvalidArgument, "name, target_host and repo_path required")
 	}
-	project := s.containerProject(ctx, req.SourceHost, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.migrate", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.SourceHost, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.migrate", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.migrate", req.Name, "project="+project, "denied")
 		return err
 	}

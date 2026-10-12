@@ -25,31 +25,38 @@ func TestScheduleRBACTarget_PoolProjectScoped(t *testing.T) {
 
 	// A project-owned pool → project-scoped path.
 	seed("h1", "hot", "tenant-a")
-	if got, want := s.scheduleRBACTarget(ctx, "pool", "", "hot", ""), poolRBACPathFor("tenant-a", "hot"); got != want {
+	if got, want := s.schedulePathOnly(ctx, "pool", "", "hot", ""), poolRBACPathFor("tenant-a", "hot"); got != want {
 		t.Fatalf("project pool: got %q, want %q", got, want)
 	}
 
 	// A found GLOBAL pool (Project "") legitimately maps to the global pool path.
 	seed("h1", "shared", "")
-	if got, want := s.scheduleRBACTarget(ctx, "pool", "", "shared", ""), poolRBACPathFor("", "shared"); got != want {
+	if got, want := s.schedulePathOnly(ctx, "pool", "", "shared", ""), poolRBACPathFor("", "shared"); got != want {
 		t.Fatalf("global pool: got %q, want %q", got, want)
 	}
 
 	// Same pool name across multiple hosts, SAME project → still resolves uniquely.
 	seed("h2", "hot", "tenant-a")
-	if got, want := s.scheduleRBACTarget(ctx, "pool", "", "hot", ""), poolRBACPathFor("tenant-a", "hot"); got != want {
+	if got, want := s.schedulePathOnly(ctx, "pool", "", "hot", ""), poolRBACPathFor("tenant-a", "hot"); got != want {
 		t.Fatalf("multi-host same-project pool: got %q, want %q", got, want)
 	}
 
 	// Unknown pool → unmatched sentinel, NOT the empty-project global path.
-	if got := s.scheduleRBACTarget(ctx, "pool", "", "ghost", ""); !strings.Contains(got, "\x00") || got == poolRBACPathFor("", "ghost") {
+	if got := s.schedulePathOnly(ctx, "pool", "", "ghost", ""); !strings.Contains(got, "\x00") || got == poolRBACPathFor("", "ghost") {
 		t.Fatalf("unknown pool must be an unmatched sentinel, got %q", got)
 	}
 
 	// Name collision: same name, DIFFERENT projects → fail closed to a sentinel.
 	seed("h1", "dup", "tenant-a")
 	seed("h2", "dup", "tenant-b")
-	if got := s.scheduleRBACTarget(ctx, "pool", "", "dup", ""); !strings.Contains(got, "\x00") {
+	if got := s.schedulePathOnly(ctx, "pool", "", "dup", ""); !strings.Contains(got, "\x00") {
 		t.Fatalf("cross-project name collision must be an unmatched sentinel, got %q", got)
 	}
+}
+
+// schedulePathOnly is scheduleRBACTarget's path, for the pool-scope cases
+// above, which are always "known" (an unresolvable pool is a deny sentinel).
+func (s *Server) schedulePathOnly(ctx context.Context, scope, vmName, poolName, projectName string) string {
+	p, _ := s.scheduleRBACTarget(ctx, scope, vmName, poolName, projectName)
+	return p
 }

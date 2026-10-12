@@ -87,6 +87,12 @@ func (s *Server) NotifyHostFenced(host, method, result, detail string) {
 	})
 }
 
+// redactedTargetConfig replaces a notification target's config for a caller
+// below the operator floor. It is deliberately not valid JSON and not empty: an
+// empty string would read as "this target has no configuration", and anything
+// parseable invites a round-trip that would write the placeholder back.
+const redactedTargetConfig = "<redacted: requires operator>"
+
 func toPbTarget(t corrosion.NotificationTarget) *pb.NotificationTarget {
 	return &pb.NotificationTarget{Id: t.ID, Name: t.Name, Type: t.Type, Config: t.Config, Enabled: t.Enabled}
 }
@@ -118,13 +124,24 @@ func (s *Server) ListNotificationTargets(ctx context.Context, _ *pb.ListNotifica
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
+	// A target's config IS its credential — a webhook or Slack URL is a bearer
+	// secret — which is why notification_targets sits in corrosion's
+	// sensitiveTableNames ("must never enter the operator-readable state dump").
+	// Knowing THAT a target exists is viewer-safe; its config is not, so it is
+	// redacted below the operator floor rather than the whole RPC being raised,
+	// which would blind the UI's notifications list to a viewer.
+	redactConfig := RequireRole(ctx, "operator") != nil
 	targets, err := corrosion.ListNotificationTargets(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list targets: %v", err)
 	}
 	resp := &pb.ListNotificationTargetsResponse{}
 	for _, t := range targets {
-		resp.Targets = append(resp.Targets, toPbTarget(t))
+		pt := toPbTarget(t)
+		if redactConfig {
+			pt.Config = redactedTargetConfig
+		}
+		resp.Targets = append(resp.Targets, pt)
 	}
 	return resp, nil
 }

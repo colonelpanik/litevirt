@@ -7,6 +7,7 @@ package grpcapi
 
 import (
 	"context"
+	"strconv"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,7 +23,7 @@ func (s *Server) CreateBackupSchedule(ctx context.Context, req *pb.CreateBackupS
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.Repo == "" || req.Cron == "" {
@@ -76,10 +77,14 @@ func (s *Server) CreateBackupSchedule(ctx context.Context, req *pb.CreateBackupS
 }
 
 // scheduleRBACTarget returns the RBAC path a schedule of the given scope is
-// checked against. For the vm scope it resolves the VM's tenancy project
-// from corrosion (falling back to the default-project path when the VM
-// record can't be found) so per-project RBAC bindings apply correctly.
-func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName, projectName string) string {
+// checked against. For the vm scope it resolves the VM's tenancy project from
+// its local row; known is false when that row is not here, and the caller then
+// authorizes through requirePermResolved. It used to fall back to the
+// _default-project path, which let a _default-only caller delete the schedule
+// of a VM in any other project through a node the VM's row had not reached —
+// the tombstone is keyed by VM name and relayed, so every node holding the
+// schedule applied it.
+func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName, projectName string) (path string, known bool) {
 	switch scope {
 	case "pool":
 		// Authorize against the PROJECT-scoped pool path (matching pool CRUD/content, which
@@ -90,7 +95,7 @@ func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName
 		// GLOBAL "/storage_pools/<name>" path a grant could match).
 		pools, err := corrosion.ListAllStoragePools(ctx, s.db)
 		if err != nil {
-			return "/storage_pools/\x00invalid" // can't verify → deny
+			return "/storage_pools/\x00invalid", true // can't verify → deny
 		}
 		projects := map[string]bool{}
 		for _, p := range pools {
@@ -100,27 +105,55 @@ func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName
 		}
 		if len(projects) != 1 {
 			// 0 = unknown/deleted pool; ≥2 = same name across different projects (collision).
-			return "/storage_pools/\x00invalid"
+			return "/storage_pools/\x00invalid", true
 		}
 		var project string
 		for pr := range projects {
 			project = pr
 		}
-		return poolRBACPathFor(project, poolName)
+		return poolRBACPathFor(project, poolName), true
 	case "project":
-		return projectRBACBase(projectName)
+		return projectRBACBase(projectName), true
 	case "cluster":
-		return "/"
+		return "/", true
 	default:
 		if vm, err := corrosion.GetVM(ctx, s.db, vmName); err == nil && vm != nil {
-			return vmRBACPath(vm)
+			return vmRBACPath(vm), true
 		}
-		return vmRBACPathFor("", vmName)
+		return "", false
 	}
 }
 
+// authorizeSchedule checks backup.schedule on a schedule's target (see
+// scheduleRBACTarget and requirePermResolved).
+func (s *Server) authorizeSchedule(ctx context.Context, scope, vmName, poolName, projectName string) error {
+	path, known := s.scheduleRBACTarget(ctx, scope, vmName, poolName, projectName)
+	return s.requirePermResolved(ctx, known, path, vmRBACPathFor("", vmName), "backup.schedule", "operator", "vm "+strconv.Quote(vmName))
+}
+
+// canReadSchedule reports whether the caller may see a backup/replication
+// schedule row — the read-side counterpart of authorizeSchedule, authorizing
+// on the same scheduleRBACTarget path but with the backup.read verb (matched
+// by Viewer/Auditor's "*.read" and by Operator/BackupOperator's "backup.*",
+// so every role that could read a schedule's target resource keeps reading
+// its schedules). A row whose project cannot be resolved here (an unreplicated
+// or deleted target) permits only a cluster-root grant or the legacy
+// no-bindings fallback — never a guess — matching requirePermResolved's rule,
+// applied to a filter instead of a single error.
+func (s *Server) canReadSchedule(ctx context.Context, r corrosion.BackupScheduleRecord) bool {
+	scope := r.Scope
+	if scope == "" {
+		scope = "vm"
+	}
+	path, known := s.scheduleRBACTarget(ctx, scope, r.VMName, r.PoolName, r.ProjectName)
+	if !known {
+		return s.RequirePerm(ctx, "/", "backup.read", "viewer") == nil
+	}
+	return s.RequirePerm(ctx, path, "backup.read", "viewer") == nil
+}
+
 func (s *Server) ListBackupSchedules(ctx context.Context, _ *pb.ListBackupSchedulesRequest) (*pb.ListBackupSchedulesResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
@@ -132,6 +165,12 @@ func (s *Server) ListBackupSchedules(ctx context.Context, _ *pb.ListBackupSchedu
 		if r.Type == "replication" {
 			continue // listed via ListReplicationSchedules
 		}
+		// ListBackupSchedules used to check only the cluster-wide viewer
+		// floor above, so a caller scoped to one project could list every
+		// VM/pool/project's backup schedules.
+		if !s.canReadSchedule(ctx, r) {
+			continue
+		}
 		resp.Schedules = append(resp.Schedules, scheduleToPB(r))
 	}
 	return resp, nil
@@ -142,7 +181,7 @@ func (s *Server) DeleteBackupSchedule(ctx context.Context, req *pb.DeleteBackupS
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.Repo == "" {

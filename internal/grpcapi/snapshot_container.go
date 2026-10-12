@@ -33,8 +33,8 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.create", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "snapshot.create", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.create", req.Name, "project="+project, "denied")
 		return nil, err
 	}
@@ -111,11 +111,26 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 // ListContainerSnapshots returns a container's snapshots. Forwards to the
 // owning host for an immediately-consistent view.
 func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContainerSnapshotsRequest) (*pb.ListContainerSnapshotsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	// ct.read OR snapshot.read on the container's own path (same shape
+	// authorizeSchedule and the other container RPCs use, extended to admit
+	// either verb per review ruling): ListContainerSnapshots used to check
+	// only the cluster-wide viewer floor above, so a caller scoped to one
+	// project could list every container's snapshots. ct.read alone also
+	// excluded BackupOperator (snapshot.*, no ct.read), which can otherwise
+	// fully create/restore/delete a container's snapshots — snapshot.read
+	// admits the one role that fully manages this resource, while still
+	// scoping per container and still hiding existence identically either
+	// way (requirePermResolvedAny).
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolvedAny(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name),
+		[]string{"ct.read", "snapshot.read"}, "viewer", containerWhat(req.Name)); err != nil {
+		return nil, err
 	}
 	host, _, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {
@@ -154,8 +169,8 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.restore", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "snapshot.restore", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "denied")
 		return nil, err
 	}
@@ -225,8 +240,8 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.delete", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "snapshot.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}

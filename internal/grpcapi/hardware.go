@@ -19,12 +19,21 @@ import (
 // InspectVM's shape: RBAC precheck, resolve the VM, forward to its owning
 // host if this isn't it, else assemble locally.
 func (s *Server) ListVMHardware(ctx context.Context, req *pb.ListVMHardwareRequest) (*pb.ListVMHardwareResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 
-	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
-	if err != nil || vm == nil {
+	// vm.read on the VM's own path (requireVMReadByName) — same
+	// existence-oracle protection as InspectVM: a foreign VM and an absent
+	// name answer alike, and this mirrors InspectVM's shape per its own
+	// doc comment above. ListVMHardware used to check only the cluster-wide
+	// viewer floor, so a caller scoped to one project could read every VM's
+	// disks, NICs and PCI devices.
+	vm, err := s.requireVMReadByName(ctx, req.VmName)
+	if err != nil {
+		return nil, err
+	}
+	if vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
 	}
 

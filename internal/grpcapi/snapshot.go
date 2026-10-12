@@ -204,13 +204,31 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 }
 
 func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest) (*pb.ListSnapshotsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
+		return nil, err
+	}
+
+	// Resolve + authorize vm.read on the VM's own path (requireVMReadByName):
+	// ListSnapshots used to check only the cluster-wide viewer floor above,
+	// so a caller scoped to one project could list every VM's snapshots.
+	// Unlike InspectVM/GetVMStats, a VM record absent here is not itself
+	// NotFound: snapshot rows may have replicated ahead of (or survive after)
+	// the vm row, so requireVMReadByName's unresolved-VM path matters here —
+	// it denies a scoped caller outright (the ordinary PermissionDenied/
+	// NotFound-for-a-matching-guess outcome requirePermResolved already
+	// documents), but passes a caller with CLUSTER-WIDE authority (a root
+	// binding, or the legacy no-bindings fallback) straight through with
+	// vm == nil. ONLY for such a caller does execution reach the local
+	// snapshot read below with no VM record in hand, answering from
+	// whatever this node holds for the name rather than NotFound for a
+	// snapshot that exists.
+	vm, err := s.requireVMReadByName(ctx, req.VmName)
+	if err != nil {
 		return nil, err
 	}
 
 	// Forward to the VM's host so the result is immediately consistent
 	// (snapshot records may not have replicated to this node yet).
-	vm, _ := corrosion.GetVM(ctx, s.db, req.VmName)
 	if vm != nil && vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err == nil {

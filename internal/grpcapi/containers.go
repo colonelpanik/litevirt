@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -31,24 +32,35 @@ import (
 //     the host that performed the action so the row reflects truth.
 
 // CreateContainer creates an LXC/OCI container on the named host.
-// containerProject resolves a container's tenancy project for RBAC/audit,
-// defaulting to "_default" when the row isn't found yet. When host is empty it
-// scans by name (lifecycle RPCs usually carry the owning host).
-func (s *Server) containerProject(ctx context.Context, host, name string) string {
+// containerProject resolves a container's tenancy project for RBAC/audit.
+// known is false when no row was found here (or the read failed): the project
+// is then unknown, NOT "_default", and the caller must authorize through
+// requirePermResolved, which refuses to guess. The "_default" returned
+// alongside known=false is only for audit text and the admission a root caller
+// reaches. When host is empty it scans by name (lifecycle RPCs usually carry
+// the owning host).
+func (s *Server) containerProject(ctx context.Context, host, name string) (project string, known bool) {
 	if host != "" {
-		if ct, _ := corrosion.GetContainer(ctx, s.db, host, name); ct != nil && ct.Project != "" {
-			return ct.Project
+		ct, err := corrosion.GetContainer(ctx, s.db, host, name)
+		if err != nil || ct == nil {
+			return tenancy.Default, false
 		}
-		return "_default"
+		return tenancy.NormalizeProject(ct.Project), true
 	}
-	cts, _ := corrosion.ListContainers(ctx, s.db, "")
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return tenancy.Default, false
+	}
 	for _, ct := range cts {
-		if ct.Name == name && ct.Project != "" {
-			return ct.Project
+		if ct.Name == name {
+			return tenancy.NormalizeProject(ct.Project), true
 		}
 	}
-	return "_default"
+	return tenancy.Default, false
 }
+
+// containerWhat names a container in requirePermResolved's NotFound.
+func containerWhat(name string) string { return "container " + strconv.Quote(name) }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {
@@ -158,7 +170,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// after safety passes.
 	var ctLease *reservationLease
 	{
-		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
+		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, tenancy.NormalizeProject(req.Project), "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -191,7 +203,13 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if ctQuota := (corrosion.QuotaAmount{
 		VCPU: int(req.Cpu), MemMiB: int(req.MemoryMib), NIC: len(plan.ifaces),
 	}); !ctQuota.IsZero() {
-		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, req.Project,
+		// Normalize before admission. project_quotas is keyed "_default", and
+		// UpsertContainer normalizes the stored row the same way — so passing the
+		// raw "" that `lv ct create` sends without --project found no quota row,
+		// skipped quotaVerdict entirely, and then counted the container against a
+		// budget that had never admitted it. It also wrote the reservation with
+		// Project "", where a concurrent VM create in _default cannot see it.
+		lease, aerr := s.admitQuotaWithReservation(ctx, "CreateContainer", s.hostName, tenancy.NormalizeProject(req.Project),
 			corrosion.WorkloadContainer, req.Name, ctQuota, ctQuota, intentContainerResident)
 		if aerr != nil {
 			_ = s.releaseContainerNICs(ctx, req.Name)
@@ -268,8 +286,8 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.start", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Resolve the OWNER when no host was named (same shape as DeleteContainer):
@@ -324,7 +342,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Reserved, not just checked, so the memory stays accounted for across the
 	// runtime start and the "running" state write below.
 	if rec.State != "running" {
-		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, tenancy.NormalizeProject(rec.Project), "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -356,8 +374,8 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.stop", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Owner resolution, same as StartContainer/DeleteContainer.
@@ -397,8 +415,8 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.delete", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}
@@ -490,18 +508,46 @@ func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.exec", "operator"); err != nil {
+	// Operator role floor BEFORE the lookup, so a caller who holds nothing
+	// cannot probe container existence through the resolution outcome.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
 		return nil, err
 	}
-	if req.HostName != "" && req.HostName != s.hostName {
-		c, conn, err := s.peerClient(ctx, req.HostName)
+	// Resolve the container the way every other lifecycle RPC does, and
+	// authorize against the row that resolution actually returned.
+	//
+	// This used to be containerProject(ctx, req.HostName, req.Name), which on an
+	// empty host scans the cluster and returns the FIRST name match — while the
+	// forward below only fires when host_name is non-empty. Authorization read
+	// one host's row and execution used a different host's container: an
+	// attacker owning a same-named container on a host that sorts earlier
+	// (ORDER BY host_name, name) got ct.exec inside the victim's. With no
+	// matching row at all the fallback was "_default", so ct.exec on _default
+	// authorized an exec against any local container of that name.
+	//
+	// resolveContainerHost refuses an ambiguous name and is NotFound on an
+	// unknown one, which is why the siblings do not have this hole.
+	host, rec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
+	if err != nil {
+		s.audit(ctx, "ct.exec", req.Name, "unresolved: "+strings.Join(req.Argv, " "), "error")
+		return nil, err
+	}
+	if err := s.RequirePerm(ctx, ctRBACPathFor(rec.Project, req.Name), "ct.exec", "operator"); err != nil {
+		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
+		return nil, err
+	}
+	if host != s.hostName {
+		c, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "forward exec: %v", err)
 		}
 		defer conn.Close()
-		return c.ExecContainer(ctx, req)
+		// Pin the resolved host on the forwarded request so the peer does not
+		// re-run the cluster-wide name resolution (same as StartContainer).
+		return c.ExecContainer(ctx, &pb.ExecContainerRequest{
+			Name: req.Name, HostName: host, Argv: req.Argv,
+		})
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")

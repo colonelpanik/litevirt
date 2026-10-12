@@ -79,16 +79,18 @@ func TestContainerRBACPathAndProject(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if p := s.containerProject(ctx, "h1", "web"); p != "acme" {
-		t.Errorf("containerProject(h1,web) = %q, want acme", p)
+	if p, known := s.containerProject(ctx, "h1", "web"); p != "acme" || !known {
+		t.Errorf("containerProject(h1,web) = %q known=%v, want acme known", p, known)
 	}
-	// Unknown container → _default (so the RBAC check is well-defined pre-create).
-	if p := s.containerProject(ctx, "h1", "nope"); p != "_default" {
-		t.Errorf("containerProject(unknown) = %q, want _default", p)
+	// Unknown container → NOT known. The "_default" beside it is audit text
+	// only: authorization must go through requirePermResolved, which refuses to
+	// judge an unknown project as _default.
+	if p, known := s.containerProject(ctx, "h1", "nope"); known || p != "_default" {
+		t.Errorf("containerProject(unknown) = %q known=%v, want _default unknown", p, known)
 	}
 	// Host-less lookup scans by name.
-	if p := s.containerProject(ctx, "", "web"); p != "acme" {
-		t.Errorf("containerProject(\"\",web) = %q, want acme", p)
+	if p, known := s.containerProject(ctx, "", "web"); p != "acme" || !known {
+		t.Errorf("containerProject(\"\",web) = %q known=%v, want acme known", p, known)
 	}
 }
 

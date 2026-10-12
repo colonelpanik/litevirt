@@ -387,6 +387,14 @@ func TestExecContainer_PassesThroughResult(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"
 	s.SetContainerRuntime(&fakeCTRuntime{})
+	// The container needs a row. This test used to pass without one, because
+	// ExecContainer fell back to project "_default" for a name it could not
+	// find and execed anyway — the hole itself (#184).
+	if err := corrosion.UpsertContainer(adminCtx(), s.db, corrosion.ContainerRecord{
+		Name: "ct1", HostName: "host-a", State: "running",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
 
 	res, err := s.ExecContainer(adminCtx(), &pb.ExecContainerRequest{
 		Name: "ct1", Argv: []string{"echo", "hi"},

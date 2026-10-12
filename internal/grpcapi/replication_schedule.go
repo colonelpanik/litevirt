@@ -19,7 +19,7 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.TargetPool == "" || req.Cron == "" {
@@ -102,7 +102,7 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 }
 
 func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplicationSchedulesRequest) (*pb.ListReplicationSchedulesResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
@@ -112,6 +112,13 @@ func (s *Server) ListReplicationSchedules(ctx context.Context, _ *pb.ListReplica
 	resp := &pb.ListReplicationSchedulesResponse{}
 	for _, r := range rows {
 		if r.Type != "replication" {
+			continue
+		}
+		// ListReplicationSchedules used to check only the cluster-wide viewer
+		// floor above, so a caller scoped to one project could list every
+		// VM/pool/project's replication schedules (canReadSchedule,
+		// backup_schedule.go — both RPCs share the same backup_schedules table).
+		if !s.canReadSchedule(ctx, r) {
 			continue
 		}
 		resp.Schedules = append(resp.Schedules, replScheduleToPB(r))
@@ -124,7 +131,7 @@ func (s *Server) DeleteReplicationSchedule(ctx context.Context, req *pb.DeleteRe
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.TargetPool == "" {

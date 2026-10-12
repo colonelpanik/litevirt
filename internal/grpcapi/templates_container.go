@@ -26,8 +26,8 @@ func (s *Server) ConvertContainerToTemplate(ctx context.Context, req *pb.Convert
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.update", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.update", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	host, rec, err := s.resolveContainerHost(ctx, req.HostName, req.Name)

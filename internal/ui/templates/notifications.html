@@ -23,8 +23,8 @@
           <span class="badge badge-blue">{{.Type}}</span>
           <span class="mono muted" style="font-size:11px">{{.Config}}</span>
           <span style="margin-left:auto"></span>
-          <button class="btn btn-sm" hx-post="/ui/notifications/targets/{{.ID}}/test" hx-swap="none" title="Send a test notification">Test</button>
-          <button class="btn btn-sm btn-danger" hx-delete="/ui/notifications/targets/{{.ID}}" hx-confirm="Delete target {{.Name}}?">{{icon "delete"}}</button>
+          <button class="btn btn-sm" hx-post="/ui/notifications/targets/{{.Id}}/test" hx-swap="none" title="Send a test notification">Test</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/ui/notifications/targets/{{.Id}}" hx-confirm="Delete target {{.Name}}?">{{icon "delete"}}</button>
         </div>
       {{end}}
     </div>

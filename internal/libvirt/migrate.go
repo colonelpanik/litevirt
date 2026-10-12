@@ -116,3 +116,15 @@ func (c *Client) DomainJobProgress(name string) (memPct, diskPct float32) {
 	}
 	return memPct, diskPct
 }
+
+// AbortMigration aborts name's running job — for a domain mid-migration, the
+// migration. MigrateToTarget blocks in libvirt and takes no context, so this is
+// the only way to stop a migration that will not converge; MigrateToTarget then
+// returns an error and the guest stays on the source.
+func (c *Client) AbortMigration(name string) error {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %q: %w", name, err)
+	}
+	return c.virt.DomainAbortJob(dom)
+}

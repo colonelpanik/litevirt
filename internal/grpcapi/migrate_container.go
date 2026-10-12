@@ -159,13 +159,16 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 			s.audit(ctx, "ct.migrate", req.Name, "project="+project+" source row vanished before stop-intent", "error")
 			return status.Errorf(codes.FailedPrecondition, "container %q no longer exists (deleted during migration setup)", req.Name)
 		}
-		// A real (transient) DB error: undo the stop (if we made one) and abort.
+		// A real (transient) DB error — or a cancelled caller: undo the stop (if we
+		// made one) and abort. Detached, for the reason rollback is.
+		uctx, ucancel := detachedMigrateCleanupCtx(ctx)
+		defer ucancel()
 		if wasRunning {
-			if serr := s.containerRuntime.StartContainer(ctx, req.Name); serr != nil {
+			if serr := s.containerRuntime.StartContainer(uctx, req.Name); serr != nil {
 				slog.Error("container migrate: failed to restart source after stop-intent write failure", "name", req.Name, "error", serr)
 			}
 		}
-		s.audit(ctx, "ct.migrate", req.Name, "project="+project, "error")
+		s.audit(uctx, "ct.migrate", req.Name, "project="+project, "error")
 		return status.Errorf(codes.Internal, "record stop intent for migration: %v", err)
 	}
 	// srcIfaces is the source's managed NIC set (read once, before the handoff): it
@@ -179,7 +182,16 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	leasesOnTarget := false
 	// rollback restores the source to its pre-migration state on any failure
 	// before the owner is re-keyed — the container never goes missing.
+	//
+	// It runs on a context DETACHED from the request: a client that disconnects
+	// or hits its deadline mid-archive cancels the request context, and that is
+	// exactly when the source has been stopped under operator-stop. Undoing that
+	// on the cancelled context failed every step — the restart AND the write
+	// clearing operator-stop — so the source stayed down indefinitely, with the
+	// reconciler honouring the marker over any restart policy.
 	rollback := func(reason error) error {
+		ctx, cancel := detachedMigrateCleanupCtx(ctx)
+		defer cancel()
 		if leasesOnTarget {
 			// Hand the leases back and PROVE the source owns every managed IP again
 			// before we dare restart it — restarting with an IP it no longer owns is
@@ -241,6 +253,8 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// stopped + operator-stop (the reconciler won't auto-restart it without its
 	// leases) and surface the ambiguity for an operator to resolve.
 	parkSource := func(reason error) error {
+		ctx, cancel := detachedMigrateCleanupCtx(ctx)
+		defer cancel()
 		if werr := corrosion.SetContainerStateDetail(ctx, s.db, source, req.Name, "stopped", "operator-stop"); werr != nil {
 			s.noteStateWriteFail(corrosion.OpContainerState, werr)
 		}
@@ -311,6 +325,12 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// idempotent success (a retry, or it was already gone).
 	leasesOnTarget = false
 	_ = send(&pb.MigrateContainerProgress{Phase: pb.MigrateContainerProgress_FINALIZING, Status: "removing source copy"})
+	// The target has landed: this is past the point of no return, so the source
+	// cleanup must not die with the caller. On the request context a client that
+	// went away now would fail the runtime delete and park a source the target
+	// has already replaced.
+	ctx, cancelFinalize := detachedMigrateCleanupCtx(ctx)
+	defer cancelFinalize()
 	if err := s.containerRuntime.DeleteContainer(ctx, req.Name); err != nil && !errors.Is(err, lxc.ErrContainerNotFound) {
 		return parkSource(fmt.Errorf("target landed but source runtime cleanup failed: %v (source left tracked+stopped on %s)", err, source))
 	}
@@ -344,6 +364,19 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		Phase:  pb.MigrateContainerProgress_DONE,
 		Status: fmt.Sprintf("migrated to %s", req.TargetHost),
 	})
+}
+
+// containerMigrateCleanupTimeout bounds a container migration's rollback and
+// finalisation once they run detached from the request (detachedMigrateCleanupCtx):
+// long enough for a runtime start or delete plus a handful of state writes, short
+// enough that a wedged runtime cannot hold the per-container lock forever.
+const containerMigrateCleanupTimeout = 2 * time.Minute
+
+// detachedMigrateCleanupCtx is the context a migration's rollback and
+// post-handoff cleanup run on: it keeps the request's values (identity, trace)
+// but not its cancellation, and is bounded by containerMigrateCleanupTimeout.
+func detachedMigrateCleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), containerMigrateCleanupTimeout)
 }
 
 // migrateRestore drives the target host's RestoreContainer over a peer

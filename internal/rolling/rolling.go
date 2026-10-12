@@ -284,7 +284,11 @@ func processSingleVM(ctx context.Context, ops Ops, a VMAction, startFirst bool, 
 			return fmt.Errorf("ordered update aborted: %s failed health check after start: %w", a.Name, err)
 		}
 		emit(Progress{VMName: a.Name, Phase: "stopping"})
-		_ = ops.StopVM(ctx, a.Name)
+		// A VM that did not stop must not be recreated over while it runs.
+		if err := ops.StopVM(ctx, a.Name); err != nil {
+			emit(Progress{VMName: a.Name, Phase: "error", Detail: "stop: " + err.Error(), Err: err})
+			return fmt.Errorf("ordered update aborted: stop %s failed: %w", a.Name, err)
+		}
 	}
 
 	emit(Progress{VMName: a.Name, Phase: "creating"})

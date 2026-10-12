@@ -158,21 +158,19 @@ func (s *Server) handleRegionMigrate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.CrossRegionMigrate(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.CrossRegionMigrate(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	// Non-SSE callers get the first progress frame; long-running callers
-	// should set Accept: text/event-stream.
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "cross-region migrate", cancel, func() (proto.Message, error) { return stream.Recv() })
 }

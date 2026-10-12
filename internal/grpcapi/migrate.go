@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -92,9 +93,17 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return err
 	}
 
-	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27).
+	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27). It is
+	// released here UNLESS the migration outlives this request, in which case it
+	// travels with the adopter — dropping it while libvirt is still moving the
+	// guest is what lets a snapshot or delete run against a VM mid-flight.
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	adopted := false
+	defer func() {
+		if !adopted {
+			unlock()
+		}
+	}()
 
 	send := func(phase pb.MigratePhase, memPct, diskPct float32) error {
 		return stream.Send(&pb.MigrateProgress{
@@ -356,11 +365,34 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// refusal still wastes no work and changes no state anywhere. The figures are
 	// the VM's ACTUAL allocation, which is what the target's usage will report
 	// once the VM lands there.
+	// No libvirt, no migration — said here, before the first thing this attempt
+	// does on the target. It used to be checked after the row was written
+	// `migrating`, and returned with the row stranded there.
+	if s.virt == nil {
+		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
+	}
+
 	migLease, err := s.acquireDestinationHostLease(ctx, "MigrateVM", targetHost.Name, vm.Project, "vm:"+vm.Name, vm.CPUActual, vm.MemActual, intentVMResident)
 	if err != nil {
 		return err
 	}
 	defer migLease.release(ctx)
+
+	// From here until libvirt is handed the guest, every exit undoes what this
+	// attempt did: the row goes back to the state the guest is actually in, and
+	// whatever was pre-created on the target is removed. Without it, a client
+	// that went away (a Ctrl-C fails the next progress Send) returned with the
+	// row `migrating` — which the reconciler and owner-assert skip, snapshot
+	// refuses, and a retry refuses as not running — and leaked the target's
+	// stubs and cloud-init ISO. Disarmed when libvirt takes over (its failure
+	// branch and the adopter own the outcome from then) and for the firmware
+	// cold move, which owns its own.
+	abort := &migrationAbort{armed: true}
+	defer func() {
+		if abort.armed {
+			s.undoMigrationAttempt(ctx, vm.Name, req.TargetHost, abort)
+		}
+	}()
 
 	// Pre-provision networks on target host. This ensures bridges, DHCP, NAT,
 	// VXLAN tunnels, and IRB gateways exist before the VM arrives — critical for
@@ -383,6 +415,8 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// libvirt validates all file paths in the domain XML before block copy starts.
 	if withStorage {
 		s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+		// The stubs are now on the target; an abort removes them with the ISO.
+		abort.withStorage = true
 	}
 
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM is migrated cold from a
@@ -393,30 +427,8 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// present), and clean up the source. Returns early — the runtime-migration
 	// machinery below is for running VMs only.
 	if fwVM {
+		abort.armed = false // the cold move owns its outcome, and its cleanup
 		return s.coldMigrateFirmwareVM(ctx, vm, targetHost, fwSpec, send)
-	}
-
-	// Hot-detach SR-IOV VFs before migration.
-	for _, vf := range detachedVFs {
-		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
-		// prior attempt already live-detached the VF but its release failed, the VF is gone
-		// from the guest and a bare DetachHostdev would error ("device not found") and abort
-		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
-		// detach so control falls through to the idempotent release. A DumpXML error still
-		// aborts the migration (fail closed — membership cannot be confirmed).
-		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
-			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
-		}
-		// DetachHostdev removed the guest device but the host vfio bind persists, so the
-		// VF is still bound. Release ownership only through the strict all-or-nothing
-		// primitive: if the unbind cannot be confirmed it releases NOTHING and errors,
-		// leaving the VF owned + bound on the source (recoverable) — never unowned +
-		// bound. ABORT the migration: a VF stuck bound on the source must not be silently
-		// released, and the move must not proceed leaving an orphan.
-		if err := s.unbindAndReleaseOwnership(ctx, req.VmName, []string{vf.Address}); err != nil {
-			return status.Errorf(codes.Internal, "release VF %s before migration: %v", vf.Address, err)
-		}
-		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
 	}
 
 	// pre_migrate hook
@@ -469,6 +481,13 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// unparseable authority and libvirt connects nowhere useful.
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(targetHost.Address))
 
+	// Announced before the row is written `migrating`: a client that has gone
+	// away fails this Send, and that is cheaper to find out while there is no
+	// state to restore.
+	if err := send(pb.MigratePhase_MIGRATE_COPYING, 0, 0); err != nil {
+		return err
+	}
+
 	// Split-brain gate, LATE re-check: the early gate (after target validation) is a
 	// fail-fast, but preflight/provisioning ran since then. Re-check quorum on the
 	// source IMMEDIATELY before the irreversible step (state → migrating, then
@@ -479,19 +498,41 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
 	}
 
-	// Mark as migrating in state store
+	// Hot-detach SR-IOV VFs, after the late gate and every progress send — the
+	// last step before the row is written `migrating` — so that as few exits as
+	// possible can follow it. Each VF is recorded in the abort as soon as it has
+	// left the guest: one that then fails to release, or that a later VF's
+	// failure strands, goes back into the guest, owned by it again.
+	for _, vf := range detachedVFs {
+		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
+		// prior attempt already live-detached the VF but its release failed, the VF is gone
+		// from the guest and a bare DetachHostdev would error ("device not found") and abort
+		// before re-attempting the release. detachHostdevIfPresent skips the already-gone
+		// detach so control falls through to the idempotent release. A DumpXML error still
+		// aborts the migration (fail closed — membership cannot be confirmed).
+		if err := s.detachHostdevIfPresent(req.VmName, vf.Address); err != nil {
+			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
+		}
+		abort.detachedVFs = append(abort.detachedVFs, vf)
+		// DetachHostdev removed the guest device but the host vfio bind persists, so the
+		// VF is still bound. Release ownership only through the strict all-or-nothing
+		// primitive: if the unbind cannot be confirmed it releases NOTHING and errors,
+		// leaving the VF owned + bound on the source (recoverable) — never unowned +
+		// bound. ABORT the migration: a VF stuck bound on the source must not be silently
+		// released, and the move must not proceed leaving an orphan.
+		if err := s.unbindAndReleaseOwnership(ctx, req.VmName, []string{vf.Address}); err != nil {
+			return status.Errorf(codes.Internal, "release VF %s before migration: %v", vf.Address, err)
+		}
+		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
+	}
+
+	// Mark as migrating in state store. Recorded first, so a write that errored
+	// after landing is still restored by the abort.
+	abort.stateWritten = true
 	if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, "migrating", fmt.Sprintf("→ %s", req.TargetHost)); err != nil {
 		s.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	migrationStart := time.Now()
-
-	if err := send(pb.MigratePhase_MIGRATE_COPYING, 0, 0); err != nil {
-		return err
-	}
-
-	if s.virt == nil {
-		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
-	}
 
 	// Apply migration timeout if configured.
 	migrateCtx := ctx
@@ -512,11 +553,12 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		}
 	}
 
-	// Run migration in background; poll progress.
-	type result struct{ err error }
-	done := make(chan result, 1)
+	// Run migration in background; poll progress. From here the failure branch
+	// below and the adopter own the outcome, so the abort stands down.
+	abort.armed = false
+	done := make(chan error, 1)
 	go func() {
-		done <- result{s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
+		done <- s.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{
 			Live:          live,
 			WithStorage:   withStorage,
 			BandwidthMiB:  bandwidthMiB,
@@ -526,7 +568,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			// into a tcp:// migrate_uri authority but must not import corrosion.
 			TargetAddress: corrosion.URIHost(targetHost.Address),
 			DiskTargets:   diskTargets,
-		})}
+		})
 	}()
 
 	ticker := time.NewTicker(2 * time.Second)
@@ -536,52 +578,46 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
-			return migrateCtx.Err()
-		case res := <-done:
-			if res.err != nil {
+			s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
+			// libvirt is still migrating. MigrateToTarget takes no context, so
+			// cancelling this request does not stop the guest moving — it only
+			// stops us watching. Returning bare here left the VM at
+			// host_name=source/state=migrating while it ran on the target, and
+			// the reconciler skips `migrating`, so nothing ever healed it.
+			adopted = true
+			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
+				withStorage, disks, done, unlock, migrationFinish{
+					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+				})
+			return status.Errorf(codes.DeadlineExceeded,
+				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
+					"libvirt and will be completed in the background — watch `lv events %s`",
+				vm.Name, req.TargetHost, migrateCtx.Err(), vm.Name)
+		case migrateErr := <-done:
+			if migrateErr != nil {
 				// Migration failed — VM is still on the source host.
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
-				if state, sErr := s.virt.DomainState(vm.Name); sErr == nil && state == "running" {
-					// A LOCAL publish, unlike the post-cutover commit below: the
-					// migration failed, so the guest and its domain are still here.
-					if werr := s.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
-						return corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
-							fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err))
-					}); werr != nil {
-						s.noteStateWriteFail(corrosion.OpVMState, werr)
-					}
+				//
+				// Bounded and detached from the request: a client that goes
+				// away now must not drop the restore and strand the row
+				// `migrating`, which nothing else heals. Two minutes is long
+				// enough for the VF reattach, a few state writes and the target
+				// cleanup, short enough that a wedged peer cannot hold this
+				// branch forever.
+				fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				defer fcancel()
+				// The VFs go back before the row says running: the guest stayed.
+				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs)
+				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
+					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 					slog.Warn("migration failed but VM still running on source",
-						"vm", vm.Name, "target", req.TargetHost, "error", res.err)
-				} else {
-					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "error", res.err.Error()); werr != nil {
-						s.noteStateWriteFail(corrosion.OpVMState, werr)
-					}
+						"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
 				}
-				// Remove the disk stubs + cloud-init ISO we pre-created on the
-				// target — the VM never got defined there, so they're orphaned
-				// and would otherwise leak space and shadow a retry. Detached
-				// context: the request ctx may itself be the cause of failure.
-				var stubPaths []string
-				if withStorage {
-					if ds, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name); derr == nil {
-						for _, d := range ds {
-							if d.Path != "" {
-								stubPaths = append(stubPaths, d.Path)
-							}
-						}
-					}
-				}
-				// (Firmware VMs never reach this runtime-migration path — they take
-				// the stopped cold-move in coldMigrateFirmwareVM — so no firmware
-				// cleanup is needed here.)
-				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
-				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths, "")
-				cancelCleanup()
-
+				s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, withStorage)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
-				return status.Errorf(codes.Internal, "migration failed: %v", res.err)
+				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
 			}
 			break poll
 		case <-ticker.C:
@@ -610,12 +646,6 @@ poll:
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
 	}
 
-	// The host link is what the mirror now has to catch up on: the VM's NetBox
-	// object still points at the source's device. Queued on a DETACHED context,
-	// like the rest of the post-commit work — the request context may already be
-	// cancelled by the time the cutover finishes.
-	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
-
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
 	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
@@ -624,52 +654,9 @@ poll:
 
 	// (Firmware-state cleanup is handled in coldMigrateFirmwareVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
-
-	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
-	if len(detachedVFs) > 0 {
-		s.reattachVFsOnTarget(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name, detachedVFs)
-	}
-
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
-
-	// Update DNS records so VM names resolve correctly after migration.
-	if s.dnsDomain != "" {
-		for _, iface := range ifaces {
-			if iface.IP != "" {
-				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
-				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
-					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
-				}
-				break // one A record per VM
-			}
-		}
-	}
-
-	// Refresh LB backends so traffic routes to the new host.
-	go s.refreshLBForStack(context.Background(), vm.StackName)
-
-	// Update FDB entries: VM MACs now live on target host's VTEP.
-	for _, iface := range ifaces {
-		s.updateFDBForMigration(ctx, iface, s.hostName, req.TargetHost)
-	}
-
-	// post_migrate hook (notify with new host)
-	pbVM.HostName = req.TargetHost
-	pbVM.State = pb.VMState_VM_RUNNING
-	hooks.Run(ctx, hooks.PostMigrate, pbVM, hspec)
-
-	// Dial target host to re-establish gRPC so it can load TLS creds.
-	go s.notifyTargetHostOfVM(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
-
-	// Clean up orphaned files on the source host (cloud-init ISO, and disk
-	// files for --with-storage migrations where copies now live on target).
-	go s.cleanupPostMigration(vm.Name)
+	s.finishMigrationOnTarget(ctx, vm, migrationFinish{
+		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+	})
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
 }
@@ -687,6 +674,110 @@ poll:
 //     cancelled ctx would recreate the very divergence we are closing.
 //   - A source disk is deleted ONLY after the commit lands. A failed commit returns
 //     an error (loud divergence) and deletes nothing.
+//
+// adoptAbandonedMigration takes over a live migration the request context
+// stopped waiting for.
+//
+// MigrateToTarget takes no context and blocks in libvirt regardless, so a
+// cancelled request or an expired migrate timeout does not stop the migration —
+// it only stops us watching. The handler used to return bare at that point: no
+// state update, no artifact cleanup, no ownership finalize, and the per-VM lock
+// dropped mid-flight. libvirt then completed with
+// MigratePersistDest|MigrateUndefineSource, so the guest ran on the TARGET
+// while corrosion still said host_name=source, state=migrating — and nothing
+// heals that, because the reconciler explicitly skips `migrating`.
+//
+// Abandoning the WAIT is fine. Abandoning the OUTCOME is not. The lock travels
+// with the adoption: releasing it while libvirt is still moving the guest is
+// what lets a concurrent snapshot or delete run against a VM mid-flight.
+func (s *Server) adoptAbandonedMigration(
+	ctx context.Context,
+	vm *corrosion.VMRecord,
+	targetHost string,
+	withStorage bool,
+	disks []corrosion.DiskRecord,
+	done <-chan error,
+	unlock func(),
+	finish migrationFinish,
+) {
+	go func() {
+		defer unlock()
+		defer func() {
+			if p := recover(); p != nil {
+				slog.Error("migrate: adopted migration panicked", "vm", vm.Name, "panic", p)
+			}
+		}()
+
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(adoptedMigrationCeiling):
+			// MigrateToTarget takes no context, so a migration that will not
+			// converge runs for as long as libvirt lets it — with this VM's lock
+			// held, blocking every later operation on it. Past the ceiling it is
+			// aborted; libvirt then returns an error and the guest stays on the
+			// source, which the failure branch below records.
+			slog.Warn("migrate: adopted migration exceeded its ceiling; aborting it",
+				"vm", vm.Name, "target", targetHost, "ceiling", adoptedMigrationCeiling)
+			if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+				slog.Error("migrate: could not abort the adopted migration", "vm", vm.Name, "error", aerr)
+			}
+			err = <-done
+		}
+		if err != nil {
+			// The migration failed after we stopped watching; the guest is still
+			// on the source. Anything but `migrating` — that is the state nothing
+			// heals.
+			// The guest stayed, so it gets back the VFs detached for the move,
+			// as a watched failure does.
+			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs)
+			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
+			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
+				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
+			}
+			// Routed through the chokepoint because this branch CAN publish
+			// "running" — the guest is still on this host after a failed
+			// adopted migration. A row saying running with no marker naming its
+			// generation is a workload nobody can prove, which is the whole
+			// reason the chokepoint exists; the "error" case passes through it
+			// unchanged.
+			if werr := s.publishRunning(ctx, vm.Name, state, func(ctx context.Context) error {
+				return corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail)
+			}); werr != nil {
+				s.noteStateWriteFail(corrosion.OpVMState, werr)
+			}
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, withStorage)
+			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
+			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
+			return
+		}
+
+		// libvirt cut over. The commit is the only thing that makes the cluster
+		// agree with reality, and it cannot be skipped just because nobody is
+		// listening any more.
+		if ferr := s.finalizeMigrationOwnership(ctx, vm, targetHost, withStorage, disks); ferr != nil {
+			slog.Error("migrate: adopted migration cut over but ownership commit FAILED — "+
+				"the guest is on the target and the cluster does not know",
+				"vm", vm.Name, "target", targetHost, "error", ferr)
+			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error",
+				"abandoned request; cut over to "+targetHost+" but ownership commit failed: "+ferr.Error())
+			return
+		}
+		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
+		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
+			"abandoned request; completed to "+targetHost)
+		// The same finish a watched migration gets. Committing ownership and
+		// stopping here left the guest without its SR-IOV VFs, its FDB entries
+		// on the old VTEP, its LB backends and DNS stale, and the source's files
+		// orphaned.
+		if finish.target != nil {
+			s.finishMigrationOnTarget(ctx, vm, finish)
+		} else {
+			s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+		}
+	}()
+}
+
 func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.VMRecord, targetHost string, withStorage bool, disks []corrosion.DiskRecord) error {
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
@@ -1203,12 +1294,12 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 // cleanupMigrationArtifactsOnTarget best-effort removes the stubs + ISO the
 // target pre-created, after a failed migration. Never blocks/fails the caller.
 func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string, firmwareUUID string) {
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cannot reach host", "host", targetHost, "error", err)
 		return
 	}
-	defer conn.Close()
+	defer closeConn()
 	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
 		VmName:          vmName,
 		DiskPaths:       diskPaths,
@@ -1360,4 +1451,280 @@ func (s *Server) notifyTargetHostOfVM(ctx context.Context, targetHostName, addr 
 		return
 	}
 	slog.Info("migrate: target acknowledged VM", "host", targetHostName, "vm", vmName)
+}
+
+// migrationFinish is what the post-cutover work needs beyond the VM itself.
+type migrationFinish struct {
+	target      *corrosion.HostRecord
+	detachedVFs []corrosion.PCIDeviceRecord
+	pbVM        *pb.VM
+	hspec       *pb.HooksSpec
+}
+
+// adoptedMigrationCeiling bounds how long an adopted migration may run before
+// it is aborted. A var so tests can shorten it.
+var adoptedMigrationCeiling = time.Hour
+
+// abortOnMigrateTimeout aborts the libvirt job when the MIGRATE TIMEOUT is what
+// ended the wait. timeout_sec is a policy on the operation — give up after N —
+// and MigrateToTarget ignores contexts, so without the abort a migration that
+// would not converge kept running, adopted, with the VM's lock held. A client
+// that merely stopped listening (ctx itself done) is not a policy: that
+// migration is adopted and allowed to finish.
+func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) {
+	if ctx.Err() != nil || !errors.Is(migrateCtx.Err(), context.DeadlineExceeded) {
+		return
+	}
+	slog.Warn("migrate: timeout reached; aborting the libvirt migration job", "vm", vmName)
+	if err := s.virt.AbortMigration(vmName); err != nil {
+		slog.Error("migrate: could not abort the timed-out migration", "vm", vmName, "error", err)
+	}
+}
+
+// finishMigrationOnTarget is everything after a committed cut-over that makes
+// the rest of the cluster agree the guest has moved: the NetBox mirror, SR-IOV
+// VFs, switch MAC tables, DNS, LB backends, VXLAN FDB, the post_migrate hook,
+// the target's own view, and the source's leftovers. Shared by the watched
+// path and an adopted migration, which used to commit ownership and stop.
+func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+	// All of it runs DETACHED from the request: ownership has been committed,
+	// nothing retries this finish, and the watched path passes the request
+	// context, which a client that went away after the cutover has cancelled.
+	// Not a timeout context cancelled on return: the target-notify goroutine
+	// below outlives this call and uses it.
+	ctx = context.WithoutCancel(ctx)
+	target := f.target.Name
+	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+
+	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
+	if len(f.detachedVFs) > 0 {
+		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
+	}
+
+	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		if iface.IP != "" {
+			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+		}
+	}
+
+	// Update DNS records so VM names resolve correctly after migration.
+	if s.dnsDomain != "" {
+		for _, iface := range ifaces {
+			if iface.IP != "" {
+				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
+				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
+					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
+				}
+				break // one A record per VM
+			}
+		}
+	}
+
+	// Refresh LB backends so traffic routes to the new host.
+	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	// Update FDB entries: VM MACs now live on target host's VTEP.
+	for _, iface := range ifaces {
+		s.updateFDBForMigration(ctx, iface, s.hostName, target)
+	}
+
+	// post_migrate hook (notify with new host)
+	if f.pbVM != nil {
+		f.pbVM.HostName = target
+		f.pbVM.State = pb.VMState_VM_RUNNING
+		hooks.Run(ctx, hooks.PostMigrate, f.pbVM, f.hspec)
+	}
+
+	// Dial target host to re-establish gRPC so it can load TLS creds.
+	go s.notifyTargetHostOfVM(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name)
+
+	// Clean up orphaned files on the source host (cloud-init ISO, and disk
+	// files for --with-storage migrations where copies now live on target).
+	go s.cleanupPostMigration(vm.Name)
+}
+
+// migrationAbort is what MigrateVM has done, before libvirt took the guest, that
+// an exit at that point must undo. See undoMigrationAttempt.
+type migrationAbort struct {
+	// armed is cleared once something else owns the outcome: libvirt's failure
+	// branch and the adopter, or the firmware cold move.
+	armed bool
+	// stateWritten is set once the row has been written `migrating`.
+	stateWritten bool
+	// withStorage is set once the disk stubs for a --with-storage copy have
+	// been pre-created on the target, so the abort removes them too.
+	withStorage bool
+	// detachedVFs are the SR-IOV VFs taken out of the guest for the move.
+	detachedVFs []corrosion.PCIDeviceRecord
+}
+
+// undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before
+// libvirt was handed the guest — a client that went away, a late gate refusal, a
+// target that cannot take the copy. The guest never left this host, so the row
+// goes back to the state it is actually in and the target's pre-created
+// artifacts are removed. Detached context: the request context going away is
+// the commonest reason to be here.
+func (s *Server) undoMigrationAttempt(ctx context.Context, vmName, target string, a *migrationAbort) {
+	ctx = context.WithoutCancel(ctx)
+	// The VFs first: the guest is staying, and every moment it runs without its
+	// NIC, with the VF free for another VM to claim, is the damage being undone.
+	s.reattachVFsOnSource(ctx, vmName, a.detachedVFs)
+	if a.stateWritten {
+		s.restoreSourceStateAfterFailedMigration(ctx, vmName,
+			fmt.Sprintf("migration to %s abandoned before the copy started", target),
+			fmt.Sprintf("migration to %s abandoned before the copy started, and the domain is not running", target))
+	}
+	s.cleanupFailedMigrationTarget(ctx, vmName, target, a.withStorage)
+	slog.Warn("migrate: attempt ended before the copy started; undone", "vm", vmName, "target", target)
+}
+
+// restoreSourceStateAfterFailedMigration takes a VM's row out of `migrating`
+// after a migration that left the guest on this host: `running` when the domain
+// still runs here, `error` otherwise. Reports whether it found it running.
+//
+// A LOCAL publish, unlike the post-cutover commit: the migration failed, so the
+// guest and its domain are still here.
+func (s *Server) restoreSourceStateAfterFailedMigration(ctx context.Context, vmName, runningDetail, errorDetail string) bool {
+	// With no libvirt there is nothing to ask whether the domain runs, so it is
+	// never claimed to.
+	if st, sErr := s.sourceDomainState(vmName); sErr == nil && st == "running" {
+		if werr := s.publishRunning(ctx, vmName, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMState(ctx, s.db, vmName, "running", runningDetail)
+		}); werr != nil {
+			s.noteStateWriteFail(corrosion.OpVMState, werr)
+		}
+		return true
+	}
+	if werr := corrosion.UpdateVMState(ctx, s.db, vmName, "error", errorDetail); werr != nil {
+		s.noteStateWriteFail(corrosion.OpVMState, werr)
+	}
+	return false
+}
+
+// reattachVFsOnSource puts the SR-IOV VFs MigrateVM hot-detached back into a
+// guest that did not move: the migration stopped before libvirt was handed it,
+// or libvirt failed. reattachVFsOnTarget is the cutover's counterpart. Without
+// it the guest ran on without its passthrough NIC, and the VF — released for
+// the move — was free for another VM to claim.
+//
+// Only into a running domain: a live attach to anything else fails, and a VM
+// whose domain is gone is restarted through the paths that allocate devices.
+// Best effort per VF, never failing the caller, whose own error is the one the
+// operator needs; each VF that cannot go back is logged and recorded as a VM
+// event.
+func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []corrosion.PCIDeviceRecord) {
+	if len(vfs) == 0 {
+		return
+	}
+	if st, err := s.sourceDomainState(vmName); err != nil || st != "running" {
+		slog.Warn("migrate: VFs detached for the move not reattached — the domain is not running",
+			"vm", vmName, "state", st, "error", err, "vfs", len(vfs))
+		return
+	}
+	for _, vf := range vfs {
+		if err := s.reattachVFOnSource(ctx, vmName, vf.Address); err != nil {
+			slog.Error("migrate: could not reattach a VF to the guest that stayed on the source",
+				"vm", vmName, "address", vf.Address, "error", err)
+			s.recordVMEvent(ctx, vmName, "device.attached", "error",
+				"VF "+vf.Address+" detached for a migration that did not happen could not be reattached: "+err.Error())
+			continue
+		}
+		slog.Info("migrate: VF reattached on the source", "vm", vmName, "address", vf.Address)
+	}
+}
+
+// reattachVFOnSource returns one VF to vmName on this host: ownership, then the
+// vfio bind, then the guest — the order an attach takes, so a failure part way
+// leaves the VF owned + bound (recoverable: a retried migration or detach
+// converges it), never unowned + bound.
+//
+// Ownership is the VM's already when the release failed, and is otherwise
+// claimed back with the same CAS any allocation uses, so a VF another VM took
+// in the meantime is left to it.
+func (s *Server) reattachVFOnSource(ctx context.Context, vmName, addr string) error {
+	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
+	if err != nil {
+		return fmt.Errorf("read ownership: %w", err)
+	}
+	owner, known := "", false
+	for _, d := range devs {
+		if d.Address == addr {
+			owner, known = d.VMName, true
+			break
+		}
+	}
+	claimed := false
+	switch {
+	case !known:
+		return errors.New("no longer in this host's PCI inventory")
+	case owner == vmName:
+		// The release never happened; still ours.
+	case owner == "":
+		ok, cerr := corrosion.ClaimPCIDevice(ctx, s.db, s.hostName, addr, vmName)
+		if cerr != nil {
+			return fmt.Errorf("claim: %w", cerr)
+		}
+		if !ok {
+			return errors.New("claimed by another VM while it was detached")
+		}
+		claimed = true
+	default:
+		return fmt.Errorf("claimed by VM %q while it was detached", owner)
+	}
+	if _, err := vfio.Bind(addr); err != nil {
+		if claimed {
+			// Give back what this call claimed; the strict primitive unbinds
+			// first if the failed bind left it bound.
+			if rerr := s.unbindAndReleaseOwnership(ctx, vmName, []string{addr}); rerr != nil {
+				slog.Warn("migrate: releasing a VF whose rebind failed", "vm", vmName, "address", addr, "error", rerr)
+			}
+		}
+		return fmt.Errorf("bind to vfio-pci: %w", err)
+	}
+	present, err := s.liveHostdevPresent(vmName, addr)
+	if err != nil {
+		return fmt.Errorf("read the guest's devices: %w", err)
+	}
+	if present {
+		return nil
+	}
+	if err := s.virt.AttachHostdev(vmName, addr); err != nil {
+		return fmt.Errorf("attach to the guest: %w", err)
+	}
+	return nil
+}
+
+// sourceDomainState is s.virt.DomainState, nil-safe: with no libvirt there is
+// no answer.
+func (s *Server) sourceDomainState(vmName string) (string, error) {
+	if s.virt == nil {
+		return "", errors.New("libvirt not connected")
+	}
+	return s.virt.DomainState(vmName)
+}
+
+// cleanupFailedMigrationTarget removes the disk stubs and cloud-init ISO a
+// migration pre-created on the target. The VM never got defined there, so they
+// are orphaned and would otherwise leak space and shadow a retry. Detached
+// context: the request context may itself be the cause of the failure. Shared
+// by the watched failure and an adopted one, which used to skip it.
+func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, withStorage bool) {
+	var stubPaths []string
+	if withStorage {
+		if ds, derr := corrosion.GetVMDisks(ctx, s.db, vmName); derr == nil {
+			for _, d := range ds {
+				if d.Path != "" {
+					stubPaths = append(stubPaths, d.Path)
+				}
+			}
+		}
+	}
+	// (Firmware VMs never reach this runtime-migration path — they take the
+	// stopped cold-move in coldMigrateFirmwareVM — so no firmware cleanup is
+	// needed here.)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	s.cleanupMigrationArtifactsOnTarget(cleanupCtx, target, vmName, stubPaths, "")
 }

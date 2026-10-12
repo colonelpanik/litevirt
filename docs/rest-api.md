@@ -310,7 +310,11 @@ POST routes that wrap streaming RPCs (`/api/v1/backup/snapshot`,
 `/api/v1/backup/restore`, `/api/v1/vms/move-volume`, `/api/v1/stacks/deploy`,
 `/api/v1/regions/migrate`, etc.) emit Server-Sent Events when the client
 sends `Accept: text/event-stream` or appends `?stream=sse`. Otherwise
-they return the first progress frame and close.
+they answer with the first progress frame as an acknowledgement, and the
+operation keeps running on the server after the response: the stream is opened
+on a context detached from the request (bounded at 6 hours) and read to its end
+in the background. Follow a long operation with SSE, or poll its resource;
+the acknowledgement does not report how it ended.
 
 ## Still gRPC-only
 

@@ -3,6 +3,7 @@ package rolling
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,7 @@ type mockOps struct {
 	failResizeOn     string
 	failHealthOn     string
 	failCreateNextOn string
+	failStopOn       string
 	onRecreate       func()
 }
 
@@ -76,6 +78,9 @@ func (m *mockOps) DeleteVM(_ context.Context, name string) error {
 	return nil
 }
 func (m *mockOps) StopVM(_ context.Context, name string) error {
+	if m.failStopOn == name {
+		return fmt.Errorf("simulated stop failure for %s", name)
+	}
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
 	m.mu.Unlock()
@@ -325,6 +330,31 @@ func TestOrdered_MaxUnavailableBatching(t *testing.T) {
 	}
 	if peak.Load() < 2 {
 		t.Errorf("expected peak concurrency >= 2 with max-unavailable=3, got %d", peak.Load())
+	}
+}
+
+// start-first stopped the VM before recreating it and threw the stop's error
+// away, so a VM that would not stop was recreated over while still running.
+// A failed stop aborts the update for that VM like a failed start or health
+// check does, and is reported against it.
+func TestOrdered_StartFirstAFailedStopAborts(t *testing.T) {
+	ops := &mockOps{failStopOn: "web-1"}
+	fn, got := collect()
+	err := Run(context.Background(), ops, "s", []VMAction{act("web-1", "start-first", recreatePlan())}, fn)
+	if err == nil || !strings.Contains(err.Error(), "stop web-1") {
+		t.Fatalf("Run = %v, want an abort naming the failed stop of web-1", err)
+	}
+	if len(ops.recreated) != 0 {
+		t.Fatalf("web-1 was recreated after its stop failed: %v", ops.recreated)
+	}
+	var reported bool
+	for _, p := range *got {
+		if p.VMName == "web-1" && p.Phase == "error" && p.Err != nil {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("no error progress for web-1: %+v", *got)
 	}
 }
 

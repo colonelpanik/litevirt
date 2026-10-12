@@ -201,6 +201,10 @@ type Fake struct {
 	pendingUnplug map[string][]func()
 	// unplugRequests counts detach requests per domain, for HonorUnplugOnRequest.
 	unplugRequests map[string]int
+
+	// OnAbortMigration runs on every AbortMigration, after it is recorded.
+	OnAbortMigration  func(name string)
+	abortedMigrations map[string]int
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -1508,4 +1512,28 @@ func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
 	}
 	e, ok := f.ownerEpochs[name]
 	return e, ok, nil
+}
+
+// AbortMigration records an abort of name's migration job and runs
+// OnAbortMigration, which a scenario uses to make its blocked MigrateToTarget
+// return the way a real abort makes it return.
+func (f *Fake) AbortMigration(name string) error {
+	f.mu.Lock()
+	if f.abortedMigrations == nil {
+		f.abortedMigrations = map[string]int{}
+	}
+	f.abortedMigrations[name]++
+	hook := f.OnAbortMigration
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+	return nil
+}
+
+// AbortedMigrations is how many times AbortMigration was called for name.
+func (f *Fake) AbortedMigrations(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.abortedMigrations[name]
 }

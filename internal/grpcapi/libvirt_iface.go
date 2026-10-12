@@ -30,6 +30,9 @@ type LibvirtBackend interface {
 	UndefineDomain(name string, removeStorage bool) error
 	UndefineDomainPreservingState(name string) error // undefine keeping NVRAM/vTPM (redefine-class, G1)
 	DomainState(name string) (string, error)
+	// AbortMigration aborts the domain's running migration job. MigrateToTarget
+	// takes no context, so this is the only way to stop one.
+	AbortMigration(name string) error
 	// DomainStateReason returns the coarse State together with the normalized
 	// Reason. DomainState collapses paused / shut-off / pm-suspended all to
 	// "stopped"; crash recovery needs the reason to tell a genuinely shut-off

@@ -368,21 +368,21 @@ func (s *Server) handleVMMoveVolume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.MoveVolume(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.MoveVolume(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "move volume", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 func (s *Server) handleVMReplicateVolume(w http.ResponseWriter, r *http.Request) {
@@ -395,21 +395,21 @@ func (s *Server) handleVMReplicateVolume(w http.ResponseWriter, r *http.Request)
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.ReplicateVolume(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.ReplicateVolume(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "replicate volume", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 // ── Backup snapshot push / pull ──────────────────────────────────────────────
@@ -424,21 +424,21 @@ func (s *Server) handleBackupSnapshot(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.BackupSnapshot(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.BackupSnapshot(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "backup snapshot", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
@@ -451,21 +451,21 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.RestoreFromBackup(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.RestoreFromBackup(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "restore from backup", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 // ── Preflight ────────────────────────────────────────────────────────────────

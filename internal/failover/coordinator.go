@@ -426,11 +426,26 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return
 	}
+	// Freshness is bounded on BOTH sides. A row stamped further ahead of this
+	// node's clock than a whole freshness window is not a recent observation
+	// but a skewed one — an observer whose clock runs fast, or one stepped
+	// forward on resume before ours was — and without the upper bound it
+	// stayed "fresh" for healthFreshness plus the skew. It counts once our
+	// clock reaches it. This errs toward not fencing, and only for as long as
+	// the skew lasts; host recovery (recoverHosts) deliberately keeps the
+	// one-sided test, since readmitting a host is not the irreversible act.
+	futureCutoff := c.now().Add(healthFreshness)
 	freshObservers := map[string]map[string]struct{}{}
 	for _, r := range hh {
 		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
 		if !ok || !inst.After(freshCutoff) {
 			continue // stale or unparseable → does not count toward quorum
+		}
+		if inst.After(futureCutoff) {
+			slog.Warn("failover: ignoring a future-dated health observation (clock skew)",
+				"target", r.String("target"), "observer", r.String("observer"),
+				"updated_at", r.String("updated_at"), "ahead", inst.Sub(c.now()).Round(time.Second))
+			continue
 		}
 		t := r.String("target")
 		if freshObservers[t] == nil {

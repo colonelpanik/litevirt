@@ -238,6 +238,13 @@ stop other rows from completing. Master-checkbox in the table header
 selects/deselects the visible rows. The list's 5s auto-refresh pauses while a
 selection is active so it doesn't clear your checkboxes mid-selection.
 
+A drain — from the host page or the bulk toolbar — answers once the daemon
+confirms it, or after 10 seconds if the daemon has not reported yet. The first
+report comes only once the first VM has migrated, so a host with a large VM
+usually answers "Drain started … (no progress reported yet)"; the drain keeps
+running on the server either way, and a refusal that arrives within those 10
+seconds is shown as a failure. Follow the drain on the host page.
+
 ## Containers
 
 `/containers` lists cluster-wide LXC/OCI workloads with full lifecycle from the

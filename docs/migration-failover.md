@@ -105,6 +105,17 @@ Every host probes every other host via TLS connection to the gRPC port (7443) ev
 
 A host transitions to `suspect` after 3 consecutive probe failures. The failover coordinator takes action after quorum confirmation.
 
+Rows are written on **transition**, not on every probe, so a steadily healthy
+peer costs no replication traffic. The one exception is a host in `offline` or
+`fenced`: its healthy row is rewritten every 10 seconds even when nothing has
+changed, because auto-recovery only counts rows younger than 30 seconds and a
+recovered host produces no further transitions to write one. Without that
+heartbeat a host that genuinely came back would sit `offline` until someone ran
+`lv host undrain` by hand. The heartbeat is deliberately limited to those two
+states — rewriting every healthy row on a timer would be N*(N-1) writes per
+interval across the cluster, for a reader that only ever looks at hosts
+awaiting recovery.
+
 Clock skew between hosts is also monitored — warnings are logged if skew exceeds 1 second.
 
 ### VM health
@@ -133,7 +144,7 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 
 When a host goes offline, the failover coordinator:
 
-1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1)
+1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence
 2. **Acquires leader lease** — only one host coordinates failover (45s TTL lease; a fence needs 30s of it still to run before it may begin)
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Reschedules VMs** — based on each VM's `on-host-failure` policy

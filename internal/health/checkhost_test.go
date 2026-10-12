@@ -142,52 +142,6 @@ func TestCheckHost_Unreachable_CumulativeFailures(t *testing.T) {
 	}
 }
 
-func TestCheckHost_Healthy_RecordsSuccess(t *testing.T) {
-	db := testCheckHostDB(t)
-	ctx := context.Background()
-
-	// Start a TLS listener that accepts connections.
-	// We can't easily do TLS here, but we can test by first creating a failure
-	// record and verifying a healthy check resets it.
-	// Since probe() requires TLS, and we can't easily set up TLS in a test,
-	// we test the checkHost logic by pre-seeding a failure record and verifying
-	// the failure path increment logic works correctly.
-
-	// Seed an initial failure record with 2 failures.
-	db.Execute(ctx,
-		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-		 VALUES (?, ?, ?, ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-		"host-a", "host-d", "healthy", 2)
-
-	c := NewChecker("host-a", "/etc/litevirt/pki", db)
-
-	// Check unreachable host — should increment to 3.
-	host := corrosion.HostRecord{
-		Name:     "host-d",
-		Address:  "127.0.0.1",
-		GRPCPort: 1,
-	}
-	c.checkHost(ctx, host)
-
-	rows, err := db.Query(ctx,
-		`SELECT consecutive_failures, status FROM host_health WHERE observer = ? AND target = ?`,
-		"host-a", "host-d")
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(rows))
-	}
-	failures := rows[0].Int("consecutive_failures")
-	if failures != 3 {
-		t.Errorf("consecutive_failures = %d, want 3 (2 pre-seeded + 1)", failures)
-	}
-	status := rows[0].String("status")
-	if status != "suspect" {
-		t.Errorf("status = %q, want suspect", status)
-	}
-}
-
 func TestCheckAllPeers_WithPeers(t *testing.T) {
 	db := testCheckHostDB(t)
 	ctx := context.Background()

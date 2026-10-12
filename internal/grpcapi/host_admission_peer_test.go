@@ -46,6 +46,13 @@ func (f *fakeDestPeer) ReleaseHostCapacity(_ context.Context, req *pb.ReleaseHos
 	return &emptypb.Empty{}, nil
 }
 
+// CleanupMigrationArtifacts accepts the target-side cleanup a failed migration
+// sends. The destination fake stands in for every call the source makes to it,
+// and a failed migration always sends this one.
+func (f *fakeDestPeer) CleanupMigrationArtifacts(context.Context, *pb.CleanupMigrationArtifactsRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+
 func (f *fakeDestPeer) released() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

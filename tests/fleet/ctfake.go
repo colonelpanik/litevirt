@@ -66,6 +66,10 @@ type CTFake struct {
 	// state mid-migrate, which is the only way to reach the target-side
 	// failures that a preflight would otherwise have caught first.
 	onExport func()
+	// onExportCtx is onExport handed the request context ExportContainer was
+	// called with, so a scenario can cancel the caller and wait for that
+	// cancellation to reach the source daemon mid-archive.
+	onExportCtx func(ctx context.Context)
 }
 
 // NewCTFake returns a container runtime rooted at dir. The directory is
@@ -167,6 +171,16 @@ func (f *CTFake) OnExport(fn func()) {
 	f.onExport = fn
 }
 
+// OnExportCtx is OnExport for a hook that needs the export's own context —
+// the source daemon's request context, which is what a client cancellation
+// reaches. After the hook, an export whose context is done fails with the
+// context's error, as the real runtime's tar (exec.CommandContext) is killed.
+func (f *CTFake) OnExportCtx(fn func(ctx context.Context)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onExportCtx = fn
+}
+
 // Counter accessors. Each returns a copy taken under the lock.
 
 func (f *CTFake) StartCalls() []string  { return f.snapshot(func() []string { return f.startCalls }) }
@@ -215,12 +229,17 @@ func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, int, erro
 	return l[0], l[1], nil
 }
 
-func (f *CTFake) StartContainer(_ context.Context, name string) error {
+func (f *CTFake) StartContainer(ctx context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls = append(f.startCalls, name)
 	if f.startErr != nil {
 		return f.startErr
+	}
+	// The real runtime execs lxc-start under exec.CommandContext, which refuses
+	// to start a process for a context that is already done.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, ok := f.state[name]; !ok {
 		return lxc.ErrContainerNotFound
@@ -321,13 +340,13 @@ func (f *CTFake) ContainerRootFSPath(name string) (string, error) {
 
 // ExportContainer writes the container's whole on-disk dir as a real tar
 // stream — the same self-contained shape lxc.ExportContainer produces.
-func (f *CTFake) ExportContainer(_ context.Context, name string, w io.Writer) error {
+func (f *CTFake) ExportContainer(ctx context.Context, name string, w io.Writer) error {
 	// Record the attempt BEFORE any injected failure: a scenario asserting
 	// "the export was reached" needs the call to count even when it fails,
 	// otherwise an injected error is indistinguishable from never getting there.
 	f.mu.Lock()
 	f.exportCalls = append(f.exportCalls, name)
-	injected, hook := f.exportErr, f.onExport
+	injected, hook, hookCtx := f.exportErr, f.onExport, f.onExportCtx
 	_, ok := f.state[name]
 	base := f.dir(name)
 	f.mu.Unlock()
@@ -335,8 +354,15 @@ func (f *CTFake) ExportContainer(_ context.Context, name string, w io.Writer) er
 	if hook != nil {
 		hook()
 	}
+	if hookCtx != nil {
+		hookCtx(ctx)
+	}
 	if injected != nil {
 		return injected
+	}
+	// A cancelled caller kills the real runtime's tar mid-archive.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if !ok {
 		return lxc.ErrContainerNotFound

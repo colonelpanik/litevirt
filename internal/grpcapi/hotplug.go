@@ -31,9 +31,22 @@ import (
 // hostdevAliasInXML on the journaled path — but keys on the source BDF, since legacy
 // hostdevs carry no user alias.
 func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
-	live, err := s.virt.DumpXML(vmName)
+	present, err := s.liveHostdevPresent(vmName, addr)
 	if err != nil {
 		return err
+	}
+	if present {
+		return s.virt.DetachHostdev(vmName, addr)
+	}
+	return nil // already detached — nothing to do
+}
+
+// liveHostdevPresent reports whether vmName's live domain carries a PCI hostdev
+// whose source BDF is addr. A DumpXML error is returned, never read as absent.
+func (s *Server) liveHostdevPresent(vmName, addr string) (bool, error) {
+	live, err := s.virt.DumpXML(vmName)
+	if err != nil {
+		return false, err
 	}
 	want, ok := pci.CanonicalBDF(addr)
 	if !ok {
@@ -45,10 +58,10 @@ func (s *Server) detachHostdevIfPresent(vmName, addr string) error {
 			got = strings.ToLower(strings.TrimSpace(raw))
 		}
 		if got == want {
-			return s.virt.DetachHostdev(vmName, addr)
+			return true, nil
 		}
 	}
-	return nil // already detached — nothing to do
+	return false, nil
 }
 
 // detachHostdevConfigIfPresent is the CONFIG-only counterpart to detachHostdevIfPresent,

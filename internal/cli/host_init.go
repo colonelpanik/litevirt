@@ -12,12 +12,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
 
 	"github.com/litevirt/litevirt/internal/pki"
+	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
 	"github.com/litevirt/litevirt/internal/systemdunit"
 )
@@ -455,14 +457,11 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 		if err != nil {
 			return fmt.Errorf("read %s: %w", filepath.Base(src), err)
 		}
-		if err := os.WriteFile(dst, data, 0600); err != nil {
+		// The Chmod this used to do afterwards was too late: WriteFile truncates in
+		// place, so the key was already in the loose inode. secretfile renames a
+		// fresh 0600 file over it instead, and never widens an operator's mode.
+		if err := secretfile.Write(dst, data, 0600); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
-		}
-		// WriteFile only applies its mode when it CREATES the file, so a
-		// re-init over an existing loose-permissioned key would silently keep
-		// the old mode.
-		if err := os.Chmod(dst, 0600); err != nil {
-			return fmt.Errorf("chmod %s: %w", filepath.Base(dst), err)
 		}
 	}
 
@@ -575,19 +574,56 @@ func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
 		if err != nil {
 			return fmt.Errorf("read CLI %s: %w", file.name, err)
 		}
-		if err := os.WriteFile(dst, data, file.mode); err != nil {
-			return fmt.Errorf("write CLI %s: %w", file.name, err)
-		}
+		// Ownership rides along with the write, on the descriptor. A chown of the
+		// PATHNAME afterwards would be a local privilege escalation: root is writing
+		// into a directory the target user owns, os.Chown follows symlinks, and the
+		// window between publishing the file and chowning it is theirs to use.
+		//
+		// file.mode is a ceiling: an operator who tightened client.key to 0400 keeps
+		// 0400, and a re-run never widens ca.crt/client.crt back to 0644.
+		uid, gid := -1, -1
 		if target.chown {
-			if err := chownPath(dst, target.uid, target.gid); err != nil {
-				return fmt.Errorf("chown CLI %s: %w", file.name, err)
-			}
+			uid, gid = target.uid, target.gid
+		}
+		if err := secretfile.WriteOwned(dst, data, file.mode, uid, gid); err != nil {
+			return fmt.Errorf("write CLI %s: %w", file.name, err)
 		}
 	}
 	if target.chown {
-		if err := chownPath(target.dir, target.uid, target.gid); err != nil {
+		if err := chownDirNoFollow(target.dir, target.uid, target.gid); err != nil {
 			return fmt.Errorf("chown CLI PKI dir %s: %w", target.dir, err)
 		}
+	}
+	return nil
+}
+
+// chownDirNoFollow changes the ownership of a DIRECTORY without following a
+// symlink at the final path component.
+//
+// os.Chown resolves the whole path, which is unsafe for a directory whose name
+// the target user controls. installCLIClientBundle chowns the CLI PKI
+// directory to the invoking user, and localCLIClientPKITargets places it under
+// that user's own home -- and MkdirAll neither guarantees the directory is
+// newly created nor stops it being REPLACED between the writes and the chown.
+// Under `sudo lv host init` the user renames the directory and drops a symlink
+// to a root-owned one in its place; root follows it and hands that directory's
+// ownership over.
+//
+// O_NOFOLLOW makes the final component a symlink an ERROR rather than
+// something to resolve, O_DIRECTORY makes "is it a directory" part of the open
+// instead of an assumption, and chowning the DESCRIPTOR lands the change on
+// the inode that was opened rather than on whatever the name means by the time
+// the syscall runs. Together they close the window instead of narrowing it.
+//
+// A var so tests can substitute it; nothing in production reassigns it.
+var chownDirNoFollow = func(dir string, uid, gid int) error {
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open %s without following symlinks: %w", dir, err)
+	}
+	defer f.Close()
+	if err := f.Chown(uid, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", dir, err)
 	}
 	return nil
 }

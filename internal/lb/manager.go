@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
 // Manager creates and manages HAProxy + keepalived instances as direct processes.
@@ -106,7 +108,10 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 		}
 		pemPath := filepath.Join(m.configDir, fmt.Sprintf("%s-%d.pem", cfg.Name, p.Listen))
 		combined := append(cert, key...)
-		if err := os.WriteFile(pemPath, combined, 0600); err != nil {
+		// combined carries the private key, so it gets the same atomic,
+		// never-widening write as every other secret in the tree: os.WriteFile
+		// would inherit the mode of a PEM left loose by an earlier render.
+		if err := secretfile.Write(pemPath, combined, 0600); err != nil {
 			return fmt.Errorf("write TLS PEM %s: %w", pemPath, err)
 		}
 	}

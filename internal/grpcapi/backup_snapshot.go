@@ -438,9 +438,10 @@ func (s *Server) pushBackup(
 		Status: fmt.Sprintf("%s guest-content backup: %d changed extent(s)", mode, len(extents)),
 	})
 
-	m, err := pbsstore.PushFromSource(ctx, repo, session, session.Size(), extents, inheritFrom, opts)
+	rec := &readRecorder{BackupReader: session}
+	m, err := pbsstore.PushFromSource(ctx, repo, rec, session.Size(), extents, inheritFrom, opts)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "push: %v", err)
+		return nil, backupPushError(req.VmName, disk, rec, err)
 	}
 
 	// Prune checkpoints no surviving manifest references.

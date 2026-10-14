@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
@@ -218,6 +219,67 @@ func (s *BackupSession) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// FailureCause says, best effort, why this session's backup failed, for a
+// caller whose read just failed with a bare broken NBD pipe. It reads the
+// backup job's own completion error (the job's `errmsg` in the completed job
+// stats, which is where a qemu block-layer failure such as an EIO on the disk
+// surfaces) and, failing that, the disks libvirt reports paused on an I/O
+// error. Empty when neither source has anything: libvirt then holds no cause.
+func (s *BackupSession) FailureCause() string {
+	if _, params, err := s.c.virt.DomainGetJobStats(s.dom, golibvirt.DomainJobStatsCompleted); err == nil {
+		if msg := backupJobErrmsg(params); msg != "" {
+			return "the backup job failed: " + msg
+		}
+	}
+	if errs, n, err := s.c.virt.DomainGetDiskErrors(s.dom, 64, 0); err == nil {
+		return diskErrorsCause(errs, n)
+	}
+	return ""
+}
+
+// backupJobErrmsg is the error message of the completed job when that job was
+// a backup: the completed stats are the domain's last completed job of any
+// kind, and a migration's or a save's error is not this backup's cause.
+func backupJobErrmsg(params []golibvirt.TypedParam) string {
+	for _, p := range params {
+		if p.Field != golibvirt.DomainJobOperationStr {
+			continue
+		}
+		op, ok := p.Value.I.(int32)
+		if !ok || golibvirt.DomainJobOperation(op) != golibvirt.DomainJobOperationStrBackup {
+			return ""
+		}
+		return jobErrmsg(params)
+	}
+	return ""
+}
+
+// jobErrmsg is the job's error message among its stats parameters.
+func jobErrmsg(params []golibvirt.TypedParam) string {
+	for _, p := range params {
+		if p.Field != golibvirt.DomainJobErrmsg {
+			continue
+		}
+		if msg, ok := p.Value.I.(string); ok {
+			return strings.TrimSpace(msg)
+		}
+	}
+	return ""
+}
+
+// diskErrorsCause names the disks libvirt reports an I/O error on. Only a disk
+// qemu paused on an error appears here, so an empty result says nothing.
+func diskErrorsCause(errs []golibvirt.DomainDiskError, n int32) string {
+	if n <= 0 || len(errs) == 0 {
+		return ""
+	}
+	disks := make([]string, 0, len(errs))
+	for _, e := range errs {
+		disks = append(disks, e.Disk)
+	}
+	return "libvirt reports an I/O error on disk " + strings.Join(disks, ", ")
 }
 
 // Close ends the NBD connection and the qemu backup job and removes the

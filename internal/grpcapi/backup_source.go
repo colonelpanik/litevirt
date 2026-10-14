@@ -1,9 +1,14 @@
 package grpcapi
 
 import (
+	"fmt"
 	"io"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -16,6 +21,63 @@ type BackupReader interface {
 	Incremental() bool
 	ChangedExtents() ([][2]int64, error)
 	Close() error
+}
+
+// backupCauser is implemented by a BackupReader that can say, best effort,
+// why its backup failed. A read that fails mid-backup surfaces as a broken NBD
+// pipe; the cause of the export's death lives in qemu's backup job.
+type backupCauser interface {
+	FailureCause() string
+}
+
+// readRecorder wraps a BackupReader and records the first error its ReadAt
+// returned, so a failed push can tell a failed read of the VM's disk from a
+// failure on the backup repository's side.
+type readRecorder struct {
+	BackupReader
+	err error
+}
+
+func (r *readRecorder) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.BackupReader.ReadAt(p, off)
+	if err != nil && err != io.EOF && r.err == nil {
+		r.err = err
+	}
+	return n, err
+}
+
+// backupPushError is the error of a failed guest-content push. When the read
+// of the VM's disk failed it names the disk and the cause of the failure when
+// libvirt can give one; any other failure (the repository full, a chunk or
+// manifest write) is a plain `push: <err>`, which says nothing about the disk.
+func backupPushError(vm string, disk *corrosion.DiskRecord, rec *readRecorder, err error) error {
+	if rec == nil || rec.err == nil {
+		return status.Errorf(codes.Internal, "push: %v", err)
+	}
+	cause := ""
+	if c, ok := rec.BackupReader.(backupCauser); ok {
+		cause = c.FailureCause()
+	}
+	return status.Error(codes.Internal, formatBackupPushError(vm, disk, err, cause))
+}
+
+// formatBackupPushError composes the message: the disk (VM, name, path,
+// storage), the original error's text, and the cause, or a plain statement
+// that none was available. An empty cause does not mean qemu saw no error.
+func formatBackupPushError(vm string, disk *corrosion.DiskRecord, err error, cause string) string {
+	where := fmt.Sprintf("disk %q of %q (%s", disk.DiskName, vm, disk.Path)
+	if disk.StorageType != "" {
+		where += ", storage " + disk.StorageType
+		if disk.StorageVolume != "" {
+			where += " " + disk.StorageVolume
+		}
+	}
+	where += ")"
+	msg := fmt.Sprintf("push: reading %s: %v", where, err)
+	if cause != "" {
+		return msg + "; cause: " + cause
+	}
+	return msg + "; no cause was available from libvirt (the disk's storage may have returned an I/O error to qemu; check the host's kernel log and the storage)"
 }
 
 // BackupSource opens guest-content backup sessions and prunes the libvirt

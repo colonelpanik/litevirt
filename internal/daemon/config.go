@@ -21,6 +21,20 @@ import (
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
 
+// HostUpdatesConfig configures the pending-OS-update check.
+type HostUpdatesConfig struct {
+	// Enabled turns the check on (default true). It reads the package
+	// manager's cached index and installs nothing.
+	Enabled bool `yaml:"enabled"`
+	// IntervalMinutes is how often the check runs (default 360, minimum 5).
+	IntervalMinutes int `yaml:"interval_minutes"`
+	// RefreshIndex runs `apt-get update` / `dnf makecache` before each check.
+	// Default false: a refresh is a network call, and on apt takes the package
+	// lock, so it is opt-in; without it the report is only as fresh as the
+	// host's own refresh timer.
+	RefreshIndex bool `yaml:"refresh_index"`
+}
+
 // Config holds litevirtd configuration.
 type Config struct {
 	HostName    string `yaml:"host_name"`
@@ -75,6 +89,10 @@ type Config struct {
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
 	Enforcement EnforcementConfig `yaml:"enforcement"`
+
+	// HostUpdates is the read-only check for pending OS package updates on this
+	// host (docs/upgrades.md, "Pending OS updates"). litevirt installs nothing.
+	HostUpdates HostUpdatesConfig `yaml:"host_updates"`
 
 	// VM holds cluster-wide defaults for newly created VMs.
 	VM VMDefaultsConfig `yaml:"vm"`
@@ -581,6 +599,8 @@ func LoadConfig() (*Config, error) {
 		VMEventErrorRetentionDays: 90,
 		VMEventMaxPerVM:           1000,
 		VMEventPruneHours:         24,
+
+		HostUpdates: HostUpdatesConfig{Enabled: true, IntervalMinutes: 360},
 
 		UpgradeWatchdogEnabled:   true,
 		UpgradeHealthDeadlineSec: 120,

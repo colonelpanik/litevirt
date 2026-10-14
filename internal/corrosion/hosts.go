@@ -290,6 +290,17 @@ func roleOrDefault(s string) string {
 // doesn't churn replication. Use the empty host row gracefully — if the host
 // isn't registered yet the UPDATE simply matches nothing.
 func SetHostLabel(ctx context.Context, c *Client, host, key, value string) error {
+	return SetHostLabels(ctx, c, host, map[string]string{key: value}, nil)
+}
+
+// SetHostLabels merges set into a host's labels and removes the keys in remove,
+// in ONE write of the labels column, and none when nothing changes. A periodic
+// writer of several labels (the pending-OS-update counts) therefore writes the
+// column once per actual change rather than once per label per check: the column
+// is replicated last-writer-wins as a whole, so each write is a chance to carry
+// back a stale copy of another node's concurrent `lv host label` edit. The
+// statement is SetHostLabel's (one shape, already known to every peer).
+func SetHostLabels(ctx context.Context, c *Client, host string, set map[string]string, remove []string) error {
 	h, err := GetHost(ctx, c, host)
 	if err != nil {
 		return err
@@ -300,10 +311,22 @@ func SetHostLabel(ctx context.Context, c *Client, host, key, value string) error
 			labels[k] = v
 		}
 	}
-	if labels[key] == value {
+	changed := false
+	for k, v := range set {
+		if cur, ok := labels[k]; !ok || cur != v {
+			labels[k] = v
+			changed = true
+		}
+	}
+	for _, k := range remove {
+		if _, ok := labels[k]; ok {
+			delete(labels, k)
+			changed = true
+		}
+	}
+	if !changed {
 		return nil // unchanged — avoid replication churn
 	}
-	labels[key] = value
 	b, err := json.Marshal(labels)
 	if err != nil {
 		return err

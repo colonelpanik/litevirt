@@ -43,6 +43,10 @@ type Server struct {
 	// (they report missing).
 	containersRoot string
 
+	// hostUpdates is host_updates: the read-only pending-OS-update check
+	// (host_updates.go).
+	hostUpdates HostUpdatesConfig
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory

@@ -397,6 +397,39 @@ systemctl restart litevirt
 
 ---
 
+## Pending OS updates
+
+litevirt does not patch a host's operating system, but it tells you which hosts
+are behind. Each daemon asks the host's package manager what its cached index
+says is upgradable (`apt list --upgradable`, or `dnf check-update` plus
+`dnf updateinfo list --security`), every `host_updates.interval_minutes`
+(default 360), and installs nothing. By default it does not refresh the index
+either: that is a network call and takes the apt lock, so it runs only with
+`host_updates.refresh_index: true`; without it the report is as fresh as the
+host's own refresh timer (`apt-daily.timer`, `dnf-makecache.timer`).
+
+The result is published three ways:
+
+- `lv host ls` shows an `UPDATES` column (`-` not reported or no apt/dnf, `?`
+  the last check failed, `0`, `5`, or `5 (2 security)`), and `lv host inspect
+  <host>` prints a note and carries the counts in its labels
+  (`litevirt.os-updates`, `litevirt.os-security-updates`).
+- The `litevirt_host_pending_updates{host,kind}` gauge (`kind` is `all` or
+  `security`), emitted for every host that has reported. A host whose last check
+  failed emits nothing rather than a zero that reads as fully patched.
+- A `host.security_updates` (warn) notification when the host has security
+  updates pending, or `host.updates` (info) when only other updates are, sent
+  when the counts change. A daemon restart does not repeat a notification the
+  published counts already cover. Route them with `lv notify route add
+  --pattern 'host.*' --target <target-id>`.
+
+A security update is one offered from a security suite (`*-security` on
+apt) or listed by `dnf updateinfo --security`. Patch the host with its own
+package manager; drain it first (`lv host drain`) when the update needs a
+reboot. A release check for litevirt itself is not part of this.
+
+---
+
 ## Operator playbook for cluster-wide upgrades
 
 A typical rolling upgrade across, say, 5 hosts:

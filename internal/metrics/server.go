@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/hostupdates"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
@@ -330,6 +331,7 @@ type collector struct {
 	// placement / rebalancer metrics.
 	placementDecisions *prometheus.Desc // counter labeled by policy + result
 	hostPressure       *prometheus.Desc // post-snapshot pressure per host × dimension
+	hostPendingUpdates *prometheus.Desc // pending OS package updates per host × kind (all|security)
 	rebalanceProposals *prometheus.Desc // pending proposals labeled by policy
 	rebalanceApplied   *prometheus.Desc // applied/approved/rejected proposals
 }
@@ -506,6 +508,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Per-host current resource pressure (used + 0)/capacity per dimension. 0 = idle, 1 = full.",
 			[]string{"host", "dim"}, nil,
 		),
+		hostPendingUpdates: prometheus.NewDesc(
+			"litevirt_host_pending_updates",
+			"Pending OS package updates per host (kind=all|security), from the host's last read-only check. Absent for a host that has not reported or whose last check failed.",
+			[]string{"host", "kind"}, nil,
+		),
 		rebalanceProposals: prometheus.NewDesc(
 			"litevirt_rebalance_proposals_pending",
 			"Number of rebalance proposals currently pending by policy",
@@ -554,6 +561,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.netboxBindingsSuspended
 	ch <- c.placementDecisions
 	ch <- c.hostPressure
+	ch <- c.hostPendingUpdates
 	ch <- c.rebalanceProposals
 	ch <- c.rebalanceApplied
 }
@@ -839,6 +847,16 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		if h.MemTotal > 0 {
 			ch <- prometheus.MustNewConstMetric(c.hostPressure,
 				prometheus.GaugeValue, float64(usedMem)/float64(h.MemTotal), h.Name, "ram")
+		}
+	}
+
+	// Pending OS package updates, as each host's daemon last published them on
+	// its host record. A host that has not reported, or whose last check failed
+	// ("unknown"), emits nothing: absence is not "fully patched".
+	for _, h := range hostList {
+		if pending, security, ok := hostupdates.FromLabels(h.Labels); ok {
+			ch <- prometheus.MustNewConstMetric(c.hostPendingUpdates, prometheus.GaugeValue, float64(pending), h.Name, "all")
+			ch <- prometheus.MustNewConstMetric(c.hostPendingUpdates, prometheus.GaugeValue, float64(security), h.Name, "security")
 		}
 	}
 

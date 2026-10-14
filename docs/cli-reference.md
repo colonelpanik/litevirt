@@ -55,7 +55,7 @@ lv health [--resolved]             # Cluster health: overall + conditions + cove
 lv host init <user@host> --name <name>    # Bootstrap first host (remote)
 lv host init --local --name <name>        # Bootstrap on localhost (standalone)
 lv host add <user@host> --name <name>     # Add host to cluster
-lv host ls                                # List hosts
+lv host ls                                # List hosts (UPDATES column: pending OS package updates, see upgrades.md)
 lv host ls --names                        # Print only host names, one per line (for scripts)
 lv host inspect <host>                    # Host details
 lv host drain <host> [--parallel 2]       # Evacuate VMs off host

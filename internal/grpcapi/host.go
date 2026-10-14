@@ -51,6 +51,7 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 			MemUsedMib:   int32(usage.MemUsedMiB),
 			DiskUsedGib:  int64(usage.DiskUsedGiB),
 			VmCount:      int32(vmCounts[h.Name]),
+			Labels:       h.Labels,
 			Version:      h.Version,
 			StoragePools: pools,
 			Region:       h.Region,

@@ -731,6 +731,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+	{
+		iv := d.cfg.HostUpdates.IntervalMinutes
+		if iv <= 0 {
+			iv = 360
+		} else if iv < 5 {
+			iv = 5
+		}
+		svc.SetHostUpdates(grpcapi.HostUpdatesConfig{
+			Enabled:      d.cfg.HostUpdates.Enabled,
+			Interval:     time.Duration(iv) * time.Minute,
+			RefreshIndex: d.cfg.HostUpdates.RefreshIndex,
+		})
+	}
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
@@ -1073,6 +1086,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
+
+	// Read-only report of this host's pending OS package updates (host_updates).
+	go svc.RunHostUpdateLoop(ctx)
 	// Leader-gated dual-run detector: alert-only cross-check that no workload/VIP runs on
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.

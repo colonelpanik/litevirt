@@ -246,3 +246,51 @@ func containsStr(s, sub string) bool {
 	}
 	return false
 }
+
+// A host's pending OS updates reach the scrape from its host record, per kind;
+// a host that has not reported, or whose last check failed, emits nothing
+// rather than a zero that reads as "fully patched".
+func TestCollect_HostPendingUpdates(t *testing.T) {
+	db := testCollectorDB(t)
+	ctx := context.Background()
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"host-a", "host-b", "host-c"} {
+		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: h, Address: "10.0.0.1", State: "active", CPUTotal: 4, MemTotal: 1024}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set := func(h, k, v string) {
+		if err := corrosion.SetHostLabel(ctx, db, h, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set("host-a", "litevirt.os-updates", "5")
+	set("host-a", "litevirt.os-security-updates", "2")
+	set("host-b", "litevirt.os-updates", "unknown")
+	set("host-b", "litevirt.os-security-updates", "unknown")
+
+	c := newCollector(db, nil, nil, "host-a")
+	ch := make(chan prometheus.Metric, 400)
+	c.Collect(ch)
+	close(ch)
+	got := map[string]float64{}
+	for m := range ch {
+		if !containsStr(m.Desc().String(), "litevirt_host_pending_updates") {
+			continue
+		}
+		var dm dto.Metric
+		if m.Write(&dm) != nil {
+			continue
+		}
+		lbl := map[string]string{}
+		for _, l := range dm.GetLabel() {
+			lbl[l.GetName()] = l.GetValue()
+		}
+		got[lbl["host"]+"/"+lbl["kind"]] = dm.GetGauge().GetValue()
+	}
+	if len(got) != 2 || got["host-a/all"] != 5 || got["host-a/security"] != 2 {
+		t.Fatalf("got %v, want only host-a all=5 security=2", got)
+	}
+}

@@ -29,6 +29,8 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 | `backup.failed` | error | a `lv backup snapshot` / scheduled backup fails |
 | `host.fenced` | error / warn | the failover coordinator fences a host (warn = partial/manual) |
 | `replication.failed` | error | a scheduled replication run fails |
+| `host.security_updates` | warn | a host has pending OS security updates (docs/upgrades.md, "Pending OS updates"); sent when the counts change |
+| `host.updates` | info | a host has pending OS package updates, none of them security |
 | `ha.vip.no_holder` | error | a configured VIP is served by nobody (VIP HA enabled) — a VIP outage |
 | `ha.vip.demotion_unfenced` | error | a minority node's VIP self-demote failed with no verified self-fence; the majority holds in the safe gap (VIP outage until an operator provides a fence / intervenes) |
 | `ha.dualrun.vm` | error | a VM is an active disk-holder on more than one host — a split-brain that can corrupt the disk |

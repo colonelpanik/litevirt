@@ -503,6 +503,17 @@ vm_event_error_retention_days: 90
 vm_event_max_per_vm: 1000
 vm_event_prune_hours: 24
 
+# Pending OS package updates (docs/upgrades.md, "Pending OS updates"). A
+# read-only check of what apt (Debian, Ubuntu) or dnf/yum (RHEL family) says is
+# upgradable from its CACHED index and installs nothing. The counts are
+# published on the host record (`lv host ls`, `lv host inspect`), as
+# litevirt_host_pending_updates{host,kind}, and as a host.updates /
+# host.security_updates notification when they change.
+host_updates:
+  enabled: true            # false stops the check on this host
+  interval_minutes: 360    # 0 -> 360; minimum 5
+  refresh_index: false     # true runs `apt-get update` / `dnf makecache` first: a network call (and the apt lock), so opt-in
+
 # Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW
 # binary's local gRPC becomes pingable within the deadline; if not, roll back to
 # the previous binary (.old) and exit so systemd restarts it. Catches a binary

@@ -149,17 +149,17 @@ func newHostLsCmd() *cobra.Command {
 				}
 
 				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-				fmt.Fprintf(w, "NAME\tADDRESS\tSTATE\tCPU\tMEMORY\tVMs\tVERSION\n")
+				fmt.Fprintf(w, "NAME\tADDRESS\tSTATE\tCPU\tMEMORY\tVMs\tVERSION\tUPDATES\n")
 				for _, h := range resp.Hosts {
 					ver := h.Version
 					if ver == "" {
 						ver = "-"
 					}
-					fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d MiB\t%d\t%s\n",
+					fmt.Fprintf(w, "%s\t%s\t%s\t%d/%d\t%d/%d MiB\t%d\t%s\t%s\n",
 						h.Name, h.Address, h.State,
 						h.CpuUsed, h.CpuTotal,
 						h.MemUsedMib, h.MemTotalMib,
-						h.VmCount, ver,
+						h.VmCount, ver, cli.HostUpdatesSummary(h.Labels),
 					)
 				}
 				return w.Flush()

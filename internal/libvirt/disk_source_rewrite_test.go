@@ -13,7 +13,7 @@ func srcOf(t *testing.T, domXML, dev string) string {
 	}
 	for _, d := range infos {
 		if d.dev == dev {
-			return d.file
+			return d.src[sourceAttrFile]
 		}
 	}
 	return ""

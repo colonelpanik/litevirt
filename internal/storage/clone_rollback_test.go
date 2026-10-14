@@ -70,12 +70,20 @@ func TestCephCreateDisk_CloneFailureRollsBackAndErrors(t *testing.T) {
 	if path != "" {
 		t.Errorf("expected empty path on failure, got %q", path)
 	}
+	// The clone IS the allocation, so a failed clone leaves nothing behind and
+	// there is nothing to roll back. This test used to require the opposite —
+	// create, then clone onto that same name, then rm the empty image — which
+	// pinned the ordering that made every image-backed ceph create fail with
+	// "(17) File exists" before the clone could ever run.
 	subs := subcommands(*calls)
-	if !hasSub(subs, "create") || !hasSub(subs, "clone") {
-		t.Errorf("expected create+clone attempts, got %v", subs)
+	if hasSub(subs, "create") {
+		t.Errorf("clone path must not pre-create the destination, got %v", subs)
 	}
-	if !hasSub(subs, "rm") {
-		t.Errorf("expected rollback 'rm' of the empty image, got %v", subs)
+	if !hasSub(subs, "clone") {
+		t.Errorf("expected a clone attempt, got %v", subs)
+	}
+	if hasSub(subs, "rm") {
+		t.Errorf("nothing was allocated, so nothing should be rolled back, got %v", subs)
 	}
 }
 

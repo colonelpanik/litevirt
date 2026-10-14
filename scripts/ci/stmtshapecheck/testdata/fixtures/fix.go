@@ -52,6 +52,18 @@ func Guarded(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, er
 	})
 }
 
+func GuardedEntries(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error)) {
+	tail := corrosion.Statement{SQL: "UPDATE t SET a = ? WHERE id = ?"}
+	_, _ = c.ExecuteEntriesGuarded(ctx, g, [][]corrosion.Statement{ // want: resolved (every entry)
+		{{SQL: "INSERT INTO t (a) VALUES (?)"}},
+		{tail},
+	})
+}
+
+func OpaqueEntries(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error), es [][]corrosion.Statement) {
+	_, _ = c.ExecuteEntriesGuarded(ctx, g, es) // want: unresolved (a parameter)
+}
+
 // Shadowed: the call uses the PARAMETER stmts; a shadowing inner `stmts :=` is a different
 // object and must NOT make it appear resolved.
 func Shadowed(c *corrosion.Client, ctx context.Context, stmts []corrosion.Statement) {

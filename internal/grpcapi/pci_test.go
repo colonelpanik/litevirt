@@ -45,6 +45,10 @@ func (f *pciBindFakeFS) ReadFile(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/device") {
 		return []byte("0x1572\n"), nil
 	}
+	if strings.HasSuffix(path, "/driver_override") {
+		// Overrides are not modelled; vfio reads this back only to confirm a clear.
+		return []byte("(null)\n"), nil
+	}
 	return nil, fmt.Errorf("pciBindFakeFS: no file %s", path)
 }
 

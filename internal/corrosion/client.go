@@ -942,6 +942,29 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 // the writes. Returns applied=false (no error) when the guard declines, so the
 // caller treats that as "preconditions no longer hold — skip and retry later".
 func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement) (bool, error) {
+	return c.ExecuteEntriesGuarded(ctx, guard, [][]Statement{stmts})
+}
+
+// ExecuteEntriesGuarded is ExecuteBatchGuarded for a write that is ONE local
+// transaction but MORE THAN ONE replicated entry: every statement of every
+// entry commits (or none does) behind the one guard, and each non-empty entry
+// becomes its own mutation_log row, in order, with its own HLC.
+//
+// It exists because local atomicity and the wire's entry shapes are different
+// constraints, and one entry cannot always satisfy both. A receiver judges each
+// entry on its own (validateGuardedMutationEntry): a guarded workload
+// transition or delete must be the unique final statement of its entry, and
+// every statement beside it must carry the same guard. A write that tombstones
+// one workload and creates another — a container relocation — has two such
+// halves, and packing them into one entry produced a shape every receiver
+// refused, stalling the sender's whole stream behind it. Here the sender keeps
+// the halves atomic locally and ships each as the shape receivers already
+// accept.
+//
+// Receivers may apply the entries in separate transactions (a push can split
+// between them), so a peer can briefly hold the state after the first entry.
+// Callers order entries so that intermediate is the safe one.
+func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), entries [][]Statement) (bool, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return false, errQuarantined(reason)
 	}
@@ -963,52 +986,64 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, nil
 	}
 	var mutated []Statement
-	relay := make([]Statement, 0, len(stmts))
-	for _, s := range stmts {
-		if s.Guard != nil {
-			matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+	relays := make([][]Statement, 0, len(entries))
+	for _, stmts := range entries {
+		relay := make([]Statement, 0, len(stmts))
+		for _, s := range stmts {
+			if s.Guard != nil {
+				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+				if err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("statement guard: %w", err)
+				}
+				if !matches {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, nil
+				}
+			}
+			res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
-				return false, fmt.Errorf("statement guard: %w", err)
+				return false, fmt.Errorf("exec guarded batch: %w", err)
 			}
-			if !matches {
+			if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
 				tx.Rollback()
 				c.mu.Unlock()
-				return false, nil
+				return false, invalidf("guarded workload transition matched authority but changed no row")
+			}
+			changed := false
+			if n, e := res.RowsAffected(); e == nil && n > 0 {
+				changed = true
+				mutated = append(mutated, s)
+			}
+			if relayStatement(s, changed) {
+				relay = append(relay, s)
 			}
 		}
-		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
-		if err != nil {
-			tx.Rollback()
-			c.mu.Unlock()
-			return false, fmt.Errorf("exec guarded batch: %w", err)
-		}
-		if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
-			tx.Rollback()
-			c.mu.Unlock()
-			return false, invalidf("guarded workload transition matched authority but changed no row")
-		}
-		changed := false
-		if n, e := res.RowsAffected(); e == nil && n > 0 {
-			changed = true
-			mutated = append(mutated, s)
-		}
-		if relayStatement(s, changed) {
-			relay = append(relay, s)
-		}
+		relays = append(relays, relay)
 	}
 	// `relay`, not `stmts` — see relayStatement. This is the site the
 	// seed-then-compare proof validation was written to work around: it seeds a
 	// row from an untrusted proof and compares inside one transaction, because
 	// the seeding INSERT OR IGNORE reached every peer even when it changed
 	// nothing locally.
-	if c.clock != nil && len(relay) > 0 {
+	for _, relay := range relays {
+		if c.clock == nil || len(relay) == 0 {
+			continue
+		}
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, fmt.Errorf("marshal stmts: %w", err)
+		}
+		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx,
@@ -1033,6 +1068,40 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	}
 	c.notifyReplicator()
 	return true, nil
+}
+
+// refuseUnapplicableEntry runs the receiver's structural check for guarded
+// workload entries (validateGuardedMutationEntry) on the entry this node is
+// about to log, in the form a peer will decode it, and refuses the local write
+// when a peer would refuse the entry.
+//
+// Refusing here is strictly better than committing. A receiver rejects such an
+// entry with an error that back-pressures, not one it acknowledges, so a
+// committed bad entry does not cost one row: the sender's whole stream stops
+// at it, for every peer, until it ages out of the log. The local write
+// surfaces as an error instead, before anything reaches the wire.
+//
+// Only an entry carrying a mutation guard can fail the check, so an ordinary
+// write pays for a scan of its statements and nothing more.
+func refuseUnapplicableEntry(relay []Statement, stmtsJSON []byte) error {
+	guarded := false
+	for _, s := range relay {
+		if s.Guard != nil {
+			guarded = true
+			break
+		}
+	}
+	if !guarded {
+		return nil
+	}
+	var wire []Statement
+	if err := json.Unmarshal(stmtsJSON, &wire); err != nil {
+		return fmt.Errorf("decode own mutation entry: %w", err)
+	}
+	if err := validateGuardedMutationEntry(wire); err != nil {
+		return fmt.Errorf("refusing a write every peer would reject: %w", err)
+	}
+	return nil
 }
 
 func isGuardedTransitionSQL(sql string) bool {
@@ -1093,6 +1162,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("marshal stmts: %w", err)
+		}
+		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx,

@@ -57,6 +57,9 @@ func TestDetachNICIfPresent_DetachesWhenPresent(t *testing.T) {
 func TestDetachNICIfPresent_NoOpWhenAbsent(t *testing.T) {
 	s := hotplugDiskServer(t)
 	fake := hotplugFake(t, s)
+	// A running domain always has a persistent definition too; detachNICIfPresent
+	// reads both copies.
+	fake.SetState("vm1", libvirtfake.StateRunning)
 	fake.SetActiveXML("vm1", nicDomainXML)
 
 	// A MAC the live domain does not carry — the DB/live drift case. Reaching
@@ -75,6 +78,7 @@ func TestDetachNICIfPresent_NoOpWhenAbsent(t *testing.T) {
 func TestDetachNICIfPresent_ConvergesOnRetry(t *testing.T) {
 	s := hotplugDiskServer(t)
 	fake := hotplugFake(t, s)
+	fake.SetState("vm1", libvirtfake.StateRunning)
 	fake.SetActiveXML("vm1", nicDomainXML)
 
 	const mac = "52:54:00:aa:bb:cc"
@@ -107,5 +111,38 @@ func TestDetachNICIfPresent_FailsClosedOnDumpError(t *testing.T) {
 	}
 	if got := fake.DetachNICCount(); got != 0 {
 		t.Fatalf("DetachNIC called %d times despite an unconfirmable read, want 0", got)
+	}
+}
+
+// A NIC gone from the live domain but still in the persistent definition is NOT
+// detached: it comes back on the next cold boot, and recovery's absence check
+// (verifyNICDetached) refuses it on every pass. The live-only membership check
+// skipped it (lab finding N1, second direction).
+func TestDetachNICIfPresent_DetachesPersistentOnlyRemnant(t *testing.T) {
+	s := hotplugDiskServer(t)
+	fake := hotplugFake(t, s)
+	fake.SetActiveXML("vm1", `<domain type='kvm'><devices></devices></domain>`)
+	fake.SetInactiveXML("vm1", nicDomainXML)
+
+	const mac = "52:54:00:aa:bb:cc"
+	if err := s.detachNICIfPresent("vm1", mac); err != nil {
+		t.Fatalf("detach of a persistent-only NIC: %v", err)
+	}
+	if inactive, _ := fake.DumpXMLInactive("vm1"); nicMacInXML(inactive, mac) {
+		t.Fatal("the persistent copy of the NIC must be removed")
+	}
+}
+
+// The persistent read is a membership read like the live one: failing it must not
+// read as "already detached".
+func TestDetachNICIfPresent_FailsClosedOnInactiveDumpError(t *testing.T) {
+	s := hotplugDiskServer(t)
+	fake := hotplugFake(t, s)
+	fake.SetActiveXML("vm1", `<domain type='kvm'><devices></devices></domain>`)
+	fake.FailDumpXMLInactive = func(string) error { return errors.New("persistent read failed") }
+
+	err := s.detachNICIfPresent("vm1", "52:54:00:aa:bb:cc")
+	if err == nil || !strings.Contains(err.Error(), "persistent read failed") {
+		t.Fatalf("an unreadable persistent definition must fail closed, got %v", err)
 	}
 }

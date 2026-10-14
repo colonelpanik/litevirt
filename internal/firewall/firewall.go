@@ -34,6 +34,7 @@ package firewall
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 )
@@ -324,29 +325,96 @@ func renderHostIsolation(b *strings.Builder, chains []IsolationChain) {
 	fmt.Fprintf(b, "    }\n\n")
 }
 
-// renderIPSets writes one `set <name> { … }` block per IPSet.
+// renderIPSets writes one `set <name> { … }` block per set NAME.
 // nftables sets are typed; we use ipv4_addr with the `interval` flag
 // so CIDRs work natively.
+//
+// Several live rows can share a name: ip_sets is keyed by a random id with no
+// UNIQUE on name, and two stacks may each declare the same set. nft merges
+// repeated declarations of one set into their union, so the union is what a
+// duplicate already meant whenever the ruleset applied; rendering it as one
+// block makes that explicit and independent of row order (#218).
 func renderIPSets(b *strings.Builder, sets []IPSet) {
 	if len(sets) == 0 {
 		return
 	}
+	byName := map[string][]string{}
+	var names []string
+	for _, s := range sets {
+		if _, ok := byName[s.Name]; !ok {
+			names = append(names, s.Name)
+			byName[s.Name] = nil
+		}
+		byName[s.Name] = append(byName[s.Name], s.CIDRs...)
+	}
 	// Stable order so the rendered output is byte-deterministic.
-	sortedSets := make([]IPSet, len(sets))
-	copy(sortedSets, sets)
-	sort.Slice(sortedSets, func(i, j int) bool { return sortedSets[i].Name < sortedSets[j].Name })
+	sort.Strings(names)
 
-	for _, s := range sortedSets {
-		fmt.Fprintf(b, "    set %s {\n", s.Name)
+	for _, name := range names {
+		fmt.Fprintf(b, "    set %s {\n", name)
 		fmt.Fprintf(b, "        type ipv4_addr\n")
 		fmt.Fprintf(b, "        flags interval\n")
-		if len(s.CIDRs) > 0 {
-			cidrs := append([]string(nil), s.CIDRs...)
-			sort.Strings(cidrs)
+		if cidrs := collapseSetElements(byName[name]); len(cidrs) > 0 {
 			fmt.Fprintf(b, "        elements = { %s }\n", strings.Join(cidrs, ", "))
 		}
 		fmt.Fprintf(b, "    }\n\n")
 	}
+}
+
+// collapseSetElements returns the elements sorted, with duplicates removed and
+// with every prefix that another element already covers dropped.
+//
+// An interval set refuses overlapping elements ("conflicting intervals
+// specified"), and since the ruleset loads as one transaction that refusal
+// stops the whole firewall from applying. Two IPv4 prefixes either nest or are
+// disjoint, so dropping the covered ones removes every conflict without
+// changing what the set matches. An element that does not parse is kept
+// verbatim and never used to drop another: the renderer does not second-guess
+// input it cannot read.
+func collapseSetElements(in []string) []string {
+	type elem struct {
+		s  string
+		p  netip.Prefix
+		ok bool
+	}
+	elems := make([]elem, 0, len(in))
+	for _, s := range in {
+		e := elem{s: s}
+		if p, err := netip.ParsePrefix(s); err == nil {
+			e.p, e.ok = p.Masked(), true
+		} else if a, err := netip.ParseAddr(s); err == nil {
+			e.p, e.ok = netip.PrefixFrom(a, a.BitLen()), true
+		}
+		elems = append(elems, e)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for i, e := range elems {
+		if seen[e.s] {
+			continue
+		}
+		covered := false
+		for j, o := range elems {
+			if i == j || !e.ok || !o.ok || o.s == e.s {
+				continue
+			}
+			if o.p.Bits() < e.p.Bits() && o.p.Contains(e.p.Addr()) {
+				covered = true // strictly inside a wider element
+				break
+			}
+			if o.p == e.p && o.s < e.s {
+				covered = true // the same interval spelled differently; keep one
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		seen[e.s] = true
+		out = append(out, e.s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // renderTierChain emits a chain whose rules apply to every packet

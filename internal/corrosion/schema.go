@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -521,9 +522,10 @@ func InitSchema(ctx context.Context, c *Client) error {
 		}
 		stmts := []Statement{{SQL: m.SQL}}
 		if m.Kind == kindRebuildClusterCRL {
-			stmts = []Statement{
-				{SQL: `DROP TABLE IF EXISTS cluster_crl`},
-				{SQL: clusterCRLDDL},
+			// Not m.SQL: the ledger checksum covers it, and nodes that already
+			// applied it would see checksum drift. The heal copies the rows.
+			if stmts, err = rebuildClusterCRLStatements(ctx, c, now); err != nil {
+				return fmt.Errorf("schema migration %q: %w", m.ID, err)
 			}
 		}
 		stmts = append(stmts, Statement{
@@ -795,6 +797,78 @@ func containsFold(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// rebuildClusterCRLStatements returns the local batch that moves an earlier
+// cluster_crl shape (the early-v47 table keyed on id alone) onto the composite
+// primary key WITHOUT losing a row.
+//
+// The heal used to be DROP plus CREATE, which threw away every published
+// revocation on the node, and on a fleet-wide restart onto the heal, on every
+// node until somebody republished. Instead the final shape is built beside the
+// old table, every row is copied across, and the new table takes the old name.
+//
+// Only the columns both shapes have are copied. A NOT NULL timestamp the old
+// shape lacks (or holds NULL in) falls back to its sibling, then to now;
+// deleted_at the old shape lacks is NULL. The composite key is a superset of the
+// old uniqueness, so every row fits. Copying cannot raise trust: the rows are
+// CA-signed, and every reader verifies the signature before using one.
+func rebuildClusterCRLStatements(ctx context.Context, c *Client, now string) ([]Statement, error) {
+	info, err := c.Query(ctx, `PRAGMA table_info(cluster_crl)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect cluster_crl: %w", err)
+	}
+	old := map[string]bool{}
+	for _, r := range info {
+		old[r.String("name")] = true
+	}
+	const rebuild = "cluster_crl__rebuild"
+	stmts := []Statement{
+		{SQL: `DROP TABLE IF EXISTS ` + rebuild},
+		{SQL: strings.Replace(clusterCRLDDL, "cluster_crl (", rebuild+" (", 1)},
+	}
+	if old["id"] && old["crl_pem"] {
+		stamp := func(col, sibling string) string {
+			parts := []string{}
+			for _, name := range []string{col, sibling} {
+				if old[name] {
+					parts = append(parts, name)
+				}
+			}
+			return "COALESCE(" + strings.Join(append(parts, "?"), ", ") + ")"
+		}
+		deleted := "NULL"
+		if old["deleted_at"] {
+			deleted = "deleted_at"
+		}
+		stmts = append(stmts, Statement{
+			SQL: `INSERT OR IGNORE INTO ` + rebuild + ` (id, crl_pem, created_at, updated_at, deleted_at)
+			 SELECT id, crl_pem, ` + stamp("created_at", "updated_at") + `, ` +
+				stamp("updated_at", "created_at") + `, ` + deleted + ` FROM cluster_crl`,
+			Params: []interface{}{now, now},
+		})
+	} else if old["crl_pem"] {
+		// No id column: derive it the way PublishCRL does, row by row.
+		rows, err := c.Query(ctx, `SELECT crl_pem FROM cluster_crl WHERE crl_pem IS NOT NULL`)
+		if err != nil {
+			return nil, fmt.Errorf("read cluster_crl: %w", err)
+		}
+		for _, r := range rows {
+			pem := r.String("crl_pem")
+			stmts = append(stmts, Statement{
+				SQL: `INSERT OR IGNORE INTO ` + rebuild + ` (id, crl_pem, created_at, updated_at, deleted_at)
+				 VALUES (?, ?, ?, ?, NULL)`,
+				Params: []interface{}{crlRowID(pem), pem, now, now},
+			})
+		}
+	} else if len(info) > 0 {
+		slog.Warn("schema ledger: cluster_crl has no crl_pem column; nothing to carry over")
+	}
+	stmts = append(stmts,
+		Statement{SQL: `DROP TABLE IF EXISTS cluster_crl`},
+		Statement{SQL: `ALTER TABLE ` + rebuild + ` RENAME TO cluster_crl`},
+	)
+	return stmts, nil
 }
 
 const clusterCRLDDL = `CREATE TABLE IF NOT EXISTS cluster_crl (

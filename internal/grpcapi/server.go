@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -463,6 +464,16 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// pciScanOverride is a test seam for the host hardware scan. Nil in
+	// production, where RescanHost calls pci.Scan directly.
+	//
+	// It exists because the stranded-ownership sweep shipped dead: every test
+	// called corrosion.SweepStrandedPCIOwnership directly, so none of them
+	// reproduced the one thing that broke it — RescanHost refreshing every
+	// present device's updated_at immediately before invoking the sweep. A
+	// defect that only appears in the ORDER two correct pieces are called in
+	// needs a test that calls them in that order.
+	pciScanOverride func() ([]pci.Device, error)
 
 	// stopVMOverride is a test seam for ShutdownHostWorkloads: when non-nil it
 	// replaces the in-process StopVM call (unit tests have no libvirt/peer), so

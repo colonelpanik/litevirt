@@ -216,7 +216,30 @@ func TestReplicationRPCsRequirePeerMTLS(t *testing.T) {
 	if _, err := s.PushMutations(replicationPeerCtx("node-a"), &pb.ReplicateRequest{Sender: "node-a", AfterSeq: 7}); err != nil {
 		t.Fatalf("PushMutations with matching peer CN: %v", err)
 	}
-	if _, err := s.AckMutations(replicationPeerCtx("node-a"), &pb.AckRequest{Sender: "node-a", AckedSeq: 7}); err != nil {
-		t.Fatalf("AckMutations with matching peer CN: %v", err)
+}
+
+// AckMutations has never had a caller: the replicator advances a peer's
+// watermark itself, from the AppliedUpTo of each push it makes. The RPC was a
+// second, unsolicited writer of that same row. Through it, an authenticated
+// peer could move this node's push cursor for it past entries it never
+// received (they would never be sent), or keep re-acking a low sequence to
+// keep its watermark fresh and hold back log compaction until the retention
+// ceiling (#218). It now refuses, and writes nothing.
+//
+// Mutation: restore the watermark upsert — the call succeeds and the row
+// reads 1000.
+func TestAckMutations_RefusesAndWritesNoWatermark(t *testing.T) {
+	s := testServer(t)
+	_, err := s.AckMutations(replicationPeerCtx("node-a"), &pb.AckRequest{Sender: "node-a", AckedSeq: 1000})
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("AckMutations from a matching peer: code = %v, want Unimplemented (err=%v)", status.Code(err), err)
+	}
+	rows, qErr := s.db.Query(adminCtx(), `SELECT last_seq FROM replication_watermarks WHERE peer_name = ?`, "node-a")
+	if qErr != nil {
+		t.Fatalf("read watermark: %v", qErr)
+	}
+	if len(rows) != 0 {
+		t.Errorf("AckMutations wrote a watermark (last_seq=%s); the replicator alone owns that row",
+			rows[0].String("last_seq"))
 	}
 }

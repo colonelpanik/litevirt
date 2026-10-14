@@ -234,6 +234,8 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		"AppendedBatch":          {resolved: 2},
 		"HelperReturnBatch":      {resolved: 1},
 		"Guarded":                {resolved: 1},
+		"GuardedEntries":         {resolved: 2},
+		"OpaqueEntries":          {unresolved: 1},
 		"SameHelperTwice":        {resolved: 2}, // finding 4: visited set popped, both calls resolve
 		"Shadowed":               {unresolved: 1},
 		"AssignAfterCall":        {unresolved: 1}, // finding 1: post-call assignment ignored

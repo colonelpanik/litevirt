@@ -136,6 +136,129 @@ func TestInitSchema_RebuildsTheEarlierV47ClusterCRLShape(t *testing.T) {
 	}
 }
 
+// The composite-PK heal keeps every revocation the earlier shape held. It used
+// to DROP the table and re-create it, so every node restarting onto the heal lost
+// its published CRLs until somebody republished one.
+func TestInitSchema_ClusterCRLHealKeepsRevocations(t *testing.T) {
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	ctx := context.Background()
+	if err := c.execLocal(ctx, `CREATE TABLE cluster_crl (
+		id TEXT PRIMARY KEY,
+		crl_pem TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`); err != nil {
+		t.Fatalf("create earlier v47 shape: %v", err)
+	}
+	pem := "-----BEGIN X509 CRL-----\nMIIBsigned\n-----END X509 CRL-----\n"
+	if err := c.execLocal(ctx,
+		`INSERT INTO cluster_crl (id, crl_pem, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, '2026-01-02T03:04:05Z', '2026-01-02T03:04:06Z', '2026-01-03T00:00:00Z')`,
+		crlRowID(pem), pem); err != nil {
+		t.Fatalf("seed earlier-shape CRL row: %v", err)
+	}
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	got, err := primaryKeyColumns(ctx, c.db, "cluster_crl")
+	if err != nil {
+		t.Fatalf("read rebuilt primary key: %v", err)
+	}
+	if !slices.Equal(got, []string{"id", "crl_pem"}) {
+		t.Fatalf("cluster_crl primary key = %v, want [id crl_pem]", got)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT id, crl_pem, created_at, updated_at, deleted_at FROM cluster_crl`)
+	if err != nil {
+		t.Fatalf("read cluster_crl: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("cluster_crl rows after heal = %d, want 1 (the revocation was dropped)", len(rows))
+	}
+	r := rows[0]
+	if r.String("id") != crlRowID(pem) || r.String("crl_pem") != pem ||
+		r.String("created_at") != "2026-01-02T03:04:05Z" ||
+		r.String("updated_at") != "2026-01-02T03:04:06Z" ||
+		r.String("deleted_at") != "2026-01-03T00:00:00Z" {
+		t.Errorf("healed row = %v, want the earlier row unchanged", r.Values)
+	}
+	if n := countAppliedID(t, c, "r_cluster_crl_composite_pk"); n != 1 {
+		t.Errorf("r_cluster_crl_composite_pk ledger rows = %d, want 1", n)
+	}
+	if ok, _ := tableExists(ctx, c, "cluster_crl__rebuild"); ok {
+		t.Error("cluster_crl__rebuild left behind after the heal")
+	}
+}
+
+// An earlier shape that lacks columns the final DDL has — here deleted_at, and
+// a NOT NULL timestamp — still heals, with the missing columns defaulted, and a
+// column the final shape no longer has (the retired peer-supplied version) is
+// not carried over.
+func TestInitSchema_ClusterCRLHealDefaultsMissingColumns(t *testing.T) {
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	ctx := context.Background()
+	if err := c.execLocal(ctx, `CREATE TABLE cluster_crl (
+		id TEXT PRIMARY KEY,
+		crl_pem TEXT NOT NULL,
+		version INTEGER NOT NULL,
+		updated_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create earlier shape: %v", err)
+	}
+	pem := "-----BEGIN X509 CRL-----\nMIIBother\n-----END X509 CRL-----\n"
+	if err := c.execLocal(ctx,
+		`INSERT INTO cluster_crl (id, crl_pem, version, updated_at)
+		 VALUES (?, ?, 7, '2026-01-02T03:04:06Z')`, crlRowID(pem), pem); err != nil {
+		t.Fatalf("seed earlier-shape CRL row: %v", err)
+	}
+	if err := InitSchema(ctx, c); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT id, crl_pem, created_at, updated_at, deleted_at FROM cluster_crl`)
+	if err != nil {
+		t.Fatalf("read cluster_crl: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("cluster_crl rows after heal = %d, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.String("crl_pem") != pem || r.String("id") != crlRowID(pem) {
+		t.Errorf("healed row = %v, want the earlier CRL", r.Values)
+	}
+	if r.String("updated_at") != "2026-01-02T03:04:06Z" {
+		t.Errorf("updated_at = %q, want it carried over", r.String("updated_at"))
+	}
+	if r.String("created_at") != "2026-01-02T03:04:06Z" {
+		t.Errorf("created_at = %q, want it defaulted from updated_at", r.String("created_at"))
+	}
+	if v := r.get("deleted_at"); v != nil {
+		t.Errorf("deleted_at = %v, want NULL", v)
+	}
+	if ok, _ := columnExists(ctx, c.db, "cluster_crl", "version"); ok {
+		t.Error("the retired version column survived the rebuild")
+	}
+}
+
+func countAppliedID(t *testing.T, c *Client, id string) int {
+	t.Helper()
+	rows, err := c.Query(context.Background(),
+		`SELECT COUNT(*) AS n FROM applied_migrations WHERE id = ?`, id)
+	if err != nil {
+		t.Fatalf("count applied %s: %v", id, err)
+	}
+	return rows[0].Int("n")
+}
+
 // Bootstrap: a legacy v28 DB (no ledger) gets the ledger seeded by mark-only
 // (nothing re-run), version stays 28.
 func TestInitSchema_SeedsLedgerOnExistingDB(t *testing.T) {

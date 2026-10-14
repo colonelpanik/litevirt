@@ -101,15 +101,28 @@ func (s *Server) detachHostdevConfigIfPresent(vmName, addr string) error {
 // domain disagrees. That drift is exactly the post-crash / failed-prior-detach /
 // manual-virsh state an operator is recovering from, and it is non-convergent:
 // every retry produces the same misleading error because nothing clears it.
-// Checking LIVE membership first turns that case into a no-op, which is what it
-// is.
+// Checking membership first turns that case into a no-op, which is what it is.
+//
+// Membership is checked in BOTH copies of the running domain, live and
+// persistent. They diverge mid-detach (the persistent copy goes at once, the live
+// one when the guest answers), and a copy left holding the NIC is exactly what a
+// retry has to clear: a persistent-only remnant would otherwise come back on the
+// next cold boot, and recovery's absence check would refuse it forever. DetachNIC
+// detaches from whichever copy holds it (libvirt.DetachLiveAndConfig). Either
+// read failing fails closed.
 func (s *Server) detachNICIfPresent(vmName, mac string) error {
 	live, err := s.virt.DumpXML(vmName)
 	if err != nil {
 		return err
 	}
 	if !nicMacInXML(live, mac) {
-		return nil // already detached — nothing to do
+		inactive, err := s.virt.DumpXMLInactive(vmName)
+		if err != nil {
+			return err
+		}
+		if !nicMacInXML(inactive, mac) {
+			return nil // already detached from both — nothing to do
+		}
 	}
 	return s.virt.DetachNIC(vmName, mac)
 }

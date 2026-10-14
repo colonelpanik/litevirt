@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -352,8 +351,15 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	return &pb.ReplicateResponse{AppliedUpTo: lastSeq}, nil
 }
 
-// AckMutations records that a peer has acknowledged processing mutations
-// up to a given sequence number. This updates the replication_watermarks table.
+// AckMutations is retired and refuses every call. No litevirt release has
+// ever called it: the replicator advances a peer's watermark itself, from the
+// AppliedUpTo of each push it makes (Replicator.replicateOnce). As a second
+// writer of that row it let an authenticated peer move this node's push cursor
+// for it past entries it never received, so they were never sent, or re-ack a
+// low sequence to keep its watermark fresh and hold back log compaction until
+// the retention ceiling (#218). The method stays in the service definition so
+// the wire contract is unchanged; the peer check still runs first, so a
+// non-peer gets the same PermissionDenied as before.
 func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb.Empty, error) {
 	if req.Sender == "" {
 		return nil, status.Error(codes.InvalidArgument, "sender required")
@@ -361,23 +367,8 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
 		return nil, err
 	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	db := s.db.DB()
-	mu := s.db.Mu()
-
-	mu.Lock()
-	_, err := db.ExecContext(ctx,
-		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(peer_name) DO UPDATE SET last_seq = excluded.last_seq, updated_at = excluded.updated_at`,
-		req.Sender, req.AckedSeq, now)
-	mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("update watermark: %w", err)
-	}
-
-	slog.Debug("ackMutations", "sender", req.Sender, "acked_seq", req.AckedSeq)
-	return &emptypb.Empty{}, nil
+	return nil, status.Error(codes.Unimplemented,
+		"AckMutations is retired: the replicator records a peer's watermark from its own pushes")
 }
 
 func requireReplicationPeer(ctx context.Context, sender string) error {

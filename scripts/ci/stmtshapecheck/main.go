@@ -449,6 +449,10 @@ func scanPkg(pkg *packages.Package) []finding {
 					if len(call.Args) >= 3 {
 						got = s.resolveBatchArg(call.Args[2])
 					}
+				case "ExecuteEntriesGuarded": // (ctx, guard, [][]Statement) — one batch per entry
+					if len(call.Args) >= 3 {
+						got = s.resolveEntriesArg(call.Args[2])
+					}
 				}
 				for i := range got {
 					got[i].fn = fd.Name.Name // attribute to the calling builder
@@ -463,7 +467,8 @@ func scanPkg(pkg *packages.Package) []finding {
 
 func isReplicatingMethod(m string) bool {
 	switch m {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
+		"ExecuteEntriesGuarded":
 		return true
 	}
 	return false
@@ -481,7 +486,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 	}
 	switch fd.Name.Name {
 	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
-		"executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
+		"ExecuteEntriesGuarded", "executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}
 	return false
@@ -549,6 +554,21 @@ func (s *scanner) resolveBatchArg(arg ast.Expr) []finding {
 		}
 	}
 	return []finding{{pos: s.pkg.Fset.Position(arg.Pos()), unresolvedBatch: true}}
+}
+
+// resolveEntriesArg resolves the [][]Statement argument of ExecuteEntriesGuarded: an inline
+// literal whose every element is itself a batch resolveBatchArg can follow. Anything else fails
+// closed, as resolveBatchArg does.
+func (s *scanner) resolveEntriesArg(arg ast.Expr) []finding {
+	lit, ok := arg.(*ast.CompositeLit)
+	if !ok || len(lit.Elts) == 0 {
+		return []finding{{pos: s.pkg.Fset.Position(arg.Pos()), unresolvedBatch: true}}
+	}
+	var out []finding
+	for _, elt := range lit.Elts {
+		out = append(out, s.resolveBatchArg(elt)...)
+	}
+	return out
 }
 
 // resolveStmtElt resolves one element of a []Statement literal: a Statement{SQL:...}

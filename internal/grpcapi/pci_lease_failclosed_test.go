@@ -45,7 +45,7 @@ func TestAcquireDeviceLeases_BeginLeaseWriteFails_ReleasesClaimsAndAborts(t *tes
 		return nil
 	}
 
-	_, _, err := s.acquireDeviceLeases(ctx, "vm-a", []ResolvedMember{{Address: addr}}, deviceLeaseStageBound)
+	_, _, err := s.acquireDeviceLeases(ctx, "vm-a", []ResolvedMember{{Address: addr}}, deviceLeaseStageBound, nil)
 	if err == nil {
 		t.Fatal("a failed durable device-lease write must fail the acquire (fail closed), got nil error")
 	}

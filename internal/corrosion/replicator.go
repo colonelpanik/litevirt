@@ -1123,7 +1123,7 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 				"origin", entry.Origin, "seq", entry.Seq)
 			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
 		}
-		if err := validateGuardedMutationEntry(stmts); err != nil {
+		if err := validateReceivedMutationEntry(stmts); err != nil {
 			_ = tx.Rollback()
 			r.client.observeMergeRejected("unknown", "wal", "guard")
 			return 0, fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
@@ -1879,6 +1879,83 @@ func legacyContainerRekeySafe(
 		targetSpec == coerceString(p[11]) &&
 		targetToken == coerceString(p[12]) &&
 		targetCreated == coerceString(p[13]), nil
+}
+
+// validateReceivedMutationEntry is the receiver's structural check:
+// validateGuardedMutationEntry, plus ONE exact historical shape it must still
+// admit so a stream already stalled on it can drain.
+//
+// Builds from e062efe1 up to the fix that split it logged a container
+// relocation as a single entry — [the source's guarded interface cleanup, its
+// guarded tombstone, the unguarded target row] — which the strict rule refuses
+// because the tombstone is not the entry's unique final statement. The refusal
+// back-pressures, so the relocating node's whole stream stopped at it for
+// every peer, and it cannot be taken out of that node's log without losing
+// everything behind it. New writers can no longer produce it: the local write
+// path runs the STRICT check and refuses (refuseUnapplicableEntry).
+//
+// Why admitting it is safe. The rule has two jobs. (1) Every guarded statement
+// must re-evaluate the SAME guard against a still-live source and reach the
+// same answer, which is why the tombstone that ends the source must come last;
+// here the guarded prefix is [cleanup, tombstone] exactly, the barrier IS its
+// last statement, and the prefix is re-checked under the strict rule on its
+// own. (2) Nothing unguarded may ride inside a guarded entry on the guard's
+// authority; the trailing statement here carries no guard and is applied on
+// its own merits (plain LWW, no guard evaluated), exactly as the standalone
+// entry the relocation wrote before e062efe1 — and writes again now — is
+// applied. So the admitted entry means, statement for statement and in the
+// same order, the two entries a fixed sender logs, applied in one receiver
+// transaction; a receiver learns nothing from it that the split form would not
+// tell it. The trailing statement is pinned to the two relocation target
+// shapes, to the containers row of the SAME name on a DIFFERENT host than the
+// one tombstoned, so the exception cannot admit anything else.
+func validateReceivedMutationEntry(stmts []Statement) error {
+	err := validateGuardedMutationEntry(stmts)
+	if err == nil {
+		return nil
+	}
+	if prefix, ok := legacyAtomicRelocationEntry(stmts); ok {
+		return validateGuardedMutationEntry(prefix)
+	}
+	return err
+}
+
+// legacyAtomicRelocationEntry recognises the single-entry container
+// relocation (see validateReceivedMutationEntry) and returns its guarded
+// prefix.
+func legacyAtomicRelocationEntry(stmts []Statement) ([]Statement, bool) {
+	if len(stmts) != 3 || stmts[0].Guard == nil || stmts[1].Guard == nil || stmts[2].Guard != nil {
+		return nil, false
+	}
+	fp := func(s Statement) string {
+		sh, _, err := parseResolved(s.SQL)
+		if err != nil {
+			return ""
+		}
+		return stmtFingerprint(sh)
+	}
+	if fp(stmts[0]) != mustStatementFingerprint(containerCreateCleanupSQL) ||
+		fp(stmts[1]) != mustStatementFingerprint(containerDeleteSQL) {
+		return nil, false
+	}
+	switch fp(stmts[2]) {
+	case mustStatementFingerprint(containerUpsertSQL),
+		mustStatementFingerprint(containerRelocatePendingInsertSQL):
+	default:
+		return nil, false
+	}
+	// containerDeleteSQL: (deleted_at, updated_at, host_name, name, epoch, gen);
+	// both target shapes open with (host_name, name).
+	del, tgt := stmts[1].Params, stmts[2].Params
+	if len(del) < 4 || len(tgt) < 2 {
+		return nil, false
+	}
+	srcHost, srcName := coerceString(del[2]), coerceString(del[3])
+	dstHost, dstName := coerceString(tgt[0]), coerceString(tgt[1])
+	if srcName == "" || dstName != srcName || dstHost == "" || dstHost == srcHost {
+		return nil, false
+	}
+	return stmts[:2], true
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {

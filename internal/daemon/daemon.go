@@ -110,6 +110,10 @@ type Daemon struct {
 	// overridable in tests.
 	exitFunc func(int)
 
+	// pciScanOverride replaces pci.Scan in runPCIScan. Nil in production;
+	// tests have no sysfs to scan.
+	pciScanOverride func() ([]pci.Device, error)
+
 	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Assigned
 	// once in Run, BEFORE the upgrade watchdog is armed — the watchdog
 	// goroutine can call exit() before obs.Setup completes, and this field
@@ -1745,7 +1749,11 @@ func getOutboundIP() string {
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.
 func (d *Daemon) runPCIScan(ctx context.Context) {
-	devices, err := pci.Scan()
+	scan := pci.Scan
+	if d.pciScanOverride != nil {
+		scan = d.pciScanOverride
+	}
+	devices, err := scan()
 	if err != nil {
 		slog.Warn("PCI scan failed", "error", err)
 		return
@@ -1776,6 +1784,18 @@ func (d *Daemon) runPCIScan(ctx context.Context) {
 		}
 	}
 	slog.Info("PCI startup scan complete", "interesting_devices", len(interesting), "total_scanned", len(devices))
+
+	// The observe loop above revives a tombstoned row with its vm_name intact
+	// (deliberately: a transient scan drop must not free in-use hardware), so
+	// after a reboot a device whose VM was deleted meanwhile comes back still
+	// assigned to it. Reclaim those here, as RescanHost does, rather than
+	// leaving them stranded until an operator runs `lv host rescan` (#218).
+	if freed, err := corrosion.SweepStrandedPCIOwnership(ctx, d.db, d.cfg.HostName,
+		corrosion.DefaultPCIOwnershipSweepAge); err != nil {
+		slog.Warn("PCI scan: stranded-ownership sweep failed", "error", err)
+	} else if len(freed) > 0 {
+		slog.Info("PCI scan: reclaimed devices whose owning VM no longer exists", "addresses", freed)
+	}
 
 	// NVMe namespace discovery (informational log for now).
 	namespaces, err := pci.ScanNVMeNamespaces()

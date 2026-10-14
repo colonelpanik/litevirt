@@ -44,26 +44,34 @@ func (d *cephDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, 
 		sizeMiB = 1024
 	}
 
-	args := d.rbdArgs("create",
-		"--size", fmt.Sprintf("%d", sizeMiB),
-		"--image-feature", "layering",
-		fmt.Sprintf("%s/%s", d.pool, imageName),
-	)
-	if out, err := d.rbd(ctx, args...); err != nil {
-		return "", fmt.Errorf("rbd create %s: %w: %s", imageName, err, out)
-	}
-
+	// Clone and create are ALTERNATIVES, not a sequence. `rbd clone` allocates
+	// the destination itself and refuses one that already exists, so creating
+	// the image first made every image-backed VM creation on ceph fail with
+	// "(17) File exists" — and then roll the image back, leaving no trace of
+	// why. The local and nfs drivers branch the same way.
 	if opts.SourceImage != "" {
+		// rbd can only clone a SNAPSHOT, and only a protected one. Refuse a bare
+		// image name before allocating anything rather than let rbd fail with a
+		// message that reads like a permissions problem — the VM create path
+		// passes spec.Image (e.g. "ubuntu-24.04"), which is exactly this case.
+		if !strings.Contains(opts.SourceImage, "@") {
+			return "", fmt.Errorf(
+				"%w: ceph clone source must name a protected snapshot (pool/image@snap), got %q",
+				ErrUnimplemented, opts.SourceImage)
+		}
 		if err := d.cloneFromImage(ctx, opts.SourceImage, imageName); err != nil {
-			// A blank-but-"successful" disk would silently boot the wrong OS, so
-			// roll back the empty image and surface the failure to the caller.
-			rmArgs := d.rbdArgs("rm", fmt.Sprintf("%s/%s", d.pool, imageName))
-			if rmOut, rmErr := d.rbd(ctx, rmArgs...); rmErr != nil {
-				slog.Error("ceph: rollback of un-cloned image failed; manual cleanup needed",
-					"image", imageName, "error", rmErr, "output", string(rmOut))
-			}
-			return "", fmt.Errorf("ceph clone %s from %s failed (rolled back empty image): %w",
-				imageName, opts.SourceImage, err)
+			// Nothing was allocated before the clone, so there is nothing to roll
+			// back: a failed clone leaves no image behind.
+			return "", fmt.Errorf("ceph clone %s from %s: %w", imageName, opts.SourceImage, err)
+		}
+	} else {
+		args := d.rbdArgs("create",
+			"--size", fmt.Sprintf("%d", sizeMiB),
+			"--image-feature", "layering",
+			fmt.Sprintf("%s/%s", d.pool, imageName),
+		)
+		if out, err := d.rbd(ctx, args...); err != nil {
+			return "", fmt.Errorf("rbd create %s: %w: %s", imageName, err, out)
 		}
 	}
 

@@ -15,13 +15,13 @@ import (
 // pciUnbindRecordingFS is a vfio.SysFS that models BOTH a vfio bind and a vfio
 // UNBIND (pciBindFakeFS only models bind), and records every Unbind so a detach test
 // can assert whether a device was actually unbound. A bind flips the driver symlink
-// to vfio-pci; an unbind honors vfio.Unbind's real sequence — the .../driver/unbind
-// write clears the vfio-pci binding, and the driver_override clear that Unbind performs
-// unconditionally on EVERY call is recorded per address as the unambiguous
-// "Unbind was invoked" signal (nothing else writes an empty driver_override). Because
-// Unbind clears the override before its drivers_probe, that probe rebinds to the
-// ORIGINAL driver (not vfio-pci), so an unbound device stays unbound and Unbind's own
-// verify passes.
+// to vfio-pci; an unbind honors vfio.Unbind's real sequence — driver_override is
+// cleared the way the kernel takes it (a zero-length write is ignored, "\n" clears it,
+// and it reads back as "(null)"), the clear Unbind performs first on EVERY call is
+// recorded per address as the "Unbind was invoked" signal, and the .../driver/unbind
+// write clears the vfio-pci binding and fires onUnbind. Because Unbind clears the override before its
+// drivers_probe, that probe rebinds to the ORIGINAL driver (not vfio-pci), so an
+// unbound device stays unbound and Unbind's own verify passes.
 type pciUnbindRecordingFS struct {
 	mu         sync.Mutex
 	bound      map[string]bool   // address -> bound to vfio-pci
@@ -31,7 +31,7 @@ type pciUnbindRecordingFS struct {
 	failBind   map[string]bool   // address -> the vfio-pci bind never takes (models a device that won't bind)
 	vf         map[string]bool   // address -> device is an SR-IOV VF (has a physfn symlink)
 	binds      int               // count of vfio-pci bind writes
-	onUnbind   func(addr string) // fired once per unbind (at the driver_override clear), if set
+	onUnbind   func(addr string) // fired once per unbind (at the driver/unbind write), if set
 }
 
 func newPCIUnbindRecordingFS() *pciUnbindRecordingFS {
@@ -102,6 +102,14 @@ func (f *pciUnbindRecordingFS) ReadFile(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/device") {
 		return []byte("0x1572\n"), nil
 	}
+	if strings.HasSuffix(path, "/driver_override") {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.override[f.devAddr(path, "/driver_override")] {
+			return []byte("vfio-pci\n"), nil
+		}
+		return []byte("(null)\n"), nil // how the kernel shows a cleared override
+	}
 	return nil, fmt.Errorf("pciUnbindRecordingFS: no file %s", path)
 }
 
@@ -112,18 +120,17 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 	switch {
 	case strings.HasSuffix(path, "/driver_override"):
 		a := f.devAddr(path, "/driver_override")
-		if val == "vfio-pci" {
+		switch {
+		case len(data) == 0:
+			// The kernel ignores a zero-length write: the override stays as it was.
+		case val == "vfio-pci":
 			f.override[a] = true
-		} else {
-			// vfio.Unbind clears the override on EVERY call → the unbind signal.
+		default:
+			// vfio.Unbind clears the override first, on EVERY call, bound or not → the
+			// "Unbind was invoked" signal. (Bind's rollback after a failed bind clears it
+			// too; no test counts unbinds of a device whose bind failed.)
 			f.override[a] = false
 			f.unbinds[a]++
-			if f.onUnbind != nil {
-				// Fires AFTER the .../driver/unbind write already flipped the device
-				// unbound but BEFORE the caller's post-unbind ReleasePCIDevice loop — lets a
-				// test model a fault that appears only once the hardware mutation is done.
-				f.onUnbind(a)
-			}
 		}
 	case strings.HasSuffix(path, "/driver/unbind"):
 		if f.failUnbind[val] {
@@ -132,6 +139,12 @@ func (f *pciUnbindRecordingFS) WriteFile(path string, data []byte, _ os.FileMode
 		}
 		// Unbind from the current (vfio-pci) driver: the device is now driverless.
 		f.bound[val] = false
+		if f.onUnbind != nil {
+			// Fires AFTER the .../driver/unbind write flipped the device unbound but
+			// BEFORE the caller's post-unbind ReleasePCIDevice loop — lets a test model a
+			// fault that appears only once the hardware mutation is done.
+			f.onUnbind(val)
+		}
 	case strings.Contains(path, "vfio-pci/bind"):
 		if f.failBind[val] {
 			// The bind never takes → the device stays unbound and vfio.Bind's verify fails.

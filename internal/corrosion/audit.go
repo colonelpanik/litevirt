@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // AuditRecord is a single entry in the audit log.
@@ -64,8 +66,9 @@ type chainState struct {
 // chainTail is one host's in-flight sub-chain position.
 type chainTail struct {
 	hash  string
-	seq   int64 // highest seq this host has written; the next row is seq+1
-	known bool  // true once the tail has been read back from the DB
+	seq   int64  // highest seq this host has written; the next row is seq+1
+	ts    string // the stamp on that row; the ceiling a generated stamp clamps to
+	known bool   // true once the tail has been read back from the DB
 }
 
 // tail returns hostName's tail state, creating it on first use.
@@ -82,19 +85,76 @@ func (cs *chainState) tail(hostName string) *chainTail {
 	return t
 }
 
+// maxClampSkew is how far ahead of this node's clock a ceiling may sit and still
+// be treated as one. Beyond it the ceiling is assumed to come from a clock that
+// is wrong, a caller that supplied its own timestamp, or a row that was not
+// written by a daemon at all.
+const maxClampSkew = 5 * time.Minute
+
+// stampAfter renders now at the chain's fixed width, never earlier than ceiling.
+//
+// The width is the first half: the stamp is compared as TEXT wherever rows are
+// ordered by it, so its text order has to be its time order, and
+// time.RFC3339Nano trims trailing zeros — a trimmed ".12Z" sorts after a later
+// ".125Z". nowTSLayout pads instead.
+//
+// The clamp is the second. A wall clock goes backwards: NTP corrects a drift, a
+// hypervisor restores a snapshot, an operator sets the date. Ordering the chain
+// by seq means such a stamp no longer reads as tampering, but it still puts rows
+// out of order in `lv audit ls` and in any export, and it invites every future
+// reader to assume an order the data does not have. client.go's NowTS already
+// made this trade for replication keys, clamping to lastTS+1ns against a durable
+// ceiling; this is the same trade for audit stamps, with the host's own tail as
+// the ceiling.
+//
+// The cost is explicit: after a backward step, a generated stamp is as much as
+// that step too high, and it says a row was written later than it was. A stamp
+// that is slightly late is a smaller lie than a log that claims an order it does
+// not have.
+//
+// Only GENERATED stamps are clamped. A caller-supplied timestamp is stored
+// verbatim — rewriting it would alter data this node did not author.
+func stampAfter(now time.Time, ceiling string) string {
+	ts := now.UTC()
+	if ceiling == "" {
+		return ts.Format(nowTSLayout)
+	}
+	prev, err := time.Parse(time.RFC3339Nano, ceiling)
+	if err != nil {
+		return ts.Format(nowTSLayout)
+	}
+	// A ceiling far in the FUTURE is not a clock reading to respect. The clamp
+	// only ever raises, so honouring one would move every later stamp with it
+	// until wall time caught up — and a stamp a year ahead is not a smaller
+	// problem than one a millisecond behind: it breaks timestamp-window exports
+	// and makes `lv audit ls` lie about when things happened, with nothing to
+	// correct it. Past maxClampSkew the wall clock wins and the row is stamped
+	// honestly. Ordering within the host is carried by seq regardless, which is
+	// what makes that the safe way to lose this particular tie.
+	if prev.After(ts.Add(maxClampSkew)) {
+		return ts.Format(nowTSLayout)
+	}
+	if !ts.After(prev) {
+		ts = prev.Add(time.Nanosecond)
+	}
+	return ts.Format(nowTSLayout)
+}
+
 // InsertAuditLog appends an entry to the audit_log table and stamps
 // the prev_hash / content_hash chain fields. Idempotent on ID: if
 // a row with the same ID already exists (e.g. arrived via Crescent
 // replication), the INSERT is silently skipped — the replicator's
 // LWW guard does the right thing for the replicated path.
 func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
-	if r.Timestamp == "" {
-		// Nanosecond precision so two rows inserted in the same second
-		// still sort deterministically. The verifier orders by
-		// (timestamp ASC, id ASC) — a tie would break the chain when
-		// the secondary id-sort doesn't match insert order.
-		r.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	// id is the primary key and the insert is INSERT OR IGNORE, so a caller
+	// that left it empty got one row ever: every later id-less row was dropped
+	// silently, and the tail below advanced anyway, leaving the next row linked
+	// to a row that does not exist -- a sequence gap and a hash mismatch that
+	// `lv audit verify` reads as tampering. An id is not the caller's to forget.
+	if r.ID == "" {
+		r.ID = randid.New()
 	}
+	generated := r.Timestamp == ""
 	c.auditChain.mu.Lock()
 	defer c.auditChain.mu.Unlock()
 	tail := c.auditChain.tail(r.HostName)
@@ -108,8 +168,18 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 		tail.known = true
 	}
 
+	if generated {
+		r.Timestamp = stampAfter(c.now(), tail.ts)
+	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1
+	// After every hashed input is final, prev_hash included, and before the
+	// hash: this is the one place every audit row passes through
+	// (TestAuditWriters_EveryCallSiteIsCovered holds it so).
+	if err := guardAuditNUL(&r); err != nil {
+		slog.Error("audit row refused", "action", r.Action, "host", r.HostName, "error", err)
+		return err
+	}
 	r.ContentHash = HashAuditRow(r)
 
 	// Sign before writing, and fail the insert if signing itself errors.
@@ -145,36 +215,103 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 			"action", r.Action, "target", r.Target, "host", r.HostName, "id", r.ID)
 	}
 
-	if err := c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`INSERT OR IGNORE INTO audit_log
 		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash, key_id, signature, seq)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.Timestamp, r.Username, r.HostName,
 		r.Action, r.Target, r.Detail, r.Result,
 		r.PrevHash, r.ContentHash, r.KeyID, r.Signature, r.Seq,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
+	if n == 0 {
+		// The id was already present, so nothing was written — the idempotent
+		// no-op the doc comment promises (a pending-audit replay after a crash
+		// lands here by design). The tail must not move: advancing it chained
+		// the next row onto a row that is not in the table, which verify reads
+		// as a hash break and a sequence gap. Not an error, because the record
+		// for this id exists; but the row that exists is the FIRST one, so a
+		// caller reusing an id for a different event has lost that event.
+		slog.Debug("audit row not written: id already present", "id", r.ID, "action", r.Action, "host", r.HostName)
+		return nil
+	}
 	tail.hash, tail.seq = r.ContentHash, r.Seq
+	// Only a stamp this node generated raises the ceiling. A caller-supplied one
+	// is stored verbatim but is not a reading of this node's clock, and letting
+	// it set the floor for every later row hands any caller a lever on the whole
+	// host's timeline.
+	if generated && raisesStampCeiling(r.Timestamp, tail.ts) {
+		tail.ts = r.Timestamp
+	}
+	return nil
+}
+
+// auditNULReplacement stands in for a NUL byte in a free-text audit field. It is
+// U+2400 SYMBOL FOR NULL: visible in `lv audit ls`, and not a byte the encoding
+// treats as a separator.
+const auditNULReplacement = "␀"
+
+// guardAuditNUL keeps every row InsertAuditLog writes inside the domain on
+// which the content hash is injective (no NUL in any hashed field; see
+// auditCanonical). It decides per field whether to escape or refuse.
+//
+// username, target and detail are ESCAPED. They carry text that callers take
+// from requests — a login writes the submitted username into target and
+// username verbatim, before anything has authenticated it — so a NUL there is
+// attacker-chosen. Refusing would hand that attacker an unaudited action:
+// every caller discards InsertAuditLog's error, so a refused row is a silent
+// gap, and a failed login that leaves no trace is worse than one recorded with
+// a visible stand-in. The escape is lossy (a literal U+2400 in the input reads
+// the same), which costs nothing here: the log records what was attempted, and
+// the hash only needs the STORED value to be NUL-free.
+//
+// id, timestamp, host_name, action and result are REFUSED. The daemon sets
+// them; none is free text from a request. Each is also load-bearing as an
+// exact value — id is the primary key every replica dedups on, host_name keys
+// the sub-chain, a timestamp is parsed and ordered, action and result are
+// matched by equality — so rewriting one would silently change what the row
+// means. A NUL in one is a bug, and the row is refused loudly.
+//
+// prev_hash is refused for the same reason: it is this host's own previous
+// content hash, hex by construction, and a NUL there means the table under
+// this node was edited.
+func guardAuditNUL(r *AuditRecord) error {
+	for _, f := range []*string{&r.Username, &r.Target, &r.Detail} {
+		if strings.IndexByte(*f, 0) >= 0 {
+			*f = strings.ReplaceAll(*f, "\x00", auditNULReplacement)
+		}
+	}
+	if f := auditRecordNULField(*r); f != "" {
+		return fmt.Errorf("audit row %q: field %s contains a NUL byte, which would make its content hash ambiguous", r.ID, f)
+	}
 	return nil
 }
 
 // loadHostTail reads back hostName's current chain position: the content hash
 // of its last row and the highest seq it has issued.
 //
-// Ordering matches the verifier's (timestamp, id), so the tail this returns is
-// the row the verifier will also treat as last. seq is taken as a MAX rather
-// than from that row, because a legacy row carries seq 0 and must not drag the
-// counter backwards onto a value already in use.
+// Ordering matches the verifier's (seq, then timestamp and id), so the tail this
+// returns is the row the verifier will also treat as last. A tail picked by
+// stamp alone is the wrong row to chain onto the moment a clock steps back, and
+// the broken link that follows is WRITTEN into the table rather than merely read
+// out of it.
+//
+// The stamp on that row comes back with it: it is the ceiling the next generated
+// stamp clamps to, so a backward clock step cannot put an older stamp on a newer
+// row. seq is taken as a MAX rather than from that row so a row inserted outside
+// InsertAuditLog cannot drag the counter onto a value already in use.
 func loadHostTail(ctx context.Context, c *Client, hostName string, tail *chainTail) error {
 	rows, err := c.Query(ctx,
-		`SELECT content_hash FROM audit_log WHERE host_name = ?
-		 ORDER BY timestamp DESC, id DESC LIMIT 1`, hostName)
+		`SELECT content_hash, timestamp FROM audit_log WHERE host_name = ?
+		 ORDER BY seq DESC, timestamp DESC, id DESC LIMIT 1`, hostName)
 	if err != nil {
 		return fmt.Errorf("read audit chain tail for %s: %w", hostName, err)
 	}
 	if len(rows) == 1 {
 		tail.hash = rows[0].String("content_hash")
+		tail.ts = rows[0].String("timestamp")
 	}
 	seqRows, err := c.Query(ctx,
 		`SELECT COALESCE(MAX(seq), 0) AS max_seq FROM audit_log WHERE host_name = ?`, hostName)
@@ -267,31 +404,75 @@ func HostHasSignedAuditRows(ctx context.Context, c *Client, hostName string) (bo
 	return len(rows) > 0, nil
 }
 
+// auditFieldNames are the row fields HashAuditRow covers, in hash order.
+var auditFieldNames = [...]string{
+	"id", "timestamp", "username", "host_name", "action", "target", "detail", "result",
+}
+
+// auditFieldValues returns r's hashed fields in auditFieldNames order.
+func auditFieldValues(r AuditRecord) [len(auditFieldNames)]string {
+	return [...]string{r.ID, r.Timestamp, r.Username, r.HostName, r.Action, r.Target, r.Detail, r.Result}
+}
+
+// auditCanonical is the v1 encoding HashAuditRow hashes:
+//
+//	prev_hash NUL ("id" NUL id NUL) ("timestamp" NUL timestamp NUL) ... ("result" NUL result NUL)
+//
+// It is injective ONLY over records with no NUL in any value, prev_hash
+// included. Under that condition the encoding holds exactly 17 NULs, so it
+// parses back one way only: prev_hash runs to the first NUL, and each following
+// pair is a field name — a fixed NUL-free constant, which the parse checks
+// rather than trusts — then a value running to the next NUL. An empty value is
+// two adjacent NULs and parses back as empty. Equal encodings therefore parse
+// to equal records.
+//
+// With a NUL inside a value the argument fails — the separators and field names
+// on their own do not stop a value from forging a field boundary. It fails
+// usefully, though: equal encodings have equal NUL counts, so any colliding pair
+// carries a NUL in a value on BOTH sides. Refusing or escaping NUL at the one
+// write path (InsertAuditLog) and flagging any NUL row on read
+// (VerifyAuditChain) closes collisions without changing a byte of the encoding
+// for any row that has none, so every hash and signature already written stays
+// valid and no peer on an older build disagrees about a hash.
+func auditCanonical(r AuditRecord) []byte {
+	b := make([]byte, 0, 256)
+	b = append(b, r.PrevHash...)
+	b = append(b, 0)
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		b = append(b, k...)
+		b = append(b, 0)
+		b = append(b, vals[i]...)
+		b = append(b, 0)
+	}
+	return b
+}
+
+// auditRecordNULField names the first hashed input of r — prev_hash included —
+// that contains a NUL byte, or "" when none does. A record for which this is
+// non-empty lies outside the domain on which auditCanonical is injective.
+func auditRecordNULField(r AuditRecord) string {
+	if strings.IndexByte(r.PrevHash, 0) >= 0 {
+		return "prev_hash"
+	}
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		if strings.IndexByte(vals[i], 0) >= 0 {
+			return k
+		}
+	}
+	return ""
+}
+
 // HashAuditRow returns the canonical SHA-256 of one audit row, mixed
 // with its prev_hash. Format-stable across versions — operators can
 // re-verify chains lifted from any future schema rev.
+//
+// It is collision-free only over rows with no NUL in any field; see
+// auditCanonical for why, and for where that is enforced.
 func HashAuditRow(r AuditRecord) string {
-	h := sha256.New()
-	h.Write([]byte(r.PrevHash))
-	h.Write([]byte{0})
-	// Use a NUL separator + field name so a field reorganisation
-	// (or an injected NUL byte in any field) can't forge a chain.
-	for _, kv := range []struct{ k, v string }{
-		{"id", r.ID},
-		{"timestamp", r.Timestamp},
-		{"username", r.Username},
-		{"host_name", r.HostName},
-		{"action", r.Action},
-		{"target", r.Target},
-		{"detail", r.Detail},
-		{"result", r.Result},
-	} {
-		h.Write([]byte(kv.k))
-		h.Write([]byte{0})
-		h.Write([]byte(kv.v))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256(auditCanonical(r))
+	return hex.EncodeToString(sum[:])
 }
 
 // VerifyAuditChain validates every host's audit sub-chain independently
@@ -317,6 +498,9 @@ type AuditVerifyResult struct {
 	// BrokenAt is the first row whose content hash does not match a
 	// recomputation. Empty when every chain links correctly.
 	BrokenAt string
+	// BrokenKind says what kind of break BrokenAt is: AuditBrokenContent,
+	// AuditBrokenForked or AuditBrokenUnlinked. Empty when BrokenAt is.
+	BrokenKind string
 	// Unsigned counts rows carrying no signature: written before v45, or while
 	// enforcement.audit_signature was off. They are chain-checked only.
 	Unsigned int
@@ -357,9 +541,27 @@ type AuditVerifyResult struct {
 	// UnknownKeyID lists rows whose key has no usable published certificate —
 	// either never published, or one that does not chain to the cluster CA.
 	UnknownKeyID []string
-	// SeqGaps lists breaks in a host's sequence numbering, which is how the
-	// deletion of a whole run of rows shows up.
+	// SeqGaps lists breaks in a host's sequence numbering: a jump, which is how
+	// the deletion of a whole run of rows shows up, or a repeated seq, which is
+	// a forked chain and is labelled as a duplicate.
 	SeqGaps []string
+	// SeqDuplicates counts the SeqGaps entries that are a repeated seq (the
+	// forked-chain kind), not a jump.
+	SeqDuplicates int
+	// Every unlinked row is classified, not only the first (BrokenAt):
+	// ContentBreaks counts those whose content does not hash to their stored
+	// hash (an edit); ForkedHosts lists the hosts with a second genesis
+	// (AuditBrokenForked); UnlinkedOutsideForks counts the other unlinked
+	// rows on hosts with no second genesis (a deleted or rewritten row).
+	ContentBreaks        int
+	ForkedHosts          []string
+	UnlinkedOutsideForks int
+	// Orphaned counts unlinked rows on a host with a second genesis whose
+	// stored prev_hash is the hash of no row of that host one seq before them:
+	// their predecessor was deleted (or the row renumbered). A fork does not
+	// excuse them. Orphans names each, as "host: row ID (seq N) ...".
+	Orphaned int
+	Orphans  []string
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
 	Laundered []string
@@ -380,6 +582,18 @@ type AuditVerifyResult struct {
 	// signature verifies, the sequence numbers are untouched, and only the head
 	// — signed by the successor key they do not have — disagrees.
 	HeadMismatch []string
+	// Ambiguous lists rows with a NUL byte in a hashed field. The content hash
+	// is injective only over NUL-free rows (see auditCanonical), so such a row's
+	// hash — and the signature over it — does not pin down which content it
+	// covers: a different row with the same hash verifies just as well. A daemon
+	// that guards NUL at write time never produces one; it comes from an older
+	// build or from a direct write to the table.
+	//
+	// Not tamper evidence: the row may have been written verbatim by an older
+	// build, and the verifier cannot tell that from a substitution. It fails
+	// verification as Unverified instead, because the row's content is exactly
+	// what could not be verified.
+	Ambiguous []string
 }
 
 // Tampered reports whether anything found is evidence of deliberate
@@ -425,6 +639,21 @@ func (r AuditVerifyResult) Tampered() bool {
 		len(r.UnsignedAfterSigned) > 0
 }
 
+// Forked reports whether the only tamper finding is a forked chain: some host
+// has a second genesis (AuditBrokenForked), no row's content fails its hash,
+// every other unlinked row is on a host with a second genesis and links to a
+// row of that host (no Orphaned), and every
+// sequence break is a repeated seq. It is still Tampered — a fork fails verification — but
+// nothing found says a row was edited, deleted or forged, so the periodic
+// verifier names it a forked chain, as `lv audit verify` does.
+func (r AuditVerifyResult) Forked() bool {
+	return len(r.ForkedHosts) > 0 && r.ContentBreaks == 0 && r.UnlinkedOutsideForks == 0 && r.Orphaned == 0 &&
+		len(r.SeqGaps) == r.SeqDuplicates &&
+		len(r.BadSignature) == 0 && len(r.UnknownKeyID) == 0 && len(r.Laundered) == 0 &&
+		len(r.TruncatedHosts) == 0 && len(r.RetiredKeyUse) == 0 && len(r.HeadMismatch) == 0 &&
+		len(r.UnsignedAfterSigned) == 0
+}
+
 // Unverified reports a host that declares its rows are signed and demonstrably
 // cannot sign them.
 //
@@ -451,7 +680,37 @@ func (r AuditVerifyResult) Tampered() bool {
 // not simply made deletable — that would hand the same attacker a way to suppress
 // a GENUINE finding.
 func (r AuditVerifyResult) Unverified() bool {
-	return len(r.NeverAdopted) > 0
+	return len(r.NeverAdopted) > 0 || len(r.Ambiguous) > 0
+}
+
+// brokenLinkKind classifies a row that does not link to the walk's running tail
+// by re-hashing it against the prev_hash it STORED. A row that does not hash
+// even against that was edited.
+//
+// A row that does hash is called a fork only when it has the whole shape of
+// one: an empty prev_hash AND seq 1 repeating a seq 1 the host already has
+// (repeatsSeq1) — a second genesis, which is what a host rebuilt on an empty
+// database writes. Anything else self-consistent is a broken link. That matters
+// because a stored prev_hash is as writable as the content: an edit to an
+// unsigned row mid-chain that blanks prev_hash and recomputes the hash is
+// self-consistent too, and calling IT a fork would tell the operator the one
+// thing that is false. Every kind is still a finding.
+//
+// That holds only while seq is honest. seq is not in the content hash, only
+// under the signature, so on an UNSIGNED row it is as writable as prev_hash: a
+// rewrite that also renumbers the row to seq 1 has exactly a fork's shape and
+// is labelled one. No check can tell the two apart there. A signed row
+// rewritten that way also shows a bad signature.
+func brokenLinkKind(rec AuditRecord, storedPrev, stored string, repeatsSeq1 bool) string {
+	rec.PrevHash = storedPrev
+	switch {
+	case !strings.EqualFold(HashAuditRow(rec), stored):
+		return AuditBrokenContent
+	case storedPrev == "" && repeatsSeq1:
+		return AuditBrokenForked
+	default:
+		return AuditBrokenUnlinked
+	}
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -466,7 +725,7 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		`SELECT id, timestamp, username, host_name, action, target, detail, result,
 		        prev_hash, content_hash, key_id, signature, seq
 		 FROM audit_log
-		 ORDER BY host_name ASC, timestamp ASC, id ASC`)
+		 ORDER BY host_name ASC, seq ASC, timestamp ASC, id ASC`)
 	if err != nil {
 		return res, fmt.Errorf("list audit_log: %w", err)
 	}
@@ -495,9 +754,29 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				"is tamper-evident (a key that cannot be read cannot sign the adoption either)",
 			u.host, u.keyID, u.publishedAt))
 	}
-	prevByHost := map[string]string{} // per-host running tail
-	seqByHost := map[string]int64{}   // per-host last seq seen
-	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
+	prevByHost := map[string]string{}  // per-host running tail
+	seqByHost := map[string]int64{}    // per-host last seq seen
+	forkedHost := map[string]bool{}    // hosts with a second genesis
+	// unlinked rows, neither content nor genesis: excused on a forked host
+	// only when they link to a row of that host (see Orphaned)
+	type unlinkedRow struct {
+		host, id, prev string
+		seq            int64
+	}
+	var unlinked []unlinkedRow
+	seqOfHash := map[string]map[string]int64{} // per-host stored content_hash -> seq
+	hashedByHost := map[string]bool{}          // has this host produced a hashed row yet?
+	// Unsigned seq-0 rows of a contracted host, held until the chain says where
+	// they sit. See "seq 0 under a contract" below.
+	legacy := map[string]*legacyRun{}
+	var legacyOrder []string
+	flagLegacy := func(host string) {
+		for _, id := range legacy[host].ids {
+			res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+				"%s: row %s carries no signature and no sequence, and does not link into the "+
+					"history before this host's signing contract", host, id))
+		}
+	}
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -540,11 +819,44 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			Result:    r.String("result"),
 			PrevHash:  prevByHost[host],
 		}
-		if expect := HashAuditRow(rec); !strings.EqualFold(expect, stored) && res.BrokenAt == "" {
-			res.BrokenAt = rec.ID
+		linked := strings.EqualFold(HashAuditRow(rec), stored)
+		if !linked {
+			last, seen := seqByHost[host]
+			kind := brokenLinkKind(rec, r.String("prev_hash"), stored,
+				r.Int64("seq") == 1 && seen && last == 1)
+			if res.BrokenAt == "" {
+				res.BrokenAt, res.BrokenKind = rec.ID, kind
+			}
+			switch kind {
+			case AuditBrokenContent:
+				res.ContentBreaks++
+			case AuditBrokenForked:
+				if !forkedHost[host] {
+					forkedHost[host] = true
+					res.ForkedHosts = append(res.ForkedHosts, host)
+				}
+			default:
+				unlinked = append(unlinked, unlinkedRow{host: host, id: rec.ID, prev: r.String("prev_hash"), seq: r.Int64("seq")})
+			}
+		}
+		if run := legacy[host]; run != nil && !linked {
+			run.broken = true
+		}
+		// A row with a NUL in a hashed field can share its hash — and so its
+		// signature — with a different row (auditCanonical). Checked whether or
+		// not the hash matched: a matching hash is exactly the case in which
+		// the content it covers is in doubt.
+		if f := auditRecordNULField(rec); f != "" {
+			res.Ambiguous = append(res.Ambiguous, fmt.Sprintf(
+				"%s: %s: field %s contains a NUL byte, so its hash and signature do not determine "+
+					"its content — a different row would verify the same", rec.ID, host, f))
 		}
 		hashedByHost[host] = true
 		prevByHost[host] = stored
+		if seqOfHash[host] == nil {
+			seqOfHash[host] = map[string]int64{}
+		}
+		seqOfHash[host][strings.ToLower(stored)] = r.Int64("seq")
 
 		sig, keyID, seq := r.String("signature"), r.String("key_id"), r.Int64("seq")
 
@@ -561,7 +873,24 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		// hundreds of them on the first verify after an upgrade, under a heading
 		// that says rows were deleted. Skipped rather than compared.
 		if seq > 0 {
-			if last, seen := seqByHost[host]; seen && seq != last+1 {
+			// The host's first numbered row closes its seq-0 region: its stored
+			// hash commits to everything before it.
+			if run := legacy[host]; run != nil && !run.resolved {
+				run.resolved = true
+				if run.broken {
+					flagLegacy(host)
+				}
+			}
+			if last, seen := seqByHost[host]; seen && seq == last {
+				// Not a deletion: two rows claim one position. That is a forked
+				// chain — a second writer, or a host that appended to a replica
+				// still missing its own history — and saying "rows deleted" sends
+				// the investigation the wrong way.
+				res.SeqGaps = append(res.SeqGaps,
+					fmt.Sprintf("%s: row %s repeats seq %d (duplicate: two rows claim the same position, a forked chain)",
+						host, rec.ID, seq))
+				res.SeqDuplicates++
+			} else if seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
 			}
@@ -586,17 +915,62 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// report a whole cluster's pre-enforcement history as tampering the
 			// day signing is switched on.
 			//
-			// A row with NO sequence is placed by where it sits in the chain
-			// instead. seq 0 is what every pre-v45 row carries, so an attacker
-			// appending one would otherwise sit below any contract start and be
-			// excused for free — and to place it below the start honestly they
-			// would have to link it into the legacy region, which breaks the hash
-			// of every row after it.
-			pos := seq
-			if pos == 0 {
-				pos = seqByHost[host]
+			// seq 0 under a contract. seq 0 is not a position: it is the column
+			// default the v45 migration gave every row written before it, and a
+			// legacy host adopts at startSeq 0. Reading it as "after the start"
+			// (the old `seq == 0 ||`) reported an upgraded cluster's whole
+			// history as tampering the day signing came on, which is the false
+			// alarm the contract start exists to prevent.
+			//
+			// It cannot simply be excused either. Since v45 InsertAuditLog
+			// assigns seq = tail+1 >= 1 to every row it writes, so no daemon
+			// writes a seq-0 row after the upgrade — but anyone who can write
+			// the table can, and an unconditional excuse would make seq 0 the
+			// free way to forge an unsigned row under a contract.
+			//
+			// So a seq-0 row is placed by the chain instead. The walk orders by
+			// seq, so a host's seq-0 rows form one region ahead of all its
+			// numbered rows, and the host's first numbered row was chained onto
+			// the tail of that region when it was written. Its stored hash
+			// therefore commits to every seq-0 row before it. The region is
+			// excused only if every row in it, and that first numbered row,
+			// link: a row spliced in anywhere — appended after the legacy tail,
+			// or chained onto a post-upgrade row and sorted back by its seq of 0
+			// — breaks a link the real history committed to, and the whole
+			// region is reported, since the verifier cannot tell which of its
+			// rows is the stranger.
+			//
+			// A host with no numbered row yet (upgraded and adopted, idle since)
+			// has nothing committing to its region, and it is excused if it is
+			// internally linked. That is deliberate. With no post-upgrade anchor
+			// the region is unsigned, unanchored history that anyone able to
+			// write the table could already rewrite and re-hash undetected; an
+			// appended row is no more than that. Flagging the region instead
+			// says "tampered" for every honest idle host and for an attacked one
+			// alike, which distinguishes nothing. Once the host writes, its first
+			// row is chained onto the tail it holds, and a row appended after
+			// that tail was loaded breaks the link and is reported here.
+			contract, underContract := contracted[host]
+			if underContract && seq == 0 {
+				run := legacy[host]
+				if run == nil {
+					run = &legacyRun{}
+					legacy[host] = run
+					legacyOrder = append(legacyOrder, host)
+				}
+				if run.resolved {
+					// Cannot happen in seq order; never excuse what cannot be placed.
+					res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+						"%s: row %s carries no signature and no sequence", host, rec.ID))
+					continue
+				}
+				run.ids = append(run.ids, rec.ID)
+				if !linked {
+					run.broken = true
+				}
+				continue
 			}
-			if contract, underContract := contracted[host]; underContract && pos > contract.startSeq {
+			if underContract && seq > contract.startSeq {
 				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
 					"%s: row %s carries no signature, but this host has a published signing "+
 						"certificate and no retirement", host, rec.ID))
@@ -628,10 +1002,59 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 	}
 
+	// Regions no numbered row closed: excused when internally linked (see "seq 0
+	// under a contract"), reported when not.
+	for _, host := range legacyOrder {
+		if run := legacy[host]; !run.resolved && run.broken {
+			flagLegacy(host)
+		}
+	}
+
+	// On a host with a second genesis its two chains interleave by seq, so
+	// rows there are unlinked against the walk's running tail as a matter of
+	// course. Only a row that links to a row of its own host, one seq before
+	// it, is part of a chain; one whose stored prev_hash names no such row
+	// lost its predecessor — deleted inside the seq range the other chain
+	// covers, where no seq jump shows it — or was relinked to a row at another
+	// seq, and is an orphan.
+	for _, u := range unlinked {
+		if !forkedHost[u.host] {
+			res.UnlinkedOutsideForks++
+			continue
+		}
+		if u.prev == "" && u.seq == 1 {
+			continue // a genesis
+		}
+		pseq, ok := seqOfHash[u.host][strings.ToLower(u.prev)]
+		if ok && (u.seq == 0 || pseq == u.seq-1) {
+			continue
+		}
+		res.Orphaned++
+		var why string
+		switch {
+		case ok:
+			why = fmt.Sprintf("which is the hash of row seq %d of %s, not seq %d — renumbered or relinked", pseq, u.host, u.seq-1)
+		case u.seq == 0:
+			why = fmt.Sprintf("which is the hash of no row of %s — a seq-0 row whose predecessor is gone", u.host)
+		default:
+			why = fmt.Sprintf("which is the hash of no row of %s at seq %d — the row before it was deleted (or rewritten)", u.host, u.seq-1)
+		}
+		res.Orphans = append(res.Orphans, fmt.Sprintf("%s: row %s (seq %d) follows prev_hash %s, %s",
+			u.host, u.id, u.seq, u.prev, why))
+	}
+
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {
 		return res, err
 	}
 	return res, nil
+}
+
+// legacyRun is one contracted host's unsigned seq-0 rows, pending until the
+// chain places them (VerifyAuditChain, "seq 0 under a contract").
+type legacyRun struct {
+	ids      []string
+	broken   bool // a row in the region, or the row closing it, failed to link
+	resolved bool // the host's first numbered row has been reached
 }
 
 // isUnknownKeyErr separates "we could not obtain a trustworthy public key" from
@@ -717,18 +1140,23 @@ func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, err
 const auditResealGuardedSQL = `UPDATE audit_log SET prev_hash = ?, content_hash = ?
 	 WHERE id = ? AND (signature IS NULL OR signature = '')`
 
-// resealHostChainLocked walks hostName's rows oldest-first, recomputes the
+// resealHostChainLocked walks hostName's rows in authored (seq) order, recomputes the
 // per-host prev_hash/content_hash chain, and UPDATEs any row whose stored
-// content_hash differs. Returns the resealed tail hash + rows rewritten.
+// content_hash differs.
+//
+// The order has to be the verifier's. Reseal WRITES the chain it computes, and
+// the write replicates, so walking these rows in an order the verifier does not
+// share does not repair a chain — it rewrites a correct one into a shape every
+// peer then reports as broken. Returns the resealed tail hash + rows rewritten.
 // Caller must hold auditChainState.mu. A host authors all its own rows
 // locally, so the local DB has the complete sub-chain even right after a
 // restart (replication only brings OTHER hosts' rows).
 func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
 	rows, err := c.Query(ctx,
-		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature
+		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature, seq
 		 FROM audit_log
 		 WHERE host_name = ?
-		 ORDER BY timestamp ASC, id ASC`, hostName)
+		 ORDER BY seq ASC, timestamp ASC, id ASC`, hostName)
 	if err != nil {
 		return "", 0, fmt.Errorf("list host audit rows: %w", err)
 	}
@@ -837,4 +1265,32 @@ func HostManualFenceConfirmed(ctx context.Context, c *Client, host string, now t
 		}
 	}
 	return false, nil
+}
+
+// raisesStampCeiling reports whether a newly generated stamp is later than the
+// current ceiling, comparing INSTANTS rather than strings.
+//
+// The two sides are not the same format. A generated stamp is fixed-width
+// nowTSLayout; the ceiling comes back verbatim from audit_log and may be a
+// legacy RFC3339Nano value with trailing zeros trimmed. A string compare then
+// gets it exactly backwards whenever the new stamp extends the stored one as a
+// prefix — '.' is 0x2E and 'Z' is 0x5A, so "…10:00:00.000000001Z" sorts BEFORE
+// "…10:00:00Z" though it is a nanosecond later. The ceiling never rose past such
+// a row, and stampAfter went on returning prev+1ns from that same unchanged
+// ceiling, so every row written while the clock was behind carried an identical
+// timestamp — the strict ordering the clamp exists to preserve.
+//
+// An unparseable side falls back to the string compare rather than to a verdict:
+// it is the only ordering information left, and treating garbage as "later"
+// would let one bad row pin the ceiling for good.
+func raisesStampCeiling(stamp, ceiling string) bool {
+	if ceiling == "" {
+		return true
+	}
+	newT, nerr := time.Parse(time.RFC3339Nano, stamp)
+	oldT, oerr := time.Parse(time.RFC3339Nano, ceiling)
+	if nerr != nil || oerr != nil {
+		return stamp > ceiling
+	}
+	return newT.After(oldT)
 }

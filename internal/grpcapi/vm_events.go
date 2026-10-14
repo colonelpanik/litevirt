@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -55,7 +56,11 @@ func (s *Server) ListVMEvents(ctx context.Context, req *pb.ListVMEventsRequest) 
 	if err := RequireRole(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	rows, err := corrosion.ListVMEvents(ctx, s.db, req.VmName, int(req.Limit), req.Since)
+	window, err := parseTimeWindow(req.Since, "", time.Now())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := corrosion.ListVMEventsWindow(ctx, s.db, req.VmName, int(req.Limit), window)
 	if err != nil {
 		return nil, err
 	}

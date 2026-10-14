@@ -28,6 +28,10 @@ transitions and backup outcomes (e.g. when a VM failed to back up).`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// History mode: a VM name was given.
 			if len(args) == 1 {
+				since, _, err := resolveTimeBounds(since, "")
+				if err != nil {
+					return err
+				}
 				return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 					resp, err := c.ListVMEvents(ctx, &pb.ListVMEventsRequest{
 						VmName: args[0], Limit: limit, Since: since,
@@ -77,6 +81,6 @@ transitions and backup outcomes (e.g. when a VM failed to back up).`,
 
 	cmd.Flags().StringSliceVar(&types, "type", nil, "Filter live stream by event type (comma-separated, e.g. vm.created,vm.deleted)")
 	cmd.Flags().Int32Var(&limit, "limit", 50, "History mode: max events to return")
-	cmd.Flags().StringVar(&since, "since", "", "History mode: only events at/after this RFC3339 timestamp")
+	cmd.Flags().StringVar(&since, "since", "", "History mode: only events at/after this time (RFC3339, a date like 2026-06-01, or a duration ago like 24h)")
 	return cmd
 }

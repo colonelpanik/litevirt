@@ -54,6 +54,26 @@ Two columns join the audit row to the chain:
 | `prev_hash` | TEXT (SHA-256 hex) | every new row — the previous **same-host** row's `content_hash` |
 | `content_hash` | TEXT (SHA-256 hex) | every new row — `SHA256(prev_hash || canonical(row))` |
 
+`canonical(row)` is each field name and value, NUL-separated:
+`prev_hash NUL id NUL <id> NUL timestamp NUL <timestamp> NUL … result NUL <result> NUL`.
+That encoding is collision-free **only while no value contains a NUL byte** —
+with one, a value can forge a field boundary (target `a\0detail\0b` with detail
+`c` hashes the same as target `a` with detail `b\0detail\0c`), and since a
+signature covers the content hash and `seq` and nothing else, it would verify
+either row. Without NULs the encoding parses back one way only, so the daemon
+keeps every row it writes NUL-free rather than changing the format:
+
+- `username`, `target` and `detail` carry request text — a login records the
+  submitted username before anything has checked it — so a NUL there is replaced
+  with `␀` (U+2400) and the row is written. Refusing it would let whoever chose
+  the input leave no audit row at all.
+- `id`, `timestamp`, `host_name`, `action` and `result` are set by the daemon
+  and matched by exact value, so a NUL in one is a bug and the row is refused.
+
+`verify` reports any row that does carry a NUL — written by an older build or
+straight into the table — as **ambiguous** (see [Verifying](#verifying)). Rows
+without one hash exactly as they always have.
+
 The first row of each host's sub-chain has `prev_hash = NULL`. Rows with a NULL
 `content_hash` (written before the chain columns existed) **and** rows with no
 host identity (background-context writes such as the failover coordinator's, now
@@ -88,12 +108,51 @@ lv audit ls --target /projects/acme --action vm.start
 
 `--target` matches the exact target path; `--action` matches an action,
 with a trailing `*` acting as a prefix glob; `--user` filters by
-username; `--since` takes an RFC3339 timestamp (entries at/after it).
+username; `--since` keeps entries at or after a time (see [Time
+bounds](#time-bounds)).
 
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
 - What did `alice` do today? — `lv audit ls --user alice --limit 200`
 - What touched the firewall recently? — `lv audit ls --action 'sg.*' --since 2026-06-01T00:00:00Z`
+
+### Time bounds
+
+`--since` on `lv events <vm>`, and `--since` / `--until` on `lv audit ls` and
+`lv audit export`, are read as times and compared as instants. Each takes:
+
+- an RFC3339 timestamp, with or without a fraction (`.` or `,`), in UTC or with
+  an offset: `2026-10-03T22:16:30Z`, `2026-10-04T00:16:30+02:00`,
+  `2026-10-03T22:16:30.5Z`;
+- the same without a zone, or with a space for the `T`, read as UTC;
+- a minute, hour, date, month or year: `2026-10-03T22:16`, `2026-10-03T22`,
+  `2026-10-03`, `2026-10`, `2026`;
+- a Unix time in seconds, any bare integer other than a four-digit year:
+  `1791065790`. `--since 0` is the beginning, so it still returns every row;
+- a duration, meaning that long ago: `90m`, `24h`. A duration needs a unit.
+
+A bound covers the whole unit it names: `--since` starts at the beginning of it
+and `--until` runs to the end. So `--until 2026-06-30` includes all of 30 June,
+and `--since 2026-10-03T22:16:30Z` includes a row stamped
+`22:16:30.767241380Z`. `--until 9999-12-31T23:59:59Z` matches every row. A bound that lands past
+9999-12-31T23:59:59.999999999Z once converted to UTC (a year-9999 bound with a
+negative offset) is clamped to it: as `--until` it still matches every row, as
+`--since` it matches nothing after that instant.
+Anything else is refused with `InvalidArgument` and a message naming the bound.
+
+The CLI resolves the bound itself and sends the daemon a fixed-width UTC stamp
+(`2026-10-03T22:16:30.000000000Z`), so a daemon not yet upgraded, which still
+compares the bound as text, draws the window in the right place too, and a
+relative bound is fixed once for every page of an export. `lv mcp` does the
+same for the `since` / `until` arguments of its tools. A client calling the
+API directly with any other form gets the right answer only from an upgraded
+daemon.
+
+Before this, the bound was compared to the stored stamp as text. The stamps are
+fixed-width UTC with nine fractional digits, and `.` sorts below `Z`, so
+`--since` with a whole second dropped every row inside that second. An offset
+bound was wrong by the offset, and `--since 24h` sorted below every stamp and
+matched every row.
 
 ## Verifying
 
@@ -103,8 +162,11 @@ lv audit verify
 ```
 
 `verify` walks **each host's sub-chain** (rows ordered by `host_name`, then
-timestamp, then id) and recomputes each row's hash against the previous
-same-host row. On top of that it checks each row's signature, its per-host
+`seq`, then timestamp and id) and recomputes each row's hash against the
+previous same-host row. `seq` is the per-host counter assigned when the row
+was appended, in the same locked section as `prev_hash`, so it is the append
+order — a timestamp is only the writer's clock reading, and a clock can go
+backwards. On top of that it checks each row's signature, its per-host
 sequence number, and the signed chain heads — a hash can be recomputed by
 whoever edited the row, a signature cannot.
 
@@ -112,13 +174,44 @@ It does **not** stop at the first problem. One broken id says nothing about
 whether the rest of the log was rewritten too, so every finding is printed,
 grouped by what it means:
 
-- **hash mismatch** — a row was edited, or a row before it was deleted, or a
-  migration replayed the table without rebuilding hashes (operator error).
+- **hash mismatch** — a row was edited, or a migration replayed the table
+  without rebuilding hashes (operator error). The row does not hash to its
+  stored `content_hash` even against its own stored `prev_hash`.
+- **forked chain** — the row has the whole shape of a second genesis: it
+  hashes correctly against its own stored `prev_hash`, that `prev_hash` is
+  empty, and it is a second `seq 1` for a host that already has one. Expect the
+  duplicate seqs under **sequence break**. The hash shows no edit to the row,
+  but it is still a finding, and `verify` still exits non-zero. On an
+  **unsigned** row this is also exactly what a rewrite looks like that blanked
+  `prev_hash`, recomputed the hash and renumbered the row to seq 1: seq is
+  covered only by the signature, so nothing can tell the two apart. A signed
+  row rewritten that way also shows a **bad signature**.
+- **broken link** — the row hashes correctly against its own stored
+  `prev_hash`, but that is not the hash of the row before it, and the row is not
+  a second genesis. A row between them was deleted or rewritten, the chain
+  branched, or this row was rewritten together with its `prev_hash` and hash
+  (possible undetected only on an unsigned row; a signed one also shows a bad
+  signature).
+
+  Only the first broken link is named, under whichever of these three headings
+  fits it. A daemon too old to classify the break is shown as a hash mismatch.
 - **bad signature** — the row was edited by someone without the authoring
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
   cluster CA.
-- **sequence gap** — a run of rows was deleted from one host's chain.
+- **sequence break** — a jump in one host's numbering (a run of rows was
+  deleted from its chain), or a **duplicate**: two rows claiming the same seq,
+  which is a forked chain — a second writer, or a host that appended to a
+  replica still missing its own history — and is labelled as one rather than as
+  a deletion.
+- **orphaned** — on a host whose chain forked, a row whose stored `prev_hash`
+  is the hash of no row of that host one seq before it: the row before it was
+  deleted or rewritten, or the row was renumbered or relinked. The two chains
+  of a forked host interleave by seq, so the deletion leaves no sequence
+  break; this lists each such row by host, id and seq. A
+  fork whose only other findings are its duplicate seqs is reported as a
+  forked chain by the hourly check and headed `AUDIT CHAIN FORKED` by
+  `lv audit verify`; one with an orphaned row is reported as tampering.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist.
 - **retired key used** — a row signed by a key past the sequence at which it was
@@ -127,13 +220,17 @@ grouped by what it means:
 - **unsigned after signed** — a host under a signing contract (see below)
   produced a row with no signature.
 
-Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
+Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`, except a fork
+whose only other findings are its duplicate seqs, which prints `AUDIT CHAIN FORKED`.
 
-There is a **third outcome** between intact and tampered, currently holding one
-finding — `never adopted`, below. It exits non-zero and prints `PART OF THIS LOG
-COULD NOT BE VERIFIED`, but it does not say tampered, because it is inferred from
-a row any peer can write rather than from something only a key holder could
-produce. The distinction is not pedantry: a verdict anyone can manufacture, and
+There is a **third outcome** between intact and tampered, currently holding two
+findings — `never adopted`, below, and **ambiguous**: a row with a NUL byte in
+a hashed field, whose hash and signature would verify a different row equally
+well (see the encoding above). It exits non-zero and prints `PART OF THIS LOG
+COULD NOT BE VERIFIED`, but it does not say tampered: `never adopted` is inferred
+from a row any peer can write rather than from something only a key holder could
+produce, and an ambiguous row may have been written verbatim by an older build.
+The distinction is not pedantry: a verdict anyone can manufacture, and
 that an operator cannot clear, is what teaches people to stop reading the output.
 
 **Unsigned rows on their own are not tampering.** Rows written before signing was
@@ -434,9 +531,64 @@ lv audit export --since 2026-06-01T00:00:00Z --until 2026-06-30T23:59:59Z --out 
 `export` emits a JSON document suitable for write-once-read-many
 offload (S3 Object Lock, immutable filesystem snapshot, tape archive).
 `--out <file>` writes the JSON to a file (default stdout); `--since` /
-`--until` bound the export window (both RFC3339, inclusive).
-The export includes every chain field so an external system can
-re-verify without contacting the daemon.
+`--until` bound the export window (both inclusive; every form in [Time
+bounds](#time-bounds) works).
+The export includes every `audit_log` chain field — `seq`, `key_id` and
+`signature` among them — ordered the same way `verify` walks, so an external
+system can recompute each host's hash chain in the right order without
+contacting the daemon.
+
+Alongside them it carries the replicated state `verify` reasons over, under
+the keys `chain_heads`, `signing_keys` and `key_lifecycle`, plus the cluster
+CA as `ca_pem`: the signed chain heads that make a truncated tail detectable,
+the certificates a `key_id` resolves through, the adoption and retirement
+events that bound each host's signing contract, and the root those
+certificates have to chain to. Without the heads a truncated chain replays
+clean — a backward-linked chain has nothing pointing forward, so cutting the
+last N rows leaves every surviving link valid. Without the contracts an
+unsigned row cannot be told from one written before the host committed to
+signing. Without the CA a certificate can be read but not attributed to this
+cluster.
+
+Rows in those three tables are exported **including** any marked deleted.
+That is deliberate and matches the verifier, which does not filter
+`deleted_at` on them either. Deleting a chain head is the efficient attack on
+truncation detection, so a tombstone has to be inert in both places — an
+export that honoured one would report clean on exactly the cluster the daemon
+reports as tampered.
+
+The export is paginated, and every way of asking for it assembles the pages for
+you: `lv audit export`, the web UI's Export button, and `GET
+/api/v1/audit/export` each follow the cursor to the end and hand back one
+document. None of them can return a partial chain — a caller that stopped at
+page one would produce a file that is complete in form and truncated in fact,
+which is the one failure an attestation must not have. The page size exists
+because the response is a unary gRPC message against a 64 MiB server cap, and a
+chain worth attesting to is larger than that.
+
+The web UI and the REST endpoint assemble the document in the daemon's own
+memory, so they refuse a chain over 256 MiB of rows rather than risk the OOM
+killer. `lv audit export` has no such limit: it writes the pages to a spool
+file as they arrive, and the spool becomes the output (`--out`, or stdout) only
+once the whole walk has succeeded. A refused export leaves no file and prints
+nothing.
+
+An export is also refused when the server reports a **sequence gap** — a seq
+missing from a host's chain — listed per gap under `seq_gaps`. Usually that is
+replication still delivering a partitioned host's backlog, and a re-run a little
+later succeeds. A gap that persists is rows missing from the chain, and
+`lv audit export --allow-gaps` exports it anyway, with every gap listed under
+`seq_gaps`, so the rest of the chain can be examined. That document is for
+investigation, not attestation: replayed offline it shows a chain break at each
+listed gap, exactly as `lv audit verify` reports one. Under `--since` /
+`--until`, a row the window leaves out is not a gap; only a seq the host has no
+row for at all is reported.
+
+One limit remains, and it is inherent: `--since` / `--until` bound the window
+by timestamp, so a window starting mid-chain exports a fragment whose first
+row links to a row outside it. Narrow the window to answer a question about a
+period; export the whole chain to attest to it. Size is no longer a reason to
+narrow it.
 
 Pair with the cluster's storage offload (Ceph snapshot, ZFS send to a
 WORM target, periodic rsync to glacier) for a tamper-evident regulator
@@ -451,20 +603,27 @@ sign the resulting JSON with a separate signing key.
   computed on the writer host at insert time and replicated as normal
   column values, but each row's `prev_hash` links only to the previous row
   written by the **same** host — so each host has an independent sub-chain.
-  `verify` walks the rows ordered by `host_name` and validates each host's
-  sub-chain against a per-host running tail. Because a host only authors its
+  `verify` walks the rows ordered by `host_name`, then `seq`, and validates
+  each host's sub-chain against a per-host running tail. Because a host only authors its
   own rows, concurrent inserts on different hosts can't fork a single chain,
   and a missing or altered row still breaks that host's sub-chain.
-- A clock skew that violates HLC's `MaxSkewMS` is clamped, so a wildly
-  wrong host clock cannot reorder audit rows in a way that breaks the
-  chain.
+- Audit stamps come from each host's wall clock, not from the HLC, so
+  `MaxSkewMS` does not bound them. Two other things stop a wrong clock
+  reordering a sub-chain: the walk orders by `seq`, which is assigned under
+  the chain lock and so cannot disagree with `prev_hash`; and a stamp the
+  daemon generates is clamped to the host's own tail, so it never goes
+  backwards. After a backward step that clamp makes a stamp as much as the
+  step too high — a row can read slightly late, but the order is real. A
+  timestamp supplied by a caller is stored exactly as given.
 - Verification is O(N) over chain length, and the daemon runs it hourly on
   its own rather than waiting to be asked: a check that only happens when an
   operator types `lv audit verify` finds an intrusion after whatever prompted
   them to look. The outcome is published as
-  `litevirt_audit_chain_last_verified_ok` (1 when the last check found no
-  evidence of tampering), with a per-kind breakdown in
-  `litevirt_audit_chain_findings` and a
+  `litevirt_audit_chain_last_verified_ok` (1 when the last check found the
+  chain intact), with a per-kind breakdown in
+  `litevirt_audit_chain_findings` (a forked chain is `forked_chain` and its
+  repeated seqs `seq_duplicate`, not `broken_hash` and `seq_gap`; its log line
+  says "found a forked chain", not "evidence of tampering") and a
   `litevirt_audit_chain_heads_published_total` counter. Alert on the first
   going to 0; a stalled head counter means truncation detection has quietly
   stopped.

@@ -375,50 +375,7 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			slog.Warn("audit chain verification failed to run", "error", err)
 			return
 		}
-		// "ok" means verified clean, so an unverifiable log is not ok — a host that
-		// cannot read its signing key must not report a green gauge. Kept separate
-		// from the Error branch below, which is reserved for actual evidence.
-		metrics.AuditChainVerified(d.cfg.HostName, !res.Tampered() && !res.Unverified(), map[string]int{
-			"broken_hash":   boolCount(res.BrokenAt != ""),
-			"bad_signature": len(res.BadSignature),
-			"unknown_key":   len(res.UnknownKeyID),
-			"seq_gap":       len(res.SeqGaps),
-			"laundered":     len(res.Laundered),
-			"truncated":     len(res.TruncatedHosts),
-			"retired_key":   len(res.RetiredKeyUse),
-			"head_mismatch": len(res.HeadMismatch),
-			"unsigned":      res.Unsigned,
-			// Distinct from "unsigned", which is ordinary pre-enforcement
-			// history and must stay alertable-on separately: this one is a
-			// tamper finding, and it is what a node writing rows it cannot sign
-			// leaves behind.
-			"unsigned_after_signed": len(res.UnsignedAfterSigned),
-			// A host that declares it signs and demonstrably cannot. Its own
-			// node cannot raise this — it has no keyring to verify with — so the
-			// alert has to come from the peers that can. Counted, and worth
-			// alerting on, but NOT a tamper finding: the certificate row it reads
-			// is unauthenticated, so any peer can manufacture one.
-			"never_adopted": len(res.NeverAdopted),
-		})
-		if res.Tampered() {
-			// Error, not warn: this is the one finding in the daemon that means
-			// someone has altered the record of what happened on this cluster.
-			slog.Error("audit chain verification found evidence of tampering",
-				"rows", res.RowsChecked, "broken_at", res.BrokenAt,
-				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
-				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
-				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
-				"truncated_hosts", res.TruncatedHosts)
-		}
-		if res.Unverified() {
-			// Warn, not Error: part of the log went unchecked, which is serious but
-			// is not a claim that anyone interfered — and one of these findings can
-			// be produced by any peer, so an Error here would be a remotely
-			// triggerable page.
-			slog.Warn("audit chain verification could not check part of the log",
-				"rows", res.RowsChecked, "unverifiable", res.Unverifiable,
-				"never_adopted", res.NeverAdopted)
-		}
+		reportAuditVerify(d.cfg.HostName, res)
 	}
 
 	check() // once at startup, so a node that never runs an hour still reports
@@ -434,9 +391,73 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 	}
 }
 
-func boolCount(b bool) int {
-	if b {
-		return 1
+// reportAuditVerify publishes one verification of the chain as metrics and
+// logs what it found, by the kind `lv audit verify` gives it: a forked chain
+// (corrosion.AuditVerifyResult.Forked) is reported as one, and only the other
+// findings as evidence of tampering.
+func reportAuditVerify(host string, res corrosion.AuditVerifyResult) {
+	// "ok" means verified clean, so an unverifiable log is not ok — a host that
+	// cannot read its signing key must not report a green gauge — and neither
+	// is a forked chain, which fails `lv audit verify` too.
+	metrics.AuditChainVerified(host, !res.Tampered() && !res.Unverified(), map[string]int{
+		// Every unlinked row, classified: an edit, a break on a host with no
+		// second genesis, or an orphan on one that has one, is a broken
+		// hash; a fork is a forked chain.
+		"broken_hash":   res.ContentBreaks + res.UnlinkedOutsideForks + res.Orphaned,
+		"forked_chain":  len(res.ForkedHosts),
+		"bad_signature": len(res.BadSignature),
+		"unknown_key":   len(res.UnknownKeyID),
+		"seq_gap":       len(res.SeqGaps) - res.SeqDuplicates,
+		"seq_duplicate": res.SeqDuplicates,
+		"laundered":     len(res.Laundered),
+		"truncated":     len(res.TruncatedHosts),
+		"retired_key":   len(res.RetiredKeyUse),
+		"head_mismatch": len(res.HeadMismatch),
+		"unsigned":      res.Unsigned,
+		// Distinct from "unsigned", which is ordinary pre-enforcement
+		// history and must stay alertable-on separately: this one is a
+		// tamper finding, and it is what a node writing rows it cannot sign
+		// leaves behind.
+		"unsigned_after_signed": len(res.UnsignedAfterSigned),
+		// A host that declares it signs and demonstrably cannot. Its own
+		// node cannot raise this — it has no keyring to verify with — so the
+		// alert has to come from the peers that can. Counted, and worth
+		// alerting on, but NOT a tamper finding: the certificate row it reads
+		// is unauthenticated, so any peer can manufacture one.
+		"never_adopted": len(res.NeverAdopted),
+		// Rows with a NUL in a hashed field: their hash does not determine
+		// their content. Unverified, not tampered.
+		"ambiguous": len(res.Ambiguous),
+	})
+	if res.Tampered() {
+		msg := "audit chain verification found evidence of tampering"
+		if res.Forked() {
+			// Nothing found says a row was edited, deleted or forged: a second
+			// chain was opened under a host name that already had one.
+			msg = "audit chain verification found a forked chain"
+		}
+		// Error, not warn: tampering is the one finding in the daemon that
+		// means someone has altered the record of what happened on this
+		// cluster, and a fork fails verification as it does.
+		slog.Error(msg,
+			"rows", res.RowsChecked, "broken_at", res.BrokenAt, "broken_kind", res.BrokenKind,
+			"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
+			"seq_gaps", len(res.SeqGaps), "seq_duplicates", res.SeqDuplicates, "laundered", len(res.Laundered),
+			"content_breaks", res.ContentBreaks, "unlinked_outside_forks", res.UnlinkedOutsideForks, "orphaned", res.Orphaned, "orphans", res.Orphans, "forked_hosts", res.ForkedHosts,
+			"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
+			"truncated_hosts", res.TruncatedHosts,
+			// Without it, a verdict resting only on unsigned-after-signed rows
+			// logged broken_at="" with every listed count at 0.
+			"unsigned_after_signed", len(res.UnsignedAfterSigned),
+			"never_adopted", len(res.NeverAdopted), "ambiguous", len(res.Ambiguous))
 	}
-	return 0
+	if res.Unverified() {
+		// Warn, not Error: part of the log went unchecked, which is serious but
+		// is not a claim that anyone interfered — and one of these findings can
+		// be produced by any peer, so an Error here would be a remotely
+		// triggerable page.
+		slog.Warn("audit chain verification could not check part of the log",
+			"rows", res.RowsChecked, "unverifiable", res.Unverifiable,
+			"never_adopted", res.NeverAdopted, "ambiguous", res.Ambiguous)
+	}
 }

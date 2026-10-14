@@ -1412,8 +1412,8 @@ message ListAuditLogRequest {
     string target = 2;   // filter: exact target path (empty = any)
     string action = 3;   // filter: exact, or trailing-* prefix glob e.g. "sg.*" (empty = any)
     string user   = 4;   // filter: exact username (empty = any)
-    string since  = 5;   // filter: timestamp >= since, RFC3339 (empty = open)
-    string until  = 6;   // filter: timestamp <= until, RFC3339 (empty = open)
+    string since  = 5;   // filter: at/after since, as an instant (forms as ExportAuditChainRequest; empty = open)
+    string until  = 6;   // filter: up to the end of until (forms as ExportAuditChainRequest; empty = open)
 }
 message AuditEntry {
     string timestamp = 1;
@@ -1431,7 +1431,7 @@ message ListAuditLogResponse { repeated AuditEntry entries = 1; }
 message ListVMEventsRequest {
     string vm_name = 1;
     int32  limit   = 2;  // default 100, max 1000
-    string since   = 3;  // RFC3339; empty = no lower bound
+    string since   = 3;  // at/after, as an instant (forms as ExportAuditChainRequest); empty = no lower bound
 }
 message VMEvent {
     string id        = 1;
@@ -2923,6 +2923,39 @@ message VerifyAuditChainResponse {
     // verdict field that means "not a pass" has to travel with the verdict field
     // that means "not tampering".
     bool unverified = 17;
+    // 18 is left free: the fork's not_signing_hosts holds it, and numbering
+    // past it keeps the two from colliding on the wire when both land.
+    // Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+    // content hash is injective only over NUL-free rows, so such a row's hash
+    // and signature do not determine its content: a different row verifies
+    // the same. A current daemon never writes one. Feeds `unverified`, not
+    // `tampered` — an older build may have written the row verbatim.
+    repeated string ambiguous_rows = 19;
+    // What kind of break broken_at_id is, so a client can name it rather than
+    // calling every broken link an edit:
+    //   "content"  - the row does not hash to its own stored content_hash,
+    //                even against its own stored prev_hash: it was edited.
+    //   "forked"   - the row hashes correctly against its own stored prev_hash,
+    //                which is empty: it opens a second chain under a host name
+    //                that already has one (a rebuilt host appending before its
+    //                history arrived). Still a finding.
+    //   "unlinked" - the row hashes correctly against its own stored prev_hash,
+    //                but that is not the hash of the row before it: a row
+    //                before it was deleted or rewritten, or the chain branched.
+    // Empty when broken_at_id is, and from a daemon older than this field,
+    // which a client reads as "content" — the only label it used to have.
+    string broken_at_kind = 20;
+    // Rows on a host whose audit chain forked (a second genesis) whose
+    // stored prev_hash is the hash of no row of that host one seq before
+    // them: the row before each was deleted. Its two chains interleave by
+    // seq, so such a deletion leaves no seq gap; this names it.
+    repeated string orphaned_rows = 21;
+    // True when tampered is set and the only finding is a forked chain: a
+    // second chain opened under a host name that already had one, with no
+    // edited, deleted or forged row found. Still a failure; it only changes
+    // how a client names it. Absent from an older daemon, which a client
+    // reads as false and so keeps the tampered wording.
+    bool forked = 22;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
@@ -3014,17 +3047,40 @@ message RetireAuditKeyResponse {
 }
 
 message ExportAuditChainRequest {
-    // ISO-8601 / RFC3339 timestamps (UTC). Empty since/until means
-    // "from the beginning" / "to the end".
+    // Time bounds, both inclusive, compared as instants: RFC3339 (any offset),
+    // a date or coarser, or a duration ago (corrosion.ParseTimeWindow; until
+    // runs to the end of the unit it names). Unparseable is InvalidArgument.
+    // Empty since/until means "from the beginning" / "to the end".
+    //
+    // A window that starts mid-chain exports a fragment whose first row links
+    // to a row outside it, which cannot be re-verified. Narrow the window to
+    // answer a question about a period; export the whole chain to attest to it.
     string since = 1;
     string until = 2;
+    // Opaque cursor from a previous response's next_cursor. Empty starts at the
+    // beginning.
+    //
+    // The export is paginated because it is one unary message against a 64 MiB
+    // server send cap, and a chain large enough to matter exceeds it. Without
+    // paging the only workaround is a since/until window — which produces
+    // exactly the fragment that cannot be re-verified, so the failure quietly
+    // converts a complete attestation into a useless one.
+    string cursor = 3;
+    // Audit rows per page. 0 uses the server default.
+    int32 limit = 4;
 }
 message ExportAuditChainResponse {
     // JSON blob — caller writes this to a WORM destination
     // (S3 Object Lock, immutable filesystem, etc.). Format:
-    // {"rows": [{"id":..,"timestamp":..,..,"content_hash":..},...]}
+    // {"rows": [{"id":..,"timestamp":..,..,"content_hash":..,"seq":..},...]}
+    //
+    // The FIRST page (empty request cursor) also carries the state a verifier
+    // needs and cannot derive from the rows: "chain_heads", "signing_keys",
+    // "key_lifecycle" and "ca_pem". Later pages carry rows only.
     string json     = 1;
     int32  row_count = 2;
+    // Non-empty when more rows remain; pass it back as request.cursor.
+    string next_cursor = 3;
 }
 
 // ── tenancy messages ──

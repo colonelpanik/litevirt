@@ -3,6 +3,7 @@ package restapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -29,6 +30,11 @@ type mockGRPC struct {
 	// Embed the client interface so RPCs the mock doesn't exercise (e.g. the
 	// firewall management calls) are satisfied without a hand-written stub.
 	pb.LiteVirtClient
+
+	// exportAuditPages serves a paginated audit export, keyed by the cursor the
+	// caller sends: "" is the first page, and each page names the next. A caller
+	// that ignores NextCursor therefore sees only the first entry.
+	exportAuditPages map[string]*pb.ExportAuditChainResponse
 
 	pingResp        *pb.PingResponse
 	listHostsResp   *pb.ListHostsResponse
@@ -2615,7 +2621,14 @@ func (m *mockGRPC) GetProjectUsage(context.Context, *pb.GetProjectUsageRequest, 
 func (m *mockGRPC) VerifyAuditChain(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.VerifyAuditChainResponse, error) {
 	return &pb.VerifyAuditChainResponse{RowsChecked: 3, Tampered: false}, nil
 }
-func (m *mockGRPC) ExportAuditChain(context.Context, *pb.ExportAuditChainRequest, ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
+func (m *mockGRPC) ExportAuditChain(_ context.Context, in *pb.ExportAuditChainRequest, _ ...grpc.CallOption) (*pb.ExportAuditChainResponse, error) {
+	if m.exportAuditPages != nil {
+		page, ok := m.exportAuditPages[in.GetCursor()]
+		if !ok {
+			return nil, fmt.Errorf("no page for cursor %q", in.GetCursor())
+		}
+		return page, nil
+	}
 	return &pb.ExportAuditChainResponse{Json: `{"rows":[]}`}, nil
 }
 

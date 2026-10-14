@@ -170,20 +170,35 @@ func TestTokenDialOption_WithoutToken(t *testing.T) {
 	}
 }
 
+// TestWithTokenOption_AppendsOption asserts the token option is added when a
+// token exists — stated as one MORE option than the same call without one,
+// rather than as a fixed total, so an unconditional dial option added later
+// does not read as a token appearing from nowhere.
 func TestWithTokenOption_AppendsOption(t *testing.T) {
 	t.Setenv("LV_TOKEN", "tok")
-	opts := withTokenOption(nil)
-	if len(opts) != 1 {
-		t.Errorf("len(opts) = %d, want 1", len(opts))
+	withToken := len(withTokenOption(nil))
+
+	t.Setenv("LV_TOKEN", "")
+	t.Setenv("LV_CONFIG_DIR", t.TempDir())
+	withoutToken := len(withTokenOption(nil))
+
+	if withToken != withoutToken+1 {
+		t.Errorf("with a token: %d options, without: %d — want exactly one more",
+			withToken, withoutToken)
 	}
 }
 
+// TestWithTokenOption_NoToken asserts no token option is added without one, and
+// that the options every CLI call shares survive its absence. The receive limit
+// is one of them: `lv audit export` returns the whole chain in a single message
+// and exceeds gRPC's 4 MiB default, so dropping it would break that command on
+// exactly the clusters it matters for.
 func TestWithTokenOption_NoToken(t *testing.T) {
 	t.Setenv("LV_TOKEN", "")
 	t.Setenv("LV_CONFIG_DIR", t.TempDir())
 	opts := withTokenOption(nil)
-	if len(opts) != 0 {
-		t.Errorf("len(opts) = %d, want 0", len(opts))
+	if len(opts) != 1 {
+		t.Errorf("len(opts) = %d, want 1: the shared call options, no token option", len(opts))
 	}
 }
 

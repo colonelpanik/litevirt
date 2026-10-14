@@ -170,6 +170,17 @@ func New(cfg *Config) (*Daemon, error) {
 // state replicates before the gRPC server stops serving. Best-effort and
 // bounded — it must never block shutdown for long. The caller's ctx is already
 // cancelled (SIGTERM), so this uses a fresh, short-lived context.
+// localMaxRecvMsgSize is the largest response the in-process UI and REST clients
+// will accept from the local daemon.
+//
+// gRPC defaults to 4 MiB. Both gateways serve `audit export`, and one page of
+// that carries up to the server's default page of rows plus the evidence tables
+// and the CA — comfortably past 4 MiB on a busy cluster. Left at the default the
+// export fails at the gateway with a message-size error while the same call over
+// `lv` (which raises its own limit) succeeds, so the failure reads as a broken UI
+// rather than as a limit somebody chose. Matches the CLI's cliMaxRecvMsgSize.
+const localMaxRecvMsgSize = 256 << 20
+
 func (d *Daemon) markRestarting() {
 	mctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -1352,6 +1363,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		localConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
 			grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
 		)
 		if err != nil {
 			slog.Warn("UI gRPC dial failed", "error", err)
@@ -1391,6 +1403,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			restConn, err := grpc.NewClient(fmt.Sprintf("127.0.0.1:%d", d.cfg.GRPCPort),
 				grpc.WithTransportCredentials(credentials.NewTLS(restTLS)),
+				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(localMaxRecvMsgSize)),
 			)
 			if err != nil {
 				slog.Warn("REST gRPC dial failed", "error", err)

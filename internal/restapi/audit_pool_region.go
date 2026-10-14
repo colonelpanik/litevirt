@@ -5,6 +5,7 @@
 package restapi
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auditexport"
 )
 
 // registerAuditPoolRegionRoutes wires the third-pass parity additions.
@@ -60,20 +62,31 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(b)
 }
 
+// handleAuditExport returns the whole audit chain as one document.
+//
+// The RPC pages; this endpoint does not. It takes no cursor, so a client has no
+// way to ask for page two — answering with page one would cap the endpoint at
+// one page forever and hand a compliance poller a fragment. The walk therefore
+// happens here, and next_cursor comes back empty because there is nothing left
+// to fetch.
 func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		jsonError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	resp, err := s.grpc.ExportAuditChain(s.grpcCtx(r), &pb.ExportAuditChainRequest{
-		Since: r.URL.Query().Get("since"),
-		Until: r.URL.Query().Get("until"),
+	since, until := r.URL.Query().Get("since"), r.URL.Query().Get("until")
+	ctx := s.grpcCtx(r)
+
+	body, total, err := auditexport.Assemble(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		return s.grpc.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
+			Since: since, Until: until, Cursor: cursor,
+		})
 	})
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
-	jsonProto(w, resp)
+	jsonProto(w, &pb.ExportAuditChainResponse{Json: string(body), RowCount: int32(total)})
 }
 
 // ── Storage pools ─────────────────────────────────────────────────────────────

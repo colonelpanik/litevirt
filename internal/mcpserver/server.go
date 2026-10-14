@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -201,7 +202,7 @@ func (s *Server) registerTools(m *mcp.Server) {
 	s.addTool(m, "vm_stats", "Fetch live stats for one VM.", objectSchema(map[string]any{"name": stringSchema("VM name.")}, "name"), s.handleVMStats)
 	s.addTool(m, "list_vm_events", "List bounded VM events with detail redacted.", objectSchema(map[string]any{
 		"vm_name": stringSchema("Optional VM name filter."),
-		"since":   stringSchema("Optional RFC3339 lower bound."),
+		"since":   stringSchema("Optional lower bound, from the start of the unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
 		"limit":   integerSchema("Maximum events to return."),
 	}), s.handleListVMEvents)
 	s.addTool(m, "list_containers", "List containers. The current litevirt API supports host filtering only.", objectSchema(map[string]any{
@@ -222,8 +223,8 @@ func (s *Server) registerTools(m *mcp.Server) {
 		"action": stringSchema("Optional action filter."),
 		"target": stringSchema("Optional target path filter."),
 		"user":   stringSchema("Optional username filter."),
-		"since":  stringSchema("Optional RFC3339 lower bound."),
-		"until":  stringSchema("Optional RFC3339 upper bound."),
+		"since":  stringSchema("Optional lower bound, from the start of the unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
+		"until":  stringSchema("Optional upper bound, inclusive of the whole unit it names: RFC3339 with or without a fraction and in UTC, with an offset or with no zone (UTC); a minute, hour, date, month or year (2026-06-01T12:30, 2026-06-01T12, 2026-06-01, 2026-06, 2026); Unix seconds (0 is the beginning); or a duration ago such as 24h."),
 		"limit":  integerSchema("Maximum entries to return."),
 	}), s.handleListAuditLog)
 	s.addTool(m, "list_rebalance_proposals", "List rebalance proposals with bounded output.", objectSchema(map[string]any{
@@ -513,10 +514,29 @@ func (s *Server) handleVMStats(ctx context.Context, args map[string]any) *mcp.Ca
 	return s.ok("vm stats", vmStatsDTO(out.(*pb.VMStats)), false)
 }
 
+// resolveTimeBounds turns a tool's since/until arguments into the fixed-width
+// UTC stamps the daemon stores, as `lv audit ls` does. A daemon older than
+// corrosion.ParseTimeWindow compares the bound to its stamps as TEXT, and a
+// fixed-width UTC stamp is the one form that comparison gets right, so the
+// forms the tool schema advertises (24h, a date, an offset) answer correctly
+// against it too. A bad bound is refused here, before any RPC.
+func resolveTimeBounds(since, until string) (string, string, error) {
+	w, err := corrosion.ParseTimeWindow(since, until, time.Now())
+	if err != nil {
+		return "", "", status.Error(codes.InvalidArgument, err.Error())
+	}
+	s, u := w.Bounds()
+	return s, u, nil
+}
+
 func (s *Server) handleListVMEvents(ctx context.Context, args map[string]any) *mcp.CallToolResult {
 	limit := s.limit(args, "limit")
+	since, _, berr := resolveTimeBounds(stringArg(args, "since"), "")
+	if berr != nil {
+		return s.fail(berr)
+	}
 	out, err := s.rpc(ctx, true, func(ctx context.Context, c pb.LiteVirtClient) (any, error) {
-		return c.ListVMEvents(ctx, &pb.ListVMEventsRequest{VmName: stringArg(args, "vm_name"), Since: stringArg(args, "since"), Limit: int32(limit + 1)})
+		return c.ListVMEvents(ctx, &pb.ListVMEventsRequest{VmName: stringArg(args, "vm_name"), Since: since, Limit: int32(limit + 1)})
 	})
 	if err != nil {
 		return s.fail(err)
@@ -618,14 +638,18 @@ func (s *Server) handleLBStats(ctx context.Context, args map[string]any) *mcp.Ca
 
 func (s *Server) handleListAuditLog(ctx context.Context, args map[string]any) *mcp.CallToolResult {
 	limit := s.limit(args, "limit")
+	since, until, berr := resolveTimeBounds(stringArg(args, "since"), stringArg(args, "until"))
+	if berr != nil {
+		return s.fail(berr)
+	}
 	out, err := s.rpc(ctx, true, func(ctx context.Context, c pb.LiteVirtClient) (any, error) {
 		return c.ListAuditLog(ctx, &pb.ListAuditLogRequest{
 			Limit:  int32(limit + 1),
 			Action: stringArg(args, "action"),
 			Target: stringArg(args, "target"),
 			User:   stringArg(args, "user"),
-			Since:  stringArg(args, "since"),
-			Until:  stringArg(args, "until"),
+			Since:  since,
+			Until:  until,
 		})
 	})
 	if err != nil {

@@ -38,7 +38,15 @@ func InsertVMEvent(ctx context.Context, c *Client, r VMEventRecord) error {
 		r.ID = hex.EncodeToString(b[:])
 	}
 	if r.TS == "" {
-		r.TS = time.Now().UTC().Format(time.RFC3339Nano)
+		// nowTSLayout, not time.RFC3339Nano. ts is compared as TEXT — ListVMEvents
+		// orders by (ts DESC, id DESC) and the per-VM prune partitions by the same
+		// expression — so the stamp's text order has to be its time order.
+		// RFC3339Nano trims trailing zeros, and a trimmed ".12Z" sorts after the
+		// later ".125Z". Fixed width keeps the promise this comment already made.
+		//
+		// Unlike audit rows there is no seq here to fall back on, so the stamp is
+		// the only ordering vm_events has.
+		r.TS = c.now().Format(nowTSLayout)
 	}
 	if r.Result == "" {
 		r.Result = "ok"
@@ -54,9 +62,20 @@ func InsertVMEvent(ctx context.Context, c *Client, r VMEventRecord) error {
 }
 
 // ListVMEvents returns a VM's events newest-first, capped at limit (default 100,
-// max 1000). When since is non-empty (RFC3339) only events at/after it are
-// returned.
+// max 1000). When since is non-empty only events at/after it are returned; it
+// takes every form ParseTimeWindow does.
 func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, since string) ([]VMEventRecord, error) {
+	w, err := ParseTimeWindow(since, "", time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return ListVMEventsWindow(ctx, c, vmName, limit, w)
+}
+
+// ListVMEventsWindow is ListVMEvents over a parsed window. ts is compared as an
+// instant, not as text: a whole-second bound used to sort after every event
+// inside its own second, and an offset bound was wrong by the offset.
+func ListVMEventsWindow(ctx context.Context, c *Client, vmName string, limit int, w TimeWindow) ([]VMEventRecord, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -72,9 +91,9 @@ func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, sinc
 		where = append(where, "vm_name = ?")
 		args = append(args, vmName)
 	}
-	if since != "" {
-		where = append(where, "ts >= ?")
-		args = append(args, since)
+	if pred, pargs := w.Predicate("ts"); pred != "" {
+		where = append(where, pred)
+		args = append(args, pargs...)
 	}
 	if len(where) > 0 {
 		sql += " WHERE " + strings.Join(where, " AND ")
@@ -109,7 +128,12 @@ func ListVMEvents(ctx context.Context, c *Client, vmName string, limit int, sinc
 func PruneVMEvents(ctx context.Context, c *Client, hostName string, infoDays, errDays, maxPerVM int) error {
 	now := time.Now().UTC()
 	if infoDays > 0 {
-		cutoff := now.AddDate(0, 0, -infoDays).Format(time.RFC3339Nano)
+		// nowTSLayout, like the stamps it is compared against. The cutoff is
+		// compared as TEXT, and a trimmed bound does not line up with a
+		// fixed-width stamp: "…00:00:00Z" sorts AFTER "…00:00:00.000000000Z",
+		// because '.' precedes 'Z', so a bare-second cutoff sweeps up the whole
+		// second it was meant to stop at.
+		cutoff := now.AddDate(0, 0, -infoDays).Format(nowTSLayout)
 		if err := c.Execute(ctx,
 			`DELETE FROM vm_events WHERE host_name = ? AND result != 'error' AND ts < ?`,
 			hostName, cutoff); err != nil {
@@ -117,7 +141,7 @@ func PruneVMEvents(ctx context.Context, c *Client, hostName string, infoDays, er
 		}
 	}
 	if errDays > 0 {
-		cutoff := now.AddDate(0, 0, -errDays).Format(time.RFC3339Nano)
+		cutoff := now.AddDate(0, 0, -errDays).Format(nowTSLayout)
 		if err := c.Execute(ctx,
 			`DELETE FROM vm_events WHERE host_name = ? AND result = 'error' AND ts < ?`,
 			hostName, cutoff); err != nil {

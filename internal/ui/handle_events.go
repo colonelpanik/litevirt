@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/auditexport"
 )
 
 // handleEvents renders the unified cluster Events page: recent cluster-wide
@@ -152,7 +154,14 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 	var parts []string
 	if resp.BrokenAtId != "" {
-		parts = append(parts, "hash mismatch at row "+resp.BrokenAtId)
+		switch resp.BrokenAtKind {
+		case "forked":
+			parts = append(parts, "forked chain at row "+resp.BrokenAtId)
+		case "unlinked":
+			parts = append(parts, "broken link at row "+resp.BrokenAtId)
+		default:
+			parts = append(parts, "hash mismatch at row "+resp.BrokenAtId)
+		}
 	}
 	for _, c := range []struct {
 		label string
@@ -170,6 +179,7 @@ func auditTamperSummary(resp *pb.VerifyAuditChainResponse) string {
 		{"retired key use", len(resp.RetiredKeyUse)},
 		{"chain head mismatch", len(resp.HeadMismatch)},
 		{"unsigned row after signing began", len(resp.UnsignedAfterSigned)},
+		{"orphaned row", len(resp.OrphanedRows)},
 	} {
 		if c.n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s(s)", c.n, c.label))
@@ -190,6 +200,9 @@ func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
 	if n := len(resp.NeverAdopted); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d host(s) declaring signed rows they cannot sign", n))
 	}
+	if n := len(resp.AmbiguousRows); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d row(s) whose hash does not determine their content (NUL byte in a field)", n))
+	}
 	if resp.UnverifiableRows > 0 {
 		parts = append(parts, fmt.Sprintf("%d signed row(s) this daemon has no keyring to check", resp.UnverifiableRows))
 	}
@@ -201,10 +214,19 @@ func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
 
 // handleAuditExport streams the audit chain as a downloadable JSON blob suitable
 // for WORM offload. Mirrors `lv audit export [--since --until]`.
+//
+// The RPC pages, so the whole chain is assembled here before a single byte goes
+// to the browser. Writing page one would produce a download that is complete in
+// form and truncated in fact — the one failure this file must not have, since
+// the operator's next step is to archive it and treat it as the record.
 func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
-	resp, err := s.grpc.ExportAuditChain(s.uiBearerCtx(r), &pb.ExportAuditChainRequest{
-		Since: r.URL.Query().Get("since"),
-		Until: r.URL.Query().Get("until"),
+	since, until := r.URL.Query().Get("since"), r.URL.Query().Get("until")
+	ctx := s.uiBearerCtx(r)
+
+	body, _, err := auditexport.Assemble(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		return s.grpc.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
+			Since: since, Until: until, Cursor: cursor,
+		})
 	})
 	if err != nil {
 		http.Error(w, "Export failed: "+err.Error(), http.StatusInternalServerError)
@@ -212,5 +234,5 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", "attachment; filename=audit-export.json")
-	_, _ = w.Write([]byte(resp.Json))
+	_, _ = w.Write(body)
 }

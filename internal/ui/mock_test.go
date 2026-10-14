@@ -193,6 +193,10 @@ type mockGRPC struct {
 	exportAuditResp *pb.ExportAuditChainResponse
 	exportAuditErr  error
 	lastExportReq   *pb.ExportAuditChainRequest
+	// exportAuditPages serves a paginated export, keyed by the cursor the
+	// caller sends: "" is the first page, and each page names the next. A
+	// caller that ignores NextCursor therefore sees only the first entry.
+	exportAuditPages map[string]*pb.ExportAuditChainResponse
 	// Backup schedules
 	createScheduleErr     error
 	lastCreateScheduleReq *pb.CreateBackupScheduleRequest
@@ -1293,6 +1297,13 @@ func (m *mockGRPC) ExportAuditChain(_ context.Context, in *pb.ExportAuditChainRe
 	m.lastExportReq = in
 	if m.exportAuditErr != nil {
 		return nil, m.exportAuditErr
+	}
+	if m.exportAuditPages != nil {
+		page, ok := m.exportAuditPages[in.Cursor]
+		if !ok {
+			return nil, fmt.Errorf("no page for cursor %q", in.Cursor)
+		}
+		return page, nil
 	}
 	if m.exportAuditResp != nil {
 		return m.exportAuditResp, nil

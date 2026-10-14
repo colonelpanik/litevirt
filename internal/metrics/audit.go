@@ -22,14 +22,15 @@ func auditInit() {
 	auditOnce.Do(func() {
 		auditVerified = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "litevirt_audit_chain_last_verified_ok",
-			Help: "1 if the last audit chain verification found no evidence of tampering, 0 otherwise. " +
+			Help: "1 if the last audit chain verification found the chain intact, 0 otherwise: evidence of tampering, " +
+				"a forked chain, or part of the log it could not verify. " +
 				"Unsigned rows do not count as tampering — they predate enforcement.",
 		}, []string{"host"})
 		auditFindings = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "litevirt_audit_chain_findings",
 			Help: "Count of audit chain findings from the last verification, by kind " +
-				"(broken_hash, bad_signature, unknown_key, seq_gap, laundered, truncated, " +
-				"retired_key, head_mismatch, unsigned, unsigned_after_signed).",
+				"(broken_hash, forked_chain, bad_signature, unknown_key, seq_gap, seq_duplicate, laundered, truncated, " +
+				"retired_key, head_mismatch, unsigned, unsigned_after_signed, never_adopted, ambiguous).",
 		}, []string{"kind"})
 		auditHeadTotal = prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "litevirt_audit_chain_heads_published_total",

@@ -377,9 +377,17 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	noop := false
 	if err := s.containerRuntime.StopContainer(ctx, req.Name, int(req.TimeoutSec)); err != nil {
-		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
-		return nil, status.Errorf(codes.Internal, "stop: %v", err)
+		// A container that is already stopped is stopped (lxc-stop answers
+		// "is not running"), as StopVM treats a domain that is not running:
+		// the stop is recorded below. Anything else is still an error.
+		if st, serr := s.containerRuntime.StateContainer(ctx, req.Name); serr != nil || st != "stopped" {
+			s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
+			return nil, status.Errorf(codes.Internal, "stop: %v", err)
+		}
+		slog.Info("container stop: already stopped; recording the stop", "name", req.Name, "error", err)
+		noop = true
 	}
 	// Record operator intent so the container reconciler leaves it stopped (the
 	// container analogue of StopVM's vms.state_detail='operator-stop'). Strict:
@@ -389,7 +397,11 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "stop: record operator-stop intent: %v", err)
 	}
-	s.audit(ctx, "ct.stop", req.Name, "project="+project, "ok")
+	detail := "project=" + project
+	if noop {
+		detail += "; already stopped: nothing was running; the operator's stop is recorded"
+	}
+	s.audit(ctx, "ct.stop", req.Name, detail, "ok")
 	return &emptypb.Empty{}, nil
 }
 

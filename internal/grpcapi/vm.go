@@ -1558,14 +1558,30 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	pbVM := &pb.VM{Name: vm.Name, HostName: vm.HostName, State: pb.VMState_VM_STOPPING}
 	hooks.Run(ctx, hooks.PreStop, pbVM, hspec)
 
+	// A stop of a domain that is already not running is done, not an error
+	// (libvirt answers "domain is not running"), as a start of a
+	// running one is (startVMLocked): the stop is recorded below like any
+	// other. A failure while the domain is active, or when whether it is
+	// cannot be read, is still the error it was.
+	noop := false
+	alreadyStopped := func(op string, err error) bool {
+		active, aerr := s.virt.DomainIsActive(vm.Name)
+		if aerr != nil || active {
+			return false
+		}
+		slog.Info("StopVM: the domain is already not running; nothing to stop", "vm", vm.Name, "op", op, "error", err)
+		noop = true
+		return true
+	}
 	if force {
-		if err := s.virt.DestroyDomain(vm.Name); err != nil {
+		if err := s.virt.DestroyDomain(vm.Name); err != nil && !alreadyStopped("destroy", err) {
 			return nil, status.Errorf(codes.Internal, "destroy: %v", err)
 		}
-	} else {
-		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
+	} else if err := s.virt.ShutdownDomain(vm.Name); err != nil {
+		if !alreadyStopped("shutdown", err) {
 			return nil, status.Errorf(codes.Internal, "shutdown: %v", err)
 		}
+	} else {
 		// Wait for graceful shutdown with timeout, then force-kill.
 		timeout := resolveStopTimeout(timeoutSec, vm.Spec)
 		if timeout > 0 {
@@ -1576,6 +1592,26 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 		}
 	}
 
+	// pending/starting: a start is under way (a failover's, an onboot's, a
+	// self-heal's), and the reconciler will start the domain. A success here
+	// would be overridden by that start, so the stop is refused and nothing is
+	// changed. (Before this change the stop answered Internal here, so nothing
+	// that worked is refused.)
+	if noop && (vm.State == "pending" || vm.State == "starting") {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being started (%s): its domain is not running yet, and the stop was not applied; wait until it runs (`lv inspect %s`), then stop it (`lv stop %s`)",
+			vm.Name, vm.State, vm.Name, vm.Name)
+	}
+	// migrating: the source domain not running here does not mean the guest
+	// is stopped; a migration whose wait gave up can still finish and run it on
+	// the target. Recording a stop would be a false answer, so the stop is
+	// refused and nothing is changed. (It answered Internal before this change
+	// too.)
+	if noop && vm.State == "migrating" {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q is being migrated: its domain is not running on this host, and the stop was not applied; wait until the migration settles (`lv inspect %s`), then stop it (`lv stop %s`)",
+			vm.Name, vm.Name, vm.Name)
+	}
 	// PCI passthrough on stop: under the active hardware_v2 regime a stopped VM
 	// RETAINS its device reservation (host_pci_devices ownership + vfio bind) so
 	// "assigned while off, realized while running" holds — the device stays reserved
@@ -1609,7 +1645,11 @@ func (s *Server) stopVMLocked(ctx context.Context, vm *corrosion.VMRecord, force
 	if err := s.persistVMState(ctx, vm.Name, "stopped", "operator-stop", corrosion.OpVMState); err != nil {
 		return nil, status.Errorf(codes.Internal, "stopped but recording operator-stop failed: %v", err)
 	}
-	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", "")
+	evDetail := ""
+	if noop {
+		evDetail = "already stopped: the domain was not running; the operator's stop is recorded"
+	}
+	s.recordVMEvent(ctx, vm.Name, "vm.stopped", "ok", evDetail)
 
 	// Refresh LB backends so stopped VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)

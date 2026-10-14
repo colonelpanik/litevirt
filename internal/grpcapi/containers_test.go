@@ -34,6 +34,9 @@ type fakeCTRuntime struct {
 	createErr error
 	createOut *ContainerInfo
 	deleteErr error
+	// stopErr is what StopContainer returns, when set (lxc-stop of a
+	// container that is not running fails so).
+	stopErr error
 
 	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
 	// IP — what IPContainer (lxc-info -iH) would return on the LB host. ipCalls
@@ -116,6 +119,9 @@ func (f *fakeCTRuntime) StopContainer(_ context.Context, name string, timeoutSec
 		Name    string
 		Timeout int
 	}{name, timeoutSec})
+	if f.stopErr != nil {
+		return f.stopErr
+	}
 	if f.stopHook != nil {
 		f.stopHook()
 	}

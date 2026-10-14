@@ -132,7 +132,7 @@ func SyncClusterCRL(ctx context.Context, c *Client, pkiDir string) (int64, error
 	if !installed {
 		return 0, nil
 	}
-	slog.Warn("installed the cluster CRL union", "version", version, "members", len(verified))
+	slog.Warn("installed the cluster CRL union", "crl_version", version, "members", len(verified))
 	return version, nil
 }
 

@@ -44,11 +44,11 @@ func newTelemetryCollector() *telemetryCollector {
 	return &telemetryCollector{
 		exportErrors: prometheus.NewDesc(
 			"litevirt_telemetry_export_errors_total",
-			"Cumulative OTLP export failures (logs from vendor snapshot + traces from obs error handler; fail-open). Nonzero and growing means the collector is unreachable or rejecting.",
+			"Cumulative export failures (logs from vendor snapshot + traces from obs error handler; fail-open). The log figure also counts failed writes to the local log output (stderr/journald). Nonzero and growing means the collector is unreachable or rejecting, or local log writes are failing.",
 			nil, nil),
 		dropped: prometheus.NewDesc(
 			"litevirt_telemetry_dropped_total",
-			"Cumulative log records shed because the async export queue was full (backpressure; logs only). Trace drops are unobservable with the obs-owned TracerProvider and are not counted here.",
+			"Cumulative log records not exported: shed because the async export queue was full (backpressure), or refused by consent or log sampling when configured (logs only). Trace drops are unobservable with the obs-owned TracerProvider and are not counted here.",
 			nil, nil),
 		retries: prometheus.NewDesc(
 			"litevirt_telemetry_export_retries_total",

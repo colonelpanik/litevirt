@@ -558,7 +558,7 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// Seed the effective DB-applied schema cache (handshake source of truth).
 	eff := c.RefreshDBSchemaVersion(ctx)
 	slog.Info("schema initialized",
-		"version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
+		"schema_version", eff, "ledger", len(schemaMigrationLedger), "healed", healed)
 	return nil
 }
 

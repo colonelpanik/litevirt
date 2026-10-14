@@ -64,7 +64,7 @@ func newSchemaMigrateCmd() *cobra.Command {
 				return fmt.Errorf("InitSchema: %w", err)
 			}
 			slog.Info("schema migration complete",
-				"db", path, "elapsed", time.Since(start), "version", corrosion.CurrentSchemaVersion)
+				"db", path, "elapsed", time.Since(start), "schema_version", corrosion.CurrentSchemaVersion)
 			return nil
 		},
 	}

@@ -46,7 +46,7 @@ func (s *Server) PublishCRL(ctx context.Context, req *pb.PublishCRLRequest) (*pb
 			err)
 	}
 	installed := installedVersion != 0
-	slog.Warn("cluster CRL published", "version", version, "installed_locally", installed)
+	slog.Warn("cluster CRL published", "crl_version", version, "installed_locally", installed)
 	s.publish("cluster.crl.published", "", fmt.Sprintf("version=%d", version))
 	return &pb.PublishCRLResponse{Version: version}, nil
 }

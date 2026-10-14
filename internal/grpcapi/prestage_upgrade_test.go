@@ -103,6 +103,8 @@ func TestParseStagedSchemaVersion(t *testing.T) {
 	}{
 		{"schema migration complete db=x version=15", 15},
 		{`{"msg":"done","version":42}`, 42},
+		{"schema migration complete db=x elapsed=1s schema_version=17", 17},
+		{`{"msg":"schema migration complete","schema_version":18}`, 18},
 		{"nothing here", 0},
 		{"version=", 0},
 	} {

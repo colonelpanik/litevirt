@@ -121,7 +121,7 @@ func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 		return
 	}
 	upgrade.Clear(binaryPath)
-	slog.Info("post-upgrade watchdog: new binary healthy (local gRPC ping ok)", "version", d.cfg.Version)
+	slog.Info("post-upgrade watchdog: new binary healthy (local gRPC ping ok)", "build_version", d.cfg.Version)
 	metrics.UpgradeWatchdogOutcome("confirmed")
 }
 

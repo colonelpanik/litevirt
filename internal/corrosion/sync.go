@@ -1255,7 +1255,10 @@ func (c *Client) updateProofStepState(tx *sql.Tx, tableName string, pkCols []str
 //   - no local row → take incoming.
 //   - a tombstone (deleted_at set) on exactly one side dominates the live side (a
 //     terminal/GC'd row must beat a delayed live copy) → the tombstoned side wins.
-//   - identical facts (every column except updated_at/deleted_at) → idempotent, keep local.
+//   - identical facts (every column except updated_at/deleted_at) → idempotent, keep local,
+//     UNLESS both sides are tombstoned: then the two copies are one reaped row whose
+//     tombstone metadata differs (two nodes reaped it before either heard of the other,
+//     lab finding F6), and tombstoneTieKeepsLocal picks one copy deterministically.
 //   - differing facts for the SAME primary key → a genuine conflict (two entry nodes
 //     minted one operation id with different request hashes, or two executors recorded
 //     different facts for one step key): keep local AND flag it unresolved. NEVER
@@ -1273,6 +1276,10 @@ func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []i
 		return keepLocal, nil
 	}
 	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx) {
+		if delIdx >= 0 && cellNonEmpty(localRow[delIdx]) {
+			// Both tombstoned (tombstoneDominates decided every mixed case).
+			return tombstoneTieKeepsLocal(localRow, row, updatedAtIdx, delIdx), nil
+		}
 		return true, nil // idempotent re-delivery
 	}
 	// The category is chosen per TABLE, not fixed for this merge, because this one
@@ -1295,6 +1302,33 @@ func tombstoneDominates(localRow, row []interface{}, deletedAtIdx int) (keepLoca
 		return false, false
 	}
 	return localDeleted, true
+}
+
+// tombstoneTieKeepsLocal settles two tombstones of one immutable row whose facts
+// agree, so every node converges on ONE copy instead of each keeping its own.
+//
+// ReapTerminalOperations runs on every node. Two nodes that reap one finished
+// operation before either hears of the other write different (updated_at,
+// deleted_at) pairs, the peer's tombstone then lands on the WAL path as a no-op
+// (its UPDATE is guarded by `deleted_at IS NULL`), and keeping the local copy
+// here left the table digesting differently on every node for good: `lv cluster
+// converge` reported operations and operation_steps DIVERGENT forever.
+//
+// The later tombstone wins, by the replication LWW order on updated_at, then by
+// deleted_at, so the choice is a total order every node computes alike and a
+// row's updated_at only ever moves forward. Which tombstone survives carries no
+// meaning: both say "reaped", and the facts are equal by construction. Identical
+// copies keep local. A node on an older build still keeps its own copy; it does
+// not adopt a peer's, and an upgraded node never adopts one that loses this
+// order, so a mixed cluster does not diverge further and an upgraded cluster
+// heals through the ordinary anti-entropy pull, with no backfill.
+func tombstoneTieKeepsLocal(localRow, row []interface{}, updatedAtIdx, deletedAtIdx int) bool {
+	if updatedAtIdx >= 0 {
+		if ord := lwwOrder(coerceString(localRow[updatedAtIdx]), coerceString(row[updatedAtIdx])); ord != 0 {
+			return ord > 0
+		}
+	}
+	return strings.Compare(coerceString(localRow[deletedAtIdx]), coerceString(row[deletedAtIdx])) >= 0
 }
 
 // rowFactsEqual reports whether two rows agree on every column except the skipped

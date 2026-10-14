@@ -82,10 +82,17 @@ func ClaimBinding(ctx context.Context, c *Client, r BindingRecord) (bool, error)
 	return got.Network == r.Network, nil
 }
 
-// UpsertBinding rewrites an EXISTING binding — used by revalidation and re-key,
-// never to create one. Use ClaimBinding for a new bind. It refuses (returns an
-// error) when no row exists for the prefix, rather than silently creating one
-// — a silent create would bypass ClaimBinding's uniqueness read-back.
+// UpsertBinding rewrites an EXISTING, LIVE binding — used by revalidation and
+// re-key, never to create one. Use ClaimBinding for a new bind. It refuses
+// (returns an error) when no live row exists for the prefix, rather than
+// silently creating one — a silent create would bypass ClaimBinding's
+// uniqueness read-back.
+//
+// A TOMBSTONED row counts as absent. Without that, the `deleted_at = NULL` in
+// the SET clause resurrected a released binding against a network that no
+// longer exists — and worse, ClaimBinding's conflict clause is guarded by
+// `deleted_at IS NOT NULL`, so a cleared tombstone makes the prefix permanently
+// unclaimable. ClaimBinding immediately above carries the same guard.
 func UpsertBinding(ctx context.Context, c *Client, r BindingRecord) error {
 	susp := 0
 	if r.Suspended {
@@ -103,14 +110,14 @@ func UpsertBinding(ctx context.Context, c *Client, r BindingRecord) error {
 		   validated_at = ?,
 		   updated_at = ?,
 		   deleted_at = NULL
-		 WHERE prefix_id = ?`,
+		 WHERE prefix_id = ? AND deleted_at IS NULL`,
 		r.Network, r.ObservedCIDR, r.VRFID, r.ClusterFingerprint, r.NetBoxCluster,
 		susp, r.SuspendReason, c.NowWall(), c.NowTS(), r.PrefixID)
 	if err != nil {
 		return fmt.Errorf("update binding: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("binding for prefix %d does not exist; use ClaimBinding", r.PrefixID)
+		return fmt.Errorf("binding for prefix %d does not exist or was released; use ClaimBinding", r.PrefixID)
 	}
 	return nil
 }

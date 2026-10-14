@@ -1240,23 +1240,18 @@ func sameHostSet(a, b []string) bool {
 
 // ── the leader lease ────────────────────────────────────────────────────────
 
-// acquireNetBoxLease takes/renews the sweeper's leader lease. Same guarded
-// upsert plus read-back as acquireDualRunLease: the conflict clause refuses to
-// steal a lease that has not expired, and the read-back is what makes a lost
-// race observable rather than assumed.
+// acquireNetBoxLease takes/renews the sweeper's leader lease through the
+// shared lease upsert (corrosion.HoldTermlessLease): the conflict clause
+// refuses to steal a lease that has not expired, and the read-back is what
+// makes a lost race observable rather than assumed.
+//
+// It used to carry its own copy of that statement, stamping updated_at as a
+// whole-second wall time. The sweeper, the mirror and a re-key all renew this
+// lease under one holder with different TTLs, so two renewals in one second
+// tied on every peer and the later one was dropped there: the holder led for
+// thirty minutes while its peers saw the lease lapse after two.
 func (s *Server) acquireNetBoxLease(ctx context.Context, interval time.Duration) bool {
-	now := time.Now().UTC().Format(time.RFC3339)
-	expires := time.Now().Add(2 * interval).UTC().Format(time.RFC3339)
-	if err := s.db.Execute(ctx,
-		`INSERT INTO leader_election (key, holder, expires_at, updated_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(key) DO UPDATE
-		   SET holder = excluded.holder,
-		       expires_at = excluded.expires_at,
-		       updated_at = excluded.updated_at
-		   WHERE leader_election.expires_at < ?
-		      OR leader_election.holder = excluded.holder`,
-		netBoxLeaseKey, s.hostName, expires, now, now); err != nil {
+	if _, err := corrosion.HoldTermlessLease(ctx, s.db, netBoxLeaseKey, s.hostName, 2*interval, time.Now()); err != nil {
 		slog.Warn("netbox sweep: lease write", "error", err)
 		return false
 	}

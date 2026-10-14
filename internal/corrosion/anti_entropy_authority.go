@@ -443,6 +443,21 @@ func (c *Client) workloadParentAuthorityDecision(tx *sql.Tx, incoming workloadMe
 				})
 				return mergeAuthorityKeepLocal, nil
 			}
+			if localIsDeleted {
+				// Both are this workload's tombstone at one authority: the
+				// authority has nothing to decide, and the row's LWW and its
+				// tie resolver do, as for two live copies. Applied regardless,
+				// two tombstones differing in a column the authority does not
+				// cover (such as hardware_adoption_state) were exchanged by
+				// pulls in both directions and never settled. No sweep: the
+				// local tombstone's own delete batch (deleteVMGuardedFrom),
+				// or the merge that brought it, tombstoned the children. A
+				// stray live child that lands under the tombstone later — a
+				// replicated child upsert is not fenced against a tombstoned
+				// parent — is out of scope here; the old path swept one only
+				// when the two tombstones happened to differ.
+				return mergeAuthorityNormal, nil
+			}
 			return mergeAuthorityApplyIncomingAndSweep, nil
 		}
 		return mergeAuthorityNormal, nil
@@ -644,6 +659,15 @@ func (c *Client) operationStepAuthorityKeepsLocal(tx *sql.Tx, table syncTable, r
 
 	// Non-create journals retain their existing immutable merge behavior.
 	if local.OperationKind != string(OpWorkloadCreate) {
+		return false, nil
+	}
+	// A reaped create operation: the header is tombstoned on both sides and the
+	// incoming step is a tombstone too. It binds no workload to anything, so the
+	// immutable merge decides it — that is how two nodes' concurrent reaps of one
+	// operation converge on one step row (tombstoneTieKeepsLocal). Without this,
+	// each node kept its own step tombstone forever.
+	if local.DeletedAt != "" && inManifest && sourceOp.valid && sourceOp.DeletedAt != "" &&
+		mergeRowIsDeleted(table, row) && sameOperationMergeAuthority(local, sourceOp) {
 		return false, nil
 	}
 	if !inManifest || !sourceOp.valid || sourceOp.DeletedAt != "" || local.DeletedAt != "" ||

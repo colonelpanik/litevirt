@@ -152,15 +152,22 @@ operation on the offending node:
 
 > A pure column-order skew that previously mis-reported here classifies as
 > row-content divergence when the positional (v1) digest is in force. The
-> order-invariant **digest_v2** (below) makes that skew hash identically across
-> nodes, preventing the recurrence entirely — enable it fleet-wide instead of
-> repeatedly running the data remediation above for a column-order-only skew.
+> order-invariant **digest_v2** (below, on by default) makes that skew hash
+> identically across nodes, preventing the recurrence entirely — leave it on
+> fleet-wide instead of repeatedly running the data remediation above for a
+> column-order-only skew.
 
 ### `digest_v2` — the order-invariant table/row digest
 
-The default (v1) content digest hashes each row's cell **values in physical column
+The positional (v1) content digest hashes each row's cell **values in physical column
 order**, so a fresh `CREATE TABLE` node and an `ALTER ADD COLUMN`-upgraded node
-compute different table/row hashes for logically identical data. The merge is
+compute different table/row hashes for logically identical data. That is not a
+corner case: a node founded at an older schema holds every later ALTER's column
+after `deleted_at`, while a fresh node holds it where `CREATE TABLE` declares it,
+and no single `CREATE TABLE` order matches every founding version. `hosts`, `vms`,
+`vm_interfaces`, `snapshots`, `lb_configs`, `users`, `tokens`, `ip_allocations`,
+`containers`, `host_pci_devices` and (for a database created by an early v51
+build) `netbox_bindings` all depend on the founding version. The merge is
 column-**name**-safe, so this never corrupts data — but the hashes stay different
 every cycle, causing perpetual no-op anti-entropy pulls and a standing
 `lv doctor divergence` / `lv cluster digest` mismatch on the reordered tables.
@@ -168,22 +175,25 @@ every cycle, causing perpetual no-op anti-entropy pulls and a standing
 **digest_v2** pairs each value with its column name, sorts by name, and hashes a
 canonical, order-invariant encoding — so column order stops mattering. It is
 negotiated **pairwise by field presence**: a node emits the v2 hash only when its
-own `enforcement.digest_v2` flag is on, and any two peers compare v2 **only when
-both supply it**, otherwise both compare v1. There is no capability latch — the
-digest only *detects*, and each node compares independently, so a non-uniform
-rollout only affects which node pulls, never data. `lv cluster digest` /
+own `enforcement.digest_v2` flag is on (the default), and any two peers compare v2
+**only when both supply it**, otherwise both compare v1. There is no capability
+latch — the digest only *detects*, and each node compares independently, so a
+non-uniform rollout only affects which node pulls, never data. The same rule
+governs every place a digest is compared: anti-entropy,
+`lv cluster converge`, `lv doctor divergence`, and a reseed's convergence check. `lv cluster digest` /
 `lv cluster converge` print a `VER` column showing which version was compared per
 table.
 
-**Activation (do it fleet-uniformly, after every node runs a build that supports it):**
+**Rollout.** It is on by default, so upgrading is the activation: each upgraded
+node emits v2, and each pair of upgraded nodes compares v2. While some nodes still
+run an older build (which emits v1 only, since the flag defaulted off there), every
+comparison involving one of them stays v1 — exactly the behavior before the
+upgrade, so a column-order-only table may still read `DIVERGENT` (`VER v1`) in `lv
+cluster converge` until the last node is upgraded. Then:
 
-1. **Ship** the supporting binary to every node with `enforcement.digest_v2: false`
-   (the default). Flag off ⇒ v1-only emission; behavior is unchanged.
-2. **Converge** — confirm every node is upgraded (`lv host ls`).
-3. **Activate** — set `enforcement.digest_v2: true` in each node's config and
-   rolling-restart the fleet (the same procedure as any other `enforcement.*`
-   flag). Nodes now emit and compare v2 pairwise.
-4. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
+1. **Confirm** every node is upgraded (`lv host ls`) and none sets
+   `enforcement.digest_v2: false`.
+2. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
    Precise outcome:
    - Column-order-only tables **stop pulling** and read converged (`VER v2`).
    - Strictly-newer LWW drift **may** heal (normal LWW), as always.
@@ -258,8 +268,8 @@ tables by their natural key too, so a still-converging group shows as **one**
 content divergence instead of two phantom `missing_row`s; a converged group reads
 clean. The lane engages only when the scanning node has latched (uniform fleet).
 
-**Activation** mirrors `digest_v2`: ship the supporting binary everywhere (flag
-off, behavior-neutral), confirm every node is upgraded, then set
+**Activation**: ship the supporting binary everywhere (flag off,
+behavior-neutral), confirm every node is upgraded, then set
 `enforcement.canonical_identity: true` and rolling-restart. Existing divergent
 pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
 separate data migration. Kill switch: set it `false` and restart (the node reverts

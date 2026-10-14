@@ -275,6 +275,20 @@ func leaseRenewableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC strin
 	return newest == expectTerm, nil
 }
 
+// HoldTermlessLease takes or renews a lease that has no term ledger — the
+// `netbox` key — through the same guarded upsert and the same updated_at clock
+// as every other lease, and reports whether the row names holder afterwards.
+// The expiry and the expiry compare both derive from one read of now.
+//
+// updated_at is the row's LWW key and must come from NowTS: one holder renews
+// the `netbox` lease from three writers with different TTLs, and a receiver
+// drops a renewal whose updated_at ties the row it lands on, so whole-second
+// stamps left every peer on an earlier, shorter expiry than the holder's.
+func HoldTermlessLease(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, error) {
+	base := now.UTC()
+	return renewLease(ctx, c, key, holder, base.Add(ttl).Format(time.RFC3339), base.Format(time.RFC3339))
+}
+
 func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC string) (bool, error) {
 	if err := c.Execute(ctx, leaseUpsertSQL,
 		key, holder, expires, c.NowTS(), nowRFC); err != nil {

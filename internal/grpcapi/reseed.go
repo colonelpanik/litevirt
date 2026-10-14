@@ -319,9 +319,9 @@ func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtCl
 	if err != nil {
 		return 0, "", err
 	}
-	remote := map[string]string{}
+	remote := map[string]*pb.TableDigest{}
 	for _, t := range resp.GetTables() {
-		remote[t.GetName()] = t.GetHash()
+		remote[t.GetName()] = t
 	}
 	verified, mismatch := reseedDigestsConverged(local, remote)
 	return verified, mismatch, nil
@@ -330,7 +330,7 @@ func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtCl
 // reseedDigestsConverged is the convergence DECISION, split from the RPC so the
 // rule that guards an epoch clear is directly testable: it decides whether a
 // reseed earned the right to end a quarantine.
-func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]string) (int, string) {
+func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]*pb.TableDigest) (int, string) {
 	verified := 0
 	for _, t := range local {
 		// Skip what the reseed deliberately KEPT (derived from corrosion's keep
@@ -345,7 +345,11 @@ func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]str
 			// than block a reseed on a benign version difference.
 			continue
 		}
-		if r != t.Hash {
+		// Asked the way anti-entropy asks it: v2 when both sides sent one. A
+		// reseed refills rows but keeps this node's schema, so a node founded at
+		// an older schema holds them in another column order than a freshly
+		// founded source, and a v1-only comparison refused every epoch clear.
+		if !corrosion.TableDigestsAgree(t, r) {
 			return 0, fmt.Sprintf("table %s still differs", t.Name)
 		}
 		verified++

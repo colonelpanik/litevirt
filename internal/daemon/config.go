@@ -371,7 +371,8 @@ type AuthConfig struct {
 // EnforcementConfig holds the per-node kill-switches for the split-brain-family
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
-// behavior regardless of the durable latch. All default false.
+// behavior regardless of the durable latch. All default false, except DigestV2
+// (not a capability token), which LoadConfig defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -425,7 +426,8 @@ type EnforcementConfig struct {
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
 	// presence (no cluster latch): a node emits v2 only when this is on, and two peers
 	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
-	// false; reversible kill switch.
+	// TRUE (LoadConfig presets it): with it off, replicas founded at different schema
+	// versions disagree about identical rows forever. Explicit false is the kill switch.
 	DigestV2 bool `yaml:"digest_v2,omitempty"`
 	// CanonicalIdentity: resolve the natural-key identity tables (snapshots,
 	// container_snapshots) by their UNIQUE natural key instead of the minted random id
@@ -590,6 +592,10 @@ func LoadConfig() (*Config, error) {
 		QuorumLossDemoteAfterSec: 12,
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
+
+		// The enforcement flag that defaults ON — see EnforcementConfig.DigestV2.
+		// An explicit false still wins.
+		Enforcement: EnforcementConfig{DigestV2: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

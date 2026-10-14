@@ -205,14 +205,13 @@ enforcement:
                               # (an old peer could drop max_cpu from a spec it rewrites), after which
                               # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
                               # Enable fleet-uniformly; the flag is the reversible kill switch.
-  digest_v2: false            # emit the order-invariant anti-entropy row digest (digest_v2), which
+  digest_v2: true             # emit the order-invariant anti-entropy row digest (digest_v2), which
                               # pairs each value with its column NAME instead of hashing values in
                               # physical column order — so a fresh-CREATE vs ALTER-upgraded node stop
-                              # showing a permanent column-order divergence. Negotiated PAIRWISE by
-                              # field presence (no latch): two peers compare v2 only when both emit it,
-                              # else both compare v1, so a mixed fleet is always safe. Enable
-                              # fleet-uniformly then run `lv cluster converge --all`. See
-                              # docs/diagnostics.md → "digest_v2".
+                              # showing a permanent column-order divergence. DEFAULT ON. Negotiated
+                              # PAIRWISE by field presence (no latch): two peers compare v2 only when
+                              # both emit it, else both compare v1, so a mixed fleet is always safe.
+                              # Explicit false is the kill switch. See docs/diagnostics.md → "digest_v2".
   canonical_identity: false   # resolve the natural-key identity tables (snapshots,
                               # container_snapshots) by their UNIQUE natural key instead of the
                               # minted random id. Two nodes can independently create DIFFERENT ids

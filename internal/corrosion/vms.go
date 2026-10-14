@@ -246,9 +246,11 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 	}
 
 	if adopt {
+		// Its own, later updated_at: at the INSERT's, every receiver drops it
+		// as a tied partial update, and only this host records the VM adopted.
 		stmts = append(stmts, Statement{
 			SQL:    `UPDATE vms SET hardware_adoption_state = ?, hardware_adoption_error = ?, updated_at = ? WHERE name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{"adopted", nullIfEmpty(""), uts, vm.Name},
+			Params: []interface{}{"adopted", nullIfEmpty(""), c.NowTS(), vm.Name},
 		})
 	}
 

@@ -17,8 +17,10 @@ dist/
 coverage.txt
 coverage.html
 
-# Vendor (if used)
-vendor/
+# Go module vendor directory (if used). Anchored to the repo root: the bare
+# `vendor/` this used to be also matched internal/ui/static/vendor/, which kept
+# noVNC's pako out of the repo and left the web console unable to load.
+/vendor/
 
 # Generated protobuf — tracked but excluded from dirty-check accidents
 # gen/ is tracked; uncomment below if you want to ignore it:

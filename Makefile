@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
+.PHONY: all build vendor-js verify-novnc verify-pako vendor-novnc vendor-pako proto lint test test-fleet test-fleet-race test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -10,6 +10,29 @@ HTMX_VERSION := 2.0.0
 HTMX_SSE_VERSION := 2.2.2
 HTMX_DIR := internal/ui/static/vendor/htmx
 FONTS_DIR := internal/ui/static/fonts
+# internal/ui/static/novnc is noVNC v$(NOVNC_VERSION)'s core/, plus its
+# LICENSE.txt, AUTHORS and docs/LICENSE.MPL-2.0. Its inflator.js and deflator.js
+# import ../vendor/pako/, noVNC's own ES-module port of pako 1.0.3, which ships
+# in the same release. Both trees are committed and pinned file by file in
+# $(NOVNC_SUMS) and $(PAKO_SUMS); `make vendor-novnc` / `make vendor-pako`
+# re-fetch them from that release. Bumping NOVNC_VERSION means re-fetching both
+# and updating both sums files in the same change.
+NOVNC_VERSION := 1.5.0
+NOVNC_URL := https://cdn.jsdelivr.net/gh/novnc/noVNC@v$(NOVNC_VERSION)
+NOVNC_DIR := internal/ui/static/novnc
+NOVNC_SUMS := scripts/vendor-js/novnc.sha256
+PAKO_DIR := internal/ui/static/vendor/pako
+PAKO_SUMS := scripts/vendor-js/pako.sha256
+SHA256SUM := $(shell command -v sha256sum >/dev/null 2>&1 && echo sha256sum || echo 'shasum -a 256')
+
+# verify-pinned DIR,SUMS: every file in SUMS matches, and DIR holds no file
+# that SUMS does not pin. Offline.
+define verify-pinned
+	cd $(1) && $(SHA256SUM) --quiet -c $(CURDIR)/$(2) && \
+	n=$$(find . -type f | wc -l) && m=$$(wc -l < $(CURDIR)/$(2)) && \
+	if [ $$n -ne $$m ]; then echo "$(1): $$n files on disk, $$m pinned in $(2)" >&2; exit 1; fi && \
+	echo "$(1): all $$m files match $(2)"
+endef
 
 all: proto vendor-js build
 
@@ -26,8 +49,41 @@ build-litevirt:
 
 # vendor-js fetches the front-end assets that ship embedded in the single binary
 # (go:embed static/*). They are gitignored and pulled at build so no CDN is hit at
-# RUNTIME — the daemon serves htmx, uPlot, and the fonts itself.
-vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js $(HTMX_DIR)/htmx.min.js $(FONTS_DIR)/source-sans-3.woff2
+# RUNTIME — the daemon serves htmx, uPlot, and the fonts itself. noVNC and pako
+# are the exception: they are committed, and vendor-js only checks their pins.
+vendor-js: $(UPLOT_DIR)/uPlot.iife.min.js $(HTMX_DIR)/htmx.min.js $(FONTS_DIR)/source-sans-3.woff2 verify-novnc verify-pako
+
+verify-novnc:
+	$(call verify-pinned,$(NOVNC_DIR),$(NOVNC_SUMS))
+
+verify-pako:
+	$(call verify-pinned,$(PAKO_DIR),$(PAKO_SUMS))
+
+# vendor-novnc / vendor-pako re-fetch the pinned files from the noVNC
+# v$(NOVNC_VERSION) release, verify every one against the sums before touching
+# the tree, then replace the directory. A mismatch aborts with the tree
+# unchanged. noVNC's files come from core/, except its top-level LICENSE.txt and
+# AUTHORS and docs/LICENSE.MPL-2.0.
+vendor-novnc:
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	for f in $$(awk '{print $$2}' $(NOVNC_SUMS)); do \
+		case "$$f" in LICENSE.txt|AUTHORS) src=$$f ;; LICENSE.MPL-2.0) src=docs/$$f ;; *) src=core/$$f ;; esac; \
+		mkdir -p "$$tmp/$$(dirname "$$f")" && \
+		curl -sSfL "$(NOVNC_URL)/$$src" -o "$$tmp/$$f" || exit 1; \
+	done && \
+	(cd "$$tmp" && $(SHA256SUM) --quiet -c $(CURDIR)/$(NOVNC_SUMS)) && \
+	rm -rf $(NOVNC_DIR) && mkdir -p $(NOVNC_DIR) && cp -R "$$tmp"/. $(NOVNC_DIR)/ && \
+	echo "$(NOVNC_DIR): fetched noVNC v$(NOVNC_VERSION), sums verified"
+
+vendor-pako:
+	@tmp=$$(mktemp -d) && trap 'rm -rf "$$tmp"' EXIT && \
+	for f in $$(awk '{print $$2}' $(PAKO_SUMS)); do \
+		mkdir -p "$$tmp/$$(dirname "$$f")" && \
+		curl -sSfL "$(NOVNC_URL)/vendor/pako/$$f" -o "$$tmp/$$f" || exit 1; \
+	done && \
+	(cd "$$tmp" && $(SHA256SUM) --quiet -c $(CURDIR)/$(PAKO_SUMS)) && \
+	rm -rf $(PAKO_DIR) && mkdir -p $(PAKO_DIR) && cp -R "$$tmp"/. $(PAKO_DIR)/ && \
+	echo "$(PAKO_DIR): fetched from noVNC v$(NOVNC_VERSION), sums verified"
 
 $(UPLOT_DIR)/uPlot.iife.min.js:
 	@mkdir -p $(UPLOT_DIR)

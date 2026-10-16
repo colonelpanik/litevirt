@@ -117,6 +117,49 @@ func TestConfirmUpgradeHealthy(t *testing.T) {
 	}
 }
 
+// TestConfirmUpgradeHealthy_KeepsAFenceRecordedMeanwhile proves the confirm
+// never overwrites a state another writer recorded while the host was
+// upgrading: a host fenced (or drained) before its new binary answered stays
+// fenced. The binary is healthy, so the sentinel is still cleared.
+func TestConfirmUpgradeHealthy_KeepsAFenceRecordedMeanwhile(t *testing.T) {
+	for _, recorded := range []string{"fenced", "draining", "offline"} {
+		t.Run(recorded, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := corrosion.NewTestClient()
+			if err != nil {
+				t.Fatalf("NewTestClient: %v", err)
+			}
+			t.Cleanup(func() { db.Close() })
+			if err := corrosion.InitSchema(ctx, db); err != nil {
+				t.Fatalf("InitSchema: %v", err)
+			}
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: "h", Address: "127.0.0.1", SSHUser: "root", CertSerial: "s", State: recorded,
+			}); err != nil {
+				t.Fatalf("InsertHost: %v", err)
+			}
+			bin := filepath.Join(t.TempDir(), "litevirt")
+			if err := upgrade.Arm(bin, "v-old"); err != nil {
+				t.Fatalf("Arm: %v", err)
+			}
+
+			d := &Daemon{cfg: &Config{HostName: "h"}, db: db}
+			d.confirmUpgradeHealthy(bin)
+
+			h, err := corrosion.GetHost(ctx, db, "h")
+			if err != nil || h == nil {
+				t.Fatalf("GetHost: %v", err)
+			}
+			if h.State != recorded {
+				t.Fatalf("host state = %q after confirm, want %q kept", h.State, recorded)
+			}
+			if _, ok := upgrade.Read(bin); ok {
+				t.Fatal("sentinel must be cleared: the new binary answered")
+			}
+		})
+	}
+}
+
 // TestConfirmUpgradeHealthy_RetainsSentinelOnWriteFailure proves the sentinel is
 // NOT cleared when the active-state write fails — so a transient DB error can't
 // strand the host in 'upgrading' with no watchdog; the next boot re-confirms.

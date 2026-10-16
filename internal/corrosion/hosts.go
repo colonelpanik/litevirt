@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -327,6 +329,29 @@ func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
 		`UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`,
 		state, c.NowTS(), name,
 	)
+}
+
+// UpdateHostStateFrom is UpdateHostState only while the host is recorded
+// `from`, checked inside the write's own transaction: a state another writer
+// recorded first — a fence landing on a host that is turning active — is not
+// overwritten. applied=false, with no error, when the host is recorded as
+// something else or is absent.
+func UpdateHostStateFrom(ctx context.Context, c *Client, name, from, to string) (bool, error) {
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var cur string
+		err := tx.QueryRowContext(ctx,
+			`SELECT state FROM hosts WHERE name = ? AND deleted_at IS NULL`, name).Scan(&cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return cur == from, nil
+	}, []Statement{{
+		SQL:    `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`,
+		Params: []interface{}{to, c.NowTS(), name},
+	}})
 }
 
 // UpdateHostRole flips a host between "worker" and "witness". Use this to

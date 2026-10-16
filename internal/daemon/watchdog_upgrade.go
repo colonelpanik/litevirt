@@ -115,10 +115,21 @@ func (d *Daemon) runUpgradeWatchdog(ctx context.Context, binaryPath string, sent
 func (d *Daemon) confirmUpgradeHealthy(binaryPath string) {
 	mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer mcancel()
-	if err := corrosion.UpdateHostState(mctx, d.db, d.cfg.HostName, "active"); err != nil {
+	// Only from 'upgrading', checked in the write's own transaction: a fence,
+	// drain or offline mark recorded while this host was upgrading is kept.
+	applied, err := corrosion.UpdateHostStateFrom(mctx, d.db, d.cfg.HostName, "upgrading", "active")
+	if err != nil {
 		slog.Warn("post-upgrade watchdog: confirmed healthy but failed to mark host active — keeping sentinel for retry next boot", "error", err)
 		metrics.UpgradeWatchdogOutcome("confirm_failed")
 		return
+	}
+	if !applied {
+		state := "absent"
+		if h, gerr := corrosion.GetHost(mctx, d.db, d.cfg.HostName); gerr == nil && h != nil {
+			state = h.State
+		}
+		slog.Warn("post-upgrade watchdog: new binary healthy, but the host is no longer recorded upgrading — leaving its state as recorded",
+			"state", state, "version", d.cfg.Version)
 	}
 	upgrade.Clear(binaryPath)
 	slog.Info("post-upgrade watchdog: new binary healthy (local gRPC ping ok)", "version", d.cfg.Version)

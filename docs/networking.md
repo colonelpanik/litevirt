@@ -23,6 +23,25 @@ ip link set br0 up
 ip link set eth0 master br0    # attach uplink
 ```
 
+Deleting a bridge network removes the Linux bridge itself only when litevirt
+created it on that host. Each daemon records the bridges it creates under
+`/run/litevirt/bridges` (one file per bridge holding its interface index; it
+goes at reboot, along with the bridge). A bridge deleted and made again under
+the same name has a new index, so its old record is dropped, not trusted. The
+bridge is removed once it has no ports and no address other than the kernel's
+IPv6 link-local one, no other live network names it, and no VM or container
+on that host, running or stopped, has a NIC on it: one on the network, one
+naming the bridge directly (`--network <bridge>`, or a container's raw
+`bridge=` NIC), or one on another network, live or deleted, on that bridge. A
+stopped VM has no port on the bridge, and starting it does not create the
+bridge again. When those NICs cannot be read, the bridge stays. An operator's
+bridge that litevirt found already there, such as `br0` above, is never
+removed. Neither is a bridge made by an older build, which kept no record.
+
+The teardown runs on the host that serves the delete. Other hosts where the
+network was provisioned (where VMs on it were placed, or a migration brought
+it) keep their bridge, as before.
+
 ### VXLAN
 
 Creates overlay networks between hosts using VXLAN encapsulation. Useful when you need L2 connectivity across L3 boundaries.
